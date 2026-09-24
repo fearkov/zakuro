@@ -339,29 +339,44 @@ impl Gpu {
 
         for y in 0..copy_height {
             for x in 0..copy_width {
-                // averaging would be more correct for a downscale, but point
-                // sampling keeps this readable and is invisible at 1x.
-                let src_x = x * scale_x;
-                let mut src_y = y * scale_y;
-                if flip_vertically {
-                    src_y = input_height.saturating_sub(1 + src_y);
-                }
-
-                let src = if input_linear {
-                    (src_y * input_width + src_x) as usize * input_bpp
-                } else {
-                    morton(src_x, src_y, input_width, input_bpp)
-                };
                 let dst = if output_tiled {
                     morton(x, y, output_width, output_bpp)
                 } else {
                     (y * output_width + x) as usize * output_bpp
                 };
-
-                if src + input_bpp > input.len() || dst + output_bpp > output.len() {
+                if dst + output_bpp > output.len() {
                     continue;
                 }
-                let pixel = input_format.decode(&input[src..src + input_bpp]);
+
+                // a downscale averages each 2x1 or 2x2 block
+                let mut sum = [0u32; 4];
+                let mut count = 0u32;
+                for dy in 0..scale_y {
+                    for dx in 0..scale_x {
+                        let src_x = x * scale_x + dx;
+                        let mut src_y = y * scale_y + dy;
+                        if flip_vertically {
+                            src_y = input_height.saturating_sub(1 + src_y);
+                        }
+                        let src = if input_linear {
+                            (src_y * input_width + src_x) as usize * input_bpp
+                        } else {
+                            morton(src_x, src_y, input_width, input_bpp)
+                        };
+                        if src + input_bpp > input.len() {
+                            continue;
+                        }
+                        let sample = input_format.decode(&input[src..src + input_bpp]);
+                        for (total, value) in sum.iter_mut().zip(sample) {
+                            *total += value as u32;
+                        }
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    continue;
+                }
+                let pixel = sum.map(|total| ((total + count / 2) / count) as u8);
                 if trace_pixels {
                     distinct.insert(pixel);
                 }
@@ -935,5 +950,23 @@ mod tests {
         assert_eq!(gpu.internal[0x0100], 0x1111, "the sub-buffer ran");
         assert_eq!(gpu.internal[0x0102], 0x2222, "the jump back ran");
         assert_eq!(gpu.internal[0x0101], 0, "a jump does not return");
+    }
+
+    #[test]
+    fn a_downscaling_transfer_averages_each_block() {
+        let mut memory = FlatMemory(vec![0; 0x200]);
+        let reds = [[0u8, 100, 200, 0], [100, 0, 0, 200]];
+        for (y, row) in reds.iter().enumerate() {
+            for (x, red) in row.iter().enumerate() {
+                let at = 0x100 + (y * 4 + x) * 4;
+                ColorFormat::Rgba8.encode([*red, 0, 0, 255], &mut memory.0[at..at + 4]);
+            }
+        }
+        let mut gpu = Gpu::new();
+        // linear in and out, RGBA8, 2x2 downscale
+        let flags = (1 << 1) | (2 << 24);
+        gpu.display_transfer(&mut memory, 0x100, 0x180, 4 | (2 << 16), 2 | (1 << 16), flags);
+        let red_at = |i: usize| ColorFormat::Rgba8.decode(&memory.0[0x180 + i * 4..0x184 + i * 4])[0];
+        assert_eq!([red_at(0), red_at(1)], [50, 100]);
     }
 }
