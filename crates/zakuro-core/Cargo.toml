@@ -1,0 +1,17 @@
+[package]
+name = "zakuro-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zakuro-common.workspace = true
+zakuro-cpu.workspace = true
+zakuro-fs.workspace = true
+zakuro-gpu.workspace = true
+log.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+
+[dev-dependencies]
+env_logger = "0.11"

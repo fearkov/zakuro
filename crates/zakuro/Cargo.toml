@@ -1,0 +1,22 @@
+[package]
+name = "zakuro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A high-level-emulation Nintendo 3DS emulator"
+
+[[bin]]
+name = "zakuro"
+path = "src/main.rs"
+
+[dependencies]
+zakuro-common.workspace = true
+zakuro-core.workspace = true
+zakuro-fs.workspace = true
+zakuro-gpu = { workspace = true, features = ["opengl", "vulkan"] }
+log.workspace = true
+env_logger = "0.11"
+winit = "0.30"
+raw-window-handle = "0.6"
+glutin = "0.32"
+glutin-winit = "0.5"

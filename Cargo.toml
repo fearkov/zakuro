@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zakuro-common",
+    "crates/zakuro-fs",
+    "crates/zakuro-cpu",
+    "crates/zakuro-gpu",
+    "crates/zakuro-core",
+    "crates/zakuro",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/fearkov/zakuro"
+
+[workspace.dependencies]
+zakuro-common = { path = "crates/zakuro-common" }
+zakuro-fs     = { path = "crates/zakuro-fs" }
+zakuro-cpu    = { path = "crates/zakuro-cpu" }
+zakuro-gpu    = { path = "crates/zakuro-gpu" }
+zakuro-core   = { path = "crates/zakuro-core" }
+
+log = "0.4"
+thiserror = "2"
+bitflags = "2"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+parking_lot = "0.12"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+# The emulator is unusably slow in a plain debug build; give the hot crates -O2
+# even in dev profile.
+[profile.dev.package.zakuro-cpu]
+opt-level = 3
+[profile.dev.package.zakuro-gpu]
+opt-level = 3
+[profile.dev.package.zakuro-core]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+debug = 1

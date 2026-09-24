@@ -1,0 +1,9 @@
+[package]
+name = "zakuro-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zakuro-common.workspace = true
+log.workspace = true

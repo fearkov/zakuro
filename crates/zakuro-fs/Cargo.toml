@@ -1,0 +1,11 @@
+[package]
+name = "zakuro-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zakuro-common.workspace = true
+log.workspace = true
+thiserror.workspace = true
+memmap2.workspace = true
