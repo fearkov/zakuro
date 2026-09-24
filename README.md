@@ -17,8 +17,17 @@ To run it you need a decrypted ROM:
 
 No copyrighted data is included. I do not condone piracy, and I will not help you with that. So, don't ask me about that.
 
-Controls: arrow keys for the d-pad, IJKL for the circle pad, X Z S A for
-A B X Y, Q and W for L and R, Enter for Start, Backspace for Select, and the mouse for the touch screen. F1 pauses and Esc quits.
+Controls:
+
+| 3DS | Keyboard |
+|---|---|
+| A / B / X / Y | X / Z / S / A |
+| L / R | Q / W |
+| Start / Select | Enter / Backspace |
+| D-pad | Arrow keys |
+| Circle pad | I / J / K / L |
+| Touch screen | Mouse |
+| Pause / Quit | F1 / Esc |
 
 Contributions are welcome. Using AI is fine sometimes, but the code must always be reviewed by a human. Code that is entirely vibecoded will be discarded.
 
