@@ -2,7 +2,8 @@
 
 A WIP HLE Nintendo 3DS emulator written in Rust.
 
-<img width="791" height="976" alt="image" src="https://github.com/user-attachments/assets/8900d84d-27c1-44ee-91b3-be8d5fc79b54" />
+<img width="797" height="983" alt="image" src="https://github.com/user-attachments/assets/c18deb0d-3949-4493-83df-0142928d8c2d" />
+
 
 I started developing this project in October 2025, before
 [feargba](https://github.com/fearkov/feargba). 
