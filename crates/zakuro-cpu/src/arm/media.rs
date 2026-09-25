@@ -3,7 +3,7 @@
 
 use zakuro_common::bits::{bit, bits};
 
-use super::alu::{saturate_i32, signed_saturate, unsigned_saturate};
+use super::alu::{signed_saturate, unsigned_saturate};
 use crate::{Bus, Cpu, Exit};
 
 pub fn execute<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
@@ -385,16 +385,16 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     };
 
     match op1 {
-        // SMLAD / SMUAD / SMLSD / SMUSD
+        // SMLAD / SMUAD / SMLSD / SMUSD. the sum wraps, an overflow only
+        // sets Q.
         0b10000 => {
             let sum = if ra == 15 {
                 dual
             } else {
                 dual + cpu.regs[ra] as i32 as i64
             };
-            let (value, sat) = saturate_i32(sum);
-            cpu.regs[rd] = value;
-            cpu.cpsr.q |= sat;
+            cpu.regs[rd] = sum as u32;
+            cpu.cpsr.q |= sum != sum as i32 as i64;
         }
         // SMLALD / SMLSLD accumulate into the RdHi:RdLo pair.
         0b10100 => {

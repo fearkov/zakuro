@@ -405,6 +405,19 @@ fn asx_and_sax_cross_the_halves() {
 }
 
 #[test]
+fn smlad_wraps_and_sets_q_when_it_overflows() {
+    let Some(r) = run_with("smlad r0, r4, r5, r6", |cpu, _| {
+        cpu.regs[4] = 0x0001_0001;
+        cpu.regs[5] = 0x0001_0001;
+        cpu.regs[6] = 0x7FFF_FFFF;
+    }) else {
+        return;
+    };
+    assert_reg!(r, 0, 0x8000_0001);
+    assert_flags!(r, "----Q");
+}
+
+#[test]
 fn smuad_and_smmul() {
     let Some(r) = run_with("smuad r0, r4, r5\n smmul r1, r6, r7", |cpu, _| {
         cpu.regs[4] = 0x0002_0003;
