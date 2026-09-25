@@ -367,6 +367,12 @@ impl Memory {
         Some(unsafe { std::slice::from_raw_parts_mut(ptr, PAGE_SIZE as usize) })
     }
 
+    /// the read and write page tables, a host pointer per 4 KiB page or
+    /// null, for code that reads memory without going through the bus.
+    pub fn page_tables(&self) -> (*const *mut u8, *const *mut u8) {
+        (self.read_table.as_ptr(), self.write_table.as_ptr())
+    }
+
     fn note_fault(&mut self, addr: VAddr) {
         let page = addr & !PAGE_MASK;
         let count = self.faults.entry(page).or_insert(0);

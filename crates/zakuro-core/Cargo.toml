@@ -12,6 +12,7 @@ zakuro-gpu.workspace = true
 log.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true
+libloading.workspace = true
 
 [dev-dependencies]
 env_logger = "0.11"

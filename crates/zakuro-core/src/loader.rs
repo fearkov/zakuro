@@ -70,6 +70,17 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         app_bytes / (1024 * 1024)
     );
 
+    if let Some(path) = &system.config.recompiled {
+        let path = if path.is_dir() { path.join(format!("{:016X}.so", title.program_id())) } else { path.clone() };
+        match crate::recompiled::Library::open(&path) {
+            Ok(library) => {
+                log::info!("running recompiled code from {}, {}", path.display(), library.describe());
+                system.recompiled = Some(library);
+            }
+            Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
+        }
+    }
+
     system.title = Some(title);
     Ok(system)
 }

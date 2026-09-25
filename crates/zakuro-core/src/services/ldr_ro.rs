@@ -75,7 +75,12 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 auto_link,
             );
             match result {
-                Ok(fix_size) => buffer.reply(&mut system.memory, id, &[fix_size]),
+                Ok(fix_size) => {
+                    if let (Some(library), Some(module)) = (&mut system.recompiled, system.cro.modules.last()) {
+                        library.place(&module.name, module.base);
+                    }
+                    buffer.reply(&mut system.memory, id, &[fix_size])
+                }
                 Err(CroError::NotACro) => {
                     log::error!("ldr:ro: the buffer at 0x{source:08X} is not a CRO");
                     buffer.reply_error(&mut system.memory, id, ERROR_NOT_LOADED);
@@ -90,6 +95,10 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
 
         UNLOAD_CRO => {
             let address = buffer.get(&mut system.memory, 1);
+            let module = system.cro.modules.iter().find(|m| m.base == address);
+            if let (Some(library), Some(module)) = (&mut system.recompiled, module) {
+                library.place(&module.name, 0);
+            }
             system.cro.unload(&mut system.memory, address);
             buffer.reply(&mut system.memory, id, &[]);
             true

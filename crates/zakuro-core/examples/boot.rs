@@ -20,6 +20,8 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(zakuro_core::services::cfg::LANGUAGE_ENGLISH),
+        // ZAKURO_RECOMPILED=path runs the code 3dsrecomp built for the title.
+        recompiled: std::env::var("ZAKURO_RECOMPILED").ok().map(Into::into),
         ..Config::default()
     };
     let mut system = match loader::load(&path, config) {

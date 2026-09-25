@@ -5,6 +5,7 @@ pub mod cro;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
+pub mod recompiled;
 pub mod services;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +31,9 @@ pub struct Config {
     pub region: u8,
     pub language: u8,
     pub slider_3d: f32,
+    /// a library 3dsrecomp built for the title, or a directory holding one
+    /// named after its title id.
+    pub recompiled: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -40,6 +44,7 @@ impl Default for Config {
             region: services::cfg::REGION_USA,
             language: services::cfg::LANGUAGE_ENGLISH,
             slider_3d: 0.0,
+            recompiled: None,
         }
     }
 }
@@ -94,6 +99,10 @@ pub struct System {
 
     /// sampling profiler, counts how often each thread was found at each PC.
     pub profile: Option<BTreeMap<(String, u32), u64>>,
+
+    /// code recompiled ahead of time, which runs instead of the interpreter
+    /// wherever it has something.
+    pub recompiled: Option<recompiled::Library>,
 }
 
 /// cycles in one 60 Hz frame at the ARM11's clock.
@@ -146,6 +155,7 @@ impl System {
             next_audio_frame: CYCLES_PER_AUDIO_FRAME,
             next_preempt: PREEMPT_INTERVAL,
             profile: None,
+            recompiled: None,
         }
     }
 
@@ -298,7 +308,11 @@ impl System {
             self.sample();
         }
 
-        match self.cpu.step(&mut self.memory) {
+        let exit = match self.run_recompiled(deadline) {
+            Some(exit) => exit,
+            None => self.cpu.step(&mut self.memory),
+        };
+        match exit {
             None => {}
             Some(Exit::Supervisor(number)) => kernel::svc::dispatch(self, number),
             Some(Exit::Undefined { pc, opcode }) => {
@@ -340,6 +354,31 @@ impl System {
         } else {
             StepOutcome::Ran
         }
+    }
+
+    /// runs recompiled code from the pc up to the next thing the scheduler
+    /// has to look at, when the library has code there. what it returns
+    /// stands in for what one interpreted step would.
+    fn run_recompiled(&mut self, deadline: Option<u64>) -> Option<Option<Exit>> {
+        let library = self.recompiled.as_ref()?;
+        if !library.has_code(self.cpu.regs[15] | self.cpu.cpsr.thumb as u32) {
+            return None;
+        }
+        let mut limit = self.next_preempt.min(self.next_frame_boundary).min(self.next_audio_frame);
+        if let Some(deadline) = deadline {
+            limit = limit.min(deadline);
+        }
+        let budget = limit.saturating_sub(self.cpu.cycles).max(1);
+        let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
+        if ran == 0 && matches!(stop, recompiled::Stop::Left) {
+            // not enough budget left for a whole block
+            return None;
+        }
+        Some(match stop {
+            recompiled::Stop::Svc(number) => Some(Exit::Supervisor(number)),
+            recompiled::Stop::Exit(exit) => Some(exit),
+            recompiled::Stop::Left => None,
+        })
     }
 
     /// the instruction addresses executed most recently, oldest first.

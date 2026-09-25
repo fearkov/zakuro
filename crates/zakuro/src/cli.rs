@@ -14,6 +14,8 @@ pub struct Options {
     pub new3ds: bool,
     /// skip loading a ROM entirely and just paint both screens solid colors.
     pub test_pattern: bool,
+    /// a library of recompiled code for the title, or a directory of them.
+    pub recompiled: Option<String>,
 }
 
 const USAGE: &str = "\
@@ -27,6 +29,8 @@ options:
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
   --profile                        collect a sampling profile and print it
+  --recompiled <path>              run code 3dsrecomp built for the title, a
+                                   library or a directory holding <title id>.so
   -h, --help                       show this message
 
 The system font cannot be generated: put a dump at sysdata/shared_font.bin for
@@ -43,6 +47,7 @@ pub fn parse() -> Result<Options, String> {
         profile: false,
         new3ds: false,
         test_pattern: false,
+        recompiled: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -72,6 +77,9 @@ pub fn parse() -> Result<Options, String> {
                 );
             }
             "--new3ds" => options.new3ds = true,
+            "--recompiled" => {
+                options.recompiled = Some(args.next().ok_or("--recompiled needs a path")?);
+            }
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
             other if other.starts_with('-') => {
