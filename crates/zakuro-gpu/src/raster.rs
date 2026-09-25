@@ -465,15 +465,14 @@ struct BoundTexture {
     format: crate::texture::TextureFormat,
     width: u32,
     height: u32,
+    border: [f32; 4],
 }
 
 /// how a texture coordinate outside 0..1 is brought back inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wrap {
     ClampToEdge,
-    /// the PICA's border color is not modelled, clamping to the edge is
-    /// what a title sees wherever its border matches the edge texel, which
-    /// is by far the common case.
+    /// outside the texture, the unit's border color.
     ClampToBorder,
     Repeat,
     MirroredRepeat,
@@ -512,6 +511,12 @@ impl Wrap {
 
 impl BoundTexture {
     fn texel(&self, x: i32, y: i32) -> [f32; 4] {
+        let outside = |wrap: Wrap, coordinate: i32, size: u32| {
+            wrap == Wrap::ClampToBorder && !(0..size as i32).contains(&coordinate)
+        };
+        if outside(self.wrap_s, x, self.width) || outside(self.wrap_t, y, self.height) {
+            return self.border;
+        }
         let x = self.wrap_s.apply(x, self.width);
         let y = self.wrap_t.apply(y, self.height);
         let t = crate::texture::sample_texel(&self.data, self.format, self.width, x, y);
@@ -599,6 +604,8 @@ fn bind_texture<M: GpuMemory>(
         format,
         width,
         height,
+        // the border color register comes first in each unit's block, RGBA8
+        border: registers[base].to_le_bytes().map(|c| c as f32 / 255.0),
     })
 }
 
@@ -1539,5 +1546,24 @@ mod tests {
                 assert_eq!(red, row < 4, "row {row}, column {x}");
             }
         }
+    }
+
+    #[test]
+    fn clamp_to_border_reads_the_border_color() {
+        let texture = |wrap: Wrap| BoundTexture {
+            data: vec![0xFF; 8 * 8 * 4],
+            linear: false,
+            wrap_s: wrap,
+            wrap_t: wrap,
+            format: crate::texture::TextureFormat::Rgba8,
+            width: 8,
+            height: 8,
+            border: RED,
+        };
+        let white = [1.0; 4];
+        assert_eq!(texture(Wrap::ClampToBorder).texel(-1, 3), RED);
+        assert_eq!(texture(Wrap::ClampToBorder).texel(3, 8), RED);
+        assert_eq!(texture(Wrap::ClampToBorder).texel(3, 3), white);
+        assert_eq!(texture(Wrap::ClampToEdge).texel(-1, 3), white);
     }
 }
