@@ -12,7 +12,7 @@ use zakuro_cpu::{Bus, Cpu, Exit};
 use crate::memory::Memory;
 
 /// the interface version, which has to match the library's.
-const ABI: u32 = 2;
+const ABI: u32 = 3;
 
 const EXIT_SVC: u32 = 1;
 const EXIT_BUDGET: u32 = 2;
@@ -49,6 +49,8 @@ struct Context {
     depth: u32,
     read_pages: *const *mut u8,
     write_pages: *const *mut u8,
+    vfp: *mut u32,
+    fpscr: *mut u32,
     host: *const Host,
     user: *mut c_void,
 }
@@ -276,11 +278,17 @@ impl Library {
             depth: 0,
             read_pages,
             write_pages,
+            vfp: std::ptr::null_mut(),
+            fpscr: std::ptr::null_mut(),
             host: &HOST,
             user: std::ptr::null_mut(),
         };
         store(cpu, &mut ctx);
         let mut machine = Machine { cpu, memory, library: self, pending: None };
+        // the code works on the VFP registers where they are, so the
+        // interpreter sees its changes without copying them around
+        ctx.vfp = machine.cpu.vfp.regs.as_mut_ptr();
+        ctx.fpscr = &mut machine.cpu.vfp.fpscr;
         ctx.user = &mut machine as *mut Machine as *mut c_void;
 
         let stop = loop {
