@@ -88,6 +88,11 @@ pub fn extra<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 20);
     let sh = bits(op, 5, 6);
 
+    // ldrd and strd name a register pair, and r15 has no partner.
+    if !load && sh >= 0b10 && rd == PC {
+        return Some(Exit::Undefined { pc: cpu.current_pc(), opcode: op });
+    }
+
     let offset = if immediate {
         (bits(op, 8, 11) << 4) | (op & 0xF)
     } else {
@@ -291,6 +296,12 @@ pub fn exclusive<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let size = bits(op, 21, 22);
     let rn = bits(op, 16, 19) as usize;
     let addr = cpu.regs[rn];
+
+    // the doubleword forms name a register pair, and r15 has no partner.
+    let pair = if load { bits(op, 12, 15) } else { op & 0xF };
+    if size == 0b01 && pair as usize == PC {
+        return Some(Exit::Undefined { pc: cpu.current_pc(), opcode: op });
+    }
 
     if load {
         let rd = bits(op, 12, 15) as usize;

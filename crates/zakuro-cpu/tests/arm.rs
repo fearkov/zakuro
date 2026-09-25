@@ -2,7 +2,8 @@
 
 mod common;
 
-use common::{assert_flags, assert_reg, run, run_with, CODE_BASE, DATA_BASE};
+use common::{assert_flags, assert_reg, run, run_with, TestBus, CODE_BASE, DATA_BASE, STACK_TOP};
+use zakuro_cpu::{Cpu, Exit};
 
 // ---------------------------------------------------------------------------
 // Data processing
@@ -488,6 +489,19 @@ fn doubleword_round_trip() {
     };
     assert_reg!(r, 2, 0x1111_1111);
     assert_reg!(r, 3, 0x2222_2222);
+}
+
+#[test]
+fn a_register_pair_starting_at_r15_is_undefined() {
+    // ldrd r15, strd r15 and ldrexd r15, there is no register after r15.
+    for opcode in [0xE1C0_F0D0u32, 0xE1C0_F0F0, 0xE1B0_FF9F] {
+        let mut bus = TestBus::default();
+        bus.write_bytes(CODE_BASE, &opcode.to_le_bytes());
+        let mut cpu = Cpu::new();
+        cpu.reset_to(CODE_BASE, STACK_TOP);
+        cpu.regs[0] = DATA_BASE;
+        assert!(matches!(cpu.step(&mut bus), Some(Exit::Undefined { .. })), "{opcode:08X}");
+    }
 }
 
 #[test]
