@@ -225,6 +225,19 @@ fn smlabb_uses_the_bottom_halves() {
 }
 
 #[test]
+fn smlabb_wraps_and_sets_q_when_it_overflows() {
+    let Some(r) = run_with("smlabb r0, r1, r2, r3", |cpu, _| {
+        cpu.regs[1] = 1;
+        cpu.regs[2] = 1;
+        cpu.regs[3] = 0x7FFF_FFFF;
+    }) else {
+        return;
+    };
+    assert_reg!(r, 0, 0x8000_0000);
+    assert_flags!(r, "----Q");
+}
+
+#[test]
 fn smultt_uses_the_top_halves() {
     let Some(r) = run_with("smultt r0, r1, r2", |cpu, _| {
         cpu.regs[1] = 0x0003_DEAD;

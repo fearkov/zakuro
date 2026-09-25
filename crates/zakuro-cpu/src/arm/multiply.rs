@@ -97,13 +97,12 @@ pub fn halfword<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     };
 
     match bits(op, 21, 22) {
-        // SMLA<x><y>, 16x16 + 32, saturating the accumulate into Q.
+        // SMLA<x><y>, 16x16 + 32. the sum wraps, an overflow only sets Q.
         0b00 => {
             let product = half(cpu.regs[rm], x) as i64 * half(cpu.regs[rs], y) as i64;
             let sum = product + cpu.regs[rn] as i32 as i64;
-            let (result, saturated) = saturate_i32(sum);
-            cpu.regs[rd] = result;
-            cpu.cpsr.q |= saturated;
+            cpu.regs[rd] = sum as u32;
+            cpu.cpsr.q |= sum != sum as i32 as i64;
         }
         // SMLAW<y> / SMULW<y>, 32x16 keeping the top 32 bits of the 48-bit
         // product.
@@ -114,9 +113,8 @@ pub fn halfword<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
                 cpu.regs[rd] = product as u32;
             } else {
                 let sum = product + cpu.regs[rn] as i32 as i64;
-                let (result, saturated) = saturate_i32(sum);
-                cpu.regs[rd] = result;
-                cpu.cpsr.q |= saturated;
+                cpu.regs[rd] = sum as u32;
+                cpu.cpsr.q |= sum != sum as i32 as i64;
             }
         }
         // SMLAL<x><y>, 16x16 accumulated into a 64-bit pair, no saturation.
