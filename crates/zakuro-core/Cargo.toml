@@ -12,7 +12,7 @@ zakuro-gpu = { workspace = true, features = ["vulkan"] }
 log.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true
-libloading.workspace = true
+recomp-abi.workspace = true
 
 [dev-dependencies]
 env_logger = "0.11"

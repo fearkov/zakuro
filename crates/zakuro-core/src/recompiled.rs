@@ -4,131 +4,23 @@
 //! here for anything else. whatever the library has no code for stays with
 //! the interpreter.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::cell::Cell;
+use std::ffi::c_void;
 use std::path::Path;
 
+use recomp_abi::{Code, Context, Host, EXIT_BUDGET, EXIT_SVC, EXIT_UNWIND};
 use zakuro_cpu::{Bus, Cpu, Exit};
 
 use crate::memory::Memory;
 
-/// the interface version, which has to match the library's.
-const ABI: u32 = 4;
+pub use recomp_abi::Linked;
 
-const EXIT_SVC: u32 = 1;
-const EXIT_BUDGET: u32 = 2;
-const EXIT_UNWIND: u32 = 3;
-
-type Code = unsafe extern "C" fn(*mut Context);
-
-#[repr(C)]
-struct Host {
-    read8: unsafe extern "C" fn(*mut Context, u32) -> u8,
-    read16: unsafe extern "C" fn(*mut Context, u32) -> u16,
-    read32: unsafe extern "C" fn(*mut Context, u32) -> u32,
-    write8: unsafe extern "C" fn(*mut Context, u32, u8),
-    write16: unsafe extern "C" fn(*mut Context, u32, u16),
-    write32: unsafe extern "C" fn(*mut Context, u32, u32),
-    interpret: unsafe extern "C" fn(*mut Context, u32, u32),
-    lookup: unsafe extern "C" fn(*mut Context, u32) -> Option<Code>,
-}
-
-#[repr(C)]
-struct Context {
-    r: [u32; 16],
-    n: u8,
-    z: u8,
-    c: u8,
-    v: u8,
-    q: u8,
-    thumb: u8,
-    ge: u8,
-    exclusive: u8,
-    budget: i32,
-    exit: u32,
-    svc: u32,
-    depth: u32,
-    exclusive_address: u32,
-    tls: u32,
-    read_pages: *const *mut u8,
-    write_pages: *const *mut u8,
-    vfp: *mut u32,
-    fpscr: *mut u32,
-    host: *const Host,
-    user: *mut c_void,
-}
-
-#[repr(C)]
-struct Entry {
-    address: u32,
-    code: Code,
-}
-
-#[repr(C)]
-struct Module {
-    name: *const c_char,
-    base: *mut u32,
-    size: u32,
-    count: u32,
-    entries: *const Entry,
-}
-
-/// the tables of recompiled code linked into the program itself, rather
-/// than loaded from a library, which is how a title's own executable built
-/// with 3dsrecomp port runs.
-#[derive(Debug, Clone, Copy)]
-pub struct Linked {
-    program_id: u64,
-    abi: u32,
-    entries: *const c_void,
-    count: u32,
-    modules: *const c_void,
-    module_count: u32,
-}
-
-impl Linked {
-    /// # Safety
-    ///
-    /// the pointers and counts have to be the recomp_ symbols of code that
-    /// 3dsrecomp generated, linked into this program.
-    pub unsafe fn new(
-        program_id: u64,
-        abi: u32,
-        entries: *const c_void,
-        count: u32,
-        modules: *const c_void,
-        module_count: u32,
-    ) -> Linked {
-        Linked { program_id, abi, entries, count, modules, module_count }
-    }
-
-    /// the title the code was recompiled from.
-    pub fn program_id(&self) -> u64 {
-        self.program_id
-    }
-}
-
-// SAFETY: the tables live as long as the program and are read only, apart
-// from the module bases, which only the thread running the system touches.
-unsafe impl Send for Linked {}
-unsafe impl Sync for Linked {}
-
-/// a library of recompiled code, loaded.
+/// recompiled code, and how much of its work it handed back.
 pub struct Library {
-    entries: *const Entry,
-    count: usize,
-    modules: *const Module,
-    module_count: usize,
-    /// the modules the title has loaded, as base, size and index.
-    loaded: Vec<(u32, u32, usize)>,
+    code: recomp_abi::Library,
     /// instructions the code handed to the interpreter one at a time.
-    fallbacks: std::cell::Cell<u64>,
-    /// the library the tables are in, none when they are linked in.
-    _library: Option<libloading::Library>,
+    fallbacks: Cell<u64>,
 }
-
-// SAFETY: the tables the pointers lead to are read only, apart from the
-// module bases, which only the thread running the system touches.
-unsafe impl Send for Library {}
 
 /// why a run of recompiled code ended.
 pub enum Stop {
@@ -232,57 +124,19 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
     ctx.tls = cpu.cp15.thread_id_ro;
 }
 
-fn find(entries: &[Entry], address: u32) -> Option<Code> {
-    entries.binary_search_by_key(&address, |entry| entry.address).ok().map(|i| entries[i].code)
-}
-
 impl Library {
+    /// a library 3dsrecomp built.
     pub fn open(path: &Path) -> Result<Library, String> {
-        // SAFETY: a library 3dsrecomp built, whose symbols have the types
-        // its recomp.h gives them, which the version check makes sure of.
-        unsafe {
-            let library = libloading::Library::new(path).map_err(|e| e.to_string())?;
-            let symbol = |name: &[u8]| -> Result<*const c_void, String> {
-                library.get::<*const c_void>(name).map(|s| *s).map_err(|e| e.to_string())
-            };
-            let abi = *(symbol(b"recomp_abi")? as *const u32);
-            let count = *(symbol(b"recomp_entry_count")? as *const u32);
-            let entries = symbol(b"recomp_entries")?;
-            let module_count = *(symbol(b"recomp_module_count")? as *const u32);
-            let modules = symbol(b"recomp_modules")?;
-            let linked = Linked { program_id: 0, abi, entries, count, modules, module_count };
-            Library::from_tables(&linked, Some(library))
-        }
+        recomp_abi::Library::open(path).map(Library::new)
     }
 
     /// the code linked into the program.
     pub fn linked(linked: &Linked) -> Result<Library, String> {
-        Library::from_tables(linked, None)
+        recomp_abi::Library::linked(linked).map(Library::new)
     }
 
-    fn from_tables(linked: &Linked, library: Option<libloading::Library>) -> Result<Library, String> {
-        if linked.abi != ABI {
-            return Err(format!("it was built for version {} of the interface, this is {ABI}", linked.abi));
-        }
-        Ok(Library {
-            entries: linked.entries as *const Entry,
-            count: linked.count as usize,
-            modules: linked.modules as *const Module,
-            module_count: linked.module_count as usize,
-            loaded: Vec::new(),
-            fallbacks: std::cell::Cell::new(0),
-            _library: library,
-        })
-    }
-
-    fn entries(&self) -> &[Entry] {
-        // SAFETY: the table lives as long as the library does
-        unsafe { std::slice::from_raw_parts(self.entries, self.count) }
-    }
-
-    fn modules(&self) -> &[Module] {
-        // SAFETY: as above
-        unsafe { std::slice::from_raw_parts(self.modules, self.module_count) }
+    fn new(code: recomp_abi::Library) -> Library {
+        Library { code, fallbacks: Cell::new(0) }
     }
 
     /// how many instructions the code has handed to the interpreter.
@@ -290,22 +144,15 @@ impl Library {
         self.fallbacks.get()
     }
 
-    /// how many functions and modules the library has code for.
+    /// how many functions and modules there is code for.
     pub fn describe(&self) -> String {
-        format!("{} entry points, {} modules", self.count, self.module_count)
+        self.code.describe()
     }
 
     /// the code that can run from address, bit 0 set for Thumb, in the
     /// executable or in a module that is loaded.
     fn lookup(&self, address: u32) -> Option<Code> {
-        find(self.entries(), address).or_else(|| {
-            let &(base, _, index) =
-                self.loaded.iter().find(|&&(base, size, _)| address.wrapping_sub(base) < size)?;
-            let module = &self.modules()[index];
-            // SAFETY: the table lives as long as the library does
-            let entries = unsafe { std::slice::from_raw_parts(module.entries, module.count as usize) };
-            find(entries, address - base)
-        })
+        self.code.lookup(address)
     }
 
     pub fn has_code(&self, address: u32) -> bool {
@@ -315,17 +162,9 @@ impl Library {
     /// tells the code of the module called name where the title loaded it,
     /// zero when it unloads it.
     pub fn place(&mut self, name: &str, base: u32) {
-        // SAFETY: the table holds string literals
-        let index = self.modules().iter().position(|m| unsafe { CStr::from_ptr(m.name) }.to_bytes() == name.as_bytes());
-        let Some(index) = index else { return };
-        let module = &self.modules()[index];
-        // SAFETY: base points at the module's variable in the library, which
-        // the code only reads on entry
-        unsafe { *module.base = base };
-        let size = module.size;
-        self.loaded.retain(|&(_, _, i)| i != index);
+        let Some(index) = self.code.module_index(name) else { return };
+        self.code.place(index, base);
         if base != 0 {
-            self.loaded.push((base, size, index));
             log::info!("recompiled code for {name} runs at 0x{base:08X}");
         }
     }

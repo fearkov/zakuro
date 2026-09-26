@@ -1399,6 +1399,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "recomp-abi"
+version = "0.1.0"
+source = "git+https://github.com/fearkov/3dsrecomp#3029fb149101f78a2fa2c685dbbb54c9b613679c"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2265,8 +2273,8 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
  "env_logger",
- "libloading",
  "log",
+ "recomp-abi",
  "thiserror 2.0.20",
  "zakuro-common",
  "zakuro-cpu",
