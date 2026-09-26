@@ -22,6 +22,8 @@ pub struct Options {
     pub data: Option<String>,
     /// interpret everything, whatever recompiled code there is.
     pub interpreter: bool,
+    /// play no sound.
+    pub mute: bool,
 }
 
 const USAGE: &str = "\
@@ -45,6 +47,7 @@ options:
                                    for it, in ~/.local/share/3dsrecomp)
   --interpreter                    interpret everything, even with recompiled
                                    code around
+  --mute                           play no sound
   --data <dir>                     where saves live (default: the system's
                                    place for data, ~/.local/share/zakuro)
   -h, --help                       show this message
@@ -67,6 +70,7 @@ pub fn parse() -> Result<Options, String> {
         hardware_rasterizer: true,
         data: None,
         interpreter: false,
+        mute: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -111,6 +115,7 @@ pub fn parse() -> Result<Options, String> {
                 options.data = Some(args.next().ok_or("--data needs a directory")?);
             }
             "--interpreter" => options.interpreter = true,
+            "--mute" => options.mute = true,
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
             other if other.starts_with('-') => {

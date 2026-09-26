@@ -130,6 +130,8 @@ pub const CYCLES_PER_FRAME: u64 = kernel::thread::CPU_CLOCK_HZ / 60;
 /// cycles in one audio frame, 160 samples, each exactly 8192 cycles long
 /// (the DSP's 32728 Hz is the CPU clock divided by 8192).
 pub const CYCLES_PER_AUDIO_FRAME: u64 = 160 * 8192;
+/// samples the DSP plays each second, one every 8192 cycles.
+pub const AUDIO_SAMPLE_RATE: f64 = kernel::thread::CPU_CLOCK_HZ as f64 / 8192.0;
 
 /// how often the scheduler is forced to run even if no thread yields.
 pub const PREEMPT_INTERVAL: u64 = 8192;
@@ -549,6 +551,12 @@ impl System {
             services::dsp::advance(self);
             services::dsp::signal_semaphore(self);
         }
+    }
+
+    /// the stereo samples the console played since the last call, at
+    /// AUDIO_SAMPLE_RATE.
+    pub fn take_audio(&mut self) -> Vec<[i16; 2]> {
+        std::mem::take(&mut self.services.dsp.output)
     }
 
     /// feeds one frame of input to HID.

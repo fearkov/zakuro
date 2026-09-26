@@ -1,6 +1,7 @@
 //! Zakuro's frontend, a window, a presentation backend, and the loop that
 //! drives the emulated console one frame at a time.
 
+mod audio;
 mod cli;
 mod input;
 mod present;
@@ -77,12 +78,20 @@ pub fn run(linked: Option<Linked>) {
     // run_frame every tick, which is exactly "just keep presenting what's
     // there".
     let paused = options.test_pattern;
+    let audio = if options.mute {
+        None
+    } else {
+        audio::Audio::open(zakuro_core::AUDIO_SAMPLE_RATE)
+            .inspect_err(|error| log::warn!("no sound, {error}"))
+            .ok()
+    };
     let mut app = App {
         system,
         options,
         window: None,
         backend: None,
         keyboard: Keyboard::default(),
+        audio,
         last_title_update: Instant::now(),
         frame_start: Instant::now(),
         paused,
@@ -228,6 +237,7 @@ struct App {
     backend: Option<Backend>,
     window: Option<Window>,
     keyboard: Keyboard,
+    audio: Option<audio::Audio>,
     last_title_update: Instant,
     frame_start: Instant,
     paused: bool,
@@ -331,7 +341,12 @@ impl App {
 
         if !self.paused {
             self.system.set_input(self.keyboard.state());
-            match self.system.run_frame() {
+            let outcome = self.system.run_frame();
+            let sound = self.system.take_audio();
+            if let Some(audio) = &self.audio {
+                audio.push(&sound);
+            }
+            match outcome {
                 FrameOutcome::Completed => {}
                 FrameOutcome::Exited => {
                     log::info!("the title exited");

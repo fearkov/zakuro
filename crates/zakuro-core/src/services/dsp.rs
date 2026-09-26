@@ -79,7 +79,13 @@ pub struct DspState {
     pipes: [Vec<u8>; PIPE_COUNT],
     /// the 24 voices the audio firmware plays.
     voices: super::dsp_voices::Voices,
+    mixer: super::dsp_mixer::Mixer,
+    /// what came out of the speakers since the frontend last took it.
+    pub output: Vec<[i16; 2]>,
 }
+
+/// the most output kept for a frontend that is not taking it, a second.
+const MAX_OUTPUT: usize = 32_768;
 
 impl DspState {
     fn reset_pipes(&mut self) {
@@ -316,17 +322,31 @@ fn dsp_dram_to_arm(address: u16) -> u32 {
 
 /// runs one audio frame of the firmware, plays the voices through their
 /// buffers and publishes their statuses, which is how a title's sound
-/// library knows its audio is moving.
+/// library knows its audio is moving, then mixes what they played.
 pub fn advance(system: &mut System) {
     if !system.services.dsp.running {
         return;
     }
-    let layout = super::dsp_voices::Layout {
+    let voices = super::dsp_voices::Layout {
         configurations: dsp_dram_to_arm(layout::SOURCE_CONFIGURATIONS),
         statuses: dsp_dram_to_arm(layout::SOURCE_STATUSES),
+        coefficients: dsp_dram_to_arm(layout::ADPCM_COEFFICIENTS),
         frame_counter: dsp_dram_to_arm(layout::FRAME_COUNTER),
     };
-    system.services.dsp.voices.tick(&mut system.memory, layout);
+    let mixer = super::dsp_mixer::Layout {
+        configuration: dsp_dram_to_arm(layout::DSP_CONFIGURATION),
+        final_samples: dsp_dram_to_arm(layout::FINAL_SAMPLES),
+        intermediate_samples: dsp_dram_to_arm(layout::INTERMEDIATE_MIX_SAMPLES),
+    };
+    let read = super::dsp_voices::current_region(&mut system.memory, voices);
+    let dsp = &mut system.services.dsp;
+    let mixes = dsp.voices.tick(&mut system.memory, voices);
+    let frame = dsp.mixer.tick(&mut system.memory, mixer, read, mixes);
+    dsp.output.extend_from_slice(&frame);
+    if dsp.output.len() > MAX_OUTPUT {
+        let excess = dsp.output.len() - MAX_OUTPUT;
+        dsp.output.drain(..excess);
+    }
 }
 
 /// signals the DSP's interrupt events, as the firmware does at the end of

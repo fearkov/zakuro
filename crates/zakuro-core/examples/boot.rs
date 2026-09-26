@@ -68,6 +68,11 @@ fn main() {
         log::set_max_level(log::LevelFilter::Info);
     }
 
+    // everything the console played, written to a WAV at the end,
+    // ZAKURO_WAV=/tmp/zakuro.wav.
+    let wav = std::env::var("ZAKURO_WAV").ok();
+    let mut audio: Vec<[i16; 2]> = Vec::new();
+
     for frame in 0..frames {
         if log_from == Some(frame) {
             log::set_max_level(log::LevelFilter::Trace);
@@ -111,6 +116,9 @@ fn main() {
         }
         outcome = system.run_frame();
         executed = frame + 1;
+        if wav.is_some() {
+            audio.extend(system.take_audio());
+        }
         if dump_at.contains(&executed) {
             for (screen, name) in SCREENS {
                 save_screen(&mut system, screen, &format!("/tmp/zakuro-{name}-{executed}.ppm"));
@@ -122,6 +130,12 @@ fn main() {
     }
 
     let elapsed = start.elapsed();
+    if let Some(path) = &wav {
+        match write_wav(path, &audio) {
+            Ok(()) => println!("wrote {} seconds of sound to {path}", audio.len() / zakuro_core::AUDIO_SAMPLE_RATE as usize),
+            Err(error) => eprintln!("could not write {path}, {error}"),
+        }
+    }
     println!("\n--- result ---");
     println!("outcome:       {outcome:?} after {executed} frames in {elapsed:.2?}");
     println!("instructions:  {}", system.cpu.cycles);
@@ -337,4 +351,28 @@ fn parse_input_script(spec: &str) -> Vec<(u64, PadState)> {
             Some((frame.trim().parse().ok()?, buttons))
         })
         .collect()
+}
+
+/// a 16-bit stereo WAV at the DSP's rate.
+fn write_wav(path: &str, samples: &[[i16; 2]]) -> std::io::Result<()> {
+    let rate = zakuro_core::AUDIO_SAMPLE_RATE.round() as u32;
+    let data = (samples.len() * 4) as u32;
+    let mut bytes = Vec::with_capacity(44 + data as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&(rate * 4).to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    for [left, right] in samples {
+        bytes.extend_from_slice(&left.to_le_bytes());
+        bytes.extend_from_slice(&right.to_le_bytes());
+    }
+    std::fs::write(path, bytes)
 }
