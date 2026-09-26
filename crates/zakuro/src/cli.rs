@@ -18,6 +18,8 @@ pub struct Options {
     pub recompiled: Option<String>,
     /// draw on the host GPU rather than in software.
     pub hardware_rasterizer: bool,
+    /// where saves live, instead of the usual place.
+    pub data: Option<String>,
 }
 
 const USAGE: &str = "\
@@ -37,10 +39,12 @@ options:
   --profile                        collect a sampling profile and print it
   --recompiled <path>              run code 3dsrecomp built for the title, a
                                    library or a directory holding <title id>.so
+  --data <dir>                     where saves live (default: the system's
+                                   place for data, ~/.local/share/zakuro)
   -h, --help                       show this message
 
-The system font cannot be generated: put a dump at sysdata/shared_font.bin for
-titles that render text with it.
+The system font cannot be generated: put a dump at sysdata/shared_font.bin, in
+the working directory or where saves live, for titles that render text with it.
 ";
 
 pub fn parse() -> Result<Options, String> {
@@ -55,6 +59,7 @@ pub fn parse() -> Result<Options, String> {
         test_pattern: false,
         recompiled: None,
         hardware_rasterizer: true,
+        data: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -94,6 +99,9 @@ pub fn parse() -> Result<Options, String> {
             }
             "--recompiled" => {
                 options.recompiled = Some(args.next().ok_or("--recompiled needs a path")?);
+            }
+            "--data" => {
+                options.data = Some(args.next().ok_or("--data needs a directory")?);
             }
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,

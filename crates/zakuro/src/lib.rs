@@ -5,6 +5,7 @@ mod cli;
 mod input;
 mod present;
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
@@ -34,8 +35,14 @@ pub fn run(linked: Option<Linked>) {
         }
     };
 
+    let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
+    if let Some(dir) = &data_dir {
+        bring_saves(dir);
+    }
+
     let config = Config {
         new3ds: options.new3ds,
+        data_dir,
         recompiled: options.recompiled.clone().map(Into::into),
         linked,
         hardware_renderer: options.hardware_rasterizer,
@@ -83,6 +90,52 @@ pub fn run(linked: Option<Linked>) {
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("zakuro: {error}");
     }
+}
+
+/// the system's place for a program's data.
+fn default_data_dir() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let dir = if cfg!(windows) {
+        var("APPDATA")
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|home| home.join("Library/Application Support"))
+    } else {
+        var("XDG_DATA_HOME").or_else(|| var("HOME").map(|home| home.join(".local/share")))
+    };
+    dir.map(|dir| dir.join("zakuro"))
+}
+
+/// saves Zakuro kept in the working directory before it had a place for
+/// them, copied there the first time. the old ones stay as they were.
+fn bring_saves(data: &Path) {
+    let (old, new) = (Path::new("user"), data.join("user"));
+    if new.exists() || !old.is_dir() {
+        return;
+    }
+    // a copy cut short is left under another name, and tried again
+    let partial = data.join("user.copying");
+    let copied = std::fs::remove_dir_all(&partial)
+        .or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) })
+        .and_then(|()| copy_dir(old, &partial))
+        .and_then(|()| std::fs::rename(&partial, &new));
+    match copied {
+        Ok(()) => log::info!("copied the saves in ./user to {}, the old ones stay as they were", new.display()),
+        Err(error) => log::warn!("could not copy the saves in ./user to {}, {error}", new.display()),
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// builds a System with no title loaded and both screens filled with a

@@ -67,8 +67,11 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         return Some(cached);
     }
 
+    let data_dir = system.config.data_dir.clone();
     let dump = SHARED_FONT_PATHS
         .iter()
+        .map(std::path::PathBuf::from)
+        .chain(SHARED_FONT_PATHS.iter().filter_map(|path| Some(data_dir.as_ref()?.join(path))))
         .find_map(|path| std::fs::read(path).ok());
 
     let data = match dump {

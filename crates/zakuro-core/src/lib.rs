@@ -37,6 +37,9 @@ pub struct Config {
     /// recompiled code linked into the program, which comes before a
     /// library.
     pub linked: Option<recompiled::Linked>,
+    /// where saves and dumped system files live, the working directory
+    /// when there is none.
+    pub data_dir: Option<std::path::PathBuf>,
     /// draw on the host's GPU through Vulkan, when there is one that can.
     pub hardware_renderer: bool,
 }
@@ -51,6 +54,7 @@ impl Default for Config {
             slider_3d: 0.0,
             recompiled: None,
             linked: None,
+            data_dir: None,
             hardware_renderer: false,
         }
     }
@@ -140,11 +144,15 @@ pub enum StepOutcome {
 impl System {
     pub fn new(config: Config) -> System {
         let app_bytes = 64 * 1024 * 1024;
+        let mut services = ServiceState::default();
+        if let Some(dir) = &config.data_dir {
+            services.fs.user_dir = dir.join("user");
+        }
         System {
             cpu: Cpu::new(),
             memory: Memory::new(config.new3ds, app_bytes),
             kernel: Kernel::new(0, memory::MemoryRegion::Application, linear_heap_base(config.new3ds)),
-            services: ServiceState::default(),
+            services,
             gpu: Gpu::new(),
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
