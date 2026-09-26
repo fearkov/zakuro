@@ -80,6 +80,8 @@ pub struct Library {
     module_count: usize,
     /// the modules the title has loaded, as base, size and index.
     loaded: Vec<(u32, u32, usize)>,
+    /// instructions the code handed to the interpreter one at a time.
+    fallbacks: std::cell::Cell<u64>,
     _library: libloading::Library,
 }
 
@@ -143,6 +145,7 @@ unsafe extern "C" fn write32(ctx: *mut Context, address: u32, value: u32) {
 unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
     unsafe {
         let machine = machine(ctx);
+        machine.library.fallbacks.set(machine.library.fallbacks.get() + 1);
         let ctx = &mut *ctx;
         load(ctx, machine.cpu);
         machine.cpu.regs[15] = address;
@@ -209,7 +212,15 @@ impl Library {
             let entries = symbol(b"recomp_entries")? as *const Entry;
             let module_count = *(symbol(b"recomp_module_count")? as *const u32) as usize;
             let modules = symbol(b"recomp_modules")? as *const Module;
-            Ok(Library { entries, count, modules, module_count, loaded: Vec::new(), _library: library })
+            Ok(Library {
+                entries,
+                count,
+                modules,
+                module_count,
+                loaded: Vec::new(),
+                fallbacks: std::cell::Cell::new(0),
+                _library: library,
+            })
         }
     }
 
@@ -221,6 +232,11 @@ impl Library {
     fn modules(&self) -> &[Module] {
         // SAFETY: as above
         unsafe { std::slice::from_raw_parts(self.modules, self.module_count) }
+    }
+
+    /// how many instructions the code has handed to the interpreter.
+    pub fn fallbacks(&self) -> u64 {
+        self.fallbacks.get()
     }
 
     /// how many functions and modules the library has code for.

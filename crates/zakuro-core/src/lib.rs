@@ -103,6 +103,10 @@ pub struct System {
     /// code recompiled ahead of time, which runs instead of the interpreter
     /// wherever it has something.
     pub recompiled: Option<recompiled::Library>,
+    /// instructions the interpreter ran for want of recompiled code, and
+    /// the ones recompiled code ran, to see how much the library covers.
+    pub interpreted_instructions: u64,
+    pub recompiled_instructions: u64,
 }
 
 /// cycles in one 60 Hz frame at the ARM11's clock.
@@ -156,6 +160,8 @@ impl System {
             next_preempt: PREEMPT_INTERVAL,
             profile: None,
             recompiled: None,
+            interpreted_instructions: 0,
+            recompiled_instructions: 0,
         }
     }
 
@@ -310,7 +316,10 @@ impl System {
 
         let exit = match self.run_recompiled(deadline) {
             Some(exit) => exit,
-            None => self.cpu.step(&mut self.memory),
+            None => {
+                self.interpreted_instructions += 1;
+                self.cpu.step(&mut self.memory)
+            }
         };
         match exit {
             None => {}
@@ -370,6 +379,7 @@ impl System {
         }
         let budget = limit.saturating_sub(self.cpu.cycles).max(1);
         let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
+        self.recompiled_instructions += ran;
         if ran == 0 && matches!(stop, recompiled::Stop::Left) {
             // not enough budget left for a whole block
             return None;
@@ -672,7 +682,7 @@ impl System {
 
     /// a one-line summary for the window title and the log.
     pub fn status_line(&self) -> String {
-        format!(
+        let mut line = format!(
             "frame {} | {} threads | {} modules | {} draws | {} transfers | {} fills | gpu {:.1?}",
             self.frames,
             self.kernel.live_thread_count(),
@@ -681,7 +691,14 @@ impl System {
             self.gpu.transfers,
             self.gpu.fills,
             self.gpu.busy,
-        )
+        );
+        if let Some(library) = &self.recompiled {
+            // the fallbacks ran inside recompiled code, which counted them
+            let interpreted = self.interpreted_instructions + library.fallbacks();
+            let total = (self.interpreted_instructions + self.recompiled_instructions).max(1);
+            line += &format!(" | interpreted {:.2}%", interpreted as f64 * 100.0 / total as f64);
+        }
+        line
     }
 }
 
