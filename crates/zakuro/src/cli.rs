@@ -20,6 +20,8 @@ pub struct Options {
     pub hardware_rasterizer: bool,
     /// where saves live, instead of the usual place.
     pub data: Option<String>,
+    /// interpret everything, whatever recompiled code there is.
+    pub interpreter: bool,
 }
 
 const USAGE: &str = "\
@@ -39,6 +41,10 @@ options:
   --profile                        collect a sampling profile and print it
   --recompiled <path>              run code 3dsrecomp built for the title, a
                                    library or a directory holding <title id>.so
+                                   (default: the one 3dsrecomp build installed
+                                   for it, in ~/.local/share/3dsrecomp)
+  --interpreter                    interpret everything, even with recompiled
+                                   code around
   --data <dir>                     where saves live (default: the system's
                                    place for data, ~/.local/share/zakuro)
   -h, --help                       show this message
@@ -60,6 +66,7 @@ pub fn parse() -> Result<Options, String> {
         recompiled: None,
         hardware_rasterizer: true,
         data: None,
+        interpreter: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -103,6 +110,7 @@ pub fn parse() -> Result<Options, String> {
             "--data" => {
                 options.data = Some(args.next().ok_or("--data needs a directory")?);
             }
+            "--interpreter" => options.interpreter = true,
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
             other if other.starts_with('-') => {

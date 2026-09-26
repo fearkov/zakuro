@@ -1401,7 +1401,7 @@ dependencies = [
 [[package]]
 name = "recomp-abi"
 version = "0.1.0"
-source = "git+https://github.com/fearkov/3dsrecomp#3029fb149101f78a2fa2c685dbbb54c9b613679c"
+source = "git+https://github.com/fearkov/3dsrecomp#f933a8319260c3bc26c47187791c8c18e617686b"
 dependencies = [
  "libloading",
 ]

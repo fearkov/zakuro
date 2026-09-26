@@ -43,8 +43,9 @@ pub fn run(linked: Option<Linked>) {
     let config = Config {
         new3ds: options.new3ds,
         data_dir,
-        recompiled: options.recompiled.clone().map(Into::into),
-        linked,
+        recompiled: options.recompiled.clone().filter(|_| !options.interpreter).map(Into::into),
+        linked: linked.filter(|_| !options.interpreter),
+        find_recompiled: !options.interpreter,
         hardware_renderer: options.hardware_rasterizer,
         ..Config::default()
     };

@@ -86,8 +86,8 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
                 Err(error) => log::warn!("could not use the code linked in, {error}, interpreting everything"),
             }
         }
-    } else if let Some(path) = &system.config.recompiled {
-        let path = if path.is_dir() { path.join(format!("{:016X}.so", title.program_id())) } else { path.clone() };
+    } else if let Some(path) = system.config.recompiled.clone().or_else(|| installed(&system, &title)) {
+        let path = if path.is_dir() { path.join(recomp_abi::library_name(title.program_id())) } else { path };
         match crate::recompiled::Library::open(&path) {
             Ok(library) => {
                 log::info!("running recompiled code from {}, {}", path.display(), library.describe());
@@ -106,6 +106,22 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
 
     system.title = Some(title);
     Ok(system)
+}
+
+/// the library 3dsrecomp build installed for the title, when the system is
+/// to look for one.
+fn installed(system: &System, title: &Title) -> Option<std::path::PathBuf> {
+    if !system.config.find_recompiled {
+        return None;
+    }
+    let found = recomp_abi::installed(title.program_id());
+    if found.is_none() {
+        log::info!(
+            "no recompiled code for {:016X}, interpreting, 3dsrecomp build makes it",
+            title.program_id()
+        );
+    }
+    found
 }
 
 fn map_special_pages(system: &mut System, app_bytes: u32) {

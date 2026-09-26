@@ -37,6 +37,9 @@ pub struct Config {
     /// recompiled code linked into the program, which comes before a
     /// library.
     pub linked: Option<recompiled::Linked>,
+    /// with no library given, run the one 3dsrecomp build installed for the
+    /// title, if it did.
+    pub find_recompiled: bool,
     /// where saves and dumped system files live, the working directory
     /// when there is none.
     pub data_dir: Option<std::path::PathBuf>,
@@ -54,6 +57,7 @@ impl Default for Config {
             slider_3d: 0.0,
             recompiled: None,
             linked: None,
+            find_recompiled: false,
             data_dir: None,
             hardware_renderer: false,
         }
