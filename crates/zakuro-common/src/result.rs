@@ -298,13 +298,20 @@ pub mod errors {
     pub const FS_NOT_IMPLEMENTED: ResultCode =
         ResultCode::new(Level::Permanent, Summary::Internal, Module::Fs, 44);
 
+    // --- UDS --------------------------------------------------------------
+    /// 0xC9411002, what nwm::UDS answers on a console whose wireless is
+    /// switched off, and to anything sent to it before it was initialized.
+    pub const UDS_WIRELESS_OFF: ResultCode =
+        ResultCode::new(Level::Status, Summary::StatusChanged, Module::Uds, 2);
+
     /// generic "this HLE stub does not exist yet".
     pub const UNIMPLEMENTED: ResultCode =
         ResultCode::new(Level::Permanent, Summary::NotSupported, Module::Common, 1023);
 
     /// not a real hardware code either, but a deliberately chosen one, "this
     /// online feature is unavailable" for the network-facing services we have
-    /// not implemented (frd:u, boss:U, nwm::UDS, http:C, ...).
+    /// not implemented (frd:u, boss:U, http:C, ...). local wireless answers
+    /// with [UDS_WIRELESS_OFF] instead.
     pub const NOT_CONNECTED: ResultCode =
         ResultCode::new(Level::Status, Summary::NotFound, Module::Ac, 12);
 }
@@ -360,6 +367,7 @@ mod tests {
             ("FS_INVALID_PATH", FS_INVALID_PATH.0, 0xE0E0_46BE),
             ("FS_ALREADY_EXISTS", FS_ALREADY_EXISTS.0, 0xC820_44BE),
             ("FS_NOT_IMPLEMENTED", FS_NOT_IMPLEMENTED.0, 0xD960_442C),
+            ("UDS_WIRELESS_OFF", UDS_WIRELESS_OFF.0, 0xC941_1002),
         ] {
             assert_eq!(got, want, "{name}: got 0x{got:08X} want 0x{want:08X}");
         }

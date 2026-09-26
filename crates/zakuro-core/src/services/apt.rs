@@ -261,6 +261,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
+        // ReplySleepQuery(app id, reply) / ReplySleepNotificationComplete(app
+        // id). nothing here ever puts the console to sleep, so there is no
+        // query to settle and the answer is just acknowledged.
+        0x003E | 0x003F => {
+            buffer.reply(&mut system.memory, command, &[]);
+            true
+        }
         // NotifyToWait
         0x0043 => {
             buffer.reply(&mut system.memory, 0x0043, &[]);
