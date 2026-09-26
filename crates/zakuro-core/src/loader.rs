@@ -70,7 +70,23 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         app_bytes / (1024 * 1024)
     );
 
-    if let Some(path) = &system.config.recompiled {
+    if let Some(linked) = &system.config.linked {
+        if linked.program_id() != title.program_id() {
+            log::warn!(
+                "the code linked in is for title {:016X}, not {:016X}, interpreting everything",
+                linked.program_id(),
+                title.program_id()
+            );
+        } else {
+            match crate::recompiled::Library::linked(linked) {
+                Ok(library) => {
+                    log::info!("running the recompiled code linked in, {}", library.describe());
+                    system.recompiled = Some(library);
+                }
+                Err(error) => log::warn!("could not use the code linked in, {error}, interpreting everything"),
+            }
+        }
+    } else if let Some(path) = &system.config.recompiled {
         let path = if path.is_dir() { path.join(format!("{:016X}.so", title.program_id())) } else { path.clone() };
         match crate::recompiled::Library::open(&path) {
             Ok(library) => {

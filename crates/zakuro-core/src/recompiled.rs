@@ -72,6 +72,46 @@ struct Module {
     entries: *const Entry,
 }
 
+/// the tables of recompiled code linked into the program itself, rather
+/// than loaded from a library, which is how a title's own executable built
+/// with 3dsrecomp port runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Linked {
+    program_id: u64,
+    abi: u32,
+    entries: *const c_void,
+    count: u32,
+    modules: *const c_void,
+    module_count: u32,
+}
+
+impl Linked {
+    /// # Safety
+    ///
+    /// the pointers and counts have to be the recomp_ symbols of code that
+    /// 3dsrecomp generated, linked into this program.
+    pub unsafe fn new(
+        program_id: u64,
+        abi: u32,
+        entries: *const c_void,
+        count: u32,
+        modules: *const c_void,
+        module_count: u32,
+    ) -> Linked {
+        Linked { program_id, abi, entries, count, modules, module_count }
+    }
+
+    /// the title the code was recompiled from.
+    pub fn program_id(&self) -> u64 {
+        self.program_id
+    }
+}
+
+// SAFETY: the tables live as long as the program and are read only, apart
+// from the module bases, which only the thread running the system touches.
+unsafe impl Send for Linked {}
+unsafe impl Sync for Linked {}
+
 /// a library of recompiled code, loaded.
 pub struct Library {
     entries: *const Entry,
@@ -82,7 +122,8 @@ pub struct Library {
     loaded: Vec<(u32, u32, usize)>,
     /// instructions the code handed to the interpreter one at a time.
     fallbacks: std::cell::Cell<u64>,
-    _library: libloading::Library,
+    /// the library the tables are in, none when they are linked in.
+    _library: Option<libloading::Library>,
 }
 
 // SAFETY: the tables the pointers lead to are read only, apart from the
@@ -205,23 +246,33 @@ impl Library {
                 library.get::<*const c_void>(name).map(|s| *s).map_err(|e| e.to_string())
             };
             let abi = *(symbol(b"recomp_abi")? as *const u32);
-            if abi != ABI {
-                return Err(format!("it was built for version {abi} of the interface, this is {ABI}"));
-            }
-            let count = *(symbol(b"recomp_entry_count")? as *const u32) as usize;
-            let entries = symbol(b"recomp_entries")? as *const Entry;
-            let module_count = *(symbol(b"recomp_module_count")? as *const u32) as usize;
-            let modules = symbol(b"recomp_modules")? as *const Module;
-            Ok(Library {
-                entries,
-                count,
-                modules,
-                module_count,
-                loaded: Vec::new(),
-                fallbacks: std::cell::Cell::new(0),
-                _library: library,
-            })
+            let count = *(symbol(b"recomp_entry_count")? as *const u32);
+            let entries = symbol(b"recomp_entries")?;
+            let module_count = *(symbol(b"recomp_module_count")? as *const u32);
+            let modules = symbol(b"recomp_modules")?;
+            let linked = Linked { program_id: 0, abi, entries, count, modules, module_count };
+            Library::from_tables(&linked, Some(library))
         }
+    }
+
+    /// the code linked into the program.
+    pub fn linked(linked: &Linked) -> Result<Library, String> {
+        Library::from_tables(linked, None)
+    }
+
+    fn from_tables(linked: &Linked, library: Option<libloading::Library>) -> Result<Library, String> {
+        if linked.abi != ABI {
+            return Err(format!("it was built for version {} of the interface, this is {ABI}", linked.abi));
+        }
+        Ok(Library {
+            entries: linked.entries as *const Entry,
+            count: linked.count as usize,
+            modules: linked.modules as *const Module,
+            module_count: linked.module_count as usize,
+            loaded: Vec::new(),
+            fallbacks: std::cell::Cell::new(0),
+            _library: library,
+        })
     }
 
     fn entries(&self) -> &[Entry] {

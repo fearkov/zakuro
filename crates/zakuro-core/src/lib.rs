@@ -34,6 +34,9 @@ pub struct Config {
     /// a library 3dsrecomp built for the title, or a directory holding one
     /// named after its title id.
     pub recompiled: Option<std::path::PathBuf>,
+    /// recompiled code linked into the program, which comes before a
+    /// library.
+    pub linked: Option<recompiled::Linked>,
     /// draw on the host's GPU through Vulkan, when there is one that can.
     pub hardware_renderer: bool,
 }
@@ -47,6 +50,7 @@ impl Default for Config {
             language: services::cfg::LANGUAGE_ENGLISH,
             slider_3d: 0.0,
             recompiled: None,
+            linked: None,
             hardware_renderer: false,
         }
     }

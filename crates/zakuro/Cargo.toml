@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "A high-level-emulation Nintendo 3DS emulator"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "zakuro"
 path = "src/main.rs"
