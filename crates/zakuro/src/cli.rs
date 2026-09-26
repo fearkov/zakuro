@@ -24,7 +24,8 @@ zakuro - a high-level-emulation Nintendo 3DS emulator
 usage: zakuro <rom.3ds|.cxi> [options]
 
 options:
-  --renderer <gl|vulkan|software>  presentation backend (default: gl)
+  --renderer <vulkan|gl|software>  presentation backend (default: vulkan,
+                                   or gl where Vulkan does not start)
   --scale <n>                      window scale factor (default: 2)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
@@ -41,7 +42,7 @@ pub fn parse() -> Result<Options, String> {
     let mut rom = None;
     let mut options = Options {
         rom: String::new(),
-        renderer: RendererKind::OpenGl,
+        renderer: RendererKind::Vulkan,
         scale: 2,
         headless: None,
         profile: false,

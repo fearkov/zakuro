@@ -189,7 +189,15 @@ impl ApplicationHandler for App {
             .with_title("Zakuro")
             .with_inner_size(size);
 
-        match Backend::create(event_loop, attributes, self.options.renderer) {
+        let backend = Backend::create(event_loop, attributes.clone(), self.options.renderer).or_else(|error| {
+            if self.options.renderer != RendererKind::Vulkan {
+                return Err(error);
+            }
+            // a machine without a working Vulkan driver still gets a window
+            log::warn!("could not start the Vulkan backend, {error}, presenting with OpenGL instead");
+            Backend::create(event_loop, attributes, RendererKind::OpenGl)
+        });
+        match backend {
             Ok((window, backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
                 self.window = Some(window);
