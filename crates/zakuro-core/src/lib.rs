@@ -34,6 +34,8 @@ pub struct Config {
     /// a library 3dsrecomp built for the title, or a directory holding one
     /// named after its title id.
     pub recompiled: Option<std::path::PathBuf>,
+    /// draw on the host's GPU through Vulkan, when there is one that can.
+    pub hardware_renderer: bool,
 }
 
 impl Default for Config {
@@ -45,6 +47,7 @@ impl Default for Config {
             language: services::cfg::LANGUAGE_ENGLISH,
             slider_3d: 0.0,
             recompiled: None,
+            hardware_renderer: false,
         }
     }
 }
@@ -570,6 +573,17 @@ impl System {
             .process_command_list(&mut guest, self.renderer.as_mut(), paddr, size);
     }
 
+    /// makes guest memory hold what the host GPU drew over a range, before
+    /// something other than a draw reads or writes it.
+    pub fn sync_gpu(&mut self, addr: u32, len: u32) {
+        let linear_base = self.kernel.linear_base;
+        let mut guest = GuestMemory {
+            linear_base,
+            memory: &mut self.memory,
+        };
+        self.gpu.sync_memory(&mut guest, addr, len);
+    }
+
     pub fn memory_fill(&mut self, start: u32, end: u32, value: u32, width: u32) {
         let linear_base = self.kernel.linear_base;
         let mut guest = GuestMemory {
@@ -662,6 +676,7 @@ impl System {
 
         let base = services::gsp::physical_to_virtual(self, address);
         let source_len = (stride * width) as usize;
+        self.sync_gpu(base, source_len as u32);
         let mut source = vec![0u8; source_len];
         self.memory.read_bytes(base, &mut source);
 

@@ -176,6 +176,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let source = buffer.get(&mut system.memory, 1);
             let dest = buffer.get(&mut system.memory, 2);
             let size = buffer.get(&mut system.memory, 3);
+            system.sync_gpu(source, size);
+            system.sync_gpu(dest, size);
             let mut data = vec![0u8; size as usize];
             system.memory.read_bytes(source, &mut data);
             system.memory.write_bytes(dest, &data);
@@ -487,6 +489,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
         // RequestDma(source, destination, size)
         0x00 => {
             let (src, dst, size) = (command.data[0], command.data[1], command.data[2]);
+            system.sync_gpu(src, size);
+            system.sync_gpu(dst, size);
             let mut buf = vec![0u8; size as usize];
             system.memory.read_bytes(src, &mut buf);
             system.memory.write_bytes(dst, &buf);

@@ -255,6 +255,12 @@ impl Gpu {
         }
         let length = (end - start) as usize;
         let address = memory.translate(start);
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            if let Err(error) = hardware.before_fill(memory, address, length as u32) {
+                log::error!("the GPU could not write back a buffer, {error}");
+            }
+        }
 
         let pattern: Vec<u8> = match width {
             2 => value.to_le_bytes()[..2].to_vec(),
@@ -272,6 +278,12 @@ impl Gpu {
         );
         memory.write(address, &buffer);
         self.fills += 1;
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            if let Err(error) = hardware.filled(address, &buffer) {
+                log::error!("the GPU could not clear a buffer, {error}");
+            }
+        }
     }
 
     /// DisplayTransfer, copies a rectangle between buffers, converting format
@@ -289,6 +301,10 @@ impl Gpu {
         let input_height = input_dimensions >> 16;
         let output_width = output_dimensions & 0xFFFF;
         let output_height = output_dimensions >> 16;
+        // four bytes a pixel covers every format either side uses
+        let (input, output) = (memory.translate(input_paddr), memory.translate(output_paddr));
+        self.sync_memory(memory, input, input_width * input_height * 4);
+        self.sync_memory(memory, output, output_width * output_height * 4);
 
         if input_width == 0 || input_height == 0 || output_width == 0 || output_height == 0 {
             return;
@@ -411,15 +427,19 @@ impl Gpu {
     ) {
         let input_width = (input_gap & 0xFFFF) * 16;
         let input_skip = (input_gap >> 16) * 16;
+        // every line and the gaps between them
+        let span = |width: u32, skip: u32| if width == 0 { size } else { size + size.div_ceil(width) * skip };
+        let (input, output) = (memory.translate(input_paddr), memory.translate(output_paddr));
+        self.sync_memory(memory, input, span(input_width, input_skip));
         let output_width = (output_gap & 0xFFFF) * 16;
         let output_skip = (output_gap >> 16) * 16;
+        self.sync_memory(memory, output, span(output_width, output_skip));
 
         log::debug!(
             "texture copy: 0x{input_paddr:08X} -> 0x{output_paddr:08X} size 0x{size:X}"
         );
 
-        let mut src = memory.translate(input_paddr);
-        let mut dst = memory.translate(output_paddr);
+        let (mut src, mut dst) = (input, output);
 
         // a zero width means one contiguous run.
         if input_width == 0 || output_width == 0 {
@@ -457,6 +477,29 @@ impl Gpu {
         let start = std::time::Instant::now();
         self.run_command_list(memory, renderer, paddr, size);
         self.busy += start.elapsed();
+    }
+
+    /// draws on the host's GPU from now on, rather than in software, and
+    /// says which GPU that is.
+    #[cfg(feature = "vulkan")]
+    pub fn enable_hardware_renderer(&mut self) -> Result<String, String> {
+        let hardware = raster::hardware::Hardware::new()?;
+        let name = hardware.name().to_owned();
+        self.resources.hardware = Some(hardware);
+        Ok(name)
+    }
+
+    /// makes guest memory right over a range something other than a draw
+    /// is about to read or write, the host GPU keeps what it draws until then.
+    pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            if let Err(error) = hardware.sync(memory, addr, len) {
+                log::error!("the GPU could not write back a buffer, {error}");
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (memory, addr, len);
     }
 
     fn run_command_list<M: GpuMemory>(

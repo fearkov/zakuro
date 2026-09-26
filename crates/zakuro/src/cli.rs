@@ -16,6 +16,8 @@ pub struct Options {
     pub test_pattern: bool,
     /// a library of recompiled code for the title, or a directory of them.
     pub recompiled: Option<String>,
+    /// draw on the host GPU rather than in software.
+    pub hardware_rasterizer: bool,
 }
 
 const USAGE: &str = "\
@@ -26,6 +28,9 @@ usage: zakuro <rom.3ds|.cxi> [options]
 options:
   --renderer <vulkan|gl|software>  presentation backend (default: vulkan,
                                    or gl where Vulkan does not start)
+  --rasterizer <hardware|software> where the 3D is drawn (default: hardware,
+                                   the host GPU through Vulkan, or software
+                                   where that does not start)
   --scale <n>                      window scale factor (default: 2)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
@@ -49,6 +54,7 @@ pub fn parse() -> Result<Options, String> {
         new3ds: false,
         test_pattern: false,
         recompiled: None,
+        hardware_rasterizer: true,
     };
 
     let mut args = std::env::args().skip(1);
@@ -78,6 +84,14 @@ pub fn parse() -> Result<Options, String> {
                 );
             }
             "--new3ds" => options.new3ds = true,
+            "--rasterizer" => {
+                let value = args.next().ok_or("--rasterizer needs a value")?;
+                options.hardware_rasterizer = match value.as_str() {
+                    "hardware" | "vulkan" | "gpu" => true,
+                    "software" | "cpu" => false,
+                    other => return Err(format!("unknown rasterizer '{other}'")),
+                };
+            }
             "--recompiled" => {
                 options.recompiled = Some(args.next().ok_or("--recompiled needs a path")?);
             }

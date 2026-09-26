@@ -22,6 +22,8 @@ fn main() {
             .unwrap_or(zakuro_core::services::cfg::LANGUAGE_ENGLISH),
         // ZAKURO_RECOMPILED=path runs the code 3dsrecomp built for the title.
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().map(Into::into),
+        // ZAKURO_RASTERIZER=hardware draws on the host GPU.
+        hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
         ..Config::default()
     };
     let mut system = match loader::load(&path, config) {

@@ -33,6 +33,7 @@ fn main() {
     let config = Config {
         new3ds: options.new3ds,
         recompiled: options.recompiled.clone().map(Into::into),
+        hardware_renderer: options.hardware_rasterizer,
         ..Config::default()
     };
 

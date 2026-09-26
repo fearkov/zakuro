@@ -33,11 +33,15 @@ const TABLES: usize = 24;
 
 /// the lookup tables, each entry decoded as it arrives into its value and
 /// the step to the next entry, which interpolates between them.
-pub struct Tables(Box<[[[f32; 2]; 256]; TABLES]>);
+pub struct Tables {
+    entries: Box<[[[f32; 2]; 256]; TABLES]>,
+    /// goes up with every write, so a copy elsewhere knows it is stale.
+    generation: u64,
+}
 
 impl Default for Tables {
     fn default() -> Self {
-        Tables(Box::new([[[0.0; 2]; 256]; TABLES]))
+        Tables { entries: Box::new([[[0.0; 2]; 256]; TABLES]), generation: 0 }
     }
 }
 
@@ -47,7 +51,8 @@ impl Tables {
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
         let index = registers[REG_TABLE_INDEX];
         let entry = (index & 0xFF) as usize;
-        if let Some(table) = self.0.get_mut(((index >> 8) & 0x1F) as usize) {
+        self.generation += 1;
+        if let Some(table) = self.entries.get_mut(((index >> 8) & 0x1F) as usize) {
             // a 0.12 value and the step to the next one, an 11-bit magnitude
             // with the sign above it
             let step = ((value >> 12) & 0x7FF) as f32 / 2047.0;
@@ -57,8 +62,17 @@ impl Tables {
         registers[REG_TABLE_INDEX] = (index & !0xFF) | ((entry as u32 + 1) & 0xFF);
     }
 
+    /// every entry as a value and a step, table after table.
+    pub(crate) fn entries(&self) -> &[[[f32; 2]; 256]; TABLES] {
+        &self.entries
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn lookup(&self, table: usize, entry: u8, delta: f32) -> f32 {
-        let [value, step] = self.0[table][entry as usize];
+        let [value, step] = self.entries[table][entry as usize];
         value + step * delta
     }
 }
@@ -300,6 +314,61 @@ impl Lighting {
         })
     }
 
+    /// the lighting as the words of the hardware renderer's uniform block,
+    /// in the order its shader declares them.
+    pub(crate) fn pack(&self, words: &mut Vec<u32>) {
+        let bump = match self.bump {
+            Bump::None => 0,
+            Bump::Normal(unit, rebuild) => 1 | (unit as u32) << 4 | (rebuild as u32) << 8,
+            Bump::Tangent(unit) => 2 | (unit as u32) << 4,
+        };
+        let shadow = self.shadow.map_or(0, |shadow| {
+            1 | (shadow.unit as u32) << 4
+                | (shadow.invert as u32) << 8
+                | (shadow.primary as u32) << 9
+                | (shadow.secondary as u32) << 10
+                | (shadow.alpha as u32) << 11
+        });
+        words.extend([self.config, self.lights.len() as u32, bump, shadow]);
+        words.extend([
+            self.fresnel_primary as u32,
+            self.fresnel_secondary as u32,
+            self.clamp_highlights as u32,
+            self.needs_half as u32 | (self.needs_view as u32) << 1,
+        ]);
+        let lookup = |lookup: Option<Lookup>| {
+            lookup.map_or([0; 4], |lookup| [1, lookup.input, lookup.absolute as u32, lookup.scale.to_bits()])
+        };
+        for table in [self.distribution0, self.distribution1, self.fresnel]
+            .into_iter()
+            .chain(self.reflect)
+            .chain([Some(self.spotlight)])
+        {
+            words.extend(lookup(table));
+        }
+        let vector = |v: [f32; 3]| [v[0].to_bits(), v[1].to_bits(), v[2].to_bits(), 0];
+        words.extend(vector(self.global_ambient));
+        for slot in 0..8 {
+            let Some(light) = self.lights.get(slot) else {
+                words.extend([0; 36]);
+                continue;
+            };
+            for v in [light.specular0, light.specular1, light.diffuse, light.ambient, light.position, light.direction, light.spot] {
+                words.extend(vector(v));
+            }
+            let (bias, scale) = light.distance.unwrap_or((0.0, 0.0));
+            words.extend([bias.to_bits(), scale.to_bits(), 0, 0]);
+            let flags = light.directional as u32
+                | (light.two_sided as u32) << 1
+                | (light.geometric0 as u32) << 2
+                | (light.geometric1 as u32) << 3
+                | (light.distance.is_some() as u32) << 4
+                | (light.spotlight as u32) << 5
+                | (light.shadowed as u32) << 6;
+            words.extend([flags, light.number as u32, 0, 0]);
+        }
+    }
+
     /// the primary and secondary fragment colors of a fragment whose
     /// surface quaternion and view vector the vertices interpolated,
     /// textures being what the texture units sampled there.
@@ -463,8 +532,8 @@ mod tests {
         tables.write(&mut registers, 4095);
         // half of the way down, the sign sits above the step
         tables.write(&mut registers, 2048 | ((0x800 | 0x400) << 12));
-        assert_eq!(tables.0[3][0], [1.0, 0.0]);
-        assert_eq!(tables.0[3][1][1], -1024.0 / 2047.0);
+        assert_eq!(tables.entries[3][0], [1.0, 0.0]);
+        assert_eq!(tables.entries[3][1][1], -1024.0 / 2047.0);
         assert_eq!(registers[REG_TABLE_INDEX], (3 << 8) | 2);
     }
 

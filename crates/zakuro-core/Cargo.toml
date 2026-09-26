@@ -8,7 +8,7 @@ license.workspace = true
 zakuro-common.workspace = true
 zakuro-cpu.workspace = true
 zakuro-fs.workspace = true
-zakuro-gpu.workspace = true
+zakuro-gpu = { workspace = true, features = ["vulkan"] }
 log.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true

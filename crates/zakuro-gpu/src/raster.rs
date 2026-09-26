@@ -8,6 +8,9 @@ use rayon::prelude::*;
 
 use crate::registers::*;
 use crate::lighting::{Lighting, Tables};
+
+#[cfg(feature = "vulkan")]
+pub(crate) mod hardware;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderState, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -515,6 +518,9 @@ struct BoundTexture {
 pub struct Resources {
     pub textures: TextureCache,
     pub light_tables: Tables,
+    /// the host GPU, when draws go to it rather than to the software path.
+    #[cfg(feature = "vulkan")]
+    pub(crate) hardware: Option<hardware::Hardware>,
 }
 
 /// textures decoded to RGBA, kept across draws for as long as the bytes
@@ -576,7 +582,7 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 }
 
 /// how a texture coordinate outside 0..1 is brought back inside.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Wrap {
     ClampToEdge,
     /// outside the texture, the unit's border color.
@@ -713,6 +719,25 @@ fn bind_texture<M: GpuMemory>(
         // the border color register comes first in each unit's block, RGBA8
         border: registers[base].to_le_bytes().map(|c| c as f32 / 255.0),
     })
+}
+
+/// the guest memory a texture unit reads, when it is on.
+#[cfg(feature = "vulkan")]
+fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Option<(u32, u32)> {
+    if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
+        return None;
+    }
+    let base = TEXTURE_UNIT_BASES[unit];
+    let dimensions = registers[base + 1];
+    let (height, width) = (dimensions & 0x7FF, (dimensions >> 16) & 0x7FF);
+    let format_register = if unit == 0 { base + 13 } else { base + 5 };
+    let format = crate::texture::TextureFormat::from_raw(registers[format_register]);
+    let address = loc_register(registers, base + 4);
+    if width == 0 || height == 0 || address == 0 {
+        return None;
+    }
+    let bits = width as u64 * height as u64 * format.bits_per_pixel() as u64;
+    Some((memory.translate(address), bits.div_ceil(8) as u32))
 }
 
 /// where and how depth testing reads/writes, or None when disabled.
@@ -1520,6 +1545,18 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // channel's bit in GPUREG_DEPTH_COLOR_MASK.
     let color_writable = registers[REG_COLOR_BUFFER_WRITE] != 0;
     let color_mask = registers[REG_DEPTH_COLOR_MASK] >> 8;
+    // a texture can be a buffer the GPU drew into, guest memory has to have
+    // it before it is read
+    #[cfg(feature = "vulkan")]
+    if let Some(hardware) = resources.hardware.as_mut() {
+        for unit in 0..3 {
+            if let Some((addr, len)) = texture_range(registers, memory, unit) {
+                if let Err(error) = hardware.prepare_read(memory, addr, len) {
+                    log::error!("the GPU could not write back a buffer, {error}");
+                }
+            }
+        }
+    }
     let textures: [Option<BoundTexture>; 3] =
         std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit));
     let tex_env = crate::tev::TexEnv::read(registers);
@@ -1592,6 +1629,37 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         }
         for i in 1..screen.len() - 1 {
             triangles.push([screen[0], screen[i], screen[i + 1]]);
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    if let Some(hardware) = resources.hardware.as_mut() {
+        let target = &state.target;
+        // tiles are whole in any buffer a title really draws into
+        if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
+            let draw = hardware::Draw {
+                registers,
+                target: target.addr,
+                format: target.format,
+                width: target.buffer_width,
+                height: target.buffer_height,
+                scissor: [target.left, target.bottom, target.right, target.top],
+                depth: state.depth_stencil.as_ref().map(|d| (d.addr, d.bytes)),
+                depth_map: state.depth_map,
+                triangles: &triangles,
+                textures: &textures,
+                lighting: state.lighting.as_ref(),
+                tables: &resources.light_tables,
+            };
+            match hardware.draw(memory, &draw) {
+                Ok(()) => return triangle_count as u32,
+                Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
+            }
+        }
+        // the software path works on guest memory, which has to hold what
+        // the GPU drew
+        if let Err(error) = hardware.flush(memory) {
+            log::error!("the GPU could not write back its buffers, {error}");
         }
     }
 
