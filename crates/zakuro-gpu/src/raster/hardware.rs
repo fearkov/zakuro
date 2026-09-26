@@ -115,7 +115,8 @@ impl Kind {
     }
 }
 
-/// a color or depth buffer of the guest's, kept on the GPU.
+/// a color or depth buffer of the guest's, kept on the GPU with its rows
+/// bottom first, the other way from memory, see draw.
 struct Surface {
     image: Image,
     addr: u32,
@@ -191,8 +192,6 @@ pub struct Hardware {
     rendering: Option<(usize, Option<usize>)>,
     batch: u64,
     name: String,
-    /// the smallest step the GPU places vertices on, in pixels.
-    subpixel: f32,
 }
 
 impl Hardware {
@@ -326,7 +325,6 @@ impl Hardware {
                 rendering: None,
                 batch: 0,
                 name,
-                subpixel: 1.0 / (1u32 << properties.limits.sub_pixel_precision_bits.min(16)) as f32,
             };
             hardware.ring = hardware.buffer(
                 RING_SIZE,
@@ -590,7 +588,7 @@ impl Hardware {
                     for x in 0..width {
                         let at = morton_offset(x, y, width, bpp as u32) as usize;
                         let rgba = format.decode(&bytes[at..at + bpp]);
-                        let out = ((y * width + x) * 4) as usize;
+                        let out = (((height - 1 - y) * width + x) * 4) as usize;
                         staging[out..out + 4].copy_from_slice(&rgba);
                     }
                 }
@@ -608,7 +606,7 @@ impl Hardware {
                 for y in 0..height {
                     for x in 0..width {
                         let at = morton_offset(x, y, width, sample) as usize;
-                        let i = (y * width + x) as usize;
+                        let i = ((height - 1 - y) * width + x) as usize;
                         match sample {
                             2 => {
                                 let d16 = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as u64;
@@ -967,15 +965,15 @@ impl Hardware {
         let vertex_offset = self.stage(vertex_bytes, 16)?;
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
-        // a pixel whose center sits exactly on an edge belongs to the
-        // triangle on its left on the PICA and on its right in Vulkan, a
-        // step right turns one into the other
-        let nudge = self.subpixel;
+        // a pixel whose center sits exactly on an edge goes to the triangle
+        // on its right, or above it for a flat edge, on the PICA, and in
+        // Vulkan to the one on its right or further down the image, so the
+        // images run bottom up
         let staging = self.ring(vertex_offset, vertex_bytes);
         for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(draw.triangles.iter().flatten()) {
             let w = 1.0 / v.inv_w;
-            let x = (v.x + nudge) / width * 2.0 - 1.0;
-            let y = (height - v.y) / height * 2.0 - 1.0;
+            let x = v.x / width * 2.0 - 1.0;
+            let y = v.y / height * 2.0 - 1.0;
             let depth = v.z * depth_map.scale + depth_map.offset;
             let (c, t, q, view) = (v.color_over_w, v.texcoords_over_w, v.quaternion_over_w, v.view_over_w);
             let values: [f32; 24] = [
@@ -1111,7 +1109,7 @@ impl Hardware {
                 commands,
                 0,
                 &[vk::Rect2D {
-                    offset: vk::Offset2D { x: left, y: draw.height as i32 - top },
+                    offset: vk::Offset2D { x: left, y: bottom },
                     extent: vk::Extent2D { width: (right - left) as u32, height: (top - bottom) as u32 },
                 }],
             );
@@ -1298,7 +1296,7 @@ impl Hardware {
                     let bpp = format.bytes_per_pixel();
                     for y in 0..height {
                         for x in 0..width {
-                            let at = ((y * width + x) * 4) as usize;
+                            let at = (((height - 1 - y) * width + x) * 4) as usize;
                             let rgba = [data[at], data[at + 1], data[at + 2], data[at + 3]];
                             let out = morton_offset(x, y, width, bpp as u32) as usize;
                             format.encode(rgba, &mut bytes[out..out + bpp]);
@@ -1309,7 +1307,7 @@ impl Hardware {
                     let (depths, stencils) = data.split_at(pixels * 4);
                     for y in 0..height {
                         for x in 0..width {
-                            let i = (y * width + x) as usize;
+                            let i = ((height - 1 - y) * width + x) as usize;
                             let d24 = u32::from_le_bytes(depths[i * 4..i * 4 + 4].try_into().unwrap()) & 0xFF_FFFF;
                             let out = morton_offset(x, y, width, sample) as usize;
                             match sample {

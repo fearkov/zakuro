@@ -453,10 +453,12 @@ fn to_screen(vertex: Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
     let ndc_y = vertex.clip[1] * inv_w;
 
     // window coordinates, y points up, from the bottom of the buffer, the
-    // way the PICA's viewport is defined.
+    // way the PICA's viewport is defined. it places vertices on a sixteenth
+    // of a pixel.
+    let snap = |c: f32| (c * 16.0).round() / 16.0;
     Some(Screen {
-        x: vx + (ndc_x * 0.5 + 0.5) * vw,
-        y: vy + (ndc_y * 0.5 + 0.5) * vh,
+        x: snap(vx + (ndc_x * 0.5 + 0.5) * vw),
+        y: snap(vy + (ndc_y * 0.5 + 0.5) * vh),
         z: vertex.clip[2] * inv_w,
         inv_w,
         color_over_w: vertex.color.map(|c| c * inv_w),
@@ -1122,18 +1124,18 @@ fn fill_triangle(
 
     // wind every triangle the same way, so that "inside" is the positive
     // side of all three edges.
-    let mut area = Edge::new(&a, &b).at(c.x, c.y);
-    let (b, c) = if area < 0.0 {
+    let mut area = Edge::new(&a, &b).at(fixed(c.x), fixed(c.y));
+    let (b, c) = if area < 0 {
         area = -area;
         (c, b)
     } else {
         (b, c)
     };
     // zero area means the triangle is degenerate.
-    if area < 1e-6 {
+    if area == 0 {
         return;
     }
-    let inverse_area = 1.0 / area;
+    let inverse_area = 1.0 / area as f32;
     let edges = [Edge::new(&b, &c), Edge::new(&c, &a), Edge::new(&a, &b)];
 
     let bpp = target.format.bytes_per_pixel();
@@ -1145,15 +1147,15 @@ fn fill_triangle(
 
     for y in min_y..max_y {
         for x in min_x..max_x {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
+            // the pixel's center, in sixteenths
+            let (px, py) = (x as i64 * 16 + 8, y as i64 * 16 + 8);
 
             // barycentric weights via the edge functions.
             let values = edges.map(|edge| edge.at(px, py));
             if !edges.iter().zip(values).all(|(edge, value)| edge.covers(value)) {
                 continue;
             }
-            let [w0, w1, w2] = values.map(|value| value * inverse_area);
+            let [w0, w1, w2] = values.map(|value| value as f32 * inverse_area);
 
             // perspective-correct interpolation, interpolate attribute/w and
             // 1/w linearly in screen space, then divide.
@@ -1354,44 +1356,42 @@ fn fill(
     stats.add(total);
 }
 
+/// a screen coordinate in sixteenths of a pixel, the steps the PICA places
+/// vertices on.
+fn fixed(c: f32) -> i64 {
+    (c * 16.0).round() as i64
+}
+
 /// one edge of a triangle, as a function that is zero on the edge and positive
-/// on the triangle's side of it.
+/// on the triangle's side of it, in whole sixteenths so that a pixel exactly on
+/// the edge is known to be.
 #[derive(Debug, Clone, Copy)]
 struct Edge {
-    x: f32,
-    y: f32,
-    dx: f32,
-    dy: f32,
-    sign: f32,
+    x: i64,
+    y: i64,
+    dx: i64,
+    dy: i64,
     owns_ties: bool,
 }
 
 impl Edge {
     fn new(from: &Screen, to: &Screen) -> Edge {
-        let (start, end, sign) = if (from.x, from.y) <= (to.x, to.y) {
-            (from, to, 1.0)
-        } else {
-            (to, from, -1.0)
-        };
-        let (dx, dy) = (to.x - from.x, to.y - from.y);
-        Edge {
-            x: start.x,
-            y: start.y,
-            dx: end.x - start.x,
-            dy: end.y - start.y,
-            sign,
-            owns_ties: dy > 0.0 || (dy == 0.0 && dx < 0.0),
-        }
+        let (x, y) = (fixed(from.x), fixed(from.y));
+        let (dx, dy) = (fixed(to.x) - x, fixed(to.y) - y);
+        // a pixel centered on an edge goes to the triangle on its right, or
+        // above it when the edge is flat, as on the PICA
+        Edge { x, y, dx, dy, owns_ties: dy < 0 || (dy == 0 && dx > 0) }
+    }
+
+    /// the function at a point in sixteenths.
+    #[inline]
+    fn at(&self, px: i64, py: i64) -> i64 {
+        self.dx * (py - self.y) - self.dy * (px - self.x)
     }
 
     #[inline]
-    fn at(&self, px: f32, py: f32) -> f32 {
-        self.sign * (self.dx * (py - self.y) - self.dy * (px - self.x))
-    }
-
-    #[inline]
-    fn covers(&self, value: f32) -> bool {
-        value > 0.0 || (value == 0.0 && self.owns_ties)
+    fn covers(&self, value: i64) -> bool {
+        value > 0 || (value == 0 && self.owns_ties)
     }
 }
 
@@ -1995,5 +1995,91 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &again));
         let changed = cache.decoded(0x1000, TextureFormat::Rgba8, 8, 8, &[0x22; 256]);
         assert_ne!(first[0], changed[0]);
+    }
+
+    /// a pixel centered on an edge goes to the triangle on its right, or
+    /// above a flat edge, and a corner a hair off a center counts as on it.
+    #[test]
+    fn edges_through_pixel_centers_follow_the_pica() {
+        let registers = target_registers();
+        let corner = |x: f32, y: f32| Vertex {
+            clip: [x / 4.0 - 1.0, y / 4.0 - 1.0, -0.5, 1.0],
+            color: RED,
+            texcoords: [[0.0; 2]; 3],
+            quaternion: [0.0, 0.0, 0.0, 1.0],
+            view: [0.0; 3],
+        };
+        for (left, right) in [(1.5, 3.5), (1.4999967, 3.499992)] {
+            let quad = [(left, 1.5), (right, 1.5), (right, 3.5), (left, 1.5), (right, 3.5), (left, 3.5)];
+            let mut memory = ConsoleMemory::default();
+            rasterize(&registers, &mut memory, &mut Resources::default(), &quad.map(|(x, y)| corner(x, y)));
+            // the rows as the window counts them, from the bottom
+            let covered: Vec<(u32, u32)> = (0..8)
+                .flat_map(|y| (0..8).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let mut raw = [0u8; 4];
+                    memory.read(COLOR + crate::format::morton_offset(x, 7 - y, 8, 4), &mut raw);
+                    raw != [0; 4]
+                })
+                .collect();
+            assert_eq!(covered, [(1, 1), (2, 1), (1, 2), (2, 2)]);
+        }
+    }
+
+    /// a pixel whose center sits on an edge, or just beside a steep one,
+    /// goes to the same triangle on the GPU as in software.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_gpu_covers_the_same_pixels() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const SIZE: u32 = 32;
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+
+        let mut seed = 1u32;
+        let mut random = move |range: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % range
+        };
+        // corners on a sixteenth of a pixel, which every GPU places exactly,
+        // half of them on pixel centers
+        let mut coordinate = || {
+            let sixteenths = random(SIZE * 16 + 1);
+            let sixteenths = if random(2) == 0 { sixteenths / 8 * 8 + 8 } else { sixteenths };
+            (sixteenths as f32 / 16.0) / (SIZE as f32 / 2.0) - 1.0
+        };
+        let mut software = ConsoleMemory::default();
+        let mut gpu = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut differing = 0;
+        // one at a time over a cleared buffer, so that every edge shows
+        for _ in 0..200 {
+            let triangle: Vec<Vertex> = (0..3)
+                .map(|_| Vertex {
+                    clip: [coordinate(), coordinate(), -0.5, 1.0],
+                    color: RED,
+                    texcoords: [[0.0; 2]; 3],
+                    quaternion: [0.0, 0.0, 0.0, 1.0],
+                    view: [0.0; 3],
+                })
+                .collect();
+            let cleared = vec![0u8; (SIZE * SIZE * 4) as usize];
+            software.write(COLOR, &cleared);
+            gpu.write(COLOR, &cleared);
+            rasterize(&registers, &mut software, &mut Resources::default(), &triangle);
+            rasterize(&registers, &mut gpu, &mut resources, &triangle);
+            resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
+            differing += (0..SIZE * SIZE)
+                .filter(|i| {
+                    let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
+                    software.read(COLOR + i * 4, &mut a);
+                    gpu.read(COLOR + i * 4, &mut b);
+                    a != b
+                })
+                .count();
+        }
+        assert_eq!(differing, 0);
     }
 }
