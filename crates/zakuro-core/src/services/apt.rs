@@ -1,12 +1,21 @@
 //! APT:U, the applet manager.
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
+use crate::kernel::object::{KObject, ObjectId, SharedMemory};
 use crate::kernel::sync::ResetType;
 use crate::System;
 
 /// signals a parameter can carry. Wakeup is the one that starts a title.
 pub const SIGNAL_NONE: u32 = 0;
 pub const SIGNAL_WAKEUP: u32 = 1;
+/// a title asking a library applet to get ready, and the applet's answer.
+pub const SIGNAL_REQUEST: u32 = 2;
+pub const SIGNAL_RESPONSE: u32 = 3;
+/// what a library applet leaves its caller when it closes.
+pub const SIGNAL_WAKEUP_BY_EXIT: u32 = 10;
+
+/// the running title's own applet id.
+const APPLICATION: u32 = 0x300;
 
 #[derive(Debug, Clone)]
 pub struct Parameter {
@@ -14,6 +23,8 @@ pub struct Parameter {
     pub destination: u32,
     pub signal: u32,
     pub buffer: Vec<u8>,
+    /// an object handed over along with it, the receiver gets a handle.
+    pub object: Option<ObjectId>,
 }
 
 #[derive(Default)]
@@ -26,6 +37,14 @@ pub struct AptState {
     pub initialized: bool,
     /// address and handle of the shared font block, once mapped.
     pub shared_font: Option<(u32, u32)>,
+    /// the library applet a title is starting. there is no applet to run,
+    /// so APT answers for it the way it would answer.
+    pub library_applet: Option<u32>,
+    /// the block a library applet hands its caller for the screen capture,
+    /// and its size, kept for the next applet.
+    pub capture_block: Option<(ObjectId, u32)>,
+    /// how the title laid out its last screen capture, as it sent it.
+    pub capture_info: Vec<u8>,
 }
 
 /// the value the status word at the start of the shared font block takes once
@@ -163,6 +182,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 destination: buffer.get(&mut system.memory, 1),
                 signal: SIGNAL_WAKEUP,
                 buffer: Vec::new(),
+                object: None,
             });
             system.kernel.signal_event(parameter_object);
 
@@ -207,8 +227,28 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x000B, &[0]);
             true
         }
-        // SendParameter
+        // SendParameter(sender, destination, signal, size, handle, buffer)
         0x000C => {
+            let destination = buffer.get(&mut system.memory, 2);
+            let signal = buffer.get(&mut system.memory, 3);
+            let size = buffer.get(&mut system.memory, 4);
+            let data = read_static(system, buffer, 7, size);
+            if system.services.apt.library_applet == Some(destination) && signal == SIGNAL_REQUEST {
+                // the applet answers with a block to capture the screens into,
+                // as big as the capture info that came with the request says.
+                let capture_size = data.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+                let block = capture_block(system, capture_size);
+                send_parameter(
+                    system,
+                    Parameter {
+                        sender: destination,
+                        destination: APPLICATION,
+                        signal: SIGNAL_RESPONSE,
+                        buffer: Vec::new(),
+                        object: block,
+                    },
+                );
+            }
             buffer.reply(&mut system.memory, 0x000C, &[]);
             true
         }
@@ -223,23 +263,26 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
 
             match parameter {
                 Some(parameter) => {
-                    let size = parameter.buffer.len() as u32;
+                    let (ptr, capacity) = {
+                        let tls = system.kernel.current().map_or(0, |t| t.tls);
+                        buffer.static_buffer(&mut system.memory, tls, 0)
+                    };
+                    let size = (parameter.buffer.len() as u32).min(capacity);
+                    // the receiver gets its own handle to whatever came along.
+                    let handle = parameter.object.map_or(0, |object| {
+                        system.kernel.handles.create(&mut system.kernel.objects, object, "APT:parameter object")
+                    });
                     buffer.set(&mut system.memory, 0, Header::new(command, 4, 4).0);
                     buffer.set(&mut system.memory, 1, 0);
                     buffer.set(&mut system.memory, 2, parameter.sender);
                     buffer.set(&mut system.memory, 3, parameter.signal);
                     buffer.set(&mut system.memory, 4, size);
-                    // no handle travels with a wakeup parameter.
-                    buffer.set(&mut system.memory, 5, Descriptor::handles(1));
-                    buffer.set(&mut system.memory, 6, 0);
+                    buffer.set(&mut system.memory, 5, Descriptor::move_handles(1));
+                    buffer.set(&mut system.memory, 6, handle);
                     buffer.set(&mut system.memory, 7, Descriptor::static_buffer(size, 0));
-                    let (ptr, _) = {
-                        let tls = system.kernel.current().map_or(0, |t| t.tls);
-                        buffer.static_buffer(&mut system.memory, tls, 0)
-                    };
                     buffer.set(&mut system.memory, 8, ptr);
-                    if !parameter.buffer.is_empty() && ptr != 0 {
-                        system.memory.write_bytes(ptr, &parameter.buffer);
+                    if size > 0 && ptr != 0 {
+                        system.memory.write_bytes(ptr, &parameter.buffer[..size as usize]);
                     }
                 }
                 None => {
@@ -255,9 +298,41 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x000F, &[1]);
             true
         }
+        // PreloadLibraryApplet / PrepareToStartLibraryApplet(applet id), the
+        // applet counts as there from now on.
+        0x0016 | 0x0018 => {
+            system.services.apt.library_applet = Some(buffer.get(&mut system.memory, 1));
+            buffer.reply(&mut system.memory, command, &[]);
+            true
+        }
+        // StartLibraryApplet(applet id, size, handle, buffer). the applet
+        // closes as soon as it starts and hands back a blank result the size
+        // of what it was given, which is what Citra's applets do.
+        0x001E => {
+            let applet = buffer.get(&mut system.memory, 1);
+            let size = buffer.get(&mut system.memory, 2);
+            let data = read_static(system, buffer, 5, size);
+            log::info!(
+                "apt: library applet 0x{applet:03X} started with {} bytes, closing it right away",
+                data.len()
+            );
+            system.services.apt.library_applet = None;
+            send_parameter(
+                system,
+                Parameter {
+                    sender: applet,
+                    destination: APPLICATION,
+                    signal: SIGNAL_WAKEUP_BY_EXIT,
+                    buffer: vec![0; data.len()],
+                    object: None,
+                },
+            );
+            buffer.reply(&mut system.memory, command, &[]);
+            true
+        }
         // PrepareToStartApplication / StartApplication and the rest of the
         // launching machinery, nothing to do while only one title runs.
-        0x0015 | 0x0016 | 0x0017 | 0x0018 | 0x0019 | 0x001B | 0x001E | 0x001F => {
+        0x0015 | 0x0017 | 0x0019 | 0x001B | 0x001F => {
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
@@ -266,6 +341,31 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // query to settle and the answer is just acknowledged.
         0x003E | 0x003F => {
             buffer.reply(&mut system.memory, command, &[]);
+            true
+        }
+        // SendCaptureBufferInfo(size, buffer)
+        0x0040 => {
+            let size = buffer.get(&mut system.memory, 1);
+            system.services.apt.capture_info = read_static(system, buffer, 2, size);
+            buffer.reply(&mut system.memory, 0x0040, &[]);
+            true
+        }
+        // ReceiveCaptureBufferInfo(size) -> the size given back and the info.
+        0x0041 => {
+            let (ptr, capacity) = {
+                let tls = system.kernel.current().map_or(0, |t| t.tls);
+                buffer.static_buffer(&mut system.memory, tls, 0)
+            };
+            let info = system.services.apt.capture_info.clone();
+            let size = (info.len() as u32).min(buffer.get(&mut system.memory, 1)).min(capacity);
+            if size > 0 && ptr != 0 {
+                system.memory.write_bytes(ptr, &info[..size as usize]);
+            }
+            buffer.set(&mut system.memory, 0, Header::new(0x0041, 2, 2).0);
+            buffer.set(&mut system.memory, 1, 0);
+            buffer.set(&mut system.memory, 2, size);
+            buffer.set(&mut system.memory, 3, Descriptor::static_buffer(size, 0));
+            buffer.set(&mut system.memory, 4, ptr);
             true
         }
         // NotifyToWait
@@ -324,4 +424,50 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         _ => false,
     }
+}
+
+/// queues a parameter for the title and signals the event it waits on.
+fn send_parameter(system: &mut System, parameter: Parameter) {
+    system.services.apt.parameter = Some(parameter);
+    let event = system.services.apt.parameter_event.and_then(|handle| system.kernel.resolve(handle));
+    if let Some(event) = event {
+        system.kernel.signal_event(event);
+    }
+}
+
+/// the bytes a request carries in the static buffer whose descriptor sits at
+/// word index, at most size of them.
+fn read_static(system: &mut System, buffer: &CommandBuffer, index: u32, size: u32) -> Vec<u8> {
+    let descriptor = buffer.get(&mut system.memory, index);
+    let pointer = buffer.get(&mut system.memory, index + 1);
+    let length = size.min((descriptor >> 14) & 0x3FFFF);
+    let mut data = vec![0; length as usize];
+    if pointer != 0 {
+        system.memory.read_bytes(pointer, &mut data);
+    }
+    data
+}
+
+/// a block of at least size bytes for a library applet to hand over for the
+/// screen capture, made once and reused while it is big enough.
+fn capture_block(system: &mut System, size: u32) -> Option<ObjectId> {
+    if let Some((object, capacity)) = system.services.apt.capture_block {
+        if capacity >= size {
+            return Some(object);
+        }
+    }
+    let size = zakuro_common::bits::align_up(size.max(0x1000), 0x1000);
+    let block = system.memory.phys.allocate(crate::memory::MemoryRegion::Base, size)?;
+    let object = system.kernel.objects.insert(KObject::SharedMemory(SharedMemory {
+        name: "APT:capture".into(),
+        address: 0,
+        size,
+        paddr: block.addr,
+        mapped_at: None,
+    }));
+    // APT holds on to it, a title closing every handle it was given must not
+    // take it away from the next applet.
+    system.kernel.objects.add_ref(object);
+    system.services.apt.capture_block = Some((object, size));
+    Some(object)
 }

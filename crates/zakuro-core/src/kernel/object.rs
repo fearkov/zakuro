@@ -118,7 +118,9 @@ impl ObjectStore {
             .map(|s| &mut s.object)
     }
 
-    fn add_ref(&mut self, id: ObjectId) {
+    /// counts one more holder, which the kernel's own services use to keep an
+    /// object alive that no guest handle may be holding.
+    pub(crate) fn add_ref(&mut self, id: ObjectId) {
         if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
             slot.refcount += 1;
         }

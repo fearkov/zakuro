@@ -228,4 +228,77 @@ mod tests {
         assert_eq!(buffer.get(&mut system.memory, 1), 0);
         assert!(system.services.unimplemented.is_empty());
     }
+
+    /// a library applet nothing can run still answers the way one would, a
+    /// title waiting on it would otherwise wait forever.
+    #[test]
+    fn library_applets_answer_and_close() {
+        use crate::kernel::ipc::Descriptor;
+        use zakuro_common::memory_map::TLS_IPC_STATIC_BUFFERS;
+
+        let (mut system, buffer) = system_with_thread();
+        let tls = system.kernel.current().unwrap().tls;
+        let page = tls & !0xFFF;
+        let apt = || Target::service("APT:A".into(), 0);
+        let word = |value: u32| value.to_le_bytes();
+
+        // where replies put a parameter's buffer.
+        system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS, &word(Descriptor::static_buffer(0x100, 0)));
+        system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS + 4, &word(page + 0xC00));
+        let receive = |system: &mut System| {
+            buffer.set(&mut system.memory, 0, Header::new(0x000D, 2, 0).0);
+            buffer.set(&mut system.memory, 1, 0x300);
+            buffer.set(&mut system.memory, 2, 0x100);
+            handle_request(system, Target::service("APT:A".into(), 0));
+            (1..=4).chain([6]).map(|i| buffer.get(&mut system.memory, i)).collect::<Vec<_>>()
+        };
+
+        // Initialize(application, attributes), then take the wakeup.
+        buffer.set(&mut system.memory, 0, Header::new(0x0002, 2, 0).0);
+        buffer.set(&mut system.memory, 1, 0x300);
+        handle_request(&mut system, apt());
+        assert_eq!(receive(&mut system)[..3], [0, 0, 1]);
+
+        // PrepareToStartLibraryApplet(error display)
+        buffer.set(&mut system.memory, 0, Header::new(0x0018, 1, 0).0);
+        buffer.set(&mut system.memory, 1, 0x406);
+        handle_request(&mut system, apt());
+
+        // SendParameter(application, applet, request) with the capture info,
+        // whose first word is the size of the capture.
+        system.memory.write_bytes(page + 0x800, &word(0x11_8000));
+        buffer.set(&mut system.memory, 0, Header::new(0x000C, 4, 4).0);
+        for (i, value) in [0x300, 0x406, 2, 0x20, 0, 0, Descriptor::static_buffer(0x20, 0), page + 0x800]
+            .into_iter()
+            .enumerate()
+        {
+            buffer.set(&mut system.memory, i as u32 + 1, value);
+        }
+        handle_request(&mut system, apt());
+        // a glance hands out a handle as well, closing it must leave the
+        // block to whoever receives the answer.
+        buffer.set(&mut system.memory, 0, Header::new(0x000E, 2, 0).0);
+        handle_request(&mut system, apt());
+        let glanced = buffer.get(&mut system.memory, 6);
+        assert!(system.kernel.handles.close(&mut system.kernel.objects, glanced));
+        let response = receive(&mut system);
+        assert_eq!(response[..3], [0, 0x406, 3], "the applet answers the request");
+        let block = system.kernel.resolve(response[4]).and_then(|object| system.kernel.objects.get(object));
+        assert!(
+            matches!(block, Some(crate::kernel::object::KObject::SharedMemory(_))),
+            "with a block for the capture"
+        );
+
+        // StartLibraryApplet(applet, size, handle, buffer)
+        buffer.set(&mut system.memory, 0, Header::new(0x001E, 2, 4).0);
+        for (i, value) in [0x406, 0x40, 0, 0, Descriptor::static_buffer(0x40, 0), page + 0x800]
+            .into_iter()
+            .enumerate()
+        {
+            buffer.set(&mut system.memory, i as u32 + 1, value);
+        }
+        handle_request(&mut system, apt());
+        assert_eq!(receive(&mut system)[..4], [0, 0x406, 10, 0x40], "and closes, handing back a result");
+        assert!(system.services.unimplemented.is_empty());
+    }
 }
