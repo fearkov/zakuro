@@ -10,7 +10,7 @@ I started developing this project in October 2025, before
 
 I first wrote it in C++, but I was learning Rust at the time and noticed there wasn't a working 3DS emulator written in Rust, so I switched.
 
-This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot, but they run well below full speed. There's no audio output, fragment lighting or JIT yet.
+This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot, but they run well below full speed. There's no audio output or JIT yet.
 
 To run it you need a decrypted ROM:
 
