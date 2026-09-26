@@ -68,6 +68,15 @@ impl Operation {
             _ => Operation::AddMultiply,
         }
     }
+
+    /// how many of a stage's three inputs the operation reads.
+    fn inputs(self) -> usize {
+        match self {
+            Operation::Replace => 1,
+            Operation::Lerp | Operation::MultiplyAdd | Operation::AddMultiply => 3,
+            _ => 2,
+        }
+    }
 }
 
 /// one configured stage.
@@ -160,8 +169,22 @@ impl TexEnv {
         }
     }
 
+    /// whether any stage reads the colors fragment lighting produces, when
+    /// none does there is no point in working them out.
+    pub fn reads_lighting(&self) -> bool {
+        let lit = |source: &Source| matches!(source, Source::PrimaryFragmentColor | Source::SecondaryFragmentColor);
+        self.stages.iter().zip(self.passthrough).any(|(stage, passthrough)| {
+            !passthrough
+                && (stage.color_sources[..stage.color_op.inputs()].iter().any(lit)
+                    || (stage.color_op != Operation::Dot3Rgba
+                        && stage.alpha_sources[..stage.alpha_op.inputs()].iter().any(lit)))
+        })
+    }
+
     /// runs every stage for one fragment.
-    pub fn apply(&self, primary: [f32; 4], textures: [[f32; 4]; 4]) -> [f32; 4] {
+    /// fragment is the primary and secondary color fragment lighting
+    /// produced, when it is on.
+    pub fn apply(&self, primary: [f32; 4], textures: [[f32; 4]; 4], fragment: Option<([f32; 4], [f32; 4])>) -> [f32; 4] {
         let mut previous = primary;
         // the buffer lags a stage behind, the first stage reads zero, the
         // second the configured buffer color, and a stage's update is only
@@ -173,9 +196,10 @@ impl TexEnv {
             if !self.passthrough[index] {
                 let pick = |source: Source| -> [f32; 4] {
                     match source {
-                        Source::PrimaryColor | Source::PrimaryFragmentColor => primary,
-                        // without fragment lighting there is no specular term.
-                        Source::SecondaryFragmentColor => [0.0, 0.0, 0.0, 1.0],
+                        Source::PrimaryColor => primary,
+                        Source::PrimaryFragmentColor => fragment.map_or(primary, |(diffuse, _)| diffuse),
+                        // without fragment lighting there is no specular term
+                        Source::SecondaryFragmentColor => fragment.map_or([0.0, 0.0, 0.0, 1.0], |(_, specular)| specular),
                         Source::Texture(unit) => textures[unit.min(3)],
                         Source::PreviousBuffer => buffer,
                         Source::Constant => stage.constant,
@@ -333,7 +357,7 @@ mod tests {
     #[test]
     fn a_modulate_stage_multiplies_its_inputs() {
         let env = TexEnv::read(&modulate_registers());
-        let out = env.apply([1.0, 0.5, 0.0, 1.0], [[0.5, 0.5, 0.5, 0.5]; 4]);
+        let out = env.apply([1.0, 0.5, 0.0, 1.0], [[0.5, 0.5, 0.5, 0.5]; 4], None);
         assert!((out[0] - 0.5).abs() < 1e-5, "red was {}", out[0]);
         assert!((out[1] - 0.25).abs() < 1e-5, "green was {}", out[1]);
         assert!((out[2] - 0.0).abs() < 1e-5, "blue was {}", out[2]);
@@ -352,7 +376,7 @@ mod tests {
         }
         let env = TexEnv::read(&registers);
         let primary = [0.25, 0.5, 0.75, 1.0];
-        let out = env.apply(primary, [[1.0, 0.0, 0.0, 1.0]; 4]);
+        let out = env.apply(primary, [[1.0, 0.0, 0.0, 1.0]; 4], None);
         for channel in 0..4 {
             assert!(
                 (out[channel] - primary[channel]).abs() < 1e-5,
@@ -380,12 +404,23 @@ mod tests {
         registers
     }
 
+    /// a lighting color only counts in an input the operation reads.
+    #[test]
+    fn lighting_is_read_only_through_used_inputs() {
+        let mut registers = passthrough_registers();
+        // texture 0, with the primary fragment color in the second input
+        registers[STAGE_REGISTERS[0]] = 0x0003_0013;
+        assert!(!TexEnv::read(&registers).reads_lighting(), "replace reads one input");
+        registers[STAGE_REGISTERS[0] + 2] = 1;
+        assert!(TexEnv::read(&registers).reads_lighting(), "modulate reads two");
+    }
+
     #[test]
     fn pass_through_stages_leave_the_color_alone() {
         let env = TexEnv::read(&passthrough_registers());
         assert!(env.passthrough.iter().all(|&p| p));
         let color = [0.25, 0.5, 0.75, 1.0];
-        assert_eq!(env.apply(color, [[0.0; 4]; 4]), color);
+        assert_eq!(env.apply(color, [[0.0; 4]; 4], None), color);
     }
 
     /// stage 0 writes red into the buffer.
@@ -402,11 +437,11 @@ mod tests {
         let green = [0.0, 1.0, 0.0, 1.0];
         let red = [1.0, 0.0, 0.0, 1.0];
         let env = TexEnv::read(&registers);
-        assert_eq!(env.apply([0.0; 4], [[0.0; 4]; 4]), green);
+        assert_eq!(env.apply([0.0; 4], [[0.0; 4]; 4], None), green);
 
         registers[stage2] = 0x000D_000D;
         let env = TexEnv::read(&registers);
-        assert_eq!(env.apply([0.0; 4], [[0.0; 4]; 4]), red);
+        assert_eq!(env.apply([0.0; 4], [[0.0; 4]; 4], None), red);
     }
 
     /// color and alpha have separate update bits.
@@ -420,7 +455,7 @@ mod tests {
         registers[REG_BUFFER_COLOR] = 0xFF00_FF00;
         registers[stage2] = 0x000D_000D;
 
-        let out = TexEnv::read(&registers).apply([0.0; 4], [[0.0; 4]; 4]);
+        let out = TexEnv::read(&registers).apply([0.0; 4], [[0.0; 4]; 4], None);
         assert_eq!(&out[..3], &[1.0, 0.0, 0.0]);
         assert_eq!(out[3], 1.0, "alpha must still be the buffer color's");
     }

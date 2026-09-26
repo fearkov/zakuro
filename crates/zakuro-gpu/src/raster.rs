@@ -7,6 +7,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::registers::*;
+use crate::lighting::{Lighting, Tables};
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderState, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -167,6 +168,10 @@ struct Vertex {
     color: Vec4,
     /// texture coordinate sets 0-2, each (u, v).
     texcoords: [[f32; 2]; 3],
+    /// the surface's orientation and the vector to the viewer, which
+    /// fragment lighting works from.
+    quaternion: Vec4,
+    view: [f32; 3],
 }
 
 impl Vertex {
@@ -180,6 +185,8 @@ impl Vertex {
             texcoords: std::array::from_fn(|set| {
                 std::array::from_fn(|i| mix(self.texcoords[set][i], other.texcoords[set][i]))
             }),
+            quaternion: std::array::from_fn(|i| mix(self.quaternion[i], other.quaternion[i])),
+            view: std::array::from_fn(|i| mix(self.view[i], other.view[i])),
         }
     }
 }
@@ -193,6 +200,8 @@ struct OutputMap {
     color: [Option<(usize, usize)>; 4],
     /// (u, v) of texture coordinate sets 0, 1 and 2.
     texcoords: [[Option<(usize, usize)>; 2]; 3],
+    quaternion: [Option<(usize, usize)>; 4],
+    view: [Option<(usize, usize)>; 3],
 }
 
 impl Default for OutputMap {
@@ -208,6 +217,8 @@ impl Default for OutputMap {
                 Some((2, 3)),
             ],
             texcoords: [[Some((3, 0)), Some((3, 1))], [None; 2], [None; 2]],
+            quaternion: [None; 4],
+            view: [None; 3],
         }
     }
 }
@@ -222,6 +233,8 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
         position: [(0, 0), (0, 1), (0, 2), (0, 3)],
         color: [None; 4],
         texcoords: [[None; 2]; 3],
+        quaternion: [None; 4],
+        view: [None; 3],
     };
     let mut saw_position = false;
 
@@ -236,9 +249,11 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
                     map.position[semantic] = slot;
                     saw_position = true;
                 }
+                4..=7 => map.quaternion[semantic - 4] = Some(slot),
                 8..=11 => map.color[semantic - 8] = Some(slot),
                 12..=13 => map.texcoords[0][semantic - 12] = Some(slot),
                 14..=15 => map.texcoords[1][semantic - 14] = Some(slot),
+                18..=20 => map.view[semantic - 18] = Some(slot),
                 22..=23 => map.texcoords[2][semantic - 22] = Some(slot),
                 _ => {}
             }
@@ -299,6 +314,8 @@ fn to_vertex(map: &OutputMap, attributes: &[Vec4; 16]) -> Vertex {
             color_or(map.color[3]),
         ],
         texcoords: map.texcoords.map(|set| [set[0].map_or(0.0, get), set[1].map_or(0.0, get)]),
+        quaternion: map.quaternion.map(|slot| slot.map_or(0.0, get)),
+        view: map.view.map(|slot| slot.map_or(0.0, get)),
     }
 }
 
@@ -418,6 +435,8 @@ struct Screen {
     inv_w: f32,
     color_over_w: Vec4,
     texcoords_over_w: [[f32; 2]; 3],
+    quaternion_over_w: Vec4,
+    view_over_w: [f32; 3],
 }
 
 fn to_screen(vertex: Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
@@ -439,6 +458,8 @@ fn to_screen(vertex: Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
         inv_w,
         color_over_w: vertex.color.map(|c| c * inv_w),
         texcoords_over_w: vertex.texcoords.map(|[u, v]| [u * inv_w, v * inv_w]),
+        quaternion_over_w: vertex.quaternion.map(|c| c * inv_w),
+        view_over_w: vertex.view.map(|c| c * inv_w),
     })
 }
 
@@ -487,6 +508,13 @@ struct BoundTexture {
     width: u32,
     height: u32,
     border: [f32; 4],
+}
+
+/// what draws keep from one to the next.
+#[derive(Default)]
+pub struct Resources {
+    pub textures: TextureCache,
+    pub light_tables: Tables,
 }
 
 /// textures decoded to RGBA, kept across draws for as long as the bytes
@@ -1032,6 +1060,8 @@ struct DrawState<'a> {
     textures: &'a [Option<BoundTexture>; 3],
     /// texture unit 2 can read coordinate set 1 instead of its own.
     texture2_uses_coord1: bool,
+    lighting: Option<Lighting>,
+    tables: &'a Tables,
 }
 
 /// rasterizes one triangle, texturing and the combiners, then the alpha,
@@ -1053,6 +1083,17 @@ fn fill_triangle(
     if min_x >= max_x || min_y >= max_y {
         return;
     }
+
+    // q and -q are the same orientation, but halfway between them is not,
+    // so the quaternions all go to the side of the first one.
+    let flip = |mut vertex: Screen| {
+        let q = vertex.quaternion_over_w;
+        if (0..4).map(|i| q[i] * a.quaternion_over_w[i]).sum::<f32>() < 0.0 {
+            vertex.quaternion_over_w = q.map(|c| -c);
+        }
+        vertex
+    };
+    let (b, c) = (flip(b), flip(c));
 
     // wind every triangle the same way, so that "inside" is the positive
     // side of all three edges.
@@ -1145,7 +1186,14 @@ fn fill_triangle(
                 }
             }
 
-            let combined = state.tex_env.apply(color, samples);
+            let fragment = state.lighting.as_ref().map(|lighting| {
+                let quaternion = std::array::from_fn(|i| {
+                    interpolate([a.quaternion_over_w[i], b.quaternion_over_w[i], c.quaternion_over_w[i]])
+                });
+                let view = std::array::from_fn(|i| interpolate([a.view_over_w[i], b.view_over_w[i], c.view_over_w[i]]));
+                lighting.shade(state.tables, quaternion, view, &samples)
+            });
+            let combined = state.tex_env.apply(color, samples, fragment);
             let mut rgba = combined.map(|c| (c * 255.0) as u8);
 
             if let Some(test) = state.alpha_test {
@@ -1330,7 +1378,7 @@ pub fn draw<M: GpuMemory>(
     geometry_shader: &ShaderUnit,
     fixed_attributes: &[Vec4; 16],
     memory: &mut M,
-    textures: &mut TextureCache,
+    resources: &mut Resources,
     indexed: bool,
 ) -> u32 {
     let vertex_count = registers[REG_VERTEX_COUNT];
@@ -1394,7 +1442,7 @@ pub fn draw<M: GpuMemory>(
         .collect();
     let shaded = process_vertices(registers, vertex_shader, geometry_shader, &inputs, order.as_deref());
 
-    rasterize(registers, memory, textures, &shaded);
+    rasterize(registers, memory, resources, &shaded);
     vertex_count
 }
 
@@ -1405,7 +1453,7 @@ pub fn draw_immediate<M: GpuMemory>(
     vertex_shader: &ShaderUnit,
     geometry_shader: &ShaderUnit,
     memory: &mut M,
-    textures: &mut TextureCache,
+    resources: &mut Resources,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
     // immediate mode sizes its vertices by GPUREG_VSH_NUM_ATTR.
@@ -1416,12 +1464,12 @@ pub fn draw_immediate<M: GpuMemory>(
         .map(|attributes| map_inputs(registers, REG_VS_BLOCK, &attributes[..count]))
         .collect();
     let shaded = process_vertices(registers, vertex_shader, geometry_shader, &inputs, None);
-    rasterize(registers, memory, textures, &shaded)
+    rasterize(registers, memory, resources, &shaded)
 }
 
 /// assembles shaded vertices into triangles the way the primitive configuration
 /// says, and fills them with the current back-end state.
-fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, cache: &mut TextureCache, shaded: &[Vertex]) -> u32 {
+fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
     let vertex_count = shaded.len();
     // the offset is two signed 10-bit fields.
     let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
@@ -1473,7 +1521,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, cache: &mut Textur
     let color_writable = registers[REG_COLOR_BUFFER_WRITE] != 0;
     let color_mask = registers[REG_DEPTH_COLOR_MASK] >> 8;
     let textures: [Option<BoundTexture>; 3] =
-        std::array::from_fn(|unit| bind_texture(registers, memory, cache, unit));
+        std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit));
+    let tex_env = crate::tev::TexEnv::read(registers);
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
@@ -1489,11 +1538,14 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, cache: &mut Textur
         },
         depth_map: DepthMap::read(registers),
         depth_stencil: DepthStencil::read(registers, memory),
-        tex_env: crate::tev::TexEnv::read(registers),
+        tex_env,
         alpha_test: AlphaTest::read(registers),
         blend: crate::blend::Blend::read(registers),
         textures: &textures,
         texture2_uses_coord1: registers[REG_TEXTURE_CONFIG] & (1 << 13) != 0,
+        // the lighting only matters to a draw whose combiners read it.
+        lighting: tex_env.reads_lighting().then(|| Lighting::read(registers)).flatten(),
+        tables: &resources.light_tables,
     };
 
     // GPUREG_PRIMITIVE_CONFIG bits [9:8], 0 = triangle list, 1 = strip,
@@ -1687,7 +1739,7 @@ mod tests {
     fn cover(z: f32, color: Vec4) -> Vec<Vertex> {
         [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
             .into_iter()
-            .map(|[x, y]| Vertex { clip: [x, y, z, 1.0], color, texcoords: [[0.0; 2]; 3] })
+            .map(|[x, y]| Vertex { clip: [x, y, z, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] })
             .collect()
     }
 
@@ -1716,9 +1768,9 @@ mod tests {
         registers[REG_DEPTH_COLOR_MASK] |= 1 | (6 << 4) | (1 << 12);
 
         let mut memory = ConsoleMemory::default();
-        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.2, RED));
-        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.8, GREEN));
-        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.3, BLUE));
+        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.2, RED));
+        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.8, GREEN));
+        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.3, BLUE));
         assert!(pixels(&mut memory).iter().all(|&p| p == [0, 255, 0, 255]));
     }
 
@@ -1732,7 +1784,7 @@ mod tests {
         for sample in 0..32 {
             memory.write(DEPTH + sample * 4 + 3, &[1]);
         }
-        let written = rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.5, RED));
+        let written = rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED));
         assert_eq!(written, 32);
     }
 
@@ -1742,13 +1794,13 @@ mod tests {
     fn a_triangle_crossing_the_camera_is_clipped_not_dropped() {
         let registers = target_registers();
         let mut memory = ConsoleMemory::default();
-        let vertex = |clip: Vec4| Vertex { clip, color: RED, texcoords: [[0.0; 2]; 3] };
+        let vertex = |clip: Vec4| Vertex { clip, color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         let triangle = [
             vertex([-1.0, -1.0, -0.5, 1.0]),
             vertex([1.0, -1.0, -0.5, 1.0]),
             vertex([0.0, 2.0, 0.5, -1.0]),
         ];
-        let written = rasterize(&registers, &mut memory, &mut TextureCache::default(), &triangle);
+        let written = rasterize(&registers, &mut memory, &mut Resources::default(), &triangle);
         assert_eq!(written, 64);
     }
 
@@ -1762,7 +1814,7 @@ mod tests {
             ColorFormat::Rgba8.encode([10, 20, 30, 40], &mut raw);
             memory.write(COLOR + i * 4, &raw);
         }
-        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.5, [1.0, 1.0, 1.0, 1.0]));
+        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, [1.0, 1.0, 1.0, 1.0]));
         assert!(pixels(&mut memory).iter().all(|&p| p == [255, 20, 30, 40]));
     }
 
@@ -1772,7 +1824,7 @@ mod tests {
     fn a_quad_covers_every_pixel_once() {
         let registers = target_registers();
         let mut memory = ConsoleMemory::default();
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         let quad = [
             vertex(-1.0, -1.0),
             vertex(1.0, -1.0),
@@ -1781,7 +1833,7 @@ mod tests {
             vertex(1.0, 1.0),
             vertex(-1.0, 1.0),
         ];
-        assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &quad), 64);
+        assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &quad), 64);
     }
 
     /// a draw big enough to be split over threads covers the same pixels,
@@ -1797,7 +1849,7 @@ mod tests {
         registers[REG_DEPTH_BUFFER_ADDRESS] = BIG_DEPTH >> 3;
         registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12);
         let mut memory = ConsoleMemory::default();
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         let quad = [
             vertex(-1.0, -1.0),
             vertex(1.0, -1.0),
@@ -1806,7 +1858,7 @@ mod tests {
             vertex(1.0, 1.0),
             vertex(-1.0, 1.0),
         ];
-        assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &quad), 256 * 256);
+        assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &quad), 256 * 256);
         for i in 0..256 * 256 {
             let mut raw = [0u8; 4];
             memory.read(BIG_COLOR + i * 4, &mut raw);
@@ -1817,14 +1869,14 @@ mod tests {
     /// culling keeps the winding the register asks for and drops the other.
     #[test]
     fn face_culling_keeps_one_winding() {
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         // counter-clockwise with y up.
         let triangle = [vertex(-1.0, -1.0), vertex(3.0, -1.0), vertex(-1.0, 3.0)];
         for (mode, expected) in [(0, 64), (1, 0), (2, 64)] {
             let mut registers = target_registers();
             registers[REG_FACE_CULLING] = mode;
             let mut memory = ConsoleMemory::default();
-            assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &triangle), expected, "mode {mode}");
+            assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &triangle), expected, "mode {mode}");
         }
     }
 
@@ -1837,7 +1889,7 @@ mod tests {
         registers[REG_VIEWPORT_HEIGHT] = float24(2.0);
         registers[REG_VIEWPORT_XY] = 4 << 16;
         let mut memory = ConsoleMemory::default();
-        assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.5, RED)), 32);
+        assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED)), 32);
         for row in 0..8 {
             for x in 0..8 {
                 let index = crate::format::morton_offset(x, row, 8, 1);

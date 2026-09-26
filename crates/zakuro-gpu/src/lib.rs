@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod blend;
 pub mod format;
+pub mod lighting;
 pub mod raster;
 pub mod registers;
 pub mod renderer;
@@ -121,8 +122,8 @@ pub struct Gpu {
     pub vertices_drawn: u64,
     /// host time spent running command lists and display transfers.
     pub busy: std::time::Duration,
-    /// textures already decoded, kept across draws.
-    textures: raster::TextureCache,
+    /// decoded textures and the lighting tables, kept across draws.
+    resources: raster::Resources,
 }
 
 /// number of external register words we track (0x1EF00000..0x1EF04000).
@@ -155,7 +156,7 @@ impl Gpu {
             transfers: 0,
             vertices_drawn: 0,
             busy: std::time::Duration::ZERO,
-            textures: raster::TextureCache::default(),
+            resources: raster::Resources::default(),
         }
     }
 
@@ -543,7 +544,7 @@ impl Gpu {
             &self.vertex_shader,
             &self.geometry_shader,
             memory,
-            &mut self.textures,
+            &mut self.resources,
             &vertices,
         );
     }
@@ -593,7 +594,7 @@ impl Gpu {
                     &self.geometry_shader,
                     &self.fixed_attributes,
                     memory,
-                    &mut self.textures,
+                    &mut self.resources,
                     indexed,
                 );
                 self.vertices_drawn += vertices as u64;
@@ -649,6 +650,9 @@ impl Gpu {
                 }
             }
 
+            lighting::REG_TABLE_DATA..=lighting::REG_TABLE_DATA_END => {
+                self.resources.light_tables.write(&mut self.internal, new);
+            }
             REG_GS_BLOCK..=REG_GS_BLOCK_END => {
                 configure_shader(&mut self.geometry_shader, register - REG_GS_BLOCK, new);
             }
