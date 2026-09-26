@@ -4,7 +4,7 @@ use crate::format::morton_offset;
 
 /// A PICA texture format, straight from GPUREG_TEXUNIT0_TYPE and the
 /// equivalent registers for units 1/2. The numbering is fixed by hardware.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureFormat {
     Rgba8,
     Rgb8,

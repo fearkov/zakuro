@@ -121,6 +121,8 @@ pub struct Gpu {
     pub vertices_drawn: u64,
     /// host time spent running command lists and display transfers.
     pub busy: std::time::Duration,
+    /// textures already decoded, kept across draws.
+    textures: raster::TextureCache,
 }
 
 /// number of external register words we track (0x1EF00000..0x1EF04000).
@@ -153,6 +155,7 @@ impl Gpu {
             transfers: 0,
             vertices_drawn: 0,
             busy: std::time::Duration::ZERO,
+            textures: raster::TextureCache::default(),
         }
     }
 
@@ -540,6 +543,7 @@ impl Gpu {
             &self.vertex_shader,
             &self.geometry_shader,
             memory,
+            &mut self.textures,
             &vertices,
         );
     }
@@ -589,6 +593,7 @@ impl Gpu {
                     &self.geometry_shader,
                     &self.fixed_attributes,
                     memory,
+                    &mut self.textures,
                     indexed,
                 );
                 self.vertices_drawn += vertices as u64;

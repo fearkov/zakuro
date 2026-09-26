@@ -1,6 +1,11 @@
 //! software rasterization of PICA200 draw calls.
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
+
 use crate::registers::*;
+use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderState, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
 
@@ -457,15 +462,73 @@ fn clip_triangle(triangle: [Vertex; 3]) -> Vec<Vertex> {
 
 /// texture unit 0's configuration and backing data for one draw call.
 struct BoundTexture {
-    data: Vec<u8>,
+    /// the texture decoded, row by row from the top.
+    texels: Arc<[[u8; 4]]>,
     /// bilinear rather than point sampling when magnifying.
     linear: bool,
     wrap_s: Wrap,
     wrap_t: Wrap,
-    format: crate::texture::TextureFormat,
     width: u32,
     height: u32,
     border: [f32; 4],
+}
+
+/// textures decoded to RGBA, kept across draws for as long as the bytes
+/// they came from stay the same. decoding a texel for every sample, four
+/// of them when filtering, costs far more than looking one up.
+#[derive(Default)]
+pub struct TextureCache {
+    /// by address, format and size.
+    entries: HashMap<TextureKey, Decoded>,
+    texels: usize,
+}
+
+type TextureKey = (u32, TextureFormat, u32, u32);
+
+struct Decoded {
+    /// the hash of the bytes it was decoded from.
+    hash: u64,
+    texels: Arc<[[u8; 4]]>,
+}
+
+/// how many texels the cache holds before it starts over, 256 MiB of them.
+const CACHED_TEXELS: usize = 64 * 1024 * 1024;
+
+impl TextureCache {
+    fn decoded(&mut self, addr: u32, format: TextureFormat, width: u32, height: u32, data: &[u8]) -> Arc<[[u8; 4]]> {
+        let key = (addr, format, width, height);
+        let hash = fingerprint(data);
+        if let Some(decoded) = self.entries.get(&key).filter(|decoded| decoded.hash == hash) {
+            return decoded.texels.clone();
+        }
+        let count = (width * height) as usize;
+        if self.texels + count > CACHED_TEXELS {
+            self.entries.clear();
+            self.texels = 0;
+        }
+        let texels: Arc<[[u8; 4]]> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
+            .collect();
+        if let Some(old) = self.entries.insert(key, Decoded { hash, texels: texels.clone() }) {
+            self.texels -= old.texels.len();
+        }
+        self.texels += count;
+        texels
+    }
+}
+
+/// a quick hash of a texture's bytes, to notice when they change.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = bytes.len() as u64;
+    let (words, rest) = bytes.as_chunks::<8>();
+    for &word in words {
+        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+    for &byte in rest {
+        hash = (hash.rotate_left(5) ^ byte as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+    hash
 }
 
 /// how a texture coordinate outside 0..1 is brought back inside.
@@ -519,8 +582,7 @@ impl BoundTexture {
         }
         let x = self.wrap_s.apply(x, self.width);
         let y = self.wrap_t.apply(y, self.height);
-        let t = crate::texture::sample_texel(&self.data, self.format, self.width, x, y);
-        t.map(|c| c as f32 / 255.0)
+        self.texels[(y * self.width + x) as usize].map(|c| c as f32 / 255.0)
     }
 
     /// samples at (u, v), filtering the way the unit is configured.
@@ -562,6 +624,7 @@ const TEXTURE_UNIT_BASES: [usize; 3] = [0x081, 0x091, 0x099];
 fn bind_texture<M: GpuMemory>(
     registers: &[u32],
     memory: &mut M,
+    cache: &mut TextureCache,
     unit: usize,
 ) -> Option<BoundTexture> {
     // one bit per unit in GPUREG_TEXUNIT_CONFIG.
@@ -597,11 +660,10 @@ fn bind_texture<M: GpuMemory>(
     // modes for T and S in bits 8-10 and 12-14.
     let config = registers[base + 2];
     Some(BoundTexture {
-        data,
+        texels: cache.decoded(addr, format, width, height, &data),
         linear: config & 0x2 != 0,
         wrap_t: Wrap::from_raw(config >> 8),
         wrap_s: Wrap::from_raw(config >> 12),
-        format,
         width,
         height,
         // the border color register comes first in each unit's block, RGBA8
@@ -798,9 +860,9 @@ impl DepthStencil {
     }
 
     /// the stored depth, as 0..1, and stencil.
-    fn read_sample<M: GpuMemory>(&self, memory: &mut M, index: u32) -> (f32, u8) {
+    fn read_sample(&self, surface: &mut Band, index: u32) -> (f32, u8) {
         let mut raw = [0u8; 4];
-        memory.read(self.addr + index * self.bytes, &mut raw[..self.bytes as usize]);
+        raw[..self.bytes as usize].copy_from_slice(surface.at(index));
         let value = u32::from_le_bytes(raw);
         match self.bytes {
             2 => (value as f32 / 65535.0, 0),
@@ -808,19 +870,19 @@ impl DepthStencil {
         }
     }
 
-    fn write_depth<M: GpuMemory>(&self, memory: &mut M, index: u32, depth: f32) {
-        let address = self.addr + index * self.bytes;
+    fn write_depth(&self, surface: &mut Band, index: u32, depth: f32) {
+        let sample = surface.at(index);
         if self.bytes == 2 {
-            memory.write(address, &((depth * 65535.0) as u16).to_le_bytes());
+            sample.copy_from_slice(&((depth * 65535.0) as u16).to_le_bytes());
         } else {
             // only the low three bytes, the stencil shares the word.
-            memory.write(address, &((depth * 16_777_215.0) as u32).to_le_bytes()[..3]);
+            sample[..3].copy_from_slice(&((depth * 16_777_215.0) as u32).to_le_bytes()[..3]);
         }
     }
 
-    fn write_stencil<M: GpuMemory>(&self, memory: &mut M, index: u32, value: u8) {
+    fn write_stencil(&self, surface: &mut Band, index: u32, value: u8) {
         if self.write_stencil && self.bytes == 4 {
-            memory.write(self.addr + index * 4 + 3, &[value]);
+            surface.at(index)[3] = value;
         }
     }
 }
@@ -846,6 +908,68 @@ impl DepthMap {
 }
 
 /// the color buffer a draw renders into.
+/// a copy of the rows of a buffer a draw can reach, so that its pixels do
+/// not each go through guest memory. it goes back when the draw is done.
+struct Surface {
+    base: u32,
+    bytes: u32,
+    /// where the copy starts inside the buffer, in bytes.
+    first: u32,
+    data: Vec<u8>,
+}
+
+impl Surface {
+    /// copies buffer rows rows of a tiled buffer, rounded out to whole
+    /// rows of tiles, which is what keeps the copy one piece of memory.
+    fn load<M: GpuMemory>(memory: &mut M, base: u32, bytes: u32, width: u32, height: u32, rows: Range<u32>) -> Surface {
+        let tile_row = width / 8 * 64 * bytes;
+        let total = height.div_ceil(8) * tile_row;
+        // a width that is not a whole number of tiles spills into the
+        // next row of tiles.
+        let spill = if width.is_multiple_of(8) { 0 } else { 64 * bytes };
+        let first = rows.start / 8 * tile_row;
+        let end = (rows.end.div_ceil(8) * tile_row + spill).min(total).max(first);
+        let mut data = vec![0u8; (end - first) as usize];
+        memory.read(base + first, &mut data);
+        Surface { base, bytes, first, data }
+    }
+
+    fn store<M: GpuMemory>(&self, memory: &mut M) {
+        memory.write(self.base + self.first, &self.data);
+    }
+
+    fn whole(&mut self) -> Band<'_> {
+        Band { bytes: self.bytes, first: self.first, data: &mut self.data }
+    }
+
+    /// the copy cut into one band per row of tiles, top of the buffer first.
+    fn tile_rows(&mut self, width: u32) -> Vec<Band<'_>> {
+        let tile_row = (width / 8 * 64 * self.bytes) as usize;
+        let (bytes, first) = (self.bytes, self.first);
+        self.data
+            .chunks_mut(tile_row)
+            .enumerate()
+            .map(|(i, data)| Band { bytes, first: first + (i * tile_row) as u32, data })
+            .collect()
+    }
+}
+
+/// a stretch of a surface's rows, the part one thread fills.
+struct Band<'a> {
+    bytes: u32,
+    /// where the stretch starts inside the buffer, in bytes.
+    first: u32,
+    data: &'a mut [u8],
+}
+
+impl Band<'_> {
+    /// the bytes of the pixel at a tiled index.
+    fn at(&mut self, index: u32) -> &mut [u8] {
+        let offset = (index * self.bytes - self.first) as usize;
+        &mut self.data[offset..offset + self.bytes as usize]
+    }
+}
+
 struct ColorTarget {
     addr: u32,
     /// the pixels a draw may touch, in window coordinates, the viewport,
@@ -872,6 +996,15 @@ struct FillStats {
     alpha_failed: u32,
 }
 
+impl FillStats {
+    fn add(&mut self, other: FillStats) {
+        self.written += other.written;
+        self.depth_failed += other.depth_failed;
+        self.stencil_failed += other.stencil_failed;
+        self.alpha_failed += other.alpha_failed;
+    }
+}
+
 /// everything about a draw that stays the same from triangle to triangle.
 struct DrawState<'a> {
     target: ColorTarget,
@@ -888,8 +1021,10 @@ struct DrawState<'a> {
 /// rasterizes one triangle, texturing and the combiners, then the alpha,
 /// stencil and depth tests in the order the hardware runs them, then
 /// blending and the color write.
-fn fill_triangle<M: GpuMemory>(
-    memory: &mut M,
+fn fill_triangle(
+    color_surface: Option<&mut Band>,
+    mut depth_surface: Option<&mut Band>,
+    rows: Range<i32>,
     [a, b, c]: [Screen; 3],
     state: &DrawState,
     stats: &mut FillStats,
@@ -897,8 +1032,8 @@ fn fill_triangle<M: GpuMemory>(
     let target = &state.target;
     let min_x = (a.x.min(b.x).min(c.x).floor() as i32).max(target.left);
     let max_x = (a.x.max(b.x).max(c.x).ceil() as i32).min(target.right);
-    let min_y = (a.y.min(b.y).min(c.y).floor() as i32).max(target.bottom);
-    let max_y = (a.y.max(b.y).max(c.y).ceil() as i32).min(target.top);
+    let min_y = (a.y.min(b.y).min(c.y).floor() as i32).max(target.bottom).max(rows.start);
+    let max_y = (a.y.max(b.y).max(c.y).ceil() as i32).min(target.top).min(rows.end);
     if min_x >= max_x || min_y >= max_y {
         return;
     }
@@ -920,7 +1055,8 @@ fn fill_triangle<M: GpuMemory>(
     let edges = [Edge::new(&b, &c), Edge::new(&c, &a), Edge::new(&a, &b)];
 
     let bpp = target.format.bytes_per_pixel();
-    let writes_color = target.write.iter().any(|&w| w);
+    let mut color_surface = color_surface;
+    let writes_color = color_surface.is_some();
     let partial_write = writes_color && !target.write.iter().all(|&w| w);
     let any_texture = state.textures.iter().any(Option::is_some);
     let mut pixel = [0u8; 4];
@@ -960,7 +1096,8 @@ fn fill_triangle<M: GpuMemory>(
             let stored = state
                 .depth_stencil
                 .as_ref()
-                .map(|buffer| buffer.read_sample(memory, index));
+                .zip(depth_surface.as_deref_mut())
+                .map(|(buffer, surface)| buffer.read_sample(surface, index));
             if let (Some(buffer), Some((stored_depth, _))) = (&state.depth_stencil, stored) {
                 if buffer.stencil.is_none()
                     && buffer.test.is_some_and(|test| !test.passes(depth, stored_depth))
@@ -1002,10 +1139,12 @@ fn fill_triangle<M: GpuMemory>(
                 }
             }
 
-            if let (Some(buffer), Some((stored_depth, stored_stencil))) = (&state.depth_stencil, stored) {
+            if let (Some(buffer), Some((stored_depth, stored_stencil)), Some(surface)) =
+                (&state.depth_stencil, stored, depth_surface.as_deref_mut())
+            {
                 if let Some(stencil) = &buffer.stencil {
                     if !stencil.passes(stored_stencil) {
-                        buffer.write_stencil(memory, index, stencil.update(stored_stencil, stencil.fail));
+                        buffer.write_stencil(surface, index, stencil.update(stored_stencil, stencil.fail));
                         stats.stencil_failed += 1;
                         continue;
                     }
@@ -1013,27 +1152,24 @@ fn fill_triangle<M: GpuMemory>(
                 let depth_passes = buffer.test.is_none_or(|test| test.passes(depth, stored_depth));
                 if let Some(stencil) = &buffer.stencil {
                     let op = if depth_passes { stencil.pass } else { stencil.depth_fail };
-                    buffer.write_stencil(memory, index, stencil.update(stored_stencil, op));
+                    buffer.write_stencil(surface, index, stencil.update(stored_stencil, op));
                 }
                 if !depth_passes {
                     stats.depth_failed += 1;
                     continue;
                 }
                 if buffer.write_depth {
-                    buffer.write_depth(memory, index, depth);
+                    buffer.write_depth(surface, index, depth);
                 }
             }
 
-            if !writes_color {
-                continue;
-            }
+            let Some(surface) = color_surface.as_deref_mut() else { continue };
 
             // combine with what is already in the buffer, the way the output
             // merger is configured to, and keep the channels the draw may not
             // change.
-            let address = target.addr + index * bpp as u32;
             if state.blend.is_some() || partial_write {
-                memory.read(address, &mut pixel[..bpp]);
+                pixel[..bpp].copy_from_slice(surface.at(index));
                 let existing = target.format.decode(&pixel[..bpp]);
                 if let Some(blend) = &state.blend {
                     let blended = blend.apply(
@@ -1050,9 +1186,96 @@ fn fill_triangle<M: GpuMemory>(
             }
 
             target.format.encode(rgba, &mut pixel[..bpp]);
-            memory.write(address, &pixel[..bpp]);
+            surface.at(index).copy_from_slice(&pixel[..bpp]);
             stats.written += 1;
         }
+    }
+}
+
+/// a row of tiles for one thread, its color and depth and its window rows.
+type Piece<'a> = (Option<Band<'a>>, Option<Band<'a>>, Range<i32>);
+
+/// pixels a draw has to cover before it is worth splitting over threads.
+const PARALLEL_PIXELS: f32 = 16_384.0;
+
+fn threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// fills the triangles on the copies of the buffers, rows being the window
+/// rows they can reach. a big draw is cut into rows of tiles dealt out to
+/// threads in turn, which never touch the same pixel.
+fn fill(
+    color: &mut Option<Surface>,
+    depth: &mut Option<Surface>,
+    triangles: &[[Screen; 3]],
+    rows: Range<i32>,
+    state: &DrawState,
+    stats: &mut FillStats,
+) {
+    let target = &state.target;
+    let area: f32 = triangles
+        .iter()
+        .map(|t| {
+            let (x, y) = (t.map(|v| v.x), t.map(|v| v.y));
+            let span = |c: [f32; 3]| c.iter().copied().fold(f32::MIN, f32::max) - c.iter().copied().fold(f32::MAX, f32::min);
+            span(x) * span(y)
+        })
+        .sum();
+    // a width that is not a whole number of tiles spills across rows of
+    // tiles, so those stay on one thread.
+    if area < PARALLEL_PIXELS || threads() < 2 || !target.buffer_width.is_multiple_of(8) {
+        let mut color_band = color.as_mut().map(Surface::whole);
+        let mut depth_band = depth.as_mut().map(Surface::whole);
+        for &triangle in triangles {
+            fill_triangle(color_band.as_mut(), depth_band.as_mut(), rows.clone(), triangle, state, stats);
+        }
+        return;
+    }
+
+    let width = target.buffer_width;
+    let height = target.buffer_height as i32;
+    let first_tile_row = color.as_ref().or(depth.as_ref()).map_or(0, |s| s.first / (width / 8 * 64 * s.bytes)) as i32;
+    let colors = color.as_mut().map(|surface| surface.tile_rows(width));
+    let depths = depth.as_mut().map(|surface| surface.tile_rows(width));
+    let count = colors.as_ref().or(depths.as_ref()).map_or(0, Vec::len);
+    let mut colors = colors.map(|bands| bands.into_iter().map(Some).collect::<Vec<_>>());
+    let mut depths = depths.map(|bands| bands.into_iter().map(Some).collect::<Vec<_>>());
+
+    let workers = threads().min(count);
+    let mut work: Vec<Vec<Piece>> = (0..workers).map(|_| Vec::new()).collect();
+    for i in 0..count {
+        // tile row t holds buffer rows 8t to 8t+7, window rows counting from
+        // the other end
+        let t = first_tile_row + i as i32;
+        let band_rows = (height - 8 * t - 8).max(rows.start)..(height - 8 * t).min(rows.end);
+        let color_band = colors.as_mut().and_then(|bands| bands[i].take());
+        let depth_band = depths.as_mut().and_then(|bands| bands[i].take());
+        work[i % workers].push((color_band, depth_band, band_rows));
+    }
+    let totals: Vec<FillStats> = std::thread::scope(|scope| {
+        let handles: Vec<_> = work
+            .into_iter()
+            .map(|bands| {
+                scope.spawn(move || {
+                    let mut stats = FillStats::default();
+                    for (mut color_band, mut depth_band, band_rows) in bands {
+                        if band_rows.is_empty() {
+                            continue;
+                        }
+                        for &triangle in triangles {
+                            fill_triangle(color_band.as_mut(), depth_band.as_mut(), band_rows.clone(), triangle, state, &mut stats);
+                        }
+                    }
+                    stats
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    for total in totals {
+        stats.add(total);
     }
 }
 
@@ -1105,6 +1328,7 @@ pub fn draw<M: GpuMemory>(
     geometry_shader: &ShaderUnit,
     fixed_attributes: &[Vec4; 16],
     memory: &mut M,
+    textures: &mut TextureCache,
     indexed: bool,
 ) -> u32 {
     let vertex_count = registers[REG_VERTEX_COUNT];
@@ -1158,7 +1382,7 @@ pub fn draw<M: GpuMemory>(
         .collect();
     let shaded = process_vertices(registers, vertex_shader, geometry_shader, inputs.into_iter());
 
-    rasterize(registers, memory, &shaded);
+    rasterize(registers, memory, textures, &shaded);
     vertex_count
 }
 
@@ -1169,6 +1393,7 @@ pub fn draw_immediate<M: GpuMemory>(
     vertex_shader: &ShaderUnit,
     geometry_shader: &ShaderUnit,
     memory: &mut M,
+    textures: &mut TextureCache,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
     // immediate mode sizes its vertices by GPUREG_VSH_NUM_ATTR.
@@ -1178,12 +1403,12 @@ pub fn draw_immediate<M: GpuMemory>(
         .iter()
         .map(|attributes| map_inputs(registers, REG_VS_BLOCK, &attributes[..count]));
     let shaded = process_vertices(registers, vertex_shader, geometry_shader, inputs);
-    rasterize(registers, memory, &shaded)
+    rasterize(registers, memory, textures, &shaded)
 }
 
 /// assembles shaded vertices into triangles the way the primitive configuration
 /// says, and fills them with the current back-end state.
-fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, shaded: &[Vertex]) -> u32 {
+fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, cache: &mut TextureCache, shaded: &[Vertex]) -> u32 {
     let vertex_count = shaded.len();
     // the offset is two signed 10-bit fields.
     let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
@@ -1235,7 +1460,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, shaded: &[Vertex])
     let color_writable = registers[REG_COLOR_BUFFER_WRITE] != 0;
     let color_mask = registers[REG_DEPTH_COLOR_MASK] >> 8;
     let textures: [Option<BoundTexture>; 3] =
-        std::array::from_fn(|unit| bind_texture(registers, memory, unit));
+        std::array::from_fn(|unit| bind_texture(registers, memory, cache, unit));
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
@@ -1284,6 +1509,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, shaded: &[Vertex])
     let mut clipped_away = 0u32;
     let mut culled = 0u32;
     let mut stats = FillStats::default();
+    let mut triangles = Vec::new();
     for (ia, ib, ic) in triangle_indices {
         let polygon = clip_triangle([shaded[ia], shaded[ib], shaded[ic]]);
         let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(*v, viewport)).collect();
@@ -1300,7 +1526,39 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, shaded: &[Vertex])
             }
         }
         for i in 1..screen.len() - 1 {
-            fill_triangle(memory, [screen[0], screen[i], screen[i + 1]], &state, &mut stats);
+            triangles.push([screen[0], screen[i], screen[i + 1]]);
+        }
+    }
+
+    // the rows the triangles can reach, as window rows and then as rows of
+    // the buffer, which counts from the other end.
+    let target = &state.target;
+    let low = triangles.iter().map(|t| t.iter().map(|v| v.y).fold(f32::MAX, f32::min).floor() as i32).min();
+    let high = triangles.iter().map(|t| t.iter().map(|v| v.y).fold(f32::MIN, f32::max).ceil() as i32).max();
+    if let (Some(low), Some(high)) = (low, high) {
+        let (low, high) = (low.max(target.bottom), high.min(target.top));
+        if low < high {
+            let rows = (target.buffer_height - high as u32)..(target.buffer_height - low as u32);
+            let (width, height) = (target.buffer_width, target.buffer_height);
+            let bpp = target.format.bytes_per_pixel() as u32;
+            let mut color = target
+                .write
+                .iter()
+                .any(|&w| w)
+                .then(|| Surface::load(memory, target.addr, bpp, width, height, rows.clone()));
+            let mut depth = state
+                .depth_stencil
+                .as_ref()
+                .map(|buffer| Surface::load(memory, buffer.addr, buffer.bytes, width, height, rows.clone()));
+            fill(&mut color, &mut depth, &triangles, low..high, &state, &mut stats);
+            if let Some(color) = color.as_ref().filter(|_| stats.written > 0) {
+                color.store(memory);
+            }
+            if let (Some(depth), Some(buffer)) = (&depth, &state.depth_stencil) {
+                if buffer.write_depth || buffer.write_stencil {
+                    depth.store(memory);
+                }
+            }
         }
     }
 
@@ -1445,9 +1703,9 @@ mod tests {
         registers[REG_DEPTH_COLOR_MASK] |= 1 | (6 << 4) | (1 << 12);
 
         let mut memory = ConsoleMemory::default();
-        rasterize(&registers, &mut memory, &cover(-0.2, RED));
-        rasterize(&registers, &mut memory, &cover(-0.8, GREEN));
-        rasterize(&registers, &mut memory, &cover(-0.3, BLUE));
+        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.2, RED));
+        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.8, GREEN));
+        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.3, BLUE));
         assert!(pixels(&mut memory).iter().all(|&p| p == [0, 255, 0, 255]));
     }
 
@@ -1461,7 +1719,7 @@ mod tests {
         for sample in 0..32 {
             memory.write(DEPTH + sample * 4 + 3, &[1]);
         }
-        let written = rasterize(&registers, &mut memory, &cover(-0.5, RED));
+        let written = rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.5, RED));
         assert_eq!(written, 32);
     }
 
@@ -1477,7 +1735,7 @@ mod tests {
             vertex([1.0, -1.0, -0.5, 1.0]),
             vertex([0.0, 2.0, 0.5, -1.0]),
         ];
-        let written = rasterize(&registers, &mut memory, &triangle);
+        let written = rasterize(&registers, &mut memory, &mut TextureCache::default(), &triangle);
         assert_eq!(written, 64);
     }
 
@@ -1491,7 +1749,7 @@ mod tests {
             ColorFormat::Rgba8.encode([10, 20, 30, 40], &mut raw);
             memory.write(COLOR + i * 4, &raw);
         }
-        rasterize(&registers, &mut memory, &cover(-0.5, [1.0, 1.0, 1.0, 1.0]));
+        rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.5, [1.0, 1.0, 1.0, 1.0]));
         assert!(pixels(&mut memory).iter().all(|&p| p == [255, 20, 30, 40]));
     }
 
@@ -1510,7 +1768,37 @@ mod tests {
             vertex(1.0, 1.0),
             vertex(-1.0, 1.0),
         ];
-        assert_eq!(rasterize(&registers, &mut memory, &quad), 64);
+        assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &quad), 64);
+    }
+
+    /// a draw big enough to be split over threads covers the same pixels,
+    /// each once, that it would on one.
+    #[test]
+    fn a_big_draw_split_over_threads_covers_every_pixel_once() {
+        const BIG_COLOR: u32 = 0x10_0000;
+        const BIG_DEPTH: u32 = 0x20_0000;
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(128.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(128.0);
+        registers[REG_COLOR_BUFFER_ADDRESS] = BIG_COLOR >> 3;
+        registers[REG_DEPTH_BUFFER_ADDRESS] = BIG_DEPTH >> 3;
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12);
+        let mut memory = ConsoleMemory::default();
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3] };
+        let quad = [
+            vertex(-1.0, -1.0),
+            vertex(1.0, -1.0),
+            vertex(1.0, 1.0),
+            vertex(-1.0, -1.0),
+            vertex(1.0, 1.0),
+            vertex(-1.0, 1.0),
+        ];
+        assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &quad), 256 * 256);
+        for i in 0..256 * 256 {
+            let mut raw = [0u8; 4];
+            memory.read(BIG_COLOR + i * 4, &mut raw);
+            assert_eq!(ColorFormat::Rgba8.decode(&raw), [255, 0, 0, 255], "pixel {i}");
+        }
     }
 
     /// culling keeps the winding the register asks for and drops the other.
@@ -1523,7 +1811,7 @@ mod tests {
             let mut registers = target_registers();
             registers[REG_FACE_CULLING] = mode;
             let mut memory = ConsoleMemory::default();
-            assert_eq!(rasterize(&registers, &mut memory, &triangle), expected, "mode {mode}");
+            assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &triangle), expected, "mode {mode}");
         }
     }
 
@@ -1536,7 +1824,7 @@ mod tests {
         registers[REG_VIEWPORT_HEIGHT] = float24(2.0);
         registers[REG_VIEWPORT_XY] = 4 << 16;
         let mut memory = ConsoleMemory::default();
-        assert_eq!(rasterize(&registers, &mut memory, &cover(-0.5, RED)), 32);
+        assert_eq!(rasterize(&registers, &mut memory, &mut TextureCache::default(), &cover(-0.5, RED)), 32);
         for row in 0..8 {
             for x in 0..8 {
                 let index = crate::format::morton_offset(x, row, 8, 1);
@@ -1551,11 +1839,10 @@ mod tests {
     #[test]
     fn clamp_to_border_reads_the_border_color() {
         let texture = |wrap: Wrap| BoundTexture {
-            data: vec![0xFF; 8 * 8 * 4],
+            texels: vec![[0xFF; 4]; 8 * 8].into(),
             linear: false,
             wrap_s: wrap,
             wrap_t: wrap,
-            format: crate::texture::TextureFormat::Rgba8,
             width: 8,
             height: 8,
             border: RED,
@@ -1565,5 +1852,15 @@ mod tests {
         assert_eq!(texture(Wrap::ClampToBorder).texel(3, 8), RED);
         assert_eq!(texture(Wrap::ClampToBorder).texel(3, 3), white);
         assert_eq!(texture(Wrap::ClampToEdge).texel(-1, 3), white);
+    }
+
+    #[test]
+    fn the_texture_cache_notices_changed_bytes() {
+        let mut cache = TextureCache::default();
+        let first = cache.decoded(0x1000, TextureFormat::Rgba8, 8, 8, &[0x11; 256]);
+        let again = cache.decoded(0x1000, TextureFormat::Rgba8, 8, 8, &[0x11; 256]);
+        assert!(Arc::ptr_eq(&first, &again));
+        let changed = cache.decoded(0x1000, TextureFormat::Rgba8, 8, 8, &[0x22; 256]);
+        assert_ne!(first[0], changed[0]);
     }
 }
