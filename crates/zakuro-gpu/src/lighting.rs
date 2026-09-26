@@ -183,6 +183,10 @@ pub struct Lighting {
     fresnel_primary: bool,
     fresnel_secondary: bool,
     clamp_highlights: bool,
+    /// whether anything reads the half vector, or the unit vector toward
+    /// the viewer, most draws need neither and skip normalizing them.
+    needs_half: bool,
+    needs_view: bool,
     bump: Bump,
     shadow: Option<Shadow>,
 }
@@ -219,7 +223,7 @@ impl Lighting {
         };
 
         let count = (registers[REG_LIGHT_COUNT] & 7) + 1;
-        let lights = (0..count)
+        let lights: Vec<Light> = (0..count)
             .map(|slot| {
                 let number = ((registers[REG_LIGHT_SLOTS] >> (slot * 4)) & 7) as usize;
                 let block = &registers[REG_LIGHTS + number * 0x10..REG_LIGHTS + number * 0x10 + 0x10];
@@ -259,18 +263,38 @@ impl Lighting {
             alpha: config0 & (1 << 19) != 0,
         });
 
+        let distribution0 = table(DISTRIBUTION0, 16, 0);
+        let distribution1 = table(DISTRIBUTION1, 17, 1);
+        let fresnel = table(FRESNEL, 19, 3);
+        let reflect = [table(REFLECT_RED, 20, 6), table(REFLECT_GREEN, 21, 5), table(REFLECT_BLUE, 22, 4)];
+        let spotlight = lookup(2);
+
+        // the dot products the tables that get read take
+        let inputs: Vec<u32> = [distribution0, distribution1, fresnel]
+            .into_iter()
+            .chain(reflect)
+            .flatten()
+            .chain(lights.iter().any(|light| light.spotlight).then_some(spotlight))
+            .map(|lookup| lookup.input)
+            .collect();
+        let needs_half = lights.iter().any(|light| light.geometric0 || light.geometric1)
+            || inputs.iter().any(|&input| input == 0 || input == 1 || (input == 5 && config == 8));
+        let needs_view = needs_half || inputs.iter().any(|&input| input == 1 || input == 2);
+
         Some(Lighting {
             lights,
             global_ambient: color(registers[REG_GLOBAL_AMBIENT]),
             config,
-            distribution0: table(DISTRIBUTION0, 16, 0),
-            distribution1: table(DISTRIBUTION1, 17, 1),
-            fresnel: table(FRESNEL, 19, 3),
-            reflect: [table(REFLECT_RED, 20, 6), table(REFLECT_GREEN, 21, 5), table(REFLECT_BLUE, 22, 4)],
-            spotlight: lookup(2),
+            distribution0,
+            distribution1,
+            fresnel,
+            reflect,
+            spotlight,
             fresnel_primary: config0 & (1 << 2) != 0,
             fresnel_secondary: config0 & (1 << 3) != 0,
             clamp_highlights: config0 & (1 << 27) != 0,
+            needs_half,
+            needs_view,
             bump,
             shadow,
         })
@@ -302,7 +326,7 @@ impl Lighting {
         let normal = rotate(quaternion, surface_normal);
         // only the last configuration has a table that reads the tangent
         let tangent = if self.config == 8 { rotate(quaternion, surface_tangent) } else { surface_tangent };
-        let norm_view = normalized(view);
+        let norm_view = if self.needs_view { normalized(view) } else { [0.0; 3] };
 
         let mut diffuse_sum = [0.0, 0.0, 0.0, 1.0];
         let mut specular_sum = [0.0, 0.0, 0.0, 1.0];
@@ -312,8 +336,12 @@ impl Lighting {
             } else {
                 normalized(std::array::from_fn(|i| light.position[i] + view[i]))
             };
-            let half = std::array::from_fn(|i| norm_view[i] + light_vector[i]);
-            let half_unit = normalized(half);
+            let (half, half_unit) = if self.needs_half {
+                let half = std::array::from_fn(|i| norm_view[i] + light_vector[i]);
+                (half, normalized(half))
+            } else {
+                ([0.0; 3], [0.0; 3])
+            };
 
             let distance = light.distance.map_or(1.0, |(bias, scale)| {
                 let offset: [f32; 3] = std::array::from_fn(|i| -view[i] - light.position[i]);
