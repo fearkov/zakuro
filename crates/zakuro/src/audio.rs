@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
-/// how much sound to keep waiting, in the console's samples, about 60 ms.
+/// how much sound to keep waiting, in the console's samples, about 90 ms.
 /// more rides out uneven frames, less answers sooner.
-const TARGET: usize = 2048;
+const TARGET: usize = 3072;
+/// how much a queue that ran dry waits for before it plays again.
+const RESUME: usize = TARGET / 2;
 /// how much faster or slower than the rates say playback may go to keep
 /// the queue near its target, too little to hear.
 const DRIFT: f64 = 0.005;
@@ -22,24 +24,31 @@ struct Queue {
     step: f64,
     /// ran dry, and waits to fill up before it plays again.
     starved: bool,
+    /// the last sample played, which fades out when the queue runs dry
+    /// instead of stopping short.
+    last: [f32; 2],
+    /// times the queue ran dry.
+    underruns: u64,
 }
 
 impl Queue {
     /// the next output sample, between two of the console's.
     fn next(&mut self) -> [f32; 2] {
+        if !self.starved && self.samples.len() < 2 {
+            self.starved = true;
+            self.underruns += 1;
+        }
         if self.starved {
-            if self.samples.len() < TARGET {
-                return [0.0; 2];
+            if self.samples.len() < RESUME {
+                self.last = self.last.map(|v| v * 0.995);
+                return self.last;
             }
             self.starved = false;
-        }
-        if self.samples.len() < 2 {
-            self.starved = true;
-            return [0.0; 2];
         }
         let (a, b) = (self.samples[0], self.samples[1]);
         let t = self.fraction as f32;
         let out = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        self.last = out;
         // a longer queue plays a little faster, a shorter one slower
         let error = (self.samples.len() as f64 - TARGET as f64) / TARGET as f64;
         self.fraction += self.step * (1.0 + error.clamp(-1.0, 1.0) * DRIFT);
@@ -69,6 +78,8 @@ impl Audio {
             fraction: 0.0,
             step: rate / config.sample_rate.0 as f64,
             starved: true,
+            last: [0.0; 2],
+            underruns: 0,
         }));
         let stream = match format {
             SampleFormat::F32 => stream::<f32>(&device, &config, queue.clone()),
@@ -79,6 +90,11 @@ impl Audio {
         }?;
         stream.play().map_err(|e| e.to_string())?;
         Ok(Audio { queue, _stream: stream })
+    }
+
+    /// how many times the sound ran dry since the last call.
+    pub fn take_underruns(&self) -> u64 {
+        self.queue.lock().map(|mut queue| std::mem::take(&mut queue.underruns)).unwrap_or(0)
     }
 
     /// queues what the console played.
@@ -134,6 +150,8 @@ mod tests {
             fraction: 0.0,
             step,
             starved: false,
+            last: [0.0; 2],
+            underruns: 0,
         }
     }
 
@@ -146,11 +164,14 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_that_ran_dry_waits_to_fill_up() {
+    fn a_queue_that_ran_dry_fades_and_waits_to_fill_up() {
         let mut queue = queue(1, 1.0);
-        assert_eq!(queue.next(), [0.0; 2]);
+        queue.last = [0.5, 0.5];
+        let faded = queue.next();
         assert!(queue.starved);
-        queue.samples.extend((0..TARGET).map(|_| [1.0, 1.0]));
+        assert_eq!(queue.underruns, 1);
+        assert!(faded[0] < 0.5 && faded[0] > 0.4, "it fades out rather than stopping short");
+        queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
         assert_eq!(queue.next(), [0.0, -0.0], "it starts again from where it stopped");
     }
 

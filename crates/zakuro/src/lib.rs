@@ -93,7 +93,8 @@ pub fn run(linked: Option<Linked>) {
         keyboard: Keyboard::default(),
         audio,
         last_title_update: Instant::now(),
-        frame_start: Instant::now(),
+        next_frame: Instant::now(),
+        skipped: 0,
         paused,
         stop: false,
     };
@@ -239,13 +240,23 @@ struct App {
     keyboard: Keyboard,
     audio: Option<audio::Audio>,
     last_title_update: Instant,
-    frame_start: Instant,
+    /// when the next frame is due. frames run to a schedule rather than one
+    /// after another, so that a slow one is made up by those after it and
+    /// the sound, made as the console runs, keeps up.
+    next_frame: Instant,
+    /// frames in a row not shown while catching up.
+    skipped: u32,
     paused: bool,
     stop: bool,
 }
 
 /// one 3DS frame at 60 Hz.
 const FRAME_TIME: Duration = Duration::from_nanos(16_666_667);
+/// how far behind the schedule may fall before it starts over instead of
+/// running fast to catch up, after a pause say.
+const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);
+/// frames that may go unshown in a row while catching up.
+const MAX_SKIPPED: u32 = 4;
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -337,7 +348,10 @@ impl App {
         if self.stop {
             return;
         }
-        self.frame_start = Instant::now();
+        let now = Instant::now();
+        if now > self.next_frame + CATCH_UP_LIMIT {
+            self.next_frame = now;
+        }
 
         if !self.paused {
             self.system.set_input(self.keyboard.state());
@@ -362,6 +376,35 @@ impl App {
             }
         }
 
+        self.next_frame += FRAME_TIME;
+        // behind the schedule, showing the frame would wait on the display,
+        // so it goes unshown, a few at most
+        let behind = Instant::now() > self.next_frame;
+        if behind && self.skipped < MAX_SKIPPED {
+            self.skipped += 1;
+        } else {
+            self.skipped = 0;
+            self.present(event_loop);
+        }
+
+        if self.last_title_update.elapsed() >= Duration::from_millis(500) {
+            self.last_title_update = Instant::now();
+            if let Some(window) = &self.window {
+                window.set_title(&format!("Zakuro - {}", self.system.status_line()));
+            }
+            let underruns = self.audio.as_ref().map_or(0, |audio| audio.take_underruns());
+            if underruns > 0 {
+                log::warn!("the sound ran dry {underruns} times, the emulation is falling behind");
+            }
+        }
+
+        let now = Instant::now();
+        if now < self.next_frame {
+            std::thread::sleep(self.next_frame - now);
+        }
+    }
+
+    fn present(&mut self, event_loop: &ActiveEventLoop) {
         let top = self.system.read_screen(Screen::Top);
         let bottom = self.system.read_screen(Screen::Bottom);
 
@@ -385,19 +428,6 @@ impl App {
                     event_loop.exit();
                 }
             }
-        }
-
-        if self.last_title_update.elapsed() >= Duration::from_millis(500) {
-            self.last_title_update = Instant::now();
-            if let Some(window) = &self.window {
-                window.set_title(&format!("Zakuro - {}", self.system.status_line()));
-            }
-        }
-
-        // pace to 60 Hz.
-        let elapsed = self.frame_start.elapsed();
-        if elapsed < FRAME_TIME {
-            std::thread::sleep(FRAME_TIME - elapsed);
         }
     }
 }
