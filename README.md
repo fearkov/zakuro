@@ -16,9 +16,12 @@ To run it you need a decrypted ROM:
 
     cargo run --release -p zakuro -- path/to/rom.3ds
 
-It can also run code recompiled ahead of time with [3dsrecomp](https://github.com/fearkov/3dsrecomp). Anything the library doesn't cover still goes through the interpreter:
+It can also run code recompiled ahead of time with [3dsrecomp](https://github.com/fearkov/3dsrecomp). Build it once per game and Zakuro picks it up on its own. Anything the library doesn't cover still goes through the interpreter:
 
-    cargo run --release -p zakuro -- path/to/rom.3ds --recompiled path/to/library.so
+    3dsrecomp build path/to/rom.3ds
+    cargo run --release -p zakuro -- path/to/rom.3ds
+
+--recompiled points it at another library, and --interpreter runs everything in the interpreter.
 
 No copyrighted data is included. I do not condone piracy, and I will not help you with that. So, don't ask me about that.
 
