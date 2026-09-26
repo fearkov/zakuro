@@ -12,7 +12,7 @@ use zakuro_cpu::{Bus, Cpu, Exit};
 use crate::memory::Memory;
 
 /// the interface version, which has to match the library's.
-const ABI: u32 = 3;
+const ABI: u32 = 4;
 
 const EXIT_SVC: u32 = 1;
 const EXIT_BUDGET: u32 = 2;
@@ -42,11 +42,13 @@ struct Context {
     q: u8,
     thumb: u8,
     ge: u8,
-    pad: u8,
+    exclusive: u8,
     budget: i32,
     exit: u32,
     svc: u32,
     depth: u32,
+    exclusive_address: u32,
+    tls: u32,
     read_pages: *const *mut u8,
     write_pages: *const *mut u8,
     vfp: *mut u32,
@@ -169,6 +171,7 @@ fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.cpsr.q = ctx.q != 0;
     cpu.cpsr.ge = ctx.ge;
     cpu.cpsr.thumb = ctx.thumb != 0;
+    cpu.exclusive_addr = (ctx.exclusive != 0).then_some(ctx.exclusive_address);
 }
 
 fn store(cpu: &Cpu, ctx: &mut Context) {
@@ -180,6 +183,9 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
     ctx.q = cpu.cpsr.q as u8;
     ctx.ge = cpu.cpsr.ge;
     ctx.thumb = cpu.cpsr.thumb as u8;
+    ctx.exclusive = cpu.exclusive_addr.is_some() as u8;
+    ctx.exclusive_address = cpu.exclusive_addr.unwrap_or(0);
+    ctx.tls = cpu.cp15.thread_id_ro;
 }
 
 fn find(entries: &[Entry], address: u32) -> Option<Code> {
@@ -271,11 +277,13 @@ impl Library {
             q: 0,
             thumb: 0,
             ge: 0,
-            pad: 0,
+            exclusive: 0,
             budget: budget.min(i32::MAX as u64) as i32,
             exit: 0,
             svc: 0,
             depth: 0,
+            exclusive_address: 0,
+            tls: 0,
             read_pages,
             write_pages,
             vfp: std::ptr::null_mut(),
