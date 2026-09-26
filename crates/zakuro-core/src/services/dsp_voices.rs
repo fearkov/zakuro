@@ -131,10 +131,13 @@ impl Voice {
             if self.dequeue() {
                 return;
             }
-            // out of buffers, the voice switches itself off.
+            // out of buffers, the voice switches itself off and reports the
+            // buffer it finished as the last one, with none current. a title
+            // waits on that to know its sound is over.
             self.enabled = false;
             self.buffer_update = true;
             self.last_buffer_id = self.current_buffer_id;
+            self.current_buffer_id = 0;
             self.position = 0;
             return;
         }
@@ -382,6 +385,7 @@ mod tests {
         }
         assert!(!voice.enabled);
         assert_eq!(voice.last_buffer_id, 4);
+        assert_eq!(voice.current_buffer_id, 0, "no buffer is current once it stopped");
     }
 
     #[test]
