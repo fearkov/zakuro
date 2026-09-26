@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::registers::*;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderState, ShaderUnit, Vec4};
@@ -300,19 +302,19 @@ fn to_vertex(map: &OutputMap, attributes: &[Vec4; 16]) -> Vertex {
     }
 }
 
-/// takes shader inputs through the vertex shader and, when one is enabled,
-/// the geometry shader, producing the vertices the rasterizer assembles.
+/// takes shader inputs through the vertex shader, over threads when there
+/// are enough of them, and the geometry shader when one is enabled,
+/// producing the vertices the rasterizer assembles. order says which input
+/// each vertex comes from when an index buffer repeats them.
 fn process_vertices(
     registers: &[u32],
     vertex_shader: &ShaderUnit,
     geometry_shader: &ShaderUnit,
-    inputs: impl Iterator<Item = [Vec4; shader::INPUT_REGISTERS]>,
+    inputs: &[[Vec4; shader::INPUT_REGISTERS]],
+    order: Option<&[usize]>,
 ) -> Vec<Vertex> {
-    let map = read_output_map(registers);
-    let mut first = true;
-    let outputs = inputs.map(|input| {
-        if first && log::log_enabled!(log::Level::Trace) {
-            first = false;
+    if log::log_enabled!(log::Level::Trace) {
+        if let Some(input) = inputs.first() {
             let used_uniforms = vertex_shader.float_uniforms.iter().filter(|u| **u != shader::ZERO).count();
             log::trace!(
                 "vertex shader: entry {}, {used_uniforms} non-zero uniforms, output mask 0x{:X}, \
@@ -322,8 +324,15 @@ fn process_vertices(
                 &input[..8],
             );
         }
-        run_vertex_shader(vertex_shader, registers, input)
-    });
+    }
+    let shaded = shade(registers, vertex_shader, inputs);
+    // the results in draw order, which repeats vertices an index buffer
+    // names more than once
+    let outputs: Box<dyn Iterator<Item = [Vec4; 16]>> = match order {
+        Some(order) => Box::new(order.iter().map(|&i| shaded[i])),
+        None => Box::new(shaded.iter().copied()),
+    };
+    let map = read_output_map(registers);
     if registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 {
         geometry_stage(registers, geometry_shader, &map, outputs)
     } else {
@@ -331,9 +340,16 @@ fn process_vertices(
     }
 }
 
-/// runs the geometry shader, in the mode particles and sprites use, every
-/// vertex's outputs (or a fixed run of vertices') become one invocation's
-/// inputs, and the triangles it emits are drawn as a list.
+/// vertices a draw needs before shading them is worth splitting over threads.
+const PARALLEL_VERTICES: usize = 128;
+
+fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
+    if inputs.len() < PARALLEL_VERTICES {
+        return inputs.iter().map(|&input| run_vertex_shader(unit, registers, input)).collect();
+    }
+    inputs.par_iter().map(|&input| run_vertex_shader(unit, registers, input)).collect()
+}
+
 fn geometry_stage(
     registers: &[u32],
     unit: &ShaderUnit,
@@ -1192,20 +1208,15 @@ fn fill_triangle(
     }
 }
 
-/// a row of tiles for one thread, its color and depth and its window rows.
+/// a row of tiles, its color and depth and the window rows it holds.
 type Piece<'a> = (Option<Band<'a>>, Option<Band<'a>>, Range<i32>);
 
 /// pixels a draw has to cover before it is worth splitting over threads.
-const PARALLEL_PIXELS: f32 = 16_384.0;
-
-fn threads() -> usize {
-    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-}
+const PARALLEL_PIXELS: f32 = 4096.0;
 
 /// fills the triangles on the copies of the buffers, rows being the window
-/// rows they can reach. a big draw is cut into rows of tiles dealt out to
-/// threads in turn, which never touch the same pixel.
+/// rows they can reach. a big draw is cut into rows of tiles that threads
+/// take on, which never touch the same pixel.
 fn fill(
     color: &mut Option<Surface>,
     depth: &mut Option<Surface>,
@@ -1225,7 +1236,7 @@ fn fill(
         .sum();
     // a width that is not a whole number of tiles spills across rows of
     // tiles, so those stay on one thread.
-    if area < PARALLEL_PIXELS || threads() < 2 || !target.buffer_width.is_multiple_of(8) {
+    if area < PARALLEL_PIXELS || !target.buffer_width.is_multiple_of(8) {
         let mut color_band = color.as_mut().map(Surface::whole);
         let mut depth_band = depth.as_mut().map(Surface::whole);
         for &triangle in triangles {
@@ -1242,41 +1253,32 @@ fn fill(
     let count = colors.as_ref().or(depths.as_ref()).map_or(0, Vec::len);
     let mut colors = colors.map(|bands| bands.into_iter().map(Some).collect::<Vec<_>>());
     let mut depths = depths.map(|bands| bands.into_iter().map(Some).collect::<Vec<_>>());
-
-    let workers = threads().min(count);
-    let mut work: Vec<Vec<Piece>> = (0..workers).map(|_| Vec::new()).collect();
-    for i in 0..count {
-        // tile row t holds buffer rows 8t to 8t+7, window rows counting from
-        // the other end
-        let t = first_tile_row + i as i32;
-        let band_rows = (height - 8 * t - 8).max(rows.start)..(height - 8 * t).min(rows.end);
-        let color_band = colors.as_mut().and_then(|bands| bands[i].take());
-        let depth_band = depths.as_mut().and_then(|bands| bands[i].take());
-        work[i % workers].push((color_band, depth_band, band_rows));
-    }
-    let totals: Vec<FillStats> = std::thread::scope(|scope| {
-        let handles: Vec<_> = work
-            .into_iter()
-            .map(|bands| {
-                scope.spawn(move || {
-                    let mut stats = FillStats::default();
-                    for (mut color_band, mut depth_band, band_rows) in bands {
-                        if band_rows.is_empty() {
-                            continue;
-                        }
-                        for &triangle in triangles {
-                            fill_triangle(color_band.as_mut(), depth_band.as_mut(), band_rows.clone(), triangle, state, &mut stats);
-                        }
-                    }
-                    stats
-                })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
-    for total in totals {
-        stats.add(total);
-    }
+    let pieces: Vec<Piece> = (0..count)
+        .map(|i| {
+            // tile row t holds buffer rows 8t to 8t+7, window rows counting
+            // from the other end
+            let t = first_tile_row + i as i32;
+            let band_rows = (height - 8 * t - 8).max(rows.start)..(height - 8 * t).min(rows.end);
+            let color_band = colors.as_mut().and_then(|bands| bands[i].take());
+            let depth_band = depths.as_mut().and_then(|bands| bands[i].take());
+            (color_band, depth_band, band_rows)
+        })
+        .filter(|piece| !piece.2.is_empty())
+        .collect();
+    let total = pieces
+        .into_par_iter()
+        .map(|(mut color_band, mut depth_band, band_rows)| {
+            let mut stats = FillStats::default();
+            for &triangle in triangles {
+                fill_triangle(color_band.as_mut(), depth_band.as_mut(), band_rows.clone(), triangle, state, &mut stats);
+            }
+            stats
+        })
+        .reduce(FillStats::default, |mut all, stats| {
+            all.add(stats);
+            all
+        });
+    stats.add(total);
 }
 
 /// one edge of a triangle, as a function that is zero on the edge and positive
@@ -1374,13 +1376,23 @@ pub fn draw<M: GpuMemory>(
             .map(|l| (l.offset, l.components, l.stride, l.component_count))
             .collect::<Vec<_>>(),
     );
-    let inputs: Vec<_> = (0..vertex_count)
-        .map(|i| {
-            let vertex_index = resolve_index(memory, i);
-            fetch_vertex(registers, memory, attribute_base, &loaders, fixed_attributes, vertex_index)
-        })
+    // an index buffer names most vertices several times, fetch and shade
+    // each of them once.
+    let indices: Vec<u32> = (0..vertex_count).map(|i| resolve_index(memory, i)).collect();
+    let (unique, order) = if indexed {
+        let mut unique = indices.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let order: Vec<usize> = indices.iter().map(|index| unique.binary_search(index).unwrap()).collect();
+        (unique, Some(order))
+    } else {
+        (indices, None)
+    };
+    let inputs: Vec<_> = unique
+        .iter()
+        .map(|&vertex_index| fetch_vertex(registers, memory, attribute_base, &loaders, fixed_attributes, vertex_index))
         .collect();
-    let shaded = process_vertices(registers, vertex_shader, geometry_shader, inputs.into_iter());
+    let shaded = process_vertices(registers, vertex_shader, geometry_shader, &inputs, order.as_deref());
 
     rasterize(registers, memory, textures, &shaded);
     vertex_count
@@ -1399,10 +1411,11 @@ pub fn draw_immediate<M: GpuMemory>(
     // immediate mode sizes its vertices by GPUREG_VSH_NUM_ATTR.
     let count = ((registers[REG_VS_ATTRIBUTE_COUNT] & 0xF) + 1) as usize;
     log::trace!("immediate draw: {} vertices of {count} attributes", vertices.len());
-    let inputs = vertices
+    let inputs: Vec<_> = vertices
         .iter()
-        .map(|attributes| map_inputs(registers, REG_VS_BLOCK, &attributes[..count]));
-    let shaded = process_vertices(registers, vertex_shader, geometry_shader, inputs);
+        .map(|attributes| map_inputs(registers, REG_VS_BLOCK, &attributes[..count]))
+        .collect();
+    let shaded = process_vertices(registers, vertex_shader, geometry_shader, &inputs, None);
     rasterize(registers, memory, textures, &shaded)
 }
 

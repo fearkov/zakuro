@@ -27,6 +27,7 @@ log = "0.4"
 thiserror = "2"
 bitflags = "2"
 libloading = "0.8"
+rayon = "1"
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 parking_lot = "0.12"

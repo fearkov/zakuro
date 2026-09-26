@@ -14,6 +14,7 @@ zakuro-common.workspace = true
 log.workspace = true
 bitflags.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
 raw-window-handle = "0.6"
 
 glow = { version = "0.16", optional = true }
