@@ -12,7 +12,9 @@ I first wrote it in C++, but I was learning Rust at the time and noticed there w
 
 This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot. On the interpreter alone they run below full speed, but tested games run at full speed with their code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp). There's no JIT yet.
 
-To install it you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA development files (libasound2-dev on Debian and Ubuntu, alsa-lib on Arch). On Windows, nothing else is needed:
+Builds for Windows and Linux are on the [releases page](https://github.com/fearkov/zakuro/releases): on Windows, unzip it and run zakuro.exe, and on Linux, extract it and run ./zakuro.
+
+To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA development files (libasound2-dev on Debian and Ubuntu, alsa-lib on Arch). On Windows, nothing else is needed:
 
     cargo install --git https://github.com/fearkov/zakuro --locked zakuro
 
