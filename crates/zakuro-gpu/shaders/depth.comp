@@ -1,0 +1,43 @@
+#version 450
+
+// a texture that is rows of a depth buffer, read as colors the way a title
+// reads the buffer's bytes. the depth and the stencil come copied into
+// buffers, a word and a byte per sample, in the image's rows, bottom first.
+// d24s8 samples read as rgba8 give the stencil, then the depth's high,
+// middle and low bytes, d24 samples read as rgb8 give the depth's bytes.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer Depths { uint depths[]; };
+layout(set = 0, binding = 1) readonly buffer Stencils { uint stencils[]; };
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D target;
+
+layout(push_constant) uniform Copy {
+    // the texture's width and height
+    ivec2 size;
+    // the surface's width and height, and the row the texture starts at
+    int surface_width;
+    int surface_height;
+    int source_row;
+    // whether samples carry stencil, and the texture is rgba8
+    int stencil;
+} copy;
+
+void main() {
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= copy.size.x || at.y >= copy.size.y) {
+        return;
+    }
+    int row = copy.surface_height - 1 - (copy.source_row + at.y);
+    int index = row * copy.surface_width + at.x;
+    uint depth = depths[index] & 0xFFFFFFu;
+    uvec3 bytes = uvec3(depth >> 16, depth >> 8, depth) & 0xFFu;
+    uvec4 color;
+    if (copy.stencil != 0) {
+        uint stencil = (stencils[index >> 2] >> ((index & 3) * 8)) & 0xFFu;
+        color = uvec4(stencil, bytes);
+    } else {
+        color = uvec4(bytes, 255u);
+    }
+    // the texture's rows run top first
+    imageStore(target, ivec2(at.x, at.y), vec4(color) / 255.0);
+}

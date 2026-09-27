@@ -1,7 +1,7 @@
 //! pixel formats and the tiled layout the PICA200 stores images in.
 
 /// color formats a framebuffer or a display transfer can use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColorFormat {
     Rgba8,
     Rgb8,

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use super::{BoundTexture, DepthMap, Screen, Wrap, TEXTURE_UNIT_BASES};
+use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
@@ -28,6 +28,7 @@ use crate::GpuMemory;
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
+const DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/depth.comp.spv");
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
@@ -139,6 +140,8 @@ struct Surface {
     /// drawn into since guest memory last got the image.
     dirty: bool,
     capture: Option<Capture>,
+    /// counts the changes to the image, for the textures copied from it.
+    generation: u64,
 }
 
 impl Surface {
@@ -153,6 +156,7 @@ impl Surface {
     /// the GPU changed the image.
     fn changed(&mut self) {
         self.dirty = true;
+        self.generation += 1;
         if let Some(capture) = &mut self.capture {
             capture.current = false;
         }
@@ -212,12 +216,28 @@ pub(crate) struct Transfer {
     pub(crate) output_format: ColorFormat,
 }
 
-/// the compute pipeline display transfers run on.
-struct TransferPipeline {
+/// a compute pipeline, the shader and what it takes.
+struct Compute {
     shader: vk::ShaderModule,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+}
+
+/// a buffer only the GPU uses.
+struct Local {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: u64,
+}
+
+/// a texture copied from a surface the GPU drew.
+struct Copied {
+    image: Image,
+    surface: usize,
+    /// the surface's generation when it was copied.
+    generation: u64,
+    used: u64,
 }
 
 struct Texture {
@@ -257,7 +277,11 @@ pub struct Hardware {
     fragment_shader: vk::ShaderModule,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     /// made the first time a display transfer runs here.
-    transfer: Option<TransferPipeline>,
+    transfer: Option<Compute>,
+    /// made the first time a texture is read out of a depth buffer, with
+    /// where the samples go on the way.
+    depth: Option<Compute>,
+    samples: Option<Local>,
     samplers: HashMap<(bool, Wrap, Wrap), vk::Sampler>,
     ring: Buffer,
     used: u64,
@@ -265,6 +289,8 @@ pub struct Hardware {
     surfaces: Vec<Surface>,
     /// by the address of the decoded texels.
     textures: HashMap<usize, Texture>,
+    /// textures copied from surfaces, by what they are.
+    copies: HashMap<DrawnTexture, Copied>,
     /// what unused texture units sample.
     blank: Image,
     /// the tables' generation and where the batch copied them.
@@ -402,11 +428,14 @@ impl Hardware {
                 fragment_shader,
                 pipelines: HashMap::new(),
                 transfer: None,
+                depth: None,
+                samples: None,
                 samplers: HashMap::new(),
                 used: 0,
                 readback: None,
                 surfaces: Vec::new(),
                 textures: HashMap::new(),
+                copies: HashMap::new(),
                 tables: None,
                 recording: false,
                 uploads: false,
@@ -646,6 +675,7 @@ impl Hardware {
                     checked: false,
                     dirty: false,
                     capture: None,
+                    generation: 0,
                 });
                 self.surfaces.len() - 1
             }
@@ -744,7 +774,9 @@ impl Hardware {
             }
         }
         self.uploads = true;
-        if let Some(capture) = &mut self.surfaces[index].capture {
+        let surface = &mut self.surfaces[index];
+        surface.generation += 1;
+        if let Some(capture) = &mut surface.capture {
             capture.current = false;
         }
         Ok(())
@@ -1003,6 +1035,7 @@ impl Hardware {
             surface.shadow = filled;
             surface.dirty = false;
             surface.checked = false;
+            surface.generation += 1;
             if let Some(capture) = &mut surface.capture {
                 capture.current = false;
             }
@@ -1067,7 +1100,10 @@ impl Hardware {
         for (unit, bound) in draw.textures.iter().enumerate() {
             match bound {
                 Some(bound) => {
-                    views[unit] = self.texture(bound)?;
+                    views[unit] = match bound.drawn {
+                        Some(drawn) => self.copy_texture(&drawn)?,
+                        None => self.texture(bound)?,
+                    };
                     samplers[unit] = self.sampler(bound.linear, bound.wrap_s, bound.wrap_t)?;
                     enabled |= 1 << unit;
                 }
@@ -1352,23 +1388,6 @@ impl Hardware {
                 break (source, target);
             }
         };
-        let (layout, pipeline) = self.transfer_pipeline()?;
-        self.end_rendering();
-        self.barrier();
-
-        let infos = [source, target].map(|i| {
-            [vk::DescriptorImageInfo::default().image_view(self.surfaces[i].image.view).image_layout(vk::ImageLayout::GENERAL)]
-        });
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&infos[0]),
-            vk::WriteDescriptorSet::default()
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&infos[1]),
-        ];
         let constants: [i32; 11] = [
             t.copy.0 as i32,
             t.copy.1 as i32,
@@ -1382,6 +1401,31 @@ impl Hardware {
             row as i32,
             input_size.1 as i32,
         ];
+        let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
+        self.dispatch_transfer(views, constants, t.copy)?;
+        self.surfaces[target].changed();
+        self.capture(target)?;
+        self.submit()?;
+        Ok(true)
+    }
+
+    /// records the transfer shader going over size pixels, from one image
+    /// to another, as the constants say.
+    fn dispatch_transfer(&mut self, (source, target): (vk::ImageView, vk::ImageView), constants: [i32; 11], size: (u32, u32)) -> Result<(), String> {
+        let (layout, pipeline) = self.transfer_pipeline()?;
+        self.end_rendering();
+        self.barrier();
+        let infos = [source, target].map(|view| [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)]);
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&infos[0]),
+            vk::WriteDescriptorSet::default()
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&infos[1]),
+        ];
         let bytes: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
         // SAFETY: recording, outside rendering, on images in the general
         // layout made for storage
@@ -1389,12 +1433,129 @@ impl Hardware {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-            self.device.cmd_dispatch(self.commands, t.copy.0.div_ceil(8), t.copy.1.div_ceil(8), 1);
+            self.device.cmd_dispatch(self.commands, size.0.div_ceil(8), size.1.div_ceil(8), 1);
         }
-        self.surfaces[target].changed();
-        self.capture(target)?;
-        self.submit()?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// the surface a texture is rows of, and the row it starts at, when
+    /// they line up the way the PICA lays both out.
+    /// a color buffer in its own format, or a depth buffer whose samples
+    /// are as wide as the texture's pixels, d24s8 read as rgba8 or d24 as
+    /// rgb8.
+    fn texture_source(&self, texture: &DrawnTexture) -> Option<(usize, u32)> {
+        let depth = match texture.format {
+            ColorFormat::Rgba8 => Some(Kind::Depth(4)),
+            ColorFormat::Rgb8 => Some(Kind::Depth(3)),
+            _ => None,
+        };
+        let kinds = [Some(Kind::Color(texture.format)), depth];
+        let tile_rows = 8 * texture.width * Kind::Color(texture.format).bytes();
+        self.surfaces
+            .iter()
+            .position(|s| {
+                kinds.contains(&Some(s.kind)) && s.tiled && s.width == texture.width && {
+                    let offset = texture.addr.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0);
+                    offset.is_some_and(|offset| offset / tile_rows * 8 + texture.height <= s.height)
+                }
+            })
+            .map(|index| (index, (texture.addr - self.surfaces[index].addr) / tile_rows * 8))
+    }
+
+    /// whether a texture is rows of a surface the GPU drew and guest memory
+    /// has not got back, which draw then copies on the GPU.
+    pub(crate) fn holds(&self, texture: &DrawnTexture) -> bool {
+        self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].dirty)
+    }
+
+    /// the image of a texture copied from the surface it is part of, copied
+    /// again whenever the surface changed.
+    fn copy_texture(&mut self, texture: &DrawnTexture) -> Result<vk::ImageView, String> {
+        let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
+        let generation = self.surfaces[source].generation;
+        let batch = self.batch;
+        if let Some(copy) = self.copies.get_mut(texture) {
+            if copy.surface == source && copy.generation == generation {
+                copy.used = batch;
+                return Ok(copy.image.view);
+            }
+        }
+        if !self.copies.contains_key(texture) {
+            let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+            let image = self.image(texture.width, texture.height, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
+            self.copies.insert(*texture, Copied { image, surface: source, generation, used: batch });
+        }
+        let view = self.copies[texture].image.view;
+        if let Kind::Depth(bytes) = self.surfaces[source].kind {
+            self.copy_depth(source, row, bytes, view, texture)?;
+        } else {
+            // the texture's rows run top first, the surface's bottom first,
+            // so the copy flips them, and its pixels round to the format as
+            // memory would have them
+            let format = format_index(texture.format);
+            let (width, height) = (texture.width as i32, texture.height as i32);
+            let constants = [width, height, height, height, 1, 1, 1, format, format, row as i32, self.surfaces[source].height as i32];
+            self.dispatch_transfer((self.surfaces[source].image.view, view), constants, (texture.width, texture.height))?;
+        }
+        self.uploads = true;
+        if let Some(copy) = self.copies.get_mut(texture) {
+            copy.surface = source;
+            copy.generation = generation;
+            copy.used = batch;
+        }
+        Ok(view)
+    }
+
+    /// records a texture read out of a depth surface, its depth and stencil
+    /// copied into a buffer and then made into the colors their bytes read
+    /// as.
+    fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture) -> Result<(), String> {
+        let (width, height) = (self.surfaces[source].width, self.surfaces[source].height);
+        let pixels = (width * height) as u64;
+        let samples = self.samples(pixels * 5)?;
+        let (layout, pipeline) = self.depth_pipeline()?;
+        self.end_rendering();
+        self.barrier();
+        let extent = vk::Extent3D { width, height, depth: 1 };
+        let region = |offset: u64, aspect: vk::ImageAspectFlags| {
+            vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1))
+                .image_extent(extent)
+        };
+        let regions = [region(0, vk::ImageAspectFlags::DEPTH), region(pixels * 4, vk::ImageAspectFlags::STENCIL)];
+        let depths = [vk::DescriptorBufferInfo::default().buffer(samples).offset(0).range(pixels * 4)];
+        let stencils = [vk::DescriptorBufferInfo::default().buffer(samples).offset(pixels * 4).range(pixels.next_multiple_of(4))];
+        let target = [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&depths),
+            vk::WriteDescriptorSet::default()
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&stencils),
+            vk::WriteDescriptorSet::default()
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&target),
+        ];
+        let constants = [texture.width as i32, texture.height as i32, width as i32, height as i32, row as i32, (bytes == 4) as i32];
+        let constants: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
+        // SAFETY: recording, outside rendering, from a depth image in the
+        // general layout into a buffer big enough for both aspects, then a
+        // barrier before the shader reads it
+        unsafe {
+            let image = self.surfaces[source].image.image;
+            self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, samples, &regions);
+            self.barrier();
+            self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
+            self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
+            self.device.cmd_dispatch(self.commands, texture.width.div_ceil(8), texture.height.div_ceil(8), 1);
+        }
+        Ok(())
     }
 
     /// records a copy of a surface for the host to read later.
@@ -1437,24 +1598,47 @@ impl Hardware {
 
     /// the pipeline display transfers run on, made the first time.
     fn transfer_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
-        if let Some(transfer) = &self.transfer {
-            return Ok((transfer.layout, transfer.pipeline));
+        if self.transfer.is_none() {
+            let images = [vk::DescriptorType::STORAGE_IMAGE; 2];
+            self.transfer = Some(self.compute(TRANSFER_SPIRV, &images, 11 * 4)?);
         }
+        let transfer = self.transfer.as_ref().expect("made above");
+        Ok((transfer.layout, transfer.pipeline))
+    }
+
+    /// the pipeline textures are read out of depth buffers with, made the
+    /// first time.
+    fn depth_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
+        if self.depth.is_none() {
+            let bindings = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::STORAGE_IMAGE];
+            self.depth = Some(self.compute(DEPTH_SPIRV, &bindings, 6 * 4)?);
+        }
+        let depth = self.depth.as_ref().expect("made above");
+        Ok((depth.layout, depth.pipeline))
+    }
+
+    /// a compute pipeline running spirv, with a pushed descriptor per
+    /// binding and push constants of push bytes.
+    fn compute(&self, spirv: &[u8], bindings: &[vk::DescriptorType], push: u32) -> Result<Compute, String> {
         // SAFETY: plain object creation on our device, with create infos
         // that live as long as each call
         unsafe {
-            let words = ash::util::read_spv(&mut Cursor::new(TRANSFER_SPIRV)).map_err(|e| e.to_string())?;
+            let words = ash::util::read_spv(&mut Cursor::new(spirv)).map_err(|e| e.to_string())?;
             let shader = self
                 .device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .map_err(vk_error("create a shader module"))?;
-            let bindings = [0, 1].map(|binding| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            });
+            let bindings: Vec<_> = bindings
+                .iter()
+                .enumerate()
+                .map(|(binding, &kind)| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(binding as u32)
+                        .descriptor_type(kind)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
             let set_layout = self
                 .device
                 .create_descriptor_set_layout(
@@ -1465,7 +1649,7 @@ impl Hardware {
                 )
                 .map_err(vk_error("create a descriptor set layout"))?;
             let set_layouts = [set_layout];
-            let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(11 * 4)];
+            let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(push)];
             let layout = self
                 .device
                 .create_pipeline_layout(
@@ -1482,8 +1666,40 @@ impl Hardware {
                 .device
                 .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, error)| format!("could not create a pipeline, {error}"))?[0];
-            self.transfer = Some(TransferPipeline { shader, set_layout, layout, pipeline });
-            Ok((layout, pipeline))
+            Ok(Compute { shader, set_layout, layout, pipeline })
+        }
+    }
+
+    /// a buffer in the GPU's own memory of at least size bytes for depth
+    /// samples on their way to a texture, grown when it has to be.
+    fn samples(&mut self, size: u64) -> Result<vk::Buffer, String> {
+        if let Some(samples) = self.samples.as_ref().filter(|samples| samples.size >= size) {
+            return Ok(samples.buffer);
+        }
+        // the batch before may still use the old one
+        self.submit()?;
+        self.wait()?;
+        self.begin()?;
+        if let Some(old) = self.samples.take() {
+            // SAFETY: the GPU is done with everything that used it
+            unsafe {
+                self.device.destroy_buffer(old.buffer, None);
+                self.device.free_memory(old.memory, None);
+            }
+        }
+        let size = size.next_power_of_two();
+        // SAFETY: plain object creation on our device
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+            let buffer = self
+                .device
+                .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE), None)
+                .map_err(vk_error("create a buffer"))?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let (memory, _) = self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            self.device.bind_buffer_memory(buffer, memory, 0).map_err(vk_error("bind buffer memory"))?;
+            self.samples = Some(Local { buffer, memory, size });
+            Ok(buffer)
         }
     }
 
@@ -1524,6 +1740,12 @@ impl Hardware {
         for key in stale {
             if let Some(texture) = self.textures.remove(&key) {
                 self.destroy_image(&texture.image);
+            }
+        }
+        let stale: Vec<DrawnTexture> = self.copies.iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
+        for key in stale {
+            if let Some(copy) = self.copies.remove(&key) {
+                self.destroy_image(&copy.image);
             }
         }
         Ok(())
@@ -1735,6 +1957,9 @@ impl Drop for Hardware {
             for texture in self.textures.values() {
                 self.destroy_image(&texture.image);
             }
+            for copy in self.copies.values() {
+                self.destroy_image(&copy.image);
+            }
             for surface in &self.surfaces {
                 self.destroy_image(&surface.image);
             }
@@ -1745,11 +1970,15 @@ impl Drop for Hardware {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
-            if let Some(transfer) = &self.transfer {
-                self.device.destroy_pipeline(transfer.pipeline, None);
-                self.device.destroy_pipeline_layout(transfer.layout, None);
-                self.device.destroy_descriptor_set_layout(transfer.set_layout, None);
-                self.device.destroy_shader_module(transfer.shader, None);
+            for compute in [&self.transfer, &self.depth].into_iter().flatten() {
+                self.device.destroy_pipeline(compute.pipeline, None);
+                self.device.destroy_pipeline_layout(compute.layout, None);
+                self.device.destroy_descriptor_set_layout(compute.set_layout, None);
+                self.device.destroy_shader_module(compute.shader, None);
+            }
+            if let Some(samples) = &self.samples {
+                self.device.destroy_buffer(samples.buffer, None);
+                self.device.free_memory(samples.memory, None);
             }
             for &pipeline in self.pipelines.values() {
                 self.device.destroy_pipeline(pipeline, None);
