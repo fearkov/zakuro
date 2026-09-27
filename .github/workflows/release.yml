@@ -1,0 +1,64 @@
+# on a version tag, builds Zakuro for Windows and Linux and publishes both
+# as a GitHub release
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: an existing tag to release
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            archive: zakuro-windows-x86_64.zip
+          - os: ubuntu-latest
+            archive: zakuro-linux-x86_64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Sound library headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - run: cargo build --release --locked -p zakuro
+      - name: Pack for Windows
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/zakuro.exe, README.md, LICENSE -DestinationPath ${{ matrix.archive }}
+      - name: Pack for Linux
+        if: runner.os == 'Linux'
+        run: tar czf ${{ matrix.archive }} README.md LICENSE -C target/release zakuro
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cat > notes.md <<'NOTES'
+          On Windows, unzip zakuro-windows-x86_64.zip and run zakuro.exe. On Linux, extract zakuro-linux-x86_64.tar.gz and run ./zakuro, which needs the ALSA library (libasound2 on Debian and Ubuntu, alsa-lib on Arch).
+
+          Games need to be decrypted ROMs. Recompiling a game, which makes it run much faster, needs a C compiler such as gcc or clang. On Windows, gcc from MinGW-w64 (through MSYS2 or WinLibs) works out of the box.
+          NOTES
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Zakuro $TAG" --notes-file notes.md --generate-notes
