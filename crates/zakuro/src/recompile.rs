@@ -1,11 +1,12 @@
-//! recompiling a game with 3dsrecomp, which runs on its own while the rest
+//! recompiling a game with 3dsrecomp, on a thread of its own while the rest
 //! carries on.
 
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use recomp3ds::build::{self, Event};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
@@ -32,13 +33,22 @@ impl Stage {
             Stage::Done | Stage::Failed(_) => 1.0,
         }
     }
+
+    /// where an event of the build leaves it, none for one that changes
+    /// nothing.
+    fn after(event: &Event) -> Option<Stage> {
+        match event {
+            Event::Generated { .. } => Some(Stage::Compiling { done: 0, total: 1 }),
+            Event::Compiled { done, total } => Some(Stage::Compiling { done: *done, total: *total }),
+            Event::Built { .. } | Event::Installed(_) => Some(Stage::Installing),
+            Event::Note(_) => None,
+        }
+    }
 }
 
 struct State {
     stage: Stage,
     finished_at: Option<Instant>,
-    /// the last thing 3dsrecomp complained about.
-    error: String,
 }
 
 pub struct Job {
@@ -48,55 +58,33 @@ pub struct Job {
     pub announced: bool,
     started: Instant,
     state: Arc<Mutex<State>>,
-    child: Arc<Mutex<Option<Child>>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Job {
-    /// runs recompiler on the game at rom.
-    pub fn start(recompiler: &Path, rom: &Path, program_id: u64, name: &str) -> Result<Job, String> {
-        let mut child = Command::new(recompiler)
-            .arg("build")
-            .arg(rom)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("could not run {}, {error}", recompiler.display()))?;
-        let stdout = child.stdout.take().expect("piped above");
-        let stderr = child.stderr.take().expect("piped above");
-        let state = Arc::new(Mutex::new(State { stage: Stage::Generating, finished_at: None, error: String::new() }));
-        let child = Arc::new(Mutex::new(Some(child)));
-
-        let errors = state.clone();
+    /// starts recompiling the game at rom.
+    pub fn start(rom: &Path, program_id: u64, name: &str) -> Job {
+        let state = Arc::new(Mutex::new(State { stage: Stage::Generating, finished_at: None }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (progress, stop, rom) = (state.clone(), cancel.clone(), rom.to_owned());
         std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut state) = errors.lock() {
-                    state.error = line;
-                }
-            }
-        });
-
-        let (progress, waiting) = (state.clone(), child.clone());
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let (Some(stage), Ok(mut state)) = (parse(&line), progress.lock()) {
+            let events = |event: Event| {
+                if let (Some(stage), Ok(mut state)) = (Stage::after(&event), progress.lock()) {
                     state.stage = stage;
                 }
-            }
-            // the output ended, so it finished or was stopped
-            let status = waiting.lock().ok().and_then(|mut child| child.take()).map(|mut child| child.wait());
+            };
+            let options = build::Options { cancel: Some(&stop), ..build::Options::default() };
+            let result = build::build(&rom, &options, &events);
             if let Ok(mut state) = progress.lock() {
-                state.stage = match status {
-                    Some(Ok(status)) if status.success() => Stage::Done,
-                    Some(Ok(status)) if state.error.is_empty() => Stage::Failed(format!("3dsrecomp stopped with {status}")),
-                    Some(Ok(_)) => Stage::Failed(state.error.clone()),
-                    Some(Err(error)) => Stage::Failed(error.to_string()),
-                    None => Stage::Failed("cancelled".to_owned()),
+                state.stage = match result {
+                    Ok(_) => Stage::Done,
+                    Err(_) if stop.load(Ordering::Relaxed) => Stage::Failed("cancelled".to_owned()),
+                    Err(error) => Stage::Failed(error),
                 };
                 state.finished_at = Some(Instant::now());
             }
         });
-
-        Ok(Job { program_id, name: name.to_owned(), announced: false, started: Instant::now(), state, child })
+        Job { program_id, name: name.to_owned(), announced: false, started: Instant::now(), state, cancel }
     }
 
     pub fn stage(&self) -> Stage {
@@ -109,45 +97,11 @@ impl Job {
         finished.unwrap_or_else(Instant::now) - self.started
     }
 
+    /// stops it after the files being compiled, the C being written first
+    /// if it is at that.
     pub fn cancel(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            if let Some(mut running) = child.take() {
-                let _ = running.kill();
-                let _ = running.wait();
-            }
-        }
+        self.cancel.store(true, Ordering::Relaxed);
     }
-}
-
-/// what a line of 3dsrecomp's output says about where it is.
-fn parse(line: &str) -> Option<Stage> {
-    if let Some(rest) = line.strip_prefix("compiled ") {
-        let (done, total) = rest.split_once(" of ")?;
-        return Some(Stage::Compiling { done: done.trim().parse().ok()?, total: total.trim().parse().ok()? });
-    }
-    if line.starts_with("wrote ") {
-        return Some(Stage::Compiling { done: 0, total: 1 });
-    }
-    if line.starts_with("built ") {
-        return Some(Stage::Installing);
-    }
-    None
-}
-
-/// 3dsrecomp, where the settings say or else on the path. the settings may
-/// name the program or a folder, its checkout or where it was installed.
-pub fn find(configured: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = configured {
-        if path.is_file() {
-            return Some(path.to_owned());
-        }
-        return ["3dsrecomp", "target/release/3dsrecomp", "bin/3dsrecomp"]
-            .iter()
-            .map(|inside| path.join(inside))
-            .find(|program| program.is_file());
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).map(|dir| dir.join("3dsrecomp")).find(|path| path.is_file())
 }
 
 #[cfg(test)]
@@ -155,23 +109,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_folder_leads_to_the_program_in_it() {
-        let dir = std::env::temp_dir().join(format!("zakuro-recompiler-{}", std::process::id()));
-        let program = dir.join("target/release/3dsrecomp");
-        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
-        std::fs::write(&program, b"").unwrap();
-        assert_eq!(find(Some(&dir)), Some(program.clone()));
-        assert_eq!(find(Some(&program)), Some(program.clone()));
-        assert_eq!(find(Some(&dir.join("nothing"))), None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn progress_is_read_from_the_output() {
-        assert_eq!(parse("wrote 279 files, 432 MiB of C, 0 overrides"), Some(Stage::Compiling { done: 0, total: 1 }));
-        assert_eq!(parse("compiled 140 of 279"), Some(Stage::Compiling { done: 140, total: 279 }));
-        assert_eq!(parse("built /x/000400000011C500.so in 591.9s"), Some(Stage::Installing));
-        assert_eq!(parse("something else"), None);
+    fn the_build_moves_the_stage_along() {
+        let generated = Event::Generated { files: 279, bytes: 1, overrides: 0 };
+        assert_eq!(Stage::after(&generated), Some(Stage::Compiling { done: 0, total: 1 }));
+        assert_eq!(Stage::after(&Event::Compiled { done: 140, total: 279 }), Some(Stage::Compiling { done: 140, total: 279 }));
+        assert_eq!(Stage::after(&Event::Installed("/x".into())), Some(Stage::Installing));
+        assert_eq!(Stage::after(&Event::Note("hm".to_owned())), None);
         assert!(Stage::Compiling { done: 140, total: 279 }.fraction() > 0.5);
     }
 }

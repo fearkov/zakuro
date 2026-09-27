@@ -30,3 +30,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+recomp3ds = { git = "https://github.com/fearkov/3dsrecomp" }

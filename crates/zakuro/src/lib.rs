@@ -513,19 +513,11 @@ impl App {
 
     fn recompile(&mut self, index: usize) {
         let Some(game) = self.library.games.get(index) else { return };
-        let Some(recompiler) = recompile::find(self.settings.recompiler.as_deref()) else {
-            self.menus.message = Some("Zakuro could not find 3dsrecomp. Choose where it is in the settings.".to_owned());
-            self.menus.settings_open = true;
-            return;
-        };
         self.jobs.retain(|job| job.program_id != game.program_id || !job.stage().finished());
         if self.jobs.iter().any(|job| job.program_id == game.program_id) {
             return;
         }
-        match Job::start(&recompiler, &game.path, game.program_id, &game.name) {
-            Ok(job) => self.jobs.push(job),
-            Err(error) => self.menus.message = Some(error),
-        }
+        self.jobs.push(Job::start(&game.path, game.program_id, &game.name));
     }
 
     /// tells about recompiles as they finish.
@@ -581,19 +573,6 @@ impl App {
                     .pick_file();
                 if let Some(file) = picked {
                     self.settings.background = Some(file);
-                    self.settings.save();
-                }
-            }
-            Action::ChooseRecompiler => {
-                if let Some(folder) = rfd::FileDialog::new().set_title("The 3dsrecomp folder").pick_folder() {
-                    if recompile::find(Some(&folder)).is_none() {
-                        self.menus.message = Some(format!(
-                            "There is no 3dsrecomp program in {}. Build it there with cargo build --release, \
-                             or pick the folder the program is in.",
-                            folder.display()
-                        ));
-                    }
-                    self.settings.recompiler = Some(folder);
                     self.settings.save();
                 }
             }
@@ -700,7 +679,6 @@ impl App {
     /// the menus, and the actions they asked for, done.
     fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
-        let recompiler = recompile::find(self.settings.recompiler.as_deref());
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps));
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
@@ -710,7 +688,7 @@ impl App {
                 Some((name, fps)) => actions.extend(menus.game(ui, name, show_fps.then_some(*fps), jobs)),
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
-            actions.extend(menus.settings(ui.ctx(), settings, recompiler.as_deref()));
+            actions.extend(menus.settings(ui.ctx(), settings));
             menus.message(ui.ctx());
         });
         self.library.changed = false;

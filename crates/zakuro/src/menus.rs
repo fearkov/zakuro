@@ -19,7 +19,6 @@ pub enum Action {
     Recompile(usize),
     CancelRecompile(u64),
     ChooseFolder,
-    ChooseRecompiler,
     ChooseBackground,
     Rescan,
     Resume,
@@ -228,7 +227,7 @@ impl Menus {
                                     }
                                     _ => {
                                         let label = if game.recompiled { "Recompile again" } else { "Recompile" };
-                                        if ui.button(label).on_hover_text("Turn the game's code into native code with 3dsrecomp, which makes it run faster. It takes around ten minutes.").clicked() {
+                                        if ui.button(label).on_hover_text("Turn the game's code into native code with 3dsrecomp, which makes it run faster. It takes around ten minutes and needs a C compiler, such as gcc or clang.").clicked() {
                                             actions.push(Action::Recompile(index));
                                         }
                                         if let Some(Stage::Failed(error)) = job.map(Job::stage) {
@@ -296,7 +295,7 @@ impl Menus {
     }
 
     /// the settings window, when open.
-    pub fn settings(&mut self, ctx: &egui::Context, settings: &mut Settings, recompiler: Option<&std::path::Path>) -> Vec<Action> {
+    pub fn settings(&mut self, ctx: &egui::Context, settings: &mut Settings) -> Vec<Action> {
         let mut actions = Vec::new();
         let before = settings.clone();
         let mut open = self.settings_open;
@@ -355,17 +354,6 @@ impl Menus {
                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
             );
 
-            ui.separator();
-            ui.heading("3dsrecomp");
-            ui.horizontal(|ui| {
-                match recompiler {
-                    Some(path) => ui.label(path.display().to_string()),
-                    None => ui.label(RichText::new("not found, choose its folder").color(Color32::LIGHT_RED)),
-                };
-                if ui.button("Choose folder…").clicked() {
-                    actions.push(Action::ChooseRecompiler);
-                }
-            });
 
             ui.separator();
             ui.heading("Controls");

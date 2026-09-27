@@ -2126,9 +2126,17 @@ dependencies = [
 [[package]]
 name = "recomp-abi"
 version = "0.1.0"
-source = "git+https://github.com/fearkov/3dsrecomp#f933a8319260c3bc26c47187791c8c18e617686b"
+source = "git+https://github.com/fearkov/3dsrecomp#de35aaecf0f5c9cbcb310dd40eb94ec3bb21e87f"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "recomp3ds"
+version = "0.1.0"
+source = "git+https://github.com/fearkov/3dsrecomp#de35aaecf0f5c9cbcb310dd40eb94ec3bb21e87f"
+dependencies = [
+ "recomp-abi",
 ]
 
 [[package]]
@@ -3292,6 +3300,7 @@ dependencies = [
  "image",
  "log",
  "raw-window-handle",
+ "recomp3ds",
  "rfd",
  "serde",
  "toml",
