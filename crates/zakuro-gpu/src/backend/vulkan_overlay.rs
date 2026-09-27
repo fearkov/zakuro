@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ash::vk;
 
 use super::vulkan::{create_shader_module, fail, find_memory_type, transition, vk_fail};
-use super::{Overlay, OverlayVertex, PresentError};
+use super::{Overlay, OverlayTexture, OverlayVertex, PresentError};
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/overlay.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/overlay.frag.spv");
@@ -58,6 +58,10 @@ pub(super) struct OverlayPainter {
     garbage: Vec<Vec<Garbage>>,
     /// where the indices start in this frame's buffer.
     index_offset: u64,
+    /// texture changes and frees from frames that were never drawn, which
+    /// still have to happen, the overlay sends each only once.
+    pending: Vec<OverlayTexture>,
+    pending_free: Vec<u64>,
     srgb: bool,
 }
 
@@ -119,8 +123,23 @@ impl OverlayPainter {
             geometry: (0..frames).map(|_| None).collect(),
             garbage: (0..frames).map(|_| Vec::new()).collect(),
             index_offset: 0,
+            pending: Vec::new(),
+            pending_free: Vec::new(),
             srgb,
         })
+    }
+
+    /// keeps what an overlay changes for the next frame drawn, when this one
+    /// is not.
+    pub(super) fn defer(&mut self, overlay: &Overlay) {
+        self.pending.extend(overlay.textures.iter().map(|texture| OverlayTexture {
+            id: texture.id,
+            offset: texture.offset,
+            size: texture.size,
+            pixels: texture.pixels.clone(),
+            linear: texture.linear,
+        }));
+        self.pending_free.extend_from_slice(&overlay.free);
     }
 
     /// what the frame that last used this slot left behind can go, the
@@ -141,7 +160,8 @@ impl OverlayPainter {
         frame: usize,
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
-        for texture in &overlay.textures {
+        let pending = std::mem::take(&mut self.pending);
+        for texture in pending.iter().chain(&overlay.textures) {
             let [width, height] = texture.size;
             if width == 0 || height == 0 || texture.pixels.len() < (width * height * 4) as usize {
                 continue;
@@ -285,7 +305,8 @@ impl OverlayPainter {
 
     /// textures the overlay no longer needs, gone once this frame is done.
     pub(super) fn free(&mut self, frame: usize, overlay: &Overlay) {
-        for id in &overlay.free {
+        let pending = std::mem::take(&mut self.pending_free);
+        for id in pending.iter().chain(&overlay.free) {
             if let Some(texture) = self.textures.remove(id) {
                 self.garbage[frame].push(Garbage::Texture(texture));
             }

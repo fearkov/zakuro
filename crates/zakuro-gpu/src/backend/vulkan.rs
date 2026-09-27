@@ -456,6 +456,13 @@ impl VulkanPresenter {
         Ok(())
     }
 
+    /// keeps the overlay's changes for the next frame drawn.
+    fn defer(&mut self, overlay: &Overlay) {
+        if let Some(painter) = &mut self.overlay {
+            painter.defer(overlay);
+        }
+    }
+
     fn record(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -580,9 +587,11 @@ impl Presenter for VulkanPresenter {
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
         if self.extent.width == 0 || self.extent.height == 0 {
+            self.defer(overlay);
             return Ok(());
         }
         if self.stale {
+            self.defer(overlay);
             unsafe { self.device.device_wait_idle() }.map_err(vk_fail("waiting for idle"))?;
             self.build_swapchain()?;
             return Err(PresentError::OutOfDate);
@@ -608,9 +617,13 @@ impl Presenter for VulkanPresenter {
             Ok(result) => result,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.stale = true;
+                self.defer(overlay);
                 return Err(PresentError::OutOfDate);
             }
-            Err(error) => return Err(vk_fail("acquiring an image")(error)),
+            Err(error) => {
+                self.defer(overlay);
+                return Err(vk_fail("acquiring an image")(error));
+            }
         };
 
         // only reset the fence once we know we are going to submit.
