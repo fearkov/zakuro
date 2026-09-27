@@ -123,13 +123,13 @@ impl Stretch {
                 (due.saturating_sub(SEARCH)..=due + SEARCH).max_by(|&a, &b| score(a).total_cmp(&score(b))).unwrap_or(due)
             };
             let piece = &self.input[start..start + GRAIN];
-            for i in 0..HOP {
-                let w = self.window[i];
-                out.push([self.tail[i][0] + piece[i][0] * w, self.tail[i][1] + piece[i][1] * w]);
+            let (first, second) = piece.split_at(HOP);
+            let (rising, falling) = self.window.split_at(HOP);
+            for ((tail, sample), w) in self.tail.iter_mut().zip(first).zip(rising) {
+                out.push([tail[0] + sample[0] * w, tail[1] + sample[1] * w]);
             }
-            for i in 0..HOP {
-                let w = self.window[HOP + i];
-                self.tail[i] = [piece[HOP + i][0] * w, piece[HOP + i][1] * w];
+            for ((tail, sample), w) in self.tail.iter_mut().zip(second).zip(falling) {
+                *tail = [sample[0] * w, sample[1] * w];
             }
             self.last = Some(start);
             self.position += HOP as f64 / self.factor;
