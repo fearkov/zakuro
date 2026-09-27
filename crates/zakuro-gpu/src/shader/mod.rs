@@ -1,6 +1,7 @@
 //! the PICA200's shader units, which run both vertex and geometry shaders.
 
 pub mod isa;
+mod batch;
 
 use std::sync::Arc;
 
@@ -300,12 +301,64 @@ impl Op {
 /// a shader unit's program, decoded once to be run on every vertex.
 pub struct Program {
     ops: Box<[Op]>,
+    /// the input registers anything reads and the output registers
+    /// anything writes, one bit each.
+    inputs: u16,
+    outputs: u16,
 }
 
 impl Program {
     fn decode(unit: &ShaderUnit) -> Program {
-        Program { ops: unit.program.iter().map(|&word| Op::decode(Instruction(word), &unit.descriptors)).collect() }
+        let ops: Box<[Op]> = unit.program.iter().map(|&word| Op::decode(Instruction(word), &unit.descriptors)).collect();
+        let (mut inputs, mut outputs) = (0u16, 0u16);
+        for op in ops.iter() {
+            let sources = match op.opcode {
+                OpCode::Mad | OpCode::MadI => 3,
+                OpCode::Mova | OpCode::Cmp => 2,
+                opcode if opcode.writes() => 2,
+                _ => continue,
+            };
+            for source in &op.sources[..sources] {
+                if source.register < 0x10 {
+                    inputs |= 1 << source.register;
+                }
+            }
+            if op.opcode.writes() && op.destination < 0x10 {
+                outputs |= 1 << op.destination;
+            }
+        }
+        Program { ops, inputs, outputs }
     }
+}
+
+/// runs the vertex shader over many vertices, a batch of them at a time,
+/// giving what running it on each would give.
+pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
+    let decoded;
+    let program = match &unit.decoded {
+        Some(program) => program.as_ref(),
+        None => {
+            decoded = Program::decode(unit);
+            &decoded
+        }
+    };
+    // tracing NaNs is the interpreter's
+    let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
+    let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
+    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    let mut state = ShaderState::new();
+    for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
+        if !trace_nan {
+            batch::run(unit, program, inputs, outputs, &mut blocks, &mut forks);
+            continue;
+        }
+        for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
+            state.input = *input;
+            execute(unit, program, &mut state, None);
+            *output = state.output;
+        }
+    }
+    outputs
 }
 
 /// runs the shader over one vertex.
@@ -614,10 +667,11 @@ fn multiply_add(unit: &ShaderUnit, state: &mut ShaderState, op: &Op) {
 
 /// the shader's multiply, which gives zero rather than NaN for zero times
 /// infinity.
-#[inline]
+#[inline(always)]
 fn multiply(a: f32, b: f32) -> f32 {
     let product = a * b;
-    if product.is_nan() && !a.is_nan() && !b.is_nan() {
+    // without short circuits, so that it stays a select many lanes do at once
+    if product.is_nan() & !a.is_nan() & !b.is_nan() {
         0.0
     } else {
         product
@@ -648,6 +702,7 @@ fn write_masked(state: &mut ShaderState, register: u32, mask: u32, value: Vec4) 
     }
 }
 
+#[inline(always)]
 fn compare(mode: u32, a: f32, b: f32) -> bool {
     match mode {
         0 => a == b,
@@ -701,6 +756,290 @@ mod tests {
 
     /// descriptor 0, write every component, identity swizzle on both sources.
     const IDENTITY: u32 = 0xF | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
+
+    /// a little random number generator, the same numbers every run.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n
+        }
+
+        /// mostly ordinary numbers, now and then a zero, an infinity or a NaN.
+        fn float(&mut self) -> f32 {
+            match self.below(40) {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::INFINITY,
+                3 => f32::NEG_INFINITY,
+                4 => f32::NAN,
+                _ => (self.next() as f32 / u32::MAX as f32 - 0.5) * 16.0,
+            }
+        }
+    }
+
+    /// what shading each vertex on its own gives.
+    fn one_by_one(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
+        inputs
+            .iter()
+            .map(|&input| {
+                let mut state = ShaderState::new();
+                state.input = input;
+                run(unit, &mut state);
+                state.output
+            })
+            .collect()
+    }
+
+    /// the same results, a NaN matching any NaN and zeros their sign.
+    fn same(a: &[[Vec4; OUTPUT_REGISTERS]], b: &[[Vec4; OUTPUT_REGISTERS]]) -> bool {
+        let same = |x: f32, y: f32| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits();
+        a.len() == b.len() && a.iter().flatten().flatten().zip(b.iter().flatten().flatten()).all(|(&x, &y)| same(x, y))
+    }
+
+    /// the batches give exactly what the interpreter gives, over programs
+    /// made of every arithmetic instruction with random registers,
+    /// swizzles, masks and address registers.
+    #[test]
+    fn batches_shade_like_the_interpreter() {
+        let mut random = Random(1);
+        let arithmetic = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x12, 0x13];
+        let inverted = [0x18, 0x19, 0x1A, 0x1B];
+        for _ in 0..300 {
+            let mut unit = ShaderUnit::new();
+            for uniform in unit.float_uniforms.iter_mut() {
+                *uniform = std::array::from_fn(|_| random.float());
+            }
+            for descriptor in unit.descriptors.iter_mut() {
+                *descriptor = (random.next() & 0x7FFF_FFF0) | (random.below(15) + 1);
+            }
+            let mut program = Vec::new();
+            // address registers from an input, for the indexed reads after
+            program.push((0x12 << 26) | (random.below(16) << 12) | random.below(32));
+            for _ in 0..24 {
+                let (destination, index, descriptor) = (random.below(32), random.below(4), random.below(32));
+                let wide = random.below(0x80);
+                let narrow = random.below(0x20);
+                let word = match random.below(10) {
+                    0..=5 => {
+                        let op = arithmetic[random.below(arithmetic.len() as u32) as usize];
+                        (op << 26) | (destination << 21) | (index << 19) | (wide << 12) | (narrow << 7) | descriptor
+                    }
+                    6 => {
+                        let op = inverted[random.below(inverted.len() as u32) as usize];
+                        (op << 26) | (destination << 21) | (index << 19) | (narrow << 14) | (wide << 7) | descriptor
+                    }
+                    7 => {
+                        // cmp, whose first mode shares a bit with the opcode
+                        let modes = (random.below(8) << 24) | (random.below(8) << 21);
+                        (0x2E << 26) | modes | (index << 19) | (wide << 12) | (narrow << 7) | descriptor
+                    }
+                    8 => {
+                        let (src1, src3) = (random.below(0x20), random.below(0x20));
+                        (0b111 << 29) | (destination << 24) | (index << 22) | (src1 << 17) | (wide << 10) | (src3 << 5) | descriptor
+                    }
+                    _ => {
+                        let (src1, src2) = (random.below(0x20), random.below(0x20));
+                        (0b110 << 29) | (destination << 24) | (index << 22) | (src1 << 17) | (src2 << 12) | (wide << 5) | descriptor
+                    }
+                };
+                program.push(word);
+            }
+            program.push(0x22 << 26);
+            for (i, &word) in program.iter().enumerate() {
+                unit.program[i] = word;
+            }
+            unit.prepare();
+            let count = 1 + random.below(20) as usize;
+            let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..count)
+                .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| random.float())))
+                .collect();
+            assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)), "program {program:08X?}");
+        }
+    }
+
+    /// programs whose vertices branch apart every way the shader can, an
+    /// if and else, a conditional jump, a loop left early and a call, come
+    /// out the same batched as one vertex at a time.
+    #[test]
+    fn batches_that_branch_apart_shade_like_the_interpreter() {
+        let mut random = Random(3);
+        let arithmetic = [0x00, 0x01, 0x02, 0x03, 0x08, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x13];
+        for _ in 0..300 {
+            let mut unit = ShaderUnit::new();
+            for uniform in unit.float_uniforms.iter_mut() {
+                *uniform = std::array::from_fn(|_| random.float());
+            }
+            for descriptor in unit.descriptors.iter_mut() {
+                *descriptor = (random.next() & 0x7FFF_FFF0) | (random.below(15) + 1);
+            }
+            unit.int_uniforms[0] = [2 + random.below(3) as u8, 0, 1, 0];
+            let arith = |random: &mut Random| {
+                let op = arithmetic[random.below(arithmetic.len() as u32) as usize];
+                let (destination, wide, narrow) = (random.below(32), random.below(0x80), random.below(0x20));
+                (op << 26) | (destination << 21) | (wide << 12) | (narrow << 7) | random.below(32)
+            };
+            let cmp = |random: &mut Random| {
+                let modes = (random.below(6) << 24) | (random.below(6) << 21);
+                (0x2E << 26) | modes | (random.below(0x80) << 12) | (random.below(0x20) << 7)
+            };
+            // which condition bits to compare against, and how x and y combine
+            let test = |random: &mut Random| (random.below(4) << 24) | (random.below(4) << 22);
+            let mut program: Vec<u32> = Vec::new();
+            for _ in 0..6 {
+                match random.below(5) {
+                    0 | 1 => (0..3).for_each(|_| program.push(arith(&mut random))),
+                    2 => {
+                        program.push(cmp(&mut random));
+                        let at = program.len();
+                        program.push(0);
+                        (0..1 + random.below(3)).for_each(|_| program.push(arith(&mut random)));
+                        let otherwise = program.len() as u32;
+                        let count = random.below(3);
+                        (0..count).for_each(|_| program.push(arith(&mut random)));
+                        program[at] = (0x28 << 26) | test(&mut random) | (otherwise << 10) | count;
+                    }
+                    3 => {
+                        program.push(cmp(&mut random));
+                        let at = program.len();
+                        program.push(0);
+                        (0..1 + random.below(3)).for_each(|_| program.push(arith(&mut random)));
+                        program[at] = (0x2C << 26) | test(&mut random) | ((program.len() as u32) << 10);
+                    }
+                    _ => {
+                        let at = program.len();
+                        program.push(0);
+                        program.push(arith(&mut random));
+                        program.push(cmp(&mut random));
+                        program.push((0x23 << 26) | test(&mut random));
+                        program.push(arith(&mut random));
+                        program[at] = (0x29 << 26) | (((program.len() - 1) as u32) << 10);
+                    }
+                }
+            }
+            // a call to a routine past the end
+            program.push(cmp(&mut random));
+            let call = program.len();
+            program.push(0);
+            program.push(arith(&mut random));
+            program.push(0x22 << 26);
+            let routine = program.len() as u32;
+            (0..2).for_each(|_| program.push(arith(&mut random)));
+            program[call] = (0x25 << 26) | test(&mut random) | (routine << 10) | 2;
+            for (i, &word) in program.iter().enumerate() {
+                unit.program[i] = word;
+            }
+            unit.prepare();
+            let count = 1 + random.below(24) as usize;
+            let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..count)
+                .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| random.float())))
+                .collect();
+            assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)), "program {program:08X?}");
+        }
+    }
+
+    /// how fast a typical transform and lighting program shades, compared
+    /// with one vertex at a time, cargo test -- --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn batch_speed() {
+        let mut random = Random(7);
+        let mut unit = ShaderUnit::new();
+        for uniform in unit.float_uniforms.iter_mut() {
+            *uniform = std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0 - 1.0);
+        }
+        unit.descriptors[0] = IDENTITY;
+        let dp4 = |dest: u32, uniform: u32, src: u32| (0x02 << 26) | (dest << 21) | (uniform << 12) | (src << 7);
+        let mut program = Vec::new();
+        // four dot products into r0, four into o0, a multiply-add, a
+        // max, a mul, a mov, the kind of thing a vertex program does,
+        // eight times over, about as long as the programs titles run
+        for _ in 0..8 {
+            for i in 0..4 {
+                program.push(dp4(0x10, 0x20 + i, 0));
+            }
+            for i in 0..4 {
+                program.push(dp4(0x00, 0x24 + i, 0x10));
+            }
+            program.push((0b111 << 29) | (0x11 << 24) | (1 << 17) | (0x28 << 10) | (0x10 << 5));
+            program.push((0x0C << 26) | (0x12 << 21) | (0x11 << 12) | (1 << 7));
+            program.push((0x08 << 26) | (0x01 << 21) | (0x29 << 12) | (0x12 << 7));
+            program.push((0x13 << 26) | (0x02 << 21) | (2 << 12));
+        }
+        program.push(0x22 << 26);
+        for (i, &word) in program.iter().enumerate() {
+            unit.program[i] = word;
+        }
+        unit.prepare();
+        let inputs: Vec<[Vec4; INPUT_REGISTERS]> =
+            (0..80_000).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0))).collect();
+        let instructions = (program.len() - 1) as f64 * inputs.len() as f64;
+        let start = std::time::Instant::now();
+        let wide = run_vertices(&unit, &inputs);
+        let batched = start.elapsed().as_secs_f64();
+        let start = std::time::Instant::now();
+        let single = one_by_one(&unit, &inputs);
+        let alone = start.elapsed().as_secs_f64();
+        assert!(same(&wide, &single));
+        println!(
+            "batched {:.2} ns an instruction a vertex, one by one {:.2}",
+            batched * 1e9 / instructions,
+            alone * 1e9 / instructions
+        );
+    }
+
+    /// a branch half the vertices take and half do not still sends each
+    /// its own way.
+    #[test]
+    fn a_branch_that_splits_a_batch() {
+        // cmp c0, v0 with x less than, so v0 above zero, then an if on x,
+        // taking mov o0, c1 or the else, mov o0, c2
+        let cmp = (0x2E << 26) | (2 << 24) | (0x20 << 12);
+        let ifc = (0x28 << 26) | (1 << 25) | (2 << 22) | (3 << 10) | 1;
+        let then = (0x13 << 26) | (0x21 << 12);
+        let otherwise = (0x13 << 26) | (0x22 << 12);
+        let mut unit = unit_with(&[cmp, ifc, then, otherwise, 0x22 << 26], &[IDENTITY]);
+        unit.float_uniforms[1] = [1.0; 4];
+        unit.float_uniforms[2] = [2.0; 4];
+        unit.prepare();
+        let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..12)
+            .map(|i| {
+                let mut input = [ZERO; INPUT_REGISTERS];
+                input[0] = [if i % 2 == 0 { 1.0 } else { -1.0 }; 4];
+                input
+            })
+            .collect();
+        let outputs = run_vertices(&unit, &inputs);
+        for (i, output) in outputs.iter().enumerate() {
+            assert_eq!(output[0], if i % 2 == 0 { [1.0; 4] } else { [2.0; 4] });
+        }
+        assert!(same(&outputs, &one_by_one(&unit, &inputs)));
+    }
+
+    /// a loop adds up the uniforms its counter walks over.
+    #[test]
+    fn a_loop_walks_uniforms_the_same_way() {
+        // loop i0 over add r0, r0, c0[aL], then mov o0, r0
+        let looped = (0x29 << 26) | (1 << 10);
+        let add = (0x10 << 21) | (3 << 19) | (0x20 << 12) | (0x10 << 7);
+        let mov = (0x13 << 26) | (0x10 << 12);
+        let mut unit = unit_with(&[looped, add, mov, 0x22 << 26], &[IDENTITY]);
+        unit.int_uniforms[0] = [3, 2, 1, 0];
+        for (i, uniform) in unit.float_uniforms.iter_mut().enumerate() {
+            *uniform = [i as f32; 4];
+        }
+        unit.prepare();
+        let inputs = vec![[ZERO; INPUT_REGISTERS]; 5];
+        let outputs = run_vertices(&unit, &inputs);
+        // four iterations, over c2 to c5
+        assert_eq!(outputs[4][0], [14.0; 4]);
+        assert!(same(&outputs, &one_by_one(&unit, &inputs)));
+    }
 
     #[test]
     fn moves_an_input_to_an_output() {

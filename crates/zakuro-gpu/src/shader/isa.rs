@@ -50,6 +50,37 @@ pub enum OpCode {
 impl OpCode {
     /// whether this is one of the inverted encodings, whose wide operand
     /// (the one that can be a uniform) is the second source.
+    /// whether it writes a destination register, which arithmetic does
+    /// but for mova and cmp.
+    pub fn writes(self) -> bool {
+        matches!(
+            self,
+            OpCode::Add
+                | OpCode::Dp3
+                | OpCode::Dp4
+                | OpCode::Dph
+                | OpCode::Dst
+                | OpCode::Ex2
+                | OpCode::Lg2
+                | OpCode::LitP
+                | OpCode::Mul
+                | OpCode::Sge
+                | OpCode::Slt
+                | OpCode::Flr
+                | OpCode::Max
+                | OpCode::Min
+                | OpCode::Rcp
+                | OpCode::Rsq
+                | OpCode::Mov
+                | OpCode::DphI
+                | OpCode::DstI
+                | OpCode::SgeI
+                | OpCode::SltI
+                | OpCode::Mad
+                | OpCode::MadI
+        )
+    }
+
     pub fn is_inverted(self) -> bool {
         matches!(self, OpCode::DphI | OpCode::DstI | OpCode::SgeI | OpCode::SltI)
     }

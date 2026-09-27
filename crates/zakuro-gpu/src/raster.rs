@@ -304,13 +304,6 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
 
 /// runs the vertex shader over one vertex's inputs and returns the
 /// attributes it outputs, packed as the rest of the pipeline sees them.
-fn run_vertex_shader(unit: &ShaderUnit, registers: &[u32], input: [Vec4; shader::INPUT_REGISTERS]) -> [Vec4; 16] {
-    let mut state = ShaderState::new();
-    state.input = input;
-    shader::run(unit, &mut state);
-    pack_outputs(&state.output, registers[REG_VS_OUTPUT_MASK])
-}
-
 /// a stage's output attributes are the output registers its mask enables, in
 /// order, attribute 2 is the third enabled register, which is not necessarily
 /// o2.
@@ -381,26 +374,36 @@ fn process_vertices(
     let shaded = shade(registers, vertex_shader, inputs);
     // the results in draw order, which repeats vertices an index buffer
     // names more than once
-    let outputs: Box<dyn Iterator<Item = [Vec4; 16]>> = match order {
-        Some(order) => Box::new(order.iter().map(|&i| shaded[i])),
-        None => Box::new(shaded.iter().copied()),
-    };
     let map = read_output_map(registers);
     if registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 {
-        geometry_stage(registers, geometry_shader, &map, outputs)
-    } else {
-        outputs.map(|attributes| to_vertex(&map, &attributes)).collect()
+        let outputs: Box<dyn Iterator<Item = [Vec4; 16]>> = match order {
+            Some(order) => Box::new(order.iter().map(|&i| shaded[i])),
+            None => Box::new(shaded.iter().copied()),
+        };
+        return geometry_stage(registers, geometry_shader, &map, outputs);
+    }
+    // each vertex made once, then repeated
+    let vertices: Vec<Vertex> = shaded.iter().map(|attributes| to_vertex(&map, attributes)).collect();
+    match order {
+        Some(order) => order.iter().map(|&i| vertices[i]).collect(),
+        None => vertices,
     }
 }
 
 /// vertices a draw needs before shading them is worth splitting over threads.
 const PARALLEL_VERTICES: usize = 128;
+/// vertices each thread takes at a time, whole batches of the shader's.
+const PARALLEL_CHUNK: usize = 64;
 
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
+    let mask = registers[REG_VS_OUTPUT_MASK];
+    let shade = |inputs: &[[Vec4; shader::INPUT_REGISTERS]]| {
+        shader::run_vertices(unit, inputs).into_iter().map(move |outputs| pack_outputs(&outputs, mask))
+    };
     if inputs.len() < PARALLEL_VERTICES {
-        return inputs.iter().map(|&input| run_vertex_shader(unit, registers, input)).collect();
+        return shade(inputs).collect();
     }
-    inputs.par_iter().map(|&input| run_vertex_shader(unit, registers, input)).collect()
+    inputs.par_chunks(PARALLEL_CHUNK).flat_map_iter(shade).collect()
 }
 
 fn geometry_stage(

@@ -15,6 +15,7 @@ log.workspace = true
 bitflags.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
+wide = "1.7"
 raw-window-handle = "0.6"
 
 glow = { version = "0.16", optional = true }
