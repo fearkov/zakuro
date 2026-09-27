@@ -10,6 +10,7 @@ pub mod fs;
 pub mod glyphs;
 pub mod gsp;
 pub mod hid;
+pub mod ir;
 pub mod keyboard;
 pub mod ldr_ro;
 pub mod misc;
@@ -58,6 +59,7 @@ pub struct ServiceState {
     pub hid: hid::HidState,
     pub fs: fs::FsState,
     pub dsp: dsp::DspState,
+    pub ir: ir::IrState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
     pub unimplemented: BTreeMap<(String, u16), u32>,
@@ -89,6 +91,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "err:f" => err::handle(system, &buffer, header),
         "dsp::DSP" => dsp::handle(system, &buffer, header),
         "ldr:ro" => ldr_ro::handle(system, &buffer, header),
+        "ir:USER" => ir::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 
@@ -212,6 +215,23 @@ mod tests {
             buffer.get(&mut system.memory, 1),
             zakuro_common::result::errors::NOT_CONNECTED.0
         );
+    }
+
+    /// titles wait on the infrared link's events, which have to be real
+    /// ones even with nothing to link to.
+    #[test]
+    fn infrared_events_are_real_handles() {
+        let (mut system, buffer) = system_with_thread();
+        // GetConnectionStatusEvent
+        buffer.set(&mut system.memory, 0, Header::new(0x000C, 0, 0).0);
+
+        handle_request(&mut system, Target::service("ir:USER".into(), 0));
+
+        assert_eq!(buffer.header(&mut system.memory), Header::new(0x000C, 1, 2));
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        let handle = buffer.get(&mut system.memory, 3);
+        assert!(system.kernel.resolve(handle).is_some());
+        assert!(system.services.unimplemented.is_empty());
     }
 
     /// titles answer sleep queries nothing sent them, which has to succeed
