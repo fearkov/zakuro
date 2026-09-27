@@ -40,6 +40,8 @@ fn main() {
 
     println!("--- booting for {frames} frames ---");
     let start = std::time::Instant::now();
+    // how long each frame took, which shows the stutter an average hides
+    let mut frame_times = Vec::with_capacity(frames as usize);
     let mut outcome = FrameOutcome::Completed;
     let mut executed = 0u64;
 
@@ -122,6 +124,7 @@ fn main() {
                 ..InputState::default()
             });
         }
+        let frame_start = std::time::Instant::now();
         outcome = system.run_frame();
         executed = frame + 1;
         if let Some(request) = system.keyboard_request() {
@@ -133,6 +136,7 @@ fn main() {
                 std::hint::black_box(system.read_screen(screen));
             }
         }
+        frame_times.push(frame_start.elapsed());
         if wav.is_some() {
             audio.extend(system.take_audio());
         }
@@ -155,6 +159,18 @@ fn main() {
     }
     println!("\n--- result ---");
     println!("outcome:       {outcome:?} after {executed} frames in {elapsed:.2?}");
+    if !frame_times.is_empty() {
+        frame_times.sort_unstable();
+        let at = |part: f64| frame_times[((frame_times.len() - 1) as f64 * part) as usize].as_secs_f64() * 1000.0;
+        let slow = frame_times.iter().filter(|time| time.as_secs_f64() > 1.0 / 60.0).count();
+        println!(
+            "frame times:   median {:.1} ms, 95% {:.1} ms, 99% {:.1} ms, worst {:.1} ms, {slow} over a 60th of a second",
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            at(1.0)
+        );
+    }
     println!("instructions:  {}", system.cpu.cycles);
     println!(
         "speed:         {:.2} MIPS",
