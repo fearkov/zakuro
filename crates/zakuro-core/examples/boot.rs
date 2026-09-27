@@ -73,6 +73,10 @@ fn main() {
     let wav = std::env::var("ZAKURO_WAV").ok();
     let mut audio: Vec<[i16; 2]> = Vec::new();
 
+    // reads both screens after every frame the way a window showing them
+    // does, for timing a run like one, ZAKURO_PRESENT=1.
+    let present = std::env::var("ZAKURO_PRESENT").is_ok();
+
     for frame in 0..frames {
         if log_from == Some(frame) {
             log::set_max_level(log::LevelFilter::Trace);
@@ -116,6 +120,11 @@ fn main() {
         }
         outcome = system.run_frame();
         executed = frame + 1;
+        if present {
+            for (screen, _) in SCREENS {
+                std::hint::black_box(system.read_screen(screen));
+            }
+        }
         if wav.is_some() {
             audio.extend(system.take_audio());
         }

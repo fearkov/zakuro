@@ -760,6 +760,19 @@ impl GpuMemory for GuestMemory<'_> {
         self.memory.read32(addr)
     }
 
+    fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+        // the linear heap and VRAM are physical memory in order, so what
+        // translate made of a physical address leads back to it
+        let physical = if addr >= self.linear_base && addr - self.linear_base < FCRAM_SIZE_NEW3DS {
+            FCRAM_PADDR + (addr - self.linear_base)
+        } else if (VRAM_VADDR..VRAM_VADDR + VRAM_SIZE).contains(&addr) {
+            VRAM_PADDR + (addr - VRAM_VADDR)
+        } else {
+            return None;
+        };
+        self.memory.phys.host_slice_mut(physical, u32::try_from(len).ok()?).map(|slice| &*slice)
+    }
+
     fn translate(&self, paddr: u32) -> u32 {
         if paddr >= FCRAM_PADDR {
             self.linear_base + (paddr - FCRAM_PADDR)

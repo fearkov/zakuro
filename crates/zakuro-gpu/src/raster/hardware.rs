@@ -5,8 +5,13 @@
 //!
 //! guest memory stays where images live between command lists. a buffer a
 //! list draws into goes up to the GPU the first time the list needs it,
-//! unless it is still as the GPU left it, and comes back down when the list
-//! ends or when something is about to read it as a texture.
+//! unless it is still as the GPU left it, and comes back down only when
+//! something else is about to read it, a texture, a fill or the CPU.
+//!
+//! a display transfer out of such a buffer runs on the GPU as well, then its
+//! batch goes to the GPU without waiting for it, along with a copy of the
+//! output for the host to read later. recording goes on in a second command
+//! buffer meanwhile, so the CPU rarely waits for the GPU.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -22,6 +27,7 @@ use crate::GpuMemory;
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
+const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
@@ -123,12 +129,16 @@ struct Surface {
     width: u32,
     height: u32,
     kind: Kind,
+    /// tiled the way the PICA draws, or in plain rows, as a display
+    /// transfer can leave its output.
+    tiled: bool,
     /// the guest's bytes the last time the image matched them.
     shadow: Vec<u8>,
     /// the image is known to match guest memory in this batch.
     checked: bool,
     /// drawn into since guest memory last got the image.
     dirty: bool,
+    capture: Option<Capture>,
 }
 
 impl Surface {
@@ -139,6 +149,75 @@ impl Surface {
     fn overlaps(&self, addr: u32, len: u32) -> bool {
         addr < self.addr + self.size() && self.addr < addr + len
     }
+
+    /// the GPU changed the image.
+    fn changed(&mut self) {
+        self.dirty = true;
+        if let Some(capture) = &mut self.capture {
+            capture.current = false;
+        }
+    }
+
+    /// what a capture holds, when it still has the image.
+    fn captured(&self) -> Option<&Capture> {
+        self.capture.as_ref().filter(|capture| self.dirty && capture.current)
+    }
+}
+
+/// where a pixel's bytes are in a buffer of guest memory, from its start.
+fn pixel_offset(tiled: bool, x: u32, y: u32, width: u32, bpp: u32) -> usize {
+    if tiled {
+        morton_offset(x, y, width, bpp) as usize
+    } else {
+        ((y * width + x) * bpp) as usize
+    }
+}
+
+/// a copy of a surface on its way to the host, recorded along with what
+/// changed the surface so reading it back needs no batch of its own.
+struct Capture {
+    buffer: Buffer,
+    /// the batch that fills it.
+    batch: u64,
+    /// nothing changed the surface since.
+    current: bool,
+}
+
+/// a batch's command buffer, the fence the GPU signals once done with it and
+/// the ring it stages in.
+struct Frame {
+    commands: vk::CommandBuffer,
+    fence: vk::Fence,
+    ring: Buffer,
+    /// the batch it holds while the GPU may still be running it.
+    pending: Option<u64>,
+}
+
+/// a display transfer's registers, taken apart.
+pub(crate) struct Transfer {
+    pub(crate) input: u32,
+    pub(crate) output: u32,
+    pub(crate) input_width: u32,
+    pub(crate) input_height: u32,
+    pub(crate) output_width: u32,
+    pub(crate) output_height: u32,
+    /// the pixels written, width and height.
+    pub(crate) copy: (u32, u32),
+    /// the input pixels averaged into each output pixel, across and down.
+    pub(crate) scale: (u32, u32),
+    pub(crate) flip: bool,
+    pub(crate) input_linear: bool,
+    pub(crate) output_tiled: bool,
+    pub(crate) input_format: ColorFormat,
+    pub(crate) output_format: ColorFormat,
+}
+
+/// the compute pipeline display transfers run on.
+struct TransferPipeline {
+    shader: vk::ShaderModule,
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 }
 
 struct Texture {
@@ -169,11 +248,16 @@ pub struct Hardware {
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
+    /// the other command buffer, fence and ring, which the batch before
+    /// may still be using.
+    spare: Frame,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     vertex_shader: vk::ShaderModule,
     fragment_shader: vk::ShaderModule,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
+    /// made the first time a display transfer runs here.
+    transfer: Option<TransferPipeline>,
     samplers: HashMap<(bool, Wrap, Wrap), vk::Sampler>,
     ring: Buffer,
     used: u64,
@@ -245,15 +329,16 @@ impl Hardware {
                     None,
                 )
                 .map_err(vk_error("create a command pool"))?;
-            let commands = device
+            let buffers = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
+                        .command_buffer_count(2),
                 )
-                .map_err(vk_error("allocate a command buffer"))?[0];
+                .map_err(vk_error("allocate a command buffer"))?;
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
+            let spare_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
 
             let bindings: Vec<_> = (0..5)
                 .map(|binding| {
@@ -289,14 +374,16 @@ impl Hardware {
             let vertex_shader = module(VERTEX_SPIRV)?;
             let fragment_shader = module(FRAGMENT_SPIRV)?;
 
+            let unmade = || Buffer {
+                buffer: vk::Buffer::null(),
+                memory: vk::DeviceMemory::null(),
+                size: 0,
+                mapped: std::ptr::null_mut(),
+                incoherent: false,
+            };
             let mut hardware = Hardware {
-                ring: Buffer {
-                    buffer: vk::Buffer::null(),
-                    memory: vk::DeviceMemory::null(),
-                    size: 0,
-                    mapped: std::ptr::null_mut(),
-                    incoherent: false,
-                },
+                ring: unmade(),
+                spare: Frame { commands: buffers[1], fence: spare_fence, ring: unmade(), pending: None },
                 blank: Image { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null() },
                 _entry: entry,
                 instance,
@@ -307,13 +394,14 @@ impl Hardware {
                 uniform_alignment: properties.limits.min_uniform_buffer_offset_alignment.max(16),
                 storage_alignment: properties.limits.min_storage_buffer_offset_alignment.max(16),
                 pool,
-                commands,
+                commands: buffers[0],
                 fence,
                 set_layout,
                 layout,
                 vertex_shader,
                 fragment_shader,
                 pipelines: HashMap::new(),
+                transfer: None,
                 samplers: HashMap::new(),
                 used: 0,
                 readback: None,
@@ -326,14 +414,12 @@ impl Hardware {
                 batch: 0,
                 name,
             };
-            hardware.ring = hardware.buffer(
-                RING_SIZE,
-                vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC,
-                false,
-            )?;
+            let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_BUFFER
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC;
+            hardware.ring = hardware.buffer(RING_SIZE, ring_usage, false)?;
+            hardware.spare.ring = hardware.buffer(RING_SIZE, ring_usage, false)?;
             hardware.begin()?;
             hardware.blank = hardware.image(
                 1,
@@ -477,6 +563,8 @@ impl Hardware {
                     .map_err(vk_error("begin a command buffer"))?;
             }
             self.recording = true;
+            // the batch before may still be running
+            self.barrier();
         }
         Ok(())
     }
@@ -517,16 +605,27 @@ impl Hardware {
     }
 
     /// the surface for a guest buffer, matching guest memory.
-    fn surface<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, width: u32, height: u32, kind: Kind) -> Result<usize, String> {
+    fn surface<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        addr: u32,
+        (width, height): (u32, u32),
+        kind: Kind,
+        tiled: bool,
+    ) -> Result<usize, String> {
         let index = match self
             .surfaces
             .iter()
-            .position(|s| s.addr == addr && s.width == width && s.height == height && s.kind == kind)
+            .position(|s| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled == tiled)
         {
             Some(index) => index,
             None => {
                 let (format, usage, aspect) = match kind {
-                    Kind::Color(_) => (COLOR_FORMAT, vk::ImageUsageFlags::COLOR_ATTACHMENT, vk::ImageAspectFlags::COLOR),
+                    Kind::Color(_) => (
+                        COLOR_FORMAT,
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+                        vk::ImageAspectFlags::COLOR,
+                    ),
                     Kind::Depth(_) => (
                         DEPTH_FORMAT,
                         vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -536,7 +635,18 @@ impl Hardware {
                 let usage = usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
                 let image = self.image(width, height, format, usage, aspect)?;
                 self.uploads = true;
-                self.surfaces.push(Surface { image, addr, width, height, kind, shadow: Vec::new(), checked: false, dirty: false });
+                self.surfaces.push(Surface {
+                    image,
+                    addr,
+                    width,
+                    height,
+                    kind,
+                    tiled,
+                    shadow: Vec::new(),
+                    checked: false,
+                    dirty: false,
+                    capture: None,
+                });
                 self.surfaces.len() - 1
             }
         };
@@ -550,7 +660,7 @@ impl Hardware {
             .filter(|&i| i != index && self.surfaces[i].dirty && self.surfaces[i].overlaps(addr, size))
             .collect();
         if !others.is_empty() {
-            self.run(memory, others)?;
+            self.write_back(memory, others)?;
             self.begin()?;
         }
         let mut bytes = vec![0; size as usize];
@@ -566,9 +676,9 @@ impl Hardware {
     /// copies a guest buffer's bytes into its surface.
     fn upload(&mut self, index: usize, bytes: &[u8]) -> Result<(), String> {
         self.end_rendering();
-        let (width, height, kind) = {
+        let (width, height, kind, tiled) = {
             let s = &self.surfaces[index];
-            (s.width, s.height, s.kind)
+            (s.width, s.height, s.kind, s.tiled)
         };
         let pixels = (width * height) as u64;
         let image = self.surfaces[index].image.image;
@@ -586,7 +696,7 @@ impl Hardware {
                 let staging = self.ring(offset, pixels * 4);
                 for y in 0..height {
                     for x in 0..width {
-                        let at = morton_offset(x, y, width, bpp as u32) as usize;
+                        let at = pixel_offset(tiled, x, y, width, bpp as u32);
                         let rgba = format.decode(&bytes[at..at + bpp]);
                         let out = (((height - 1 - y) * width + x) * 4) as usize;
                         staging[out..out + 4].copy_from_slice(&rgba);
@@ -634,6 +744,9 @@ impl Hardware {
             }
         }
         self.uploads = true;
+        if let Some(capture) = &mut self.surfaces[index].capture {
+            capture.current = false;
+        }
         Ok(())
     }
 
@@ -841,8 +954,12 @@ impl Hardware {
             let filled = &bytes[offset..offset + size];
             let bpp = surface.kind.bytes() as usize;
             // a pattern that does not line up with the pixels leaves them
-            // different from each other, and uploading handles that
+            // different from each other, and uploading handles that, what
+            // the GPU drew is gone
             if !filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
+                let surface = &mut self.surfaces[index];
+                surface.dirty = false;
+                surface.checked = false;
                 continue;
             }
             let pixel = filled[..bpp].to_vec();
@@ -886,6 +1003,9 @@ impl Hardware {
             surface.shadow = filled;
             surface.dirty = false;
             surface.checked = false;
+            if let Some(capture) = &mut surface.capture {
+                capture.current = false;
+            }
         }
         Ok(())
     }
@@ -910,7 +1030,7 @@ impl Hardware {
             })
             .collect();
         if !partial.is_empty() {
-            self.run(memory, partial)?;
+            self.write_back(memory, partial)?;
         }
         Ok(())
     }
@@ -924,15 +1044,16 @@ impl Hardware {
             return Ok(());
         }
         if self.used > RING_FLUSH {
-            self.run(memory, Vec::new())?;
+            self.submit()?;
         }
         self.begin()?;
 
         // a flush looking one of them up drops what the other had checked
         let (color, depth) = loop {
-            let color = self.surface(memory, draw.target, draw.width, draw.height, Kind::Color(draw.format))?;
+            let size = (draw.width, draw.height);
+            let color = self.surface(memory, draw.target, size, Kind::Color(draw.format), true)?;
             let depth = match draw.depth {
-                Some((addr, bytes)) => Some(self.surface(memory, addr, draw.width, draw.height, Kind::Depth(bytes))?),
+                Some((addr, bytes)) => Some(self.surface(memory, addr, size, Kind::Depth(bytes), true)?),
                 None => None,
             };
             if self.surfaces[color].checked && depth.is_none_or(|d| self.surfaces[d].checked) {
@@ -1050,11 +1171,11 @@ impl Hardware {
             self.begin_rendering(color, depth);
         }
         if color_mask != 0 {
-            self.surfaces[color].dirty = true;
+            self.surfaces[color].changed();
         }
         if let Some(depth) = depth {
             if depth_write || (stencil_test && writable) {
-                self.surfaces[depth].dirty = true;
+                self.surfaces[depth].changed();
             }
         }
 
@@ -1170,7 +1291,9 @@ impl Hardware {
     /// guest memory.
     pub(crate) fn flush<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
         let dirty = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].dirty).collect();
-        self.run(memory, dirty)
+        self.write_back(memory, dirty)?;
+        self.submit()?;
+        self.wait()
     }
 
     /// makes guest memory right over a range something other than a draw
@@ -1179,21 +1302,293 @@ impl Hardware {
     pub(crate) fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         let overlapping: Vec<usize> = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].overlaps(addr, len)).collect();
         let dirty: Vec<usize> = overlapping.iter().copied().filter(|&i| self.surfaces[i].dirty).collect();
-        if !dirty.is_empty() {
-            self.run(memory, dirty)?;
-        }
+        self.write_back(memory, dirty)?;
         for i in overlapping {
             self.surfaces[i].checked = false;
         }
         Ok(())
     }
 
-    /// runs what the batch recorded, then writes the given surfaces back to
-    /// guest memory.
-    fn run<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
-        if !self.recording && dirty.is_empty() {
+    /// a display transfer out of a buffer the GPU drew, done on the GPU,
+    /// false when the input is anything else, for the CPU to do. the output
+    /// stays on the GPU, and a copy of it heads for the host in the same
+    /// batch, which goes to the GPU right away without waiting for it.
+    pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
+        let t = transfer;
+        let input_kind = Kind::Color(t.input_format);
+        let output_kind = Kind::Color(t.output_format);
+        let output_size = (t.output_width, t.output_height);
+        if t.input_linear || t.copy.0 == 0 || t.copy.1 == 0 {
+            return Ok(false);
+        }
+        // the input rows read, which can start a few rows of tiles into a
+        // buffer the GPU drew, titles draw both screens into one
+        let rows = t.copy.1 * t.scale.1;
+        let first = if t.flip { t.input_height - rows } else { 0 };
+        let tile_rows = 8 * t.input_width * input_kind.bytes();
+        let row_in = |s: &Surface| {
+            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * 8;
+            (offset + first + rows <= s.height).then_some(offset)
+        };
+        let Some((addr, input_size, row)) = self
+            .surfaces
+            .iter()
+            .filter(|s| s.kind == input_kind && s.tiled && s.width == t.input_width)
+            .find_map(|s| Some((s.addr, (s.width, s.height), row_in(s)?)))
+        else {
+            return Ok(false);
+        };
+        let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
+        let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
+        if (addr as u64) < output_end && (t.output as u64) < input_end {
+            return Ok(false);
+        }
+        self.begin()?;
+        // a flush looking one of them up drops what the other had checked
+        let (source, target) = loop {
+            let source = self.surface(memory, addr, input_size, input_kind, true)?;
+            let target = self.surface(memory, t.output, output_size, output_kind, t.output_tiled)?;
+            if self.surfaces[source].checked && self.surfaces[target].checked {
+                break (source, target);
+            }
+        };
+        let (layout, pipeline) = self.transfer_pipeline()?;
+        self.end_rendering();
+        self.barrier();
+
+        let infos = [source, target].map(|i| {
+            [vk::DescriptorImageInfo::default().image_view(self.surfaces[i].image.view).image_layout(vk::ImageLayout::GENERAL)]
+        });
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&infos[0]),
+            vk::WriteDescriptorSet::default()
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&infos[1]),
+        ];
+        let constants: [i32; 11] = [
+            t.copy.0 as i32,
+            t.copy.1 as i32,
+            t.input_height as i32,
+            t.output_height as i32,
+            t.scale.0 as i32,
+            t.scale.1 as i32,
+            t.flip as i32,
+            format_index(t.input_format),
+            format_index(t.output_format),
+            row as i32,
+            input_size.1 as i32,
+        ];
+        let bytes: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
+        // SAFETY: recording, outside rendering, on images in the general
+        // layout made for storage
+        unsafe {
+            self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
+            self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            self.device.cmd_dispatch(self.commands, t.copy.0.div_ceil(8), t.copy.1.div_ceil(8), 1);
+        }
+        self.surfaces[target].changed();
+        self.capture(target)?;
+        self.submit()?;
+        Ok(true)
+    }
+
+    /// records a copy of a surface for the host to read later.
+    fn capture(&mut self, index: usize) -> Result<(), String> {
+        let (width, height) = (self.surfaces[index].width, self.surfaces[index].height);
+        let size = (width * height * 4) as u64;
+        if self.surfaces[index].capture.is_none() {
+            let buffer = self.buffer(size, vk::BufferUsageFlags::TRANSFER_DST, true)?;
+            self.surfaces[index].capture = Some(Capture { buffer, batch: 0, current: false });
+        }
+        self.end_rendering();
+        self.barrier();
+        let batch = self.batch;
+        let surface = &mut self.surfaces[index];
+        let Some(capture) = surface.capture.as_mut() else { unreachable!("made above") };
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+            .image_extent(vk::Extent3D { width, height, depth: 1 })];
+        let to_host = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        // SAFETY: recording, outside rendering, into a buffer the size of
+        // the image, which the host reads only once this batch is done
+        unsafe {
+            self.device.cmd_copy_image_to_buffer(
+                self.commands,
+                surface.image.image,
+                vk::ImageLayout::GENERAL,
+                capture.buffer.buffer,
+                &region,
+            );
+            self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
+        }
+        capture.batch = batch;
+        capture.current = true;
+        Ok(())
+    }
+
+    /// the pipeline display transfers run on, made the first time.
+    fn transfer_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
+        if let Some(transfer) = &self.transfer {
+            return Ok((transfer.layout, transfer.pipeline));
+        }
+        // SAFETY: plain object creation on our device, with create infos
+        // that live as long as each call
+        unsafe {
+            let words = ash::util::read_spv(&mut Cursor::new(TRANSFER_SPIRV)).map_err(|e| e.to_string())?;
+            let shader = self
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+                .map_err(vk_error("create a shader module"))?;
+            let bindings = [0, 1].map(|binding| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            });
+            let set_layout = self
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                        .bindings(&bindings),
+                    None,
+                )
+                .map_err(vk_error("create a descriptor set layout"))?;
+            let set_layouts = [set_layout];
+            let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(11 * 4)];
+            let layout = self
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts).push_constant_ranges(&ranges),
+                    None,
+                )
+                .map_err(vk_error("create a pipeline layout"))?;
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader)
+                .name(c"main");
+            let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+            let pipeline = self
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .map_err(|(_, error)| format!("could not create a pipeline, {error}"))?[0];
+            self.transfer = Some(TransferPipeline { shader, set_layout, layout, pipeline });
+            Ok((layout, pipeline))
+        }
+    }
+
+    /// hands the batch being recorded to the GPU without waiting for it.
+    /// recording goes on in the other command buffer, once the GPU is done
+    /// with the batch before.
+    fn submit(&mut self) -> Result<(), String> {
+        if !self.recording {
             return Ok(());
         }
+        self.end_rendering();
+        self.wait()?;
+        // SAFETY: the command buffer is recording and gets submitted once,
+        // the spare one is not in use any more
+        unsafe {
+            self.device.end_command_buffer(self.commands).map_err(vk_error("end a command buffer"))?;
+            let buffers = [self.commands];
+            let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+            self.device.queue_submit(self.queue, &submit, self.fence).map_err(vk_error("submit"))?;
+        }
+        self.recording = false;
+        std::mem::swap(&mut self.commands, &mut self.spare.commands);
+        std::mem::swap(&mut self.fence, &mut self.spare.fence);
+        std::mem::swap(&mut self.ring, &mut self.spare.ring);
+        self.spare.pending = Some(self.batch);
+
+        for surface in &mut self.surfaces {
+            surface.checked = false;
+        }
+        self.used = 0;
+        self.tables = None;
+        self.batch += 1;
+
+        // textures nobody drew with for a while go, long after the GPU
+        // last used them
+        let batch = self.batch;
+        let stale: Vec<usize> = self.textures.iter().filter(|(_, t)| batch - t.used > 600).map(|(&k, _)| k).collect();
+        for key in stale {
+            if let Some(texture) = self.textures.remove(&key) {
+                self.destroy_image(&texture.image);
+            }
+        }
+        Ok(())
+    }
+
+    /// waits for the GPU to finish everything handed to it.
+    fn wait(&mut self) -> Result<(), String> {
+        if self.spare.pending.take().is_some() {
+            // SAFETY: the fence belongs to the batch submitted last, and the
+            // command buffer is reset only once the GPU is done with it
+            unsafe {
+                self.device.wait_for_fences(&[self.spare.fence], true, u64::MAX).map_err(vk_error("wait for the GPU"))?;
+                self.device.reset_fences(&[self.spare.fence]).map_err(vk_error("reset a fence"))?;
+                self.device
+                    .reset_command_buffer(self.spare.commands, vk::CommandBufferResetFlags::empty())
+                    .map_err(vk_error("reset a command buffer"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// waits for a batch, handing it to the GPU first if it is the one
+    /// being recorded.
+    fn wait_for(&mut self, batch: u64) -> Result<(), String> {
+        if batch == self.batch {
+            self.submit()?;
+        }
+        if self.spare.pending.is_some_and(|pending| pending <= batch) {
+            self.wait()?;
+        }
+        Ok(())
+    }
+
+    /// writes the given surfaces back to guest memory, from their captures
+    /// when those still hold them, else running the batch and reading them
+    /// back.
+    fn write_back<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
+        let (captured, others): (Vec<usize>, Vec<usize>) =
+            dirty.into_iter().partition(|&i| self.surfaces[i].captured().is_some());
+        if !others.is_empty() {
+            self.run(memory, others)?;
+        }
+        for i in captured {
+            // running the others may have finished it already
+            let Some(capture) = self.surfaces[i].captured() else { continue };
+            let batch = capture.batch;
+            self.wait_for(batch)?;
+            let Some(capture) = self.surfaces[i].captured() else { continue };
+            let buffer = &capture.buffer;
+            if buffer.incoherent {
+                let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
+                // SAFETY: the memory is mapped and the GPU is done with it
+                unsafe { self.device.invalidate_mapped_memory_ranges(&range) }.map_err(vk_error("invalidate memory"))?;
+            }
+            // SAFETY: the batch that filled the buffer is done, and nothing
+            // writes it again before this returns
+            let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
+            self.store(memory, i, data);
+        }
+        Ok(())
+    }
+
+    /// runs what the batch recorded, then reads the given surfaces back and
+    /// writes them to guest memory.
+    fn run<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
         self.begin()?;
         self.end_rendering();
 
@@ -1220,133 +1615,115 @@ impl Hardware {
         }
 
         let mut offsets = Vec::with_capacity(dirty.len());
-        if !dirty.is_empty() {
-            self.barrier();
-            let readback = self.readback.as_ref().map_or(vk::Buffer::null(), |b| b.buffer);
-            let mut offset = 0;
-            for &i in &dirty {
-                let s = &self.surfaces[i];
-                let extent = vk::Extent3D { width: s.width, height: s.height, depth: 1 };
-                let region = |at: u64, aspect: vk::ImageAspectFlags| {
-                    vk::BufferImageCopy::default()
-                        .buffer_offset(at)
-                        .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1))
-                        .image_extent(extent)
-                };
-                let pixels = (s.width * s.height) as u64;
-                let regions: Vec<_> = match s.kind {
-                    Kind::Color(_) => vec![region(offset, vk::ImageAspectFlags::COLOR)],
-                    Kind::Depth(_) => vec![
-                        region(offset, vk::ImageAspectFlags::DEPTH),
-                        region(offset + pixels * 4, vk::ImageAspectFlags::STENCIL),
-                    ],
-                };
-                // SAFETY: recording, outside rendering, into a buffer big
-                // enough for every region
-                unsafe {
-                    self.device.cmd_copy_image_to_buffer(self.commands, s.image.image, vk::ImageLayout::GENERAL, readback, &regions)
-                };
-                offsets.push(offset);
-                offset += size_of(s);
-            }
-            let to_host = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            // SAFETY: recording
-            unsafe {
-                self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host))
+        self.barrier();
+        let readback = self.readback.as_ref().map_or(vk::Buffer::null(), |b| b.buffer);
+        let mut offset = 0;
+        for &i in &dirty {
+            let s = &self.surfaces[i];
+            let extent = vk::Extent3D { width: s.width, height: s.height, depth: 1 };
+            let region = |at: u64, aspect: vk::ImageAspectFlags| {
+                vk::BufferImageCopy::default()
+                    .buffer_offset(at)
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1))
+                    .image_extent(extent)
             };
+            let pixels = (s.width * s.height) as u64;
+            let regions: Vec<_> = match s.kind {
+                Kind::Color(_) => vec![region(offset, vk::ImageAspectFlags::COLOR)],
+                Kind::Depth(_) => vec![
+                    region(offset, vk::ImageAspectFlags::DEPTH),
+                    region(offset + pixels * 4, vk::ImageAspectFlags::STENCIL),
+                ],
+            };
+            // SAFETY: recording, outside rendering, into a buffer big enough
+            // for every region
+            unsafe {
+                self.device.cmd_copy_image_to_buffer(self.commands, s.image.image, vk::ImageLayout::GENERAL, readback, &regions)
+            };
+            offsets.push(offset);
+            offset += size_of(s);
         }
+        let to_host = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        // SAFETY: recording
+        unsafe { self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host)) };
 
-        // SAFETY: the command buffer is recording and submitted once, then
-        // waited for before anything touches what it used
-        unsafe {
-            self.device.end_command_buffer(self.commands).map_err(vk_error("end a command buffer"))?;
-            let buffers = [self.commands];
-            let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
-            self.device.queue_submit(self.queue, &submit, self.fence).map_err(vk_error("submit"))?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX).map_err(vk_error("wait for the GPU"))?;
-            self.device.reset_fences(&[self.fence]).map_err(vk_error("reset a fence"))?;
-            self.device
-                .reset_command_buffer(self.commands, vk::CommandBufferResetFlags::empty())
-                .map_err(vk_error("reset a command buffer"))?;
-        }
-        self.recording = false;
-        if let Some(readback) = self.readback.as_ref().filter(|b| b.incoherent && !dirty.is_empty()) {
+        self.submit()?;
+        self.wait()?;
+        let Some(readback) = self.readback.as_ref() else { return Ok(()) };
+        if readback.incoherent {
             let range = [vk::MappedMemoryRange::default().memory(readback.memory).offset(0).size(vk::WHOLE_SIZE)];
             // SAFETY: the memory is mapped and the GPU is done with it
             unsafe { self.device.invalidate_mapped_memory_ranges(&range) }.map_err(vk_error("invalidate memory"))?;
         }
-
+        let mapped = readback.mapped;
         for (&i, &offset) in dirty.iter().zip(&offsets) {
-            let (width, height, kind, addr) = {
-                let s = &self.surfaces[i];
-                (s.width, s.height, s.kind, s.addr)
-            };
-            let pixels = (width * height) as usize;
-            let readback = self.readback.as_ref().expect("the readback buffer was sized above");
             // SAFETY: the GPU finished writing the buffer, and the range was
             // sized for this surface
-            let data = unsafe { std::slice::from_raw_parts(readback.mapped.add(offset as usize), size_of(&self.surfaces[i]) as usize) };
-            let mut bytes = vec![0u8; (pixels as u32 * kind.bytes()) as usize];
-            match kind {
-                Kind::Color(format) => {
-                    let bpp = format.bytes_per_pixel();
-                    for y in 0..height {
-                        for x in 0..width {
-                            let at = (((height - 1 - y) * width + x) * 4) as usize;
-                            let rgba = [data[at], data[at + 1], data[at + 2], data[at + 3]];
-                            let out = morton_offset(x, y, width, bpp as u32) as usize;
-                            format.encode(rgba, &mut bytes[out..out + bpp]);
-                        }
+            let data = unsafe { std::slice::from_raw_parts(mapped.add(offset as usize), size_of(&self.surfaces[i]) as usize) };
+            self.store(memory, i, data);
+        }
+        Ok(())
+    }
+
+    /// writes what the GPU read back of a surface to guest memory.
+    fn store<M: GpuMemory>(&mut self, memory: &mut M, index: usize, data: &[u8]) {
+        let s = &self.surfaces[index];
+        let (width, height, kind, tiled) = (s.width, s.height, s.kind, s.tiled);
+        let pixels = (width * height) as usize;
+        let mut bytes = vec![0u8; pixels * kind.bytes() as usize];
+        match kind {
+            Kind::Color(format) => {
+                let bpp = format.bytes_per_pixel();
+                for y in 0..height {
+                    for x in 0..width {
+                        let at = (((height - 1 - y) * width + x) * 4) as usize;
+                        let rgba = [data[at], data[at + 1], data[at + 2], data[at + 3]];
+                        let out = pixel_offset(tiled, x, y, width, bpp as u32);
+                        format.encode(rgba, &mut bytes[out..out + bpp]);
                     }
                 }
-                Kind::Depth(sample) => {
-                    let (depths, stencils) = data.split_at(pixels * 4);
-                    for y in 0..height {
-                        for x in 0..width {
-                            let i = ((height - 1 - y) * width + x) as usize;
-                            let d24 = u32::from_le_bytes(depths[i * 4..i * 4 + 4].try_into().unwrap()) & 0xFF_FFFF;
-                            let out = morton_offset(x, y, width, sample) as usize;
-                            match sample {
-                                2 => {
-                                    let d16 = ((d24 as u64 * 0xFFFF + 0x7F_FFFF) / 0xFF_FFFF) as u16;
-                                    bytes[out..out + 2].copy_from_slice(&d16.to_le_bytes());
-                                }
-                                3 => bytes[out..out + 3].copy_from_slice(&d24.to_le_bytes()[..3]),
-                                _ => {
-                                    let word = d24 | (stencils[i] as u32) << 24;
-                                    bytes[out..out + 4].copy_from_slice(&word.to_le_bytes());
-                                }
+            }
+            Kind::Depth(sample) => {
+                let (depths, stencils) = data.split_at(pixels * 4);
+                for y in 0..height {
+                    for x in 0..width {
+                        let i = ((height - 1 - y) * width + x) as usize;
+                        let d24 = u32::from_le_bytes(depths[i * 4..i * 4 + 4].try_into().unwrap()) & 0xFF_FFFF;
+                        let out = morton_offset(x, y, width, sample) as usize;
+                        match sample {
+                            2 => {
+                                let d16 = ((d24 as u64 * 0xFFFF + 0x7F_FFFF) / 0xFF_FFFF) as u16;
+                                bytes[out..out + 2].copy_from_slice(&d16.to_le_bytes());
+                            }
+                            3 => bytes[out..out + 3].copy_from_slice(&d24.to_le_bytes()[..3]),
+                            _ => {
+                                let word = d24 | (stencils[i] as u32) << 24;
+                                bytes[out..out + 4].copy_from_slice(&word.to_le_bytes());
                             }
                         }
                     }
                 }
             }
-            memory.write(addr, &bytes);
-            let surface = &mut self.surfaces[i];
-            surface.shadow = bytes;
-            surface.dirty = false;
         }
+        memory.write(s.addr, &bytes);
+        let surface = &mut self.surfaces[index];
+        surface.shadow = bytes;
+        surface.dirty = false;
+    }
+}
 
-        for surface in &mut self.surfaces {
-            surface.checked = false;
-        }
-        self.used = 0;
-        self.tables = None;
-        self.batch += 1;
-
-        // textures nobody drew with for a while go
-        let batch = self.batch;
-        let stale: Vec<usize> = self.textures.iter().filter(|(_, t)| batch - t.used > 600).map(|(&k, _)| k).collect();
-        for key in stale {
-            if let Some(texture) = self.textures.remove(&key) {
-                self.destroy_image(&texture.image);
-            }
-        }
-        Ok(())
+/// a color format as the transfer shader numbers it, the register's value.
+pub(crate) fn format_index(format: ColorFormat) -> i32 {
+    match format {
+        ColorFormat::Rgba8 => 0,
+        ColorFormat::Rgb8 => 1,
+        ColorFormat::Rgb565 => 2,
+        ColorFormat::Rgb5A1 => 3,
+        ColorFormat::Rgba4 => 4,
     }
 }
 
@@ -1362,9 +1739,17 @@ impl Drop for Hardware {
                 self.destroy_image(&surface.image);
             }
             self.destroy_image(&self.blank);
-            for buffer in [Some(&self.ring), self.readback.as_ref()].into_iter().flatten() {
+            let captures = self.surfaces.iter().filter_map(|s| s.capture.as_ref().map(|c| &c.buffer));
+            let buffers = [Some(&self.ring), Some(&self.spare.ring), self.readback.as_ref()].into_iter().flatten();
+            for buffer in buffers.chain(captures) {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
+            }
+            if let Some(transfer) = &self.transfer {
+                self.device.destroy_pipeline(transfer.pipeline, None);
+                self.device.destroy_pipeline_layout(transfer.layout, None);
+                self.device.destroy_descriptor_set_layout(transfer.set_layout, None);
+                self.device.destroy_shader_module(transfer.shader, None);
             }
             for &pipeline in self.pipelines.values() {
                 self.device.destroy_pipeline(pipeline, None);
@@ -1377,6 +1762,7 @@ impl Drop for Hardware {
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_fence(self.fence, None);
+            self.device.destroy_fence(self.spare.fence, None);
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);

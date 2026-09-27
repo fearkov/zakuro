@@ -21,6 +21,12 @@ pub trait GpuMemory {
     fn read(&mut self, addr: u32, out: &mut [u8]);
     fn write(&mut self, addr: u32, data: &[u8]);
 
+    /// the bytes read would find at addr, straight from memory when they
+    /// sit together there, to look at without copying them.
+    fn slice(&mut self, _addr: u32, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
     fn read_u32(&mut self, addr: u32) -> u32 {
         let mut buf = [0u8; 4];
         self.read(addr, &mut buf);
@@ -301,14 +307,7 @@ impl Gpu {
         let input_height = input_dimensions >> 16;
         let output_width = output_dimensions & 0xFFFF;
         let output_height = output_dimensions >> 16;
-        // four bytes a pixel covers every format either side uses
-        let (input, output) = (memory.translate(input_paddr), memory.translate(output_paddr));
-        self.sync_memory(memory, input, input_width * input_height * 4);
-        self.sync_memory(memory, output, output_width * output_height * 4);
-
-        if input_width == 0 || input_height == 0 || output_width == 0 || output_height == 0 {
-            return;
-        }
+        let (input_base, output_base) = (memory.translate(input_paddr), memory.translate(output_paddr));
 
         // flag layout, from the transfer engine's register,
         //   bit 0      flip the input vertically
@@ -345,8 +344,39 @@ impl Gpu {
             if output_tiled { "tiled" } else { "linear" },
         );
 
-        let input_base = memory.translate(input_paddr);
-        let output_base = memory.translate(output_paddr);
+        // what the host GPU drew it transfers itself, keeping the output
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            let transfer = raster::hardware::Transfer {
+                input: input_base,
+                output: output_base,
+                input_width,
+                input_height,
+                output_width,
+                output_height,
+                copy: (copy_width, copy_height),
+                scale: (scale_x, scale_y),
+                flip: flip_vertically,
+                input_linear,
+                output_tiled,
+                input_format,
+                output_format,
+            };
+            match hardware.display_transfer(memory, &transfer) {
+                Ok(true) => {
+                    self.transfers += 1;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => log::error!("the GPU could not transfer a buffer, {error}"),
+            }
+        }
+        // four bytes a pixel covers every format either side uses
+        self.sync_memory(memory, input_base, input_width * input_height * 4);
+        self.sync_memory(memory, output_base, output_width * output_height * 4);
+        if copy_width == 0 || copy_height == 0 {
+            return;
+        }
 
         let mut input = vec![0u8; (input_width * input_height) as usize * input_bpp];
         memory.read(input_base, &mut input);
@@ -475,6 +505,7 @@ impl Gpu {
         size: u32,
     ) {
         let start = std::time::Instant::now();
+        self.resources.textures.begin_list();
         self.run_command_list(memory, renderer, paddr, size);
         self.busy += start.elapsed();
     }
@@ -582,6 +613,8 @@ impl Gpu {
         let vertices = std::mem::take(&mut self.immediate.vertices);
         self.draw_calls += 1;
         self.vertices_drawn += vertices.len() as u64;
+        self.vertex_shader.prepare();
+        self.geometry_shader.prepare();
         raster::draw_immediate(
             &self.internal,
             &self.vertex_shader,
@@ -630,6 +663,8 @@ impl Gpu {
                     indexed,
                     registers: &self.internal,
                 });
+                self.vertex_shader.prepare();
+                self.geometry_shader.prepare();
                 let vertices =
                     raster::draw(
                     &self.internal,

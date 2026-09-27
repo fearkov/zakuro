@@ -1,0 +1,69 @@
+#version 450
+
+// a display transfer between two surfaces, the way the CPU does it. both
+// images hold rows bottom first, so a buffer's row y is image row
+// height - 1 - y, and the input can start some rows into its surface. each
+// pixel is quantized to the input format, averaged over its block, then
+// quantized to the output format, since memory would hold the pixels in
+// those formats.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D source;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+
+layout(push_constant) uniform Transfer {
+    // the pixels written, width and height
+    ivec2 size;
+    int input_height;
+    int output_height;
+    ivec2 scale;
+    int flip;
+    int input_format;
+    int output_format;
+    // the surface row the input starts at, and the surface's height
+    int source_row;
+    int source_height;
+} transfer;
+
+uint expand(uint value, uint bits) {
+    return (value << (8u - bits)) | (value >> (2u * bits - 8u));
+}
+
+// what a pixel becomes once stored in a format and read back
+uvec4 quantize(uvec4 c, int format) {
+    switch (format) {
+    case 0:
+        return c;
+    case 1:
+        return uvec4(c.rgb, 255u);
+    case 2:
+        return uvec4(expand(c.r >> 3, 5u), expand(c.g >> 2, 6u), expand(c.b >> 3, 5u), 255u);
+    case 3:
+        return uvec4(expand(c.r >> 3, 5u), expand(c.g >> 3, 5u), expand(c.b >> 3, 5u), c.a >= 128u ? 255u : 0u);
+    default:
+        return (c >> 4) * 17u;
+    }
+}
+
+void main() {
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= transfer.size.x || at.y >= transfer.size.y) {
+        return;
+    }
+    uvec4 sum = uvec4(0u);
+    for (int dy = 0; dy < transfer.scale.y; dy++) {
+        for (int dx = 0; dx < transfer.scale.x; dx++) {
+            int x = at.x * transfer.scale.x + dx;
+            int y = at.y * transfer.scale.y + dy;
+            if (transfer.flip != 0) {
+                y = transfer.input_height - 1 - y;
+            }
+            int row = transfer.source_height - 1 - (transfer.source_row + y);
+            vec4 texel = imageLoad(source, ivec2(x, row));
+            sum += quantize(uvec4(round(texel * 255.0)), transfer.input_format);
+        }
+    }
+    uint count = uint(transfer.scale.x * transfer.scale.y);
+    uvec4 pixel = quantize((sum + count / 2u) / count, transfer.output_format);
+    imageStore(target, ivec2(at.x, transfer.output_height - 1 - at.y), vec4(pixel) / 255.0);
+}

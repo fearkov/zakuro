@@ -2,6 +2,8 @@
 
 pub mod isa;
 
+use std::sync::Arc;
+
 use isa::{Instruction, OpCode, OperandDescriptor};
 
 pub const PROGRAM_SIZE: usize = 4096;
@@ -33,6 +35,8 @@ pub struct ShaderUnit {
     float_uniform_component: usize,
     float_uniform_wide: bool,
     float_uniform_staging: [u32; 4],
+    /// the program decoded, none since it or its descriptors changed.
+    decoded: Option<Arc<Program>>,
 }
 
 impl Default for ShaderUnit {
@@ -56,6 +60,7 @@ impl ShaderUnit {
             float_uniform_component: 0,
             float_uniform_wide: false,
             float_uniform_staging: [0; 4],
+            decoded: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl ShaderUnit {
         if self.program_write_offset < PROGRAM_SIZE {
             self.program[self.program_write_offset] = word;
             self.program_write_offset += 1;
+            self.decoded = None;
         }
     }
 
@@ -70,6 +76,15 @@ impl ShaderUnit {
         if self.descriptor_write_offset < DESCRIPTOR_SIZE {
             self.descriptors[self.descriptor_write_offset] = word;
             self.descriptor_write_offset += 1;
+            self.decoded = None;
+        }
+    }
+
+    /// decodes the program, if it changed, before running it on many
+    /// vertices.
+    pub fn prepare(&mut self) {
+        if self.decoded.is_none() {
+            self.decoded = Some(Arc::new(Program::decode(self)));
         }
     }
 
@@ -207,18 +222,110 @@ pub struct Emitter {
     pub triangles: Vec<[[Vec4; OUTPUT_REGISTERS]; 3]>,
 }
 
+/// one source of an instruction, with its descriptor applied ahead of time.
+#[derive(Debug, Clone, Copy, Default)]
+struct Operand {
+    register: u32,
+    /// the component each one takes.
+    swizzle: [u8; 4],
+    negate: bool,
+    /// the address register that offsets it, zero for none.
+    index: u32,
+}
+
+/// an instruction with everything it reads from its encoding and its
+/// descriptor worked out, which only the program changing changes.
+#[derive(Debug, Clone, Copy)]
+struct Op {
+    instruction: Instruction,
+    opcode: OpCode,
+    destination: u32,
+    /// the components written, the most significant bit being x.
+    mask: u32,
+    sources: [Operand; 3],
+}
+
+impl Op {
+    fn decode(instruction: Instruction, descriptors: &[u32; DESCRIPTOR_SIZE]) -> Op {
+        let opcode = instruction.opcode();
+        let operand = |descriptor: OperandDescriptor, source: u32, register: u32, index: u32| {
+            let (swizzle, negate) = descriptor.source(source);
+            Operand { register, swizzle, negate, index }
+        };
+        match opcode {
+            OpCode::Mad | OpCode::MadI => {
+                let descriptor =
+                    OperandDescriptor(descriptors[instruction.mad_descriptor_index() as usize % DESCRIPTOR_SIZE]);
+                let (src1, src2, src3) = instruction.mad_sources();
+                // the address register applies to whichever source is the
+                // wide one
+                let index = instruction.mad_address_register_index();
+                let (index2, index3) = if opcode == OpCode::MadI { (0, index) } else { (index, 0) };
+                Op {
+                    instruction,
+                    opcode,
+                    destination: instruction.mad_destination(),
+                    mask: descriptor.destination_mask(),
+                    sources: [
+                        operand(descriptor, 1, src1, 0),
+                        operand(descriptor, 2, src2, index2),
+                        operand(descriptor, 3, src3, index3),
+                    ],
+                }
+            }
+            _ => {
+                let descriptor =
+                    OperandDescriptor(descriptors[instruction.descriptor_index() as usize % DESCRIPTOR_SIZE]);
+                let (src1, src2) = instruction.sources();
+                // only the wide operand can be a uniform, and only a uniform
+                // read can be indexed by an address register
+                let index = instruction.address_register_index();
+                let (index1, index2) = if opcode.is_inverted() { (0, index) } else { (index, 0) };
+                Op {
+                    instruction,
+                    opcode,
+                    destination: instruction.destination(),
+                    mask: descriptor.destination_mask(),
+                    sources: [
+                        operand(descriptor, 1, src1, index1),
+                        operand(descriptor, 2, src2, index2),
+                        Operand::default(),
+                    ],
+                }
+            }
+        }
+    }
+}
+
+/// a shader unit's program, decoded once to be run on every vertex.
+pub struct Program {
+    ops: Box<[Op]>,
+}
+
+impl Program {
+    fn decode(unit: &ShaderUnit) -> Program {
+        Program { ops: unit.program.iter().map(|&word| Op::decode(Instruction(word), &unit.descriptors)).collect() }
+    }
+}
+
 /// runs the shader over one vertex.
 pub fn run(unit: &ShaderUnit, state: &mut ShaderState) {
-    execute(unit, state, None);
+    match &unit.decoded {
+        Some(program) => execute(unit, program, state, None),
+        None => execute(unit, &Program::decode(unit), state, None),
+    }
 }
 
 /// runs a geometry shader over one primitive's worth of input, collecting
 /// what it emits.
 pub fn run_geometry(unit: &ShaderUnit, state: &mut ShaderState, emitter: &mut Emitter) {
-    execute(unit, state, Some(emitter));
+    match &unit.decoded {
+        Some(program) => execute(unit, program, state, Some(emitter)),
+        None => execute(unit, &Program::decode(unit), state, Some(emitter)),
+    }
 }
 
-fn execute(unit: &ShaderUnit, state: &mut ShaderState, mut emitter: Option<&mut Emitter>) {
+fn execute(unit: &ShaderUnit, program: &Program, state: &mut ShaderState, mut emitter: Option<&mut Emitter>) {
     state.reset();
     // debugging aid, RUST_LOG=zakuro_gpu::shader::nan=trace reports the
     // first instruction of each run whose result is NaN, with its operands.
@@ -250,10 +357,11 @@ fn execute(unit: &ShaderUnit, state: &mut ShaderState, mut emitter: Option<&mut 
         }
         budget += 1;
 
-        let instruction = Instruction(unit.program[pc as usize]);
+        let op = &program.ops[pc as usize];
+        let instruction = op.instruction;
         let mut next = pc + 1;
 
-        match instruction.opcode() {
+        match op.opcode {
             OpCode::End => break,
             OpCode::Nop => {}
             OpCode::SetEmit => {
@@ -273,7 +381,7 @@ fn execute(unit: &ShaderUnit, state: &mut ShaderState, mut emitter: Option<&mut 
 
             OpCode::Mad | OpCode::MadI => {
                 let operands = (trace_nan && !nan_reported).then(|| operand_values(unit, state, instruction));
-                multiply_add(unit, state, instruction);
+                multiply_add(unit, state, op);
                 if let Some(operands) = operands {
                     nan_reported = report_nan(state, pc, instruction, &operands);
                 }
@@ -329,7 +437,7 @@ fn execute(unit: &ShaderUnit, state: &mut ShaderState, mut emitter: Option<&mut 
 
             _ => {
                 let operands = (trace_nan && !nan_reported).then(|| operand_values(unit, state, instruction));
-                arithmetic(unit, state, instruction);
+                arithmetic(unit, state, op);
                 if let Some(operands) = operands {
                     nan_reported = report_nan(state, pc, instruction, &operands);
                 }
@@ -403,25 +511,25 @@ fn source_value(unit: &ShaderUnit, state: &ShaderState, register: u32) -> Vec4 {
     }
 }
 
-fn arithmetic(unit: &ShaderUnit, state: &mut ShaderState, instruction: Instruction) {
-    let descriptor = OperandDescriptor(
-        unit.descriptors[instruction.descriptor_index() as usize % DESCRIPTOR_SIZE],
-    );
-
-    let (mut src1_register, mut src2_register) = instruction.sources();
-    // only the wide operand can be a uniform, and only a uniform read can be
-    // indexed by an address register.
-    let index = instruction.address_register_index();
-    if instruction.opcode().is_inverted() {
-        src2_register = indexed(state, src2_register, index);
+/// a source's value, swizzled and negated as its descriptor says.
+#[inline]
+fn operand(unit: &ShaderUnit, state: &ShaderState, operand: &Operand) -> Vec4 {
+    let register = indexed(state, operand.register, operand.index);
+    let value = source_value(unit, state, register);
+    let [x, y, z, w] = operand.swizzle.map(|component| value[component as usize]);
+    if operand.negate {
+        [-x, -y, -z, -w]
     } else {
-        src1_register = indexed(state, src1_register, index);
+        [x, y, z, w]
     }
+}
 
-    let src1 = descriptor.apply_source1(source_value(unit, state, src1_register));
-    let src2 = descriptor.apply_source2(source_value(unit, state, src2_register));
+fn arithmetic(unit: &ShaderUnit, state: &mut ShaderState, op: &Op) {
+    let src1 = operand(unit, state, &op.sources[0]);
+    let src2 = operand(unit, state, &op.sources[1]);
+    let instruction = op.instruction;
 
-    let result: Vec4 = match instruction.opcode() {
+    let result: Vec4 = match op.opcode {
         OpCode::Add => component_wise(src1, src2, |a, b| a + b),
         OpCode::Mul => component_wise(src1, src2, multiply),
         // written so NaN behaves as it does on hardware, max(0, NaN) is NaN
@@ -466,7 +574,7 @@ fn arithmetic(unit: &ShaderUnit, state: &mut ShaderState, instruction: Instructi
             ]
         }
         OpCode::Mova => {
-            let mask = descriptor.destination_mask();
+            let mask = op.mask;
             if mask & 0b1000 != 0 {
                 state.address[0] = src1[0] as i32;
             }
@@ -487,30 +595,13 @@ fn arithmetic(unit: &ShaderUnit, state: &mut ShaderState, instruction: Instructi
         }
     };
 
-    write_masked(
-        state,
-        instruction.destination(),
-        descriptor.destination_mask(),
-        result,
-    );
+    write_masked(state, op.destination, op.mask, result);
 }
 
-fn multiply_add(unit: &ShaderUnit, state: &mut ShaderState, instruction: Instruction) {
-    let descriptor = OperandDescriptor(
-        unit.descriptors[instruction.mad_descriptor_index() as usize % DESCRIPTOR_SIZE],
-    );
-    let (src1_register, mut src2_register, mut src3_register) = instruction.mad_sources();
-    // the address register applies to whichever source is the wide one.
-    let index = instruction.mad_address_register_index();
-    if instruction.opcode() == OpCode::MadI {
-        src3_register = indexed(state, src3_register, index);
-    } else {
-        src2_register = indexed(state, src2_register, index);
-    }
-
-    let src1 = descriptor.apply_source1(source_value(unit, state, src1_register));
-    let src2 = descriptor.apply_source2(source_value(unit, state, src2_register));
-    let src3 = descriptor.apply_source3(source_value(unit, state, src3_register));
+fn multiply_add(unit: &ShaderUnit, state: &mut ShaderState, op: &Op) {
+    let src1 = operand(unit, state, &op.sources[0]);
+    let src2 = operand(unit, state, &op.sources[1]);
+    let src3 = operand(unit, state, &op.sources[2]);
 
     let result = [
         multiply(src1[0], src2[0]) + src3[0],
@@ -518,12 +609,7 @@ fn multiply_add(unit: &ShaderUnit, state: &mut ShaderState, instruction: Instruc
         multiply(src1[2], src2[2]) + src3[2],
         multiply(src1[3], src2[3]) + src3[3],
     ];
-    write_masked(
-        state,
-        instruction.mad_destination(),
-        descriptor.destination_mask(),
-        result,
-    );
+    write_masked(state, op.destination, op.mask, result);
 }
 
 /// the shader's multiply, which gives zero rather than NaN for zero times
@@ -752,6 +838,25 @@ mod tests {
         state.input[0] = [1.0; 4];
         run(&unit, &mut state);
         assert_eq!(state.output[0], ZERO, "b0 is false, so the move is skipped");
+    }
+
+    /// a program decoded ahead of time is decoded again once the command
+    /// list uploads another.
+    #[test]
+    fn uploading_a_program_decodes_it_again() {
+        let mut unit = unit_with(&[0x13 << 26, 0x22 << 26], &[IDENTITY]);
+        unit.prepare();
+        let mut state = ShaderState::new();
+        state.input[0] = [1.0, 2.0, 3.0, 4.0];
+        state.input[1] = [10.0, 20.0, 30.0, 40.0];
+        run(&unit, &mut state);
+        assert_eq!(state.output[0], [1.0, 2.0, 3.0, 4.0]);
+        // add o0, v0, v1 in place of the move
+        unit.program_write_offset = 0;
+        unit.upload_program(1 << 7);
+        unit.prepare();
+        run(&unit, &mut state);
+        assert_eq!(state.output[0], [11.0, 22.0, 33.0, 44.0]);
     }
 
     #[test]

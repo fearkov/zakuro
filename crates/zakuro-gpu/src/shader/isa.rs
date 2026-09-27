@@ -218,6 +218,15 @@ impl OperandDescriptor {
         self.0 & 0xF
     }
 
+    /// a source's swizzle, the component each one takes, and whether it is
+    /// negated, source being 1, 2 or 3.
+    pub fn source(self, source: u32) -> ([u8; 4], bool) {
+        let shift = [5, 14, 23][(source as usize - 1).min(2)];
+        let pattern = (self.0 >> shift) & 0xFF;
+        let pick = |component: u32| ((pattern >> (6 - component * 2)) & 3) as u8;
+        ([pick(0), pick(1), pick(2), pick(3)], (self.0 >> (shift - 1)) & 1 != 0)
+    }
+
     pub fn apply_source1(self, value: [f32; 4]) -> [f32; 4] {
         swizzle(value, (self.0 >> 5) & 0xFF, (self.0 >> 4) & 1 != 0)
     }
