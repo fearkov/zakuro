@@ -33,6 +33,15 @@ pub fn handle(
                 buffer.reply(&mut system.memory, command, &[0]);
                 true
             }
+            // GetStepHistory(hours, start time, buffer), no steps in any of
+            // those hours
+            0x000B => {
+                let hours = buffer.get(&mut system.memory, 1).min(0x8000);
+                let pointer = buffer.get(&mut system.memory, 5);
+                system.memory.write_bytes(pointer, &vec![0; hours as usize * 2]);
+                buffer.reply(&mut system.memory, command, &[]);
+                true
+            }
             _ => false,
         },
 
@@ -40,7 +49,7 @@ pub fn handle(
         "ndm:u" => match command {
             // EnterExclusiveState / LeaveExclusiveState / SuspendDaemons /
             // ResumeDaemons / OverrideDefaultDaemons, all no-ops offline.
-            0x0001 | 0x0002 | 0x0006 | 0x0007 | 0x0008 | 0x0009 | 0x000A | 0x000E => {
+            0x0001 | 0x0002 | 0x0006 | 0x0007 | 0x0008 | 0x0009 | 0x000A | 0x000E | 0x0014 => {
                 buffer.reply(&mut system.memory, command, &[]);
                 true
             }
