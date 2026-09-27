@@ -16,6 +16,8 @@ To run it you need a decrypted ROM:
 
     cargo run --release -p zakuro -- path/to/rom.3ds
 
+Without a ROM it opens a library with the games in a folder you pick, where you can also recompile them. Esc brings up a menu over the game, and the settings (controls, sound, graphics, a background for the library) are in there too.
+
 It can also run code recompiled ahead of time with [3dsrecomp](https://github.com/fearkov/3dsrecomp). Build it once per game and Zakuro picks it up on its own. Anything the library doesn't cover still goes through the interpreter:
 
     3dsrecomp build path/to/rom.3ds
@@ -34,8 +36,8 @@ Controls:
 | Start / Select | Enter / Backspace |
 | D-pad | Arrow keys |
 | Circle pad | I / J / K / L |
-| Touch screen | Mouse |
-| Pause / Quit | F1 / Esc |
+| Touch screen | Mouse (click) |
+| Menu / Pause / Fullscreen | Esc / F1 / F11 |
 
 Contributions are welcome. Using AI is fine sometimes, but the code must always be reviewed by a human. Code that is entirely vibecoded will be discarded.
 
