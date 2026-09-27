@@ -50,7 +50,7 @@ fn main() {
 
     // a scripted alternative for reaching a specific screen reproducibly,
     // ZAKURO_INPUT=300:A,420:DOWN+A holds each listed button from that
-    // frame for a few frames.
+    // frame for a few frames, 500:@160x180 touches the bottom screen.
     let script = std::env::var("ZAKURO_INPUT")
         .map(|spec| parse_input_script(&spec))
         .unwrap_or_default();
@@ -87,12 +87,12 @@ fn main() {
             println!("--- verbose logging from frame {frame} ---");
         }
         if !script.is_empty() {
-            let buttons = script
-                .iter()
-                .filter(|(start, _)| (*start..*start + 6).contains(&frame))
-                .fold(PadState::empty(), |held, (_, buttons)| held | *buttons);
+            let held = || script.iter().filter(|(start, ..)| (*start..*start + 6).contains(&frame));
+            let buttons = held().fold(PadState::empty(), |held, (_, buttons, _)| held | *buttons);
+            let touch = held().find_map(|(.., touch)| *touch);
             system.set_input(InputState {
                 buttons,
+                touch,
                 ..InputState::default()
             });
         } else if mash_buttons {
@@ -339,12 +339,18 @@ fn save_screen(
         .collect()
 }
 
-/// parses frame:BUTTON[+BUTTON...] entries separated by commas.
-fn parse_input_script(spec: &str) -> Vec<(u64, PadState)> {
+/// parses frame:BUTTON[+BUTTON...] entries separated by commas, where @XxY
+/// touches the bottom screen at X, Y.
+fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
     spec.split(',')
         .filter_map(|entry| {
             let (frame, buttons) = entry.trim().split_once(':')?;
+            let mut touch = None;
             let buttons = buttons.split('+').try_fold(PadState::empty(), |held, name| {
+                if let Some((x, y)) = name.trim().strip_prefix('@').and_then(|at| at.split_once('x')) {
+                    touch = Some((x.parse().ok()?, y.parse().ok()?));
+                    return Some(held);
+                }
                 let button = match name.trim().to_ascii_uppercase().as_str() {
                     "A" => PadState::A,
                     "B" => PadState::B,
@@ -365,7 +371,7 @@ fn parse_input_script(spec: &str) -> Vec<(u64, PadState)> {
                 };
                 Some(held | button)
             })?;
-            Some((frame.trim().parse().ok()?, buttons))
+            Some((frame.trim().parse().ok()?, buttons, touch))
         })
         .collect()
 }
