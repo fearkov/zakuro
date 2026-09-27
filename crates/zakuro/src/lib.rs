@@ -389,12 +389,13 @@ impl App {
     /// the console's settings for a game, from the command line and the
     /// settings.
     fn config(&self) -> Config {
+        let interpret = self.options.interpreter || !self.settings.recompiled;
         Config {
             new3ds: self.options.new3ds,
             data_dir: self.data_dir.clone(),
-            recompiled: self.options.recompiled.clone().filter(|_| !self.options.interpreter).map(Into::into),
-            linked: self.linked.filter(|_| !self.options.interpreter),
-            find_recompiled: !self.options.interpreter,
+            recompiled: self.options.recompiled.clone().filter(|_| !interpret).map(Into::into),
+            linked: self.linked.filter(|_| !interpret),
+            find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
             ..Config::default()
         }
@@ -680,12 +681,14 @@ impl App {
     fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
-        let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps));
+        let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
             match &game {
-                Some((name, fps)) => actions.extend(menus.game(ui, name, show_fps.then_some(*fps), jobs)),
+                Some((name, fps, recompiled)) => {
+                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, jobs))
+                }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
             actions.extend(menus.settings(ui.ctx(), settings));

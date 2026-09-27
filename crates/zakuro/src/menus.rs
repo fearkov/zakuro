@@ -246,7 +246,7 @@ impl Menus {
 
     /// what goes over a running game, the menu when it is open and the
     /// frame rate when asked for.
-    pub fn game(&mut self, ui: &mut egui::Ui, name: &str, fps: Option<f32>, jobs: &[Job]) -> Vec<Action> {
+    pub fn game(&mut self, ui: &mut egui::Ui, name: &str, fps: Option<f32>, recompiled: bool, jobs: &[Job]) -> Vec<Action> {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
         if let Some(fps) = fps {
@@ -265,6 +265,7 @@ impl Menus {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(&ctx, |ui| {
                 ui.label(RichText::new(name).strong());
+                ui.label(RichText::new(if recompiled { "running its recompiled code" } else { "interpreted" }).weak());
                 ui.add_space(6.0);
                 let wide = |ui: &mut egui::Ui, text: &str| ui.add_sized([200.0, 28.0], egui::Button::new(text)).clicked();
                 if wide(ui, "Resume") {
@@ -325,6 +326,12 @@ impl Menus {
             ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
             ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
             ui.label(RichText::new("The presenter changes the next time Zakuro starts, the 3D with the next game.").weak());
+
+            ui.separator();
+            ui.heading("Emulation");
+            ui.radio_value(&mut settings.recompiled, true, "Recompiled code when there is some");
+            ui.radio_value(&mut settings.recompiled, false, "Interpreter only");
+            ui.label(RichText::new("It changes with the next game started, or Reset.").weak());
 
             ui.separator();
             ui.heading("Sound");
