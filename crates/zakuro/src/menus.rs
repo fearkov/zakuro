@@ -6,6 +6,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 use egui::{Align, Color32, Layout, RichText, Vec2};
 use winit::keyboard::KeyCode;
+use zakuro_core::services::keyboard::Request;
 
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
@@ -28,6 +29,8 @@ pub enum Action {
     Quit,
     /// the settings changed, to save and apply.
     Settings,
+    /// close the game's keyboard with this text and the button pressed.
+    Keyboard(String, usize),
 }
 
 #[derive(Default)]
@@ -39,6 +42,8 @@ pub struct Menus {
     pub rebinding: Option<usize>,
     /// something to tell the user, until they close it.
     pub message: Option<String>,
+    /// what is being typed into the game's keyboard, and what it asked for.
+    typing: Option<(Request, String)>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
     background: Background,
 }
@@ -392,6 +397,49 @@ impl Menus {
     }
 
     /// a message box, when there is something to tell.
+    /// the keyboard a game opened to have text typed in, it waits until a
+    /// button closes it.
+    pub fn keyboard(&mut self, ctx: &egui::Context, request: &Request) -> Option<Action> {
+        let fresh = self.typing.as_ref().is_none_or(|(asked, _)| asked != request);
+        if fresh {
+            self.typing = Some((request.clone(), request.text.clone()));
+        }
+        let (_, text) = self.typing.as_mut()?;
+        let confirm = request.buttons.len() - 1;
+        let mut action = None;
+        egui::Window::new("Keyboard")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .hint_text(&request.hint)
+                        .char_limit(request.max_length)
+                        .desired_width(260.0),
+                );
+                if fresh {
+                    field.request_focus();
+                }
+                let valid = request.accepts(text);
+                ui.horizontal(|ui| {
+                    for (button, label) in request.buttons.iter().enumerate() {
+                        if ui.add_enabled(button != confirm || valid, egui::Button::new(label)).clicked() {
+                            action = Some(Action::Keyboard(text.clone(), button));
+                        }
+                    }
+                });
+                // enter confirms, when the text will do
+                if valid && field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    action = Some(Action::Keyboard(text.clone(), confirm));
+                }
+            });
+        if action.is_some() {
+            self.typing = None;
+        }
+        action
+    }
+
     pub fn message(&mut self, ctx: &egui::Context) {
         let Some(text) = self.message.clone() else { return };
         egui::Window::new("Zakuro")

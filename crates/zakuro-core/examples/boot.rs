@@ -77,6 +77,10 @@ fn main() {
     // does, for timing a run like one, ZAKURO_PRESENT=1.
     let present = std::env::var("ZAKURO_PRESENT").is_ok();
 
+    // what gets typed when a title opens the software keyboard,
+    // ZAKURO_KEYBOARD=Link.
+    let typed = std::env::var("ZAKURO_KEYBOARD").unwrap_or_else(|_| "Zakuro".to_owned());
+
     for frame in 0..frames {
         if log_from == Some(frame) {
             log::set_max_level(log::LevelFilter::Trace);
@@ -120,6 +124,10 @@ fn main() {
         }
         outcome = system.run_frame();
         executed = frame + 1;
+        if let Some(request) = system.keyboard_request() {
+            let confirm = request.buttons.len() - 1;
+            system.answer_keyboard(&typed, confirm);
+        }
         if present {
             for (screen, _) in SCREENS {
                 std::hint::black_box(system.read_screen(screen));

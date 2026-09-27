@@ -597,6 +597,11 @@ impl App {
             Action::Fullscreen => self.toggle_fullscreen(),
             Action::Quit => event_loop.exit(),
             Action::Settings => self.apply_settings(),
+            Action::Keyboard(text, button) => {
+                if let Some(game) = &mut self.game {
+                    game.system.answer_keyboard(&text, button);
+                }
+            }
         }
     }
 
@@ -612,7 +617,10 @@ impl App {
         self.library.poll();
         self.poll_jobs();
 
-        let playing = self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open;
+        // a game waiting on its keyboard waits for the user, not running
+        let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
+        let playing =
+            self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open && !typing;
         if playing {
             self.emulate();
         }
@@ -682,6 +690,7 @@ impl App {
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
+        let keyboard = self.game.as_ref().and_then(|game| game.system.keyboard_request().cloned());
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
@@ -692,6 +701,9 @@ impl App {
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
             actions.extend(menus.settings(ui.ctx(), settings));
+            if let Some(request) = &keyboard {
+                actions.extend(menus.keyboard(ui.ctx(), request));
+            }
             menus.message(ui.ctx());
         });
         self.library.changed = false;

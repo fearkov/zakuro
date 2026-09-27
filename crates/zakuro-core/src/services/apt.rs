@@ -15,7 +15,7 @@ pub const SIGNAL_RESPONSE: u32 = 3;
 pub const SIGNAL_WAKEUP_BY_EXIT: u32 = 10;
 
 /// the running title's own applet id.
-const APPLICATION: u32 = 0x300;
+pub(crate) const APPLICATION: u32 = 0x300;
 
 #[derive(Debug, Clone)]
 pub struct Parameter {
@@ -45,6 +45,8 @@ pub struct AptState {
     pub capture_block: Option<(ObjectId, u32)>,
     /// how the title laid out its last screen capture, as it sent it.
     pub capture_info: Vec<u8>,
+    /// the software keyboard, while a title waits on it.
+    pub keyboard: Option<super::keyboard::Pending>,
 }
 
 /// the value the status word at the start of the shared font block takes once
@@ -308,13 +310,22 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // StartLibraryApplet(applet id, size, handle, buffer). the applet
+        // StartLibraryApplet(applet id, size, handle, buffer). the keyboard
+        // stays open until the frontend answers for it, any other applet
         // closes as soon as it starts and hands back a blank result the size
         // of what it was given, which is what Citra's applets do.
         0x001E => {
             let applet = buffer.get(&mut system.memory, 1);
             let size = buffer.get(&mut system.memory, 2);
             let data = read_static(system, buffer, 5, size);
+            if applet == super::keyboard::APPLET_ID {
+                let handle = buffer.get(&mut system.memory, 4);
+                let memory = system.kernel.resolve(handle);
+                system.services.apt.library_applet = None;
+                super::keyboard::start(system, data, memory);
+                buffer.reply(&mut system.memory, command, &[]);
+                return true;
+            }
             log::info!(
                 "apt: library applet 0x{applet:03X} started with {} bytes, closing it right away",
                 data.len()
@@ -430,7 +441,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
 }
 
 /// queues a parameter for the title and signals the event it waits on.
-fn send_parameter(system: &mut System, parameter: Parameter) {
+pub(crate) fn send_parameter(system: &mut System, parameter: Parameter) {
     system.services.apt.parameter = Some(parameter);
     let event = system.services.apt.parameter_event.and_then(|handle| system.kernel.resolve(handle));
     if let Some(event) = event {

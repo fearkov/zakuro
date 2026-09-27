@@ -10,6 +10,7 @@ pub mod fs;
 pub mod glyphs;
 pub mod gsp;
 pub mod hid;
+pub mod keyboard;
 pub mod ldr_ro;
 pub mod misc;
 pub mod shared_font;

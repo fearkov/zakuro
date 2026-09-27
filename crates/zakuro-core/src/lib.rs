@@ -563,6 +563,17 @@ impl System {
         std::mem::take(&mut self.services.dsp.output)
     }
 
+    /// what the software keyboard asks for, while a title waits on it.
+    pub fn keyboard_request(&self) -> Option<&services::keyboard::Request> {
+        services::keyboard::request(self)
+    }
+
+    /// closes the software keyboard with the text typed and the button
+    /// pressed, zero being the leftmost and the last one confirming.
+    pub fn answer_keyboard(&mut self, text: &str, button: usize) {
+        services::keyboard::answer(self, text, button);
+    }
+
     /// what the buttons, circle pad and touch screen are doing, which HID
     /// reports from the next frame on.
     pub fn set_input(&mut self, input: InputState) {
