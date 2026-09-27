@@ -134,10 +134,17 @@ fn parse(line: &str) -> Option<Stage> {
     None
 }
 
-/// 3dsrecomp, where the settings say or else on the path.
+/// 3dsrecomp, where the settings say or else on the path. the settings may
+/// name the program or a folder, its checkout or where it was installed.
 pub fn find(configured: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = configured {
-        return path.is_file().then(|| path.to_owned());
+        if path.is_file() {
+            return Some(path.to_owned());
+        }
+        return ["3dsrecomp", "target/release/3dsrecomp", "bin/3dsrecomp"]
+            .iter()
+            .map(|inside| path.join(inside))
+            .find(|program| program.is_file());
     }
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths).map(|dir| dir.join("3dsrecomp")).find(|path| path.is_file())
@@ -146,6 +153,18 @@ pub fn find(configured: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_leads_to_the_program_in_it() {
+        let dir = std::env::temp_dir().join(format!("zakuro-recompiler-{}", std::process::id()));
+        let program = dir.join("target/release/3dsrecomp");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, b"").unwrap();
+        assert_eq!(find(Some(&dir)), Some(program.clone()));
+        assert_eq!(find(Some(&program)), Some(program.clone()));
+        assert_eq!(find(Some(&dir.join("nothing"))), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn progress_is_read_from_the_output() {

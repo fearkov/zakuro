@@ -585,8 +585,15 @@ impl App {
                 }
             }
             Action::ChooseRecompiler => {
-                if let Some(file) = rfd::FileDialog::new().set_title("Where 3dsrecomp is").pick_file() {
-                    self.settings.recompiler = Some(file);
+                if let Some(folder) = rfd::FileDialog::new().set_title("The 3dsrecomp folder").pick_folder() {
+                    if recompile::find(Some(&folder)).is_none() {
+                        self.menus.message = Some(format!(
+                            "There is no 3dsrecomp program in {}. Build it there with cargo build --release, \
+                             or pick the folder the program is in.",
+                            folder.display()
+                        ));
+                    }
+                    self.settings.recompiler = Some(folder);
                     self.settings.save();
                 }
             }

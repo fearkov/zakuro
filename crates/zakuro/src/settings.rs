@@ -100,8 +100,8 @@ pub struct Settings {
     pub background: Option<PathBuf>,
     /// how much of it shows, 0 to 1.
     pub background_opacity: f32,
-    /// 3dsrecomp, to recompile games from the library, found on the path
-    /// when not set.
+    /// 3dsrecomp, to recompile games from the library, its program or a
+    /// folder holding it, found on the path when not set.
     pub recompiler: Option<PathBuf>,
     pub keys: Keys,
 }

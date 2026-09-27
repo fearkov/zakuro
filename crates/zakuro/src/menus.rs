@@ -360,9 +360,9 @@ impl Menus {
             ui.horizontal(|ui| {
                 match recompiler {
                     Some(path) => ui.label(path.display().to_string()),
-                    None => ui.label(RichText::new("not found, choose where it is").color(Color32::LIGHT_RED)),
+                    None => ui.label(RichText::new("not found, choose its folder").color(Color32::LIGHT_RED)),
                 };
-                if ui.button("Choose…").clicked() {
+                if ui.button("Choose folder…").clicked() {
                     actions.push(Action::ChooseRecompiler);
                 }
             });
