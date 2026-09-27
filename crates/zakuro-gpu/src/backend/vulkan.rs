@@ -5,7 +5,8 @@ use std::ffi::CStr;
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use super::{layout, PresentError, Presenter, ScreenImage, Viewport};
+use super::vulkan_overlay::OverlayPainter;
+use super::{layout, Overlay, PresentError, Presenter, ScreenImage, Viewport};
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
@@ -13,11 +14,11 @@ const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 /// how many frames may be recorded before waiting on the oldest.
 const FRAMES_IN_FLIGHT: usize = 2;
 
-fn fail(message: impl Into<String>) -> PresentError {
+pub(super) fn fail(message: impl Into<String>) -> PresentError {
     PresentError::Backend(message.into())
 }
 
-fn vk_fail(context: &str) -> impl Fn(vk::Result) -> PresentError + '_ {
+pub(super) fn vk_fail(context: &str) -> impl Fn(vk::Result) -> PresentError + '_ {
     move |error| PresentError::Backend(format!("{context}: {error}"))
 }
 
@@ -73,6 +74,8 @@ pub struct VulkanPresenter {
     frame: usize,
 
     screens: [Screen; 2],
+    /// what is drawn over the screens, none only while being dropped.
+    overlay: Option<OverlayPainter>,
     window: (u32, u32),
     /// set when the swapchain no longer matches the window.
     stale: bool,
@@ -152,6 +155,8 @@ impl VulkanPresenter {
         let descriptor_layout = create_descriptor_layout(&device)?;
         let (pipeline_layout, pipeline) =
             create_pipeline(&device, render_pass, descriptor_layout)?;
+        let srgb = matches!(surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
+        let overlay = OverlayPainter::new(&device, render_pass, FRAMES_IN_FLIGHT, srgb)?;
 
         let sampler = unsafe {
             device.create_sampler(
@@ -280,6 +285,7 @@ impl VulkanPresenter {
             in_flight,
             frame: 0,
             screens,
+            overlay: Some(overlay),
             window: size,
             stale: false,
         };
@@ -450,7 +456,13 @@ impl VulkanPresenter {
         Ok(())
     }
 
-    fn record(&self, command_buffer: vk::CommandBuffer, framebuffer: vk::Framebuffer) {
+    fn record(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        framebuffer: vk::Framebuffer,
+        painter: &mut OverlayPainter,
+        overlay: &Overlay,
+    ) -> Result<(), PresentError> {
         let device = &self.device;
         unsafe {
             device
@@ -460,6 +472,9 @@ impl VulkanPresenter {
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .expect("begin command buffer");
+        }
+        painter.upload(device, &self.memory_properties, command_buffer, self.frame, overlay)?;
+        unsafe {
 
             for screen in &self.screens {
                 if !screen.dirty {
@@ -545,9 +560,11 @@ impl VulkanPresenter {
                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
 
+            painter.draw(device, command_buffer, self.frame, overlay, self.extent);
             device.cmd_end_render_pass(command_buffer);
             device.end_command_buffer(command_buffer).expect("end command buffer");
         }
+        Ok(())
     }
 }
 
@@ -560,6 +577,7 @@ impl Presenter for VulkanPresenter {
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        overlay: &Overlay,
     ) -> Result<(), PresentError> {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(());
@@ -618,7 +636,14 @@ impl Presenter for VulkanPresenter {
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
                 .map_err(vk_fail("resetting a command buffer"))?;
         }
-        self.record(command_buffer, self.framebuffers[image_index as usize]);
+        // the painter is taken out while it records, it and the presenter
+        // both being borrowed
+        let mut painter = self.overlay.take().expect("the overlay painter lives as long as the presenter");
+        painter.begin_frame(&self.device, frame);
+        let recorded = self.record(command_buffer, self.framebuffers[image_index as usize], &mut painter, overlay);
+        painter.free(frame, overlay);
+        self.overlay = Some(painter);
+        recorded?;
 
         for screen in &mut self.screens {
             if screen.dirty {
@@ -690,6 +715,9 @@ impl Drop for VulkanPresenter {
             }
             for fence in self.in_flight.drain(..) {
                 self.device.destroy_fence(fence, None);
+            }
+            if let Some(mut painter) = self.overlay.take() {
+                painter.destroy(&self.device);
             }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_sampler(self.sampler, None);
@@ -912,7 +940,7 @@ fn create_pipeline(
     Ok((pipeline_layout, pipelines[0]))
 }
 
-fn create_shader_module(
+pub(super) fn create_shader_module(
     device: &ash::Device,
     spirv: &[u8],
 ) -> Result<vk::ShaderModule, PresentError> {
@@ -932,7 +960,7 @@ fn create_shader_module(
     .map_err(vk_fail("creating a shader module"))
 }
 
-fn find_memory_type(
+pub(super) fn find_memory_type(
     properties: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     wanted: vk::MemoryPropertyFlags,
@@ -945,7 +973,7 @@ fn find_memory_type(
     })
 }
 
-fn transition(
+pub(super) fn transition(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,

@@ -1,25 +1,37 @@
-//! Zakuro's frontend, a window, a presentation backend, and the loop that
-//! drives the emulated console one frame at a time.
+//! Zakuro's frontend, a window showing the library of games or a game with
+//! a menu over it, and the loop that drives the emulated console one frame
+//! at a time.
 
 mod audio;
 mod cli;
+mod gui;
 mod input;
+mod library;
+mod menus;
 mod present;
+mod recompile;
+mod settings;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, PresentError, RendererKind, ScreenImage};
+use zakuro_gpu::{layout, Overlay, PresentError, RendererKind, ScreenImage};
 
+use gui::Gui;
 use input::Keyboard;
+use library::Library;
+use menus::{Action, Menus};
 use present::Backend;
+use recompile::{Job, Stage};
+use settings::{Renderer, Settings};
 
 pub use zakuro_core::recompiled::Linked;
 
@@ -35,69 +47,74 @@ pub fn run(linked: Option<Linked>) {
             std::process::exit(2);
         }
     };
+    let settings = Settings::load();
 
     let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
     if let Some(dir) = &data_dir {
         bring_saves(dir);
     }
 
-    let config = Config {
-        new3ds: options.new3ds,
-        data_dir,
-        recompiled: options.recompiled.clone().filter(|_| !options.interpreter).map(Into::into),
-        linked: linked.filter(|_| !options.interpreter),
-        find_recompiled: !options.interpreter,
-        hardware_renderer: options.hardware_rasterizer,
-        ..Config::default()
-    };
-
-    let mut system = if options.test_pattern {
-        paint_test_pattern(config)
-    } else {
-        match loader::load(&options.rom, config) {
-            Ok(system) => system,
-            Err(error) => {
-                eprintln!("zakuro: could not load {}: {error}", options.rom);
-                std::process::exit(1);
-            }
-        }
-    };
-    if options.profile {
-        system.enable_profiler();
-    }
-
-    if let Some(frames) = options.headless {
-        run_headless(&mut system, frames);
-        return;
-    }
-
-    let event_loop = EventLoop::new().expect("create an event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
-
-    // the test pattern has no CPU program to run, paused already skips
-    // run_frame every tick, which is exactly "just keep presenting what's
-    // there".
-    let paused = options.test_pattern;
-    let audio = if options.mute {
-        None
-    } else {
-        audio::Audio::open(zakuro_core::AUDIO_SAMPLE_RATE)
-            .inspect_err(|error| log::warn!("no sound, {error}"))
-            .ok()
-    };
     let mut app = App {
-        system,
+        keyboard: Keyboard::new(settings.keys.clone()),
+        scale: options.scale.unwrap_or(settings.scale).max(1),
         options,
-        window: None,
+        settings,
+        linked,
+        data_dir,
+        game: None,
+        library: Library::default(),
+        menus: Menus::default(),
+        jobs: Vec::new(),
+        gui: None,
         backend: None,
-        keyboard: Keyboard::default(),
-        audio,
+        window: None,
+        audio: None,
+        mouse_down: false,
+        cursor: (0.0, 0.0),
         last_title_update: Instant::now(),
         next_frame: Instant::now(),
         skipped: 0,
-        paused,
+        paused: false,
         stop: false,
     };
+
+    if app.options.test_pattern {
+        // the test pattern has no CPU program to run, paused keeps just
+        // presenting what is there
+        let system = paint_test_pattern(app.config());
+        app.game = Some(Running::new(system, PathBuf::new(), "test pattern".to_owned()));
+        app.paused = true;
+    } else if let Some(rom) = app.options.rom.clone() {
+        if let Err(error) = app.play(Path::new(&rom)) {
+            eprintln!("zakuro: {error}");
+            std::process::exit(1);
+        }
+    }
+    if app.options.profile {
+        if let Some(game) = &mut app.game {
+            game.system.enable_profiler();
+        }
+    }
+
+    if let Some(frames) = app.options.headless {
+        if let Some(game) = &mut app.game {
+            run_headless(&mut game.system, frames);
+        }
+        return;
+    }
+
+    if let Some(folder) = app.settings.games.clone() {
+        app.library.scan(&folder);
+    }
+    app.audio = if app.options.mute {
+        None
+    } else {
+        audio::Audio::open(zakuro_core::AUDIO_SAMPLE_RATE).inspect_err(|error| log::warn!("no sound, {error}")).ok()
+    };
+    app.apply_volume();
+
+    let event_loop = EventLoop::new().expect("create an event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("zakuro: {error}");
     }
@@ -228,9 +245,43 @@ fn run_headless(system: &mut System, frames: u64) {
     }
 }
 
-struct App {
+/// a game being played.
+struct Running {
     system: System,
+    path: PathBuf,
+    name: String,
+    /// frames run since counting_since, for the frame rate.
+    frames: u32,
+    counting_since: Instant,
+    fps: f32,
+}
+
+impl Running {
+    fn new(system: System, path: PathBuf, name: String) -> Running {
+        Running { system, path, name, frames: 0, counting_since: Instant::now(), fps: 0.0 }
+    }
+
+    fn count_frame(&mut self) {
+        self.frames += 1;
+        let elapsed = self.counting_since.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            self.fps = self.frames as f32 / elapsed.as_secs_f32();
+            self.frames = 0;
+            self.counting_since = Instant::now();
+        }
+    }
+}
+
+struct App {
     options: cli::Options,
+    settings: Settings,
+    linked: Option<Linked>,
+    data_dir: Option<PathBuf>,
+    game: Option<Running>,
+    library: Library,
+    menus: Menus,
+    jobs: Vec<Job>,
+    gui: Option<Gui>,
     // backend must be declared (and therefore dropped) before window, Rust
     // drops struct fields in declaration order, and the GL surface's Drop
     // calls eglDestroySurface, which on Wayland does a protocol round-trip
@@ -239,6 +290,11 @@ struct App {
     window: Option<Window>,
     keyboard: Keyboard,
     audio: Option<audio::Audio>,
+    /// the window's size, times the console's.
+    scale: u32,
+    /// the left button is down, and where the pointer is, in window pixels.
+    mouse_down: bool,
+    cursor: (f32, f32),
     last_title_update: Instant,
     /// when the next frame is due. frames run to a schedule rather than one
     /// after another, so that a slow one is made up by those after it and
@@ -246,6 +302,7 @@ struct App {
     next_frame: Instant,
     /// frames in a row not shown while catching up.
     skipped: u32,
+    /// stopped with F1, without the menu.
     paused: bool,
     stop: bool,
 }
@@ -264,14 +321,15 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let scale = self.options.scale.max(1);
-        let size = winit::dpi::LogicalSize::new(400 * scale, 480 * scale);
-        let attributes = Window::default_attributes()
-            .with_title("Zakuro")
-            .with_inner_size(size);
+        let size = winit::dpi::LogicalSize::new(400 * self.scale, 480 * self.scale);
+        let attributes = Window::default_attributes().with_title("Zakuro").with_inner_size(size);
+        let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
+            Renderer::Vulkan => RendererKind::Vulkan,
+            Renderer::OpenGl => RendererKind::OpenGl,
+        });
 
-        let backend = Backend::create(event_loop, attributes.clone(), self.options.renderer).or_else(|error| {
-            if self.options.renderer != RendererKind::Vulkan {
+        let backend = Backend::create(event_loop, attributes.clone(), renderer).or_else(|error| {
+            if renderer != RendererKind::Vulkan {
                 return Err(error);
             }
             // a machine without a working Vulkan driver still gets a window
@@ -281,17 +339,22 @@ impl ApplicationHandler for App {
         match backend {
             Ok((window, backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
+                self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
             }
             Err(error) => {
-                eprintln!("zakuro: could not start the {:?} backend: {error}", self.options.renderer);
+                eprintln!("zakuro: could not start the {renderer:?} backend: {error}");
                 event_loop.exit();
             }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let consumed = match (&mut self.gui, &self.window) {
+            (Some(gui), Some(window)) => gui.event(window, &event),
+            _ => false,
+        };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -299,37 +362,16 @@ impl ApplicationHandler for App {
                     backend.resize(size.width, size.height);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                use winit::keyboard::{KeyCode, PhysicalKey};
-                let pressed = event.state == ElementState::Pressed;
-                if pressed && event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
-                    event_loop.exit();
-                    return;
-                }
-                if pressed && event.physical_key == PhysicalKey::Code(KeyCode::F1) {
-                    self.paused = !self.paused;
-                    log::info!("{}", if self.paused { "paused" } else { "resumed" });
-                }
-                self.keyboard.key(event.physical_key, pressed);
-            }
+            WindowEvent::KeyboardInput { event, .. } => self.key(event, consumed),
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left && state == ElementState::Released {
-                    self.keyboard.touch(None);
+                if button == MouseButton::Left {
+                    self.mouse_down = state == ElementState::Pressed && !self.pointer_taken(consumed);
+                    self.touch();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // only clicks inside the bottom screen count as touches.
-                if let Some(window) = &self.window {
-                    let size = window.inner_size();
-                    let (_, bottom) = layout(size.width, size.height);
-                    let x = position.x as f32 - bottom.x;
-                    let y = position.y as f32 - bottom.y;
-                    if x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height {
-                        let sx = (x / bottom.width * 320.0) as u16;
-                        let sy = (y / bottom.height * 240.0) as u16;
-                        self.keyboard.touch(Some((sx, sy)));
-                    }
-                }
+                self.cursor = (position.x as f32, position.y as f32);
+                self.touch();
             }
             WindowEvent::RedrawRequested => self.step(event_loop),
             _ => {}
@@ -344,43 +386,245 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// the console's settings for a game, from the command line and the
+    /// settings.
+    fn config(&self) -> Config {
+        Config {
+            new3ds: self.options.new3ds,
+            data_dir: self.data_dir.clone(),
+            recompiled: self.options.recompiled.clone().filter(|_| !self.options.interpreter).map(Into::into),
+            linked: self.linked.filter(|_| !self.options.interpreter),
+            find_recompiled: !self.options.interpreter,
+            hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
+            ..Config::default()
+        }
+    }
+
+    /// starts the game at path, in place of any other.
+    fn play(&mut self, path: &Path) -> Result<(), String> {
+        // the old game and what it holds on the GPU go first
+        self.game = None;
+        let system = loader::load(path, self.config()).map_err(|error| format!("could not open {}, {error}", path.display()))?;
+        let name = self
+            .library
+            .games
+            .iter()
+            .find(|game| game.path == path)
+            .map(|game| game.name.clone())
+            .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        self.game = Some(Running::new(system, path.to_owned(), name));
+        self.menus.menu_open = false;
+        self.keyboard.release();
+        self.paused = false;
+        self.next_frame = Instant::now();
+        Ok(())
+    }
+
+    fn back_to_library(&mut self) {
+        self.game = None;
+        self.menus.menu_open = false;
+        self.keyboard.release();
+    }
+
+    fn key(&mut self, event: KeyEvent, consumed: bool) {
+        let pressed = event.state == ElementState::Pressed;
+        let PhysicalKey::Code(code) = event.physical_key else { return };
+        // a binding waiting for a key takes it, Escape leaves it as it was
+        if let (true, Some(index)) = (pressed, self.menus.rebinding) {
+            self.menus.rebinding = None;
+            if code != KeyCode::Escape {
+                if let Some((_, key)) = self.settings.keys.all_mut().into_iter().nth(index) {
+                    *key = code;
+                }
+                self.apply_settings();
+            }
+            return;
+        }
+        if pressed && !event.repeat {
+            match code {
+                KeyCode::Escape if self.game.is_some() => {
+                    self.menus.menu_open = !self.menus.menu_open;
+                    self.keyboard.release();
+                    return;
+                }
+                KeyCode::F1 => {
+                    self.paused = !self.paused;
+                    log::info!("{}", if self.paused { "paused" } else { "resumed" });
+                }
+                KeyCode::F11 => self.toggle_fullscreen(),
+                _ => {}
+            }
+        }
+        let to_game = self.game.is_some()
+            && !self.menus.menu_open
+            && !self.menus.settings_open
+            && !consumed
+            && !self.gui.as_ref().is_some_and(Gui::wants_keyboard);
+        // letting go always gets through, so that no button stays held
+        if to_game || !pressed {
+            self.keyboard.key(event.physical_key, pressed);
+        }
+    }
+
+    /// whether the pointer is busy with something other than the game.
+    fn pointer_taken(&self, consumed: bool) -> bool {
+        consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
+    }
+
+    /// touches the bottom screen while the button is down over it.
+    fn touch(&mut self) {
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        let (_, bottom) = layout(size.width, size.height);
+        let x = self.cursor.0 - bottom.x;
+        let y = self.cursor.1 - bottom.y;
+        let inside = x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height;
+        self.keyboard.touch((self.mouse_down && inside).then(|| {
+            ((x / bottom.width * 320.0) as u16, (y / bottom.height * 240.0) as u16)
+        }));
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        if let Some(window) = &self.window {
+            let full = window.fullscreen().is_some();
+            window.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
+        }
+    }
+
+    fn apply_volume(&self) {
+        if let Some(audio) = &self.audio {
+            audio.set_volume(if self.settings.mute { 0.0 } else { self.settings.volume });
+        }
+    }
+
+    /// saves the settings and puts to use what can change right away.
+    fn apply_settings(&mut self) {
+        self.settings.save();
+        self.keyboard.set_keys(self.settings.keys.clone());
+        self.apply_volume();
+        if self.options.scale.is_none() && self.settings.scale.max(1) != self.scale {
+            self.scale = self.settings.scale.max(1);
+            if let Some(window) = &self.window {
+                let _ = window.request_inner_size(winit::dpi::LogicalSize::new(400 * self.scale, 480 * self.scale));
+            }
+        }
+    }
+
+    fn recompile(&mut self, index: usize) {
+        let Some(game) = self.library.games.get(index) else { return };
+        let Some(recompiler) = recompile::find(self.settings.recompiler.as_deref()) else {
+            self.menus.message = Some("Zakuro could not find 3dsrecomp. Choose where it is in the settings.".to_owned());
+            self.menus.settings_open = true;
+            return;
+        };
+        self.jobs.retain(|job| job.program_id != game.program_id || !job.stage().finished());
+        if self.jobs.iter().any(|job| job.program_id == game.program_id) {
+            return;
+        }
+        match Job::start(&recompiler, &game.path, game.program_id, &game.name) {
+            Ok(job) => self.jobs.push(job),
+            Err(error) => self.menus.message = Some(error),
+        }
+    }
+
+    /// tells about recompiles as they finish.
+    fn poll_jobs(&mut self) {
+        let mut finished = Vec::new();
+        for job in &mut self.jobs {
+            if !job.announced && job.stage().finished() {
+                job.announced = true;
+                finished.push((job.program_id, job.name.clone(), job.stage()));
+            }
+        }
+        for (program_id, name, stage) in finished {
+            match stage {
+                Stage::Done => {
+                    self.library.refresh_recompiled();
+                    let playing = self.game.as_ref().is_some_and(|game| game.system.title.as_ref().is_some_and(|title| title.program_id() == program_id));
+                    if playing {
+                        self.menus.message = Some(format!("{name} is recompiled. Reset it from the menu, Esc, to run it on the new code."));
+                    }
+                }
+                Stage::Failed(error) if error != "cancelled" => {
+                    self.menus.message = Some(format!("Recompiling {name} failed, {error}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn act(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
+            Action::Play(path) => {
+                if let Err(error) = self.play(&path) {
+                    self.menus.message = Some(error);
+                }
+            }
+            Action::Recompile(index) => self.recompile(index),
+            Action::CancelRecompile(program_id) => {
+                for job in self.jobs.iter().filter(|job| job.program_id == program_id) {
+                    job.cancel();
+                }
+            }
+            Action::ChooseFolder => {
+                if let Some(folder) = rfd::FileDialog::new().set_title("Where your games are").pick_folder() {
+                    self.settings.games = Some(folder.clone());
+                    self.settings.save();
+                    self.library.scan(&folder);
+                }
+            }
+            Action::ChooseRecompiler => {
+                if let Some(file) = rfd::FileDialog::new().set_title("Where 3dsrecomp is").pick_file() {
+                    self.settings.recompiler = Some(file);
+                    self.settings.save();
+                }
+            }
+            Action::Rescan => {
+                if let Some(folder) = self.settings.games.clone() {
+                    self.library.scan(&folder);
+                }
+            }
+            Action::Resume => {
+                self.menus.menu_open = false;
+                self.keyboard.release();
+            }
+            Action::Reset => {
+                if let Some(path) = self.game.as_ref().map(|game| game.path.clone()) {
+                    if let Err(error) = self.play(&path) {
+                        self.menus.message = Some(error);
+                    }
+                }
+            }
+            Action::Library => self.back_to_library(),
+            Action::Fullscreen => self.toggle_fullscreen(),
+            Action::Quit => event_loop.exit(),
+            Action::Settings => self.apply_settings(),
+        }
+    }
+
     fn step(&mut self, event_loop: &ActiveEventLoop) {
         if self.stop {
+            event_loop.exit();
             return;
         }
         let now = Instant::now();
         if now > self.next_frame + CATCH_UP_LIMIT {
             self.next_frame = now;
         }
+        self.library.poll();
+        self.poll_jobs();
 
-        if !self.paused {
-            self.system.set_input(self.keyboard.state());
-            let outcome = self.system.run_frame();
-            let sound = self.system.take_audio();
-            if let Some(audio) = &self.audio {
-                audio.push(&sound);
-            }
-            match outcome {
-                FrameOutcome::Completed => {}
-                FrameOutcome::Exited => {
-                    log::info!("the title exited");
-                    self.stop = true;
-                }
-                FrameOutcome::Faulted => {
-                    log::error!("the title stopped on a fault");
-                    if !self.system.fatal_errors.is_empty() {
-                        log::error!("{}", self.system.fatal_errors.join("; "));
-                    }
-                    self.stop = true;
-                }
-            }
+        let playing = self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open;
+        if playing {
+            self.emulate();
         }
 
         self.next_frame += FRAME_TIME;
         // behind the schedule, showing the frame would wait on the display,
         // so it goes unshown, a few at most
         let behind = Instant::now() > self.next_frame;
-        if behind && self.skipped < MAX_SKIPPED {
+        if playing && behind && self.skipped < MAX_SKIPPED {
             self.skipped += 1;
         } else {
             self.skipped = 0;
@@ -390,10 +634,14 @@ impl App {
         if self.last_title_update.elapsed() >= Duration::from_millis(500) {
             self.last_title_update = Instant::now();
             if let Some(window) = &self.window {
-                window.set_title(&format!("Zakuro - {}", self.system.status_line()));
+                let title = match &self.game {
+                    Some(game) => format!("Zakuro - {} - {}", game.name, game.system.status_line()),
+                    None => "Zakuro".to_owned(),
+                };
+                window.set_title(&title);
             }
             let underruns = self.audio.as_ref().map_or(0, |audio| audio.take_underruns());
-            if underruns > 0 {
+            if underruns > 0 && playing {
                 log::warn!("the sound ran dry {underruns} times, the emulation is falling behind");
             }
         }
@@ -404,29 +652,74 @@ impl App {
         }
     }
 
-    fn present(&mut self, event_loop: &ActiveEventLoop) {
-        let top = self.system.read_screen(Screen::Top);
-        let bottom = self.system.read_screen(Screen::Bottom);
-
-        if let Some(backend) = &mut self.backend {
-            let result = backend.present(
-                ScreenImage {
-                    width: Screen::Top.width(),
-                    height: Screen::Top.height(),
-                    pixels: &top,
-                },
-                ScreenImage {
-                    width: Screen::Bottom.width(),
-                    height: Screen::Bottom.height(),
-                    pixels: &bottom,
-                },
-            );
-            match result {
-                Ok(()) | Err(PresentError::OutOfDate) => {}
-                Err(error) => {
-                    log::error!("presentation failed: {error}");
-                    event_loop.exit();
+    /// runs one frame of the game.
+    fn emulate(&mut self) {
+        let Some(game) = &mut self.game else { return };
+        game.system.set_input(self.keyboard.state());
+        let outcome = game.system.run_frame();
+        game.count_frame();
+        let sound = game.system.take_audio();
+        if let Some(audio) = &self.audio {
+            audio.push(&sound);
+        }
+        match outcome {
+            FrameOutcome::Completed => {}
+            FrameOutcome::Exited => {
+                log::info!("the title exited");
+                self.back_to_library();
+            }
+            FrameOutcome::Faulted => {
+                log::error!("the title stopped on a fault");
+                let errors = game.system.fatal_errors.join("; ");
+                if !errors.is_empty() {
+                    log::error!("{errors}");
                 }
+                self.menus.message = Some(format!("The game stopped on a fault. {errors}"));
+                self.back_to_library();
+            }
+        }
+    }
+
+    /// the menus, and the actions they asked for, done.
+    fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
+        let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
+        let recompiler = recompile::find(self.settings.recompiler.as_deref());
+        let show_fps = self.settings.show_fps;
+        let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps));
+        let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
+        let mut actions = Vec::new();
+        let overlay = gui.frame(window, |ui| {
+            match &game {
+                Some((name, fps)) => actions.extend(menus.game(ui, name, show_fps.then_some(*fps), jobs)),
+                None => actions.extend(menus.library(ui, library, settings, jobs)),
+            }
+            actions.extend(menus.settings(ui.ctx(), settings, recompiler.as_deref()));
+            menus.message(ui.ctx());
+        });
+        self.library.changed = false;
+        for action in actions {
+            self.act(action, event_loop);
+        }
+        overlay
+    }
+
+    fn present(&mut self, event_loop: &ActiveEventLoop) {
+        let overlay = self.interface(event_loop);
+        let (top, bottom) = match &mut self.game {
+            Some(game) => (game.system.read_screen(Screen::Top), game.system.read_screen(Screen::Bottom)),
+            None => (Vec::new(), Vec::new()),
+        };
+        let Some(backend) = &mut self.backend else { return };
+        let result = backend.present(
+            ScreenImage { width: Screen::Top.width(), height: Screen::Top.height(), pixels: &top },
+            ScreenImage { width: Screen::Bottom.width(), height: Screen::Bottom.height(), pixels: &bottom },
+            &overlay,
+        );
+        match result {
+            Ok(()) | Err(PresentError::OutOfDate) => {}
+            Err(error) => {
+                log::error!("presentation failed: {error}");
+                event_loop.exit();
             }
         }
     }

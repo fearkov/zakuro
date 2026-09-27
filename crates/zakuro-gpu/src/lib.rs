@@ -13,7 +13,7 @@ pub mod texture;
 
 use format::ColorFormat;
 use registers::*;
-pub use backend::{layout, PresentError, Presenter, ScreenImage, Viewport};
+pub use backend::{layout, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenImage, Viewport};
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
 
 /// how the GPU reaches guest memory.

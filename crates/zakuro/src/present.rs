@@ -12,7 +12,7 @@ use winit::window::{Window, WindowAttributes};
 
 use zakuro_gpu::backend::gl::GlPresenter;
 use zakuro_gpu::backend::vulkan::VulkanPresenter;
-use zakuro_gpu::{PresentError, Presenter, RendererKind, ScreenImage};
+use zakuro_gpu::{Overlay, PresentError, Presenter, RendererKind, ScreenImage};
 
 // exactly one backend exists per process, so the size of the largest variant
 // is not worth an extra allocation to avoid.
@@ -79,6 +79,7 @@ impl Backend {
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        overlay: &Overlay,
     ) -> Result<(), PresentError> {
         match self {
             Backend::OpenGl {
@@ -86,12 +87,12 @@ impl Backend {
                 context,
                 surface,
             } => {
-                presenter.present(top, bottom)?;
+                presenter.present(top, bottom, overlay)?;
                 surface
                     .swap_buffers(context)
                     .map_err(|e| PresentError::Backend(e.to_string()))
             }
-            Backend::Vulkan(presenter) => presenter.present(top, bottom),
+            Backend::Vulkan(presenter) => presenter.present(top, bottom, overlay),
             Backend::None => Ok(()),
         }
     }

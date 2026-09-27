@@ -62,6 +62,8 @@ impl Queue {
 
 pub struct Audio {
     queue: Arc<Mutex<Queue>>,
+    /// 0 to 1, applied as samples come in.
+    volume: std::cell::Cell<f32>,
     _stream: cpal::Stream,
 }
 
@@ -89,7 +91,7 @@ impl Audio {
             other => return Err(format!("the output takes {other} samples, which Zakuro does not make")),
         }?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Audio { queue, _stream: stream })
+        Ok(Audio { queue, volume: std::cell::Cell::new(1.0), _stream: stream })
     }
 
     /// how many times the sound ran dry since the last call.
@@ -97,10 +99,15 @@ impl Audio {
         self.queue.lock().map(|mut queue| std::mem::take(&mut queue.underruns)).unwrap_or(0)
     }
 
+    pub fn set_volume(&self, volume: f32) {
+        self.volume.set(volume.clamp(0.0, 1.0));
+    }
+
     /// queues what the console played.
     pub fn push(&self, samples: &[[i16; 2]]) {
         let Ok(mut queue) = self.queue.lock() else { return };
-        queue.samples.extend(samples.iter().map(|s| s.map(|v| v as f32 / 32768.0)));
+        let scale = self.volume.get() / 32768.0;
+        queue.samples.extend(samples.iter().map(|s| s.map(|v| v as f32 * scale)));
         // far ahead, after a stall on the output side, it drops the oldest
         // rather than lag behind the picture
         if queue.samples.len() > TARGET * 4 {

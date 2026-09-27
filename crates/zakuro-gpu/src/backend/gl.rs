@@ -1,8 +1,10 @@
 //! OpenGL presentation backend.
 
+use std::collections::HashMap;
+
 use glow::HasContext;
 
-use super::{layout, PresentError, Presenter, ScreenImage, Viewport};
+use super::{layout, Overlay, OverlayVertex, PresentError, Presenter, ScreenImage, Viewport};
 
 const VERTEX_SHADER: &str = r#"#version 330 core
 // a single oversized triangle covers the viewport with no vertex buffer.
@@ -23,10 +25,45 @@ void main() {
 }
 "#;
 
+const OVERLAY_VERTEX_SHADER: &str = r#"#version 330 core
+// the overlay's triangles, given in window pixels from the top left.
+uniform vec2 size;
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in vec4 color;
+out vec2 frag_uv;
+out vec4 frag_color;
+void main() {
+    frag_uv = uv;
+    frag_color = color;
+    gl_Position = vec4(position.x / size.x * 2.0 - 1.0, 1.0 - position.y / size.y * 2.0, 0.0, 1.0);
+}
+"#;
+
+const OVERLAY_FRAGMENT_SHADER: &str = r#"#version 330 core
+in vec2 frag_uv;
+in vec4 frag_color;
+out vec4 color;
+uniform sampler2D image;
+void main() {
+    color = frag_color * texture(image, frag_uv);
+}
+"#;
+
+/// what draws the overlay.
+struct GlOverlay {
+    program: glow::Program,
+    vertex_array: glow::VertexArray,
+    vertices: glow::Buffer,
+    indices: glow::Buffer,
+    textures: HashMap<u64, glow::Texture>,
+}
+
 pub struct GlPresenter {
     gl: glow::Context,
     program: glow::Program,
     vertex_array: glow::VertexArray,
+    overlay: GlOverlay,
     /// index 0 is the top screen, 1 the bottom.
     textures: [glow::Texture; 2],
     /// dimensions each texture was last allocated at, so uploads can use
@@ -86,10 +123,12 @@ impl GlPresenter {
             textures.push(texture);
         }
 
+        let overlay = unsafe { GlOverlay::new(&gl)? };
         Ok(GlPresenter {
             gl,
             program,
             vertex_array,
+            overlay,
             textures: [textures[0], textures[1]],
             sizes: [(0, 0); 2],
             window,
@@ -156,6 +195,7 @@ impl Presenter for GlPresenter {
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        overlay: &Overlay,
     ) -> Result<(), PresentError> {
         if !top.is_empty() {
             self.upload(0, &top);
@@ -186,6 +226,7 @@ impl Presenter for GlPresenter {
 
         unsafe {
             self.gl.bind_vertex_array(None);
+            self.overlay.draw(&self.gl, overlay, self.window);
         }
         Ok(())
     }
@@ -200,8 +241,144 @@ impl Drop for GlPresenter {
         unsafe {
             self.gl.delete_program(self.program);
             self.gl.delete_vertex_array(self.vertex_array);
+            self.gl.delete_program(self.overlay.program);
+            self.gl.delete_vertex_array(self.overlay.vertex_array);
+            self.gl.delete_buffer(self.overlay.vertices);
+            self.gl.delete_buffer(self.overlay.indices);
+            for (_, texture) in self.overlay.textures.drain() {
+                self.gl.delete_texture(texture);
+            }
             for texture in self.textures {
                 self.gl.delete_texture(texture);
+            }
+        }
+    }
+}
+
+impl GlOverlay {
+    /// # Safety
+    ///
+    /// the context has to be current.
+    unsafe fn new(gl: &glow::Context) -> Result<GlOverlay, PresentError> {
+        unsafe {
+            let program = link_program(gl, OVERLAY_VERTEX_SHADER, OVERLAY_FRAGMENT_SHADER)?;
+            let vertex_array = gl.create_vertex_array().map_err(PresentError::Backend)?;
+            let vertices = gl.create_buffer().map_err(PresentError::Backend)?;
+            let indices = gl.create_buffer().map_err(PresentError::Backend)?;
+            gl.bind_vertex_array(Some(vertex_array));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(indices));
+            let stride = size_of::<OverlayVertex>() as i32;
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
+            gl.enable_vertex_attrib_array(2);
+            gl.vertex_attrib_pointer_f32(2, 4, glow::UNSIGNED_BYTE, true, stride, 16);
+            gl.bind_vertex_array(None);
+            Ok(GlOverlay { program, vertex_array, vertices, indices, textures: HashMap::new() })
+        }
+    }
+
+    /// # Safety
+    ///
+    /// the context has to be current.
+    unsafe fn draw(&mut self, gl: &glow::Context, overlay: &Overlay, window: (u32, u32)) {
+        unsafe {
+            for texture in &overlay.textures {
+                let [width, height] = texture.size;
+                if texture.pixels.len() < (width * height * 4) as usize {
+                    continue;
+                }
+                let pixels = glow::PixelUnpackData::Slice(Some(&texture.pixels));
+                match texture.offset {
+                    None => {
+                        let Ok(made) = gl.create_texture() else { continue };
+                        if let Some(old) = self.textures.insert(texture.id, made) {
+                            gl.delete_texture(old);
+                        }
+                        gl.bind_texture(glow::TEXTURE_2D, Some(made));
+                        let filter = if texture.linear { glow::LINEAR } else { glow::NEAREST } as i32;
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA8 as i32,
+                            width as i32,
+                            height as i32,
+                            0,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            pixels,
+                        );
+                    }
+                    Some([x, y]) => {
+                        let Some(&target) = self.textures.get(&texture.id) else { continue };
+                        gl.bind_texture(glow::TEXTURE_2D, Some(target));
+                        gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            x as i32,
+                            y as i32,
+                            width as i32,
+                            height as i32,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            pixels,
+                        );
+                    }
+                }
+            }
+
+            if !overlay.meshes.is_empty() {
+                gl.viewport(0, 0, window.0 as i32, window.1 as i32);
+                gl.enable(glow::BLEND);
+                // premultiplied alpha over what is already drawn
+                gl.blend_equation(glow::FUNC_ADD);
+                gl.blend_func_separate(glow::ONE, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE);
+                gl.enable(glow::SCISSOR_TEST);
+                gl.use_program(Some(self.program));
+                if let Some(location) = gl.get_uniform_location(self.program, "size") {
+                    gl.uniform_2_f32(Some(&location), window.0 as f32, window.1 as f32);
+                }
+                if let Some(location) = gl.get_uniform_location(self.program, "image") {
+                    gl.uniform_1_i32(Some(&location), 0);
+                }
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_vertex_array(Some(self.vertex_array));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
+                gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.indices));
+                for mesh in &overlay.meshes {
+                    let Some(&texture) = self.textures.get(&mesh.texture) else { continue };
+                    let [left, top, right, bottom] = mesh.clip;
+                    let (right, bottom) = (right.min(window.0), bottom.min(window.1));
+                    if left >= right || top >= bottom || mesh.indices.is_empty() {
+                        continue;
+                    }
+                    // OpenGL counts rows from the bottom
+                    gl.scissor(left as i32, (window.1 - bottom) as i32, (right - left) as i32, (bottom - top) as i32);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    let vertex_bytes = std::slice::from_raw_parts(
+                        mesh.vertices.as_ptr() as *const u8,
+                        mesh.vertices.len() * size_of::<OverlayVertex>(),
+                    );
+                    let index_bytes = std::slice::from_raw_parts(mesh.indices.as_ptr() as *const u8, mesh.indices.len() * 4);
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STREAM_DRAW);
+                    gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, index_bytes, glow::STREAM_DRAW);
+                    gl.draw_elements(glow::TRIANGLES, mesh.indices.len() as i32, glow::UNSIGNED_INT, 0);
+                }
+                gl.bind_vertex_array(None);
+                gl.disable(glow::SCISSOR_TEST);
+                gl.disable(glow::BLEND);
+            }
+
+            for id in &overlay.free {
+                if let Some(texture) = self.textures.remove(id) {
+                    gl.delete_texture(texture);
+                }
             }
         }
     }

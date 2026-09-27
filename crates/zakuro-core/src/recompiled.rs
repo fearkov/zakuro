@@ -15,6 +15,11 @@ use crate::memory::Memory;
 
 pub use recomp_abi::Linked;
 
+/// the library 3dsrecomp build installed for a title, if there is one.
+pub fn installed(program_id: u64) -> Option<std::path::PathBuf> {
+    recomp_abi::installed(program_id)
+}
+
 /// recompiled code, and how much of its work it handed back.
 pub struct Library {
     code: recomp_abi::Library,

@@ -4,10 +4,13 @@ use zakuro_gpu::RendererKind;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    pub rom: String,
-    pub renderer: RendererKind,
-    /// window scale relative to the console's 400x480 combined screens.
-    pub scale: u32,
+    /// the game to start, none to open the library.
+    pub rom: Option<String>,
+    /// the settings' choice when not given.
+    pub renderer: Option<RendererKind>,
+    /// window scale relative to the console's 400x480 combined screens, the
+    /// settings' when not given.
+    pub scale: Option<u32>,
     /// run without a window for this many frames, then report.
     pub headless: Option<u64>,
     pub profile: bool,
@@ -16,8 +19,9 @@ pub struct Options {
     pub test_pattern: bool,
     /// a library of recompiled code for the title, or a directory of them.
     pub recompiled: Option<String>,
-    /// draw on the host GPU rather than in software.
-    pub hardware_rasterizer: bool,
+    /// draw on the host GPU rather than in software, the settings' choice
+    /// when not given.
+    pub hardware_rasterizer: Option<bool>,
     /// where saves live, instead of the usual place.
     pub data: Option<String>,
     /// interpret everything, whatever recompiled code there is.
@@ -29,7 +33,10 @@ pub struct Options {
 const USAGE: &str = "\
 zakuro - a high-level-emulation Nintendo 3DS emulator
 
-usage: zakuro <rom.3ds|.cxi> [options]
+usage: zakuro [rom.3ds|.cxi] [options]
+
+Without a game it opens the library, the games in a folder you pick. The
+options below override the settings for this run.
 
 options:
   --renderer <vulkan|gl|software>  presentation backend (default: vulkan,
@@ -38,6 +45,7 @@ options:
                                    the host GPU through Vulkan, or software
                                    where that does not start)
   --scale <n>                      window scale factor (default: 2)
+  (Esc opens the menu over a game, F1 pauses, F11 goes fullscreen)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
   --profile                        collect a sampling profile and print it
@@ -59,15 +67,15 @@ the working directory or where saves live, for titles that render text with it.
 pub fn parse() -> Result<Options, String> {
     let mut rom = None;
     let mut options = Options {
-        rom: String::new(),
-        renderer: RendererKind::Vulkan,
-        scale: 2,
+        rom: None,
+        renderer: None,
+        scale: None,
         headless: None,
         profile: false,
         new3ds: false,
         test_pattern: false,
         recompiled: None,
-        hardware_rasterizer: true,
+        hardware_rasterizer: None,
         data: None,
         interpreter: false,
         mute: false,
@@ -82,14 +90,13 @@ pub fn parse() -> Result<Options, String> {
             }
             "--renderer" => {
                 let value = args.next().ok_or("--renderer needs a value")?;
-                options.renderer = RendererKind::parse(&value)
-                    .ok_or_else(|| format!("unknown renderer '{value}'"))?;
+                options.renderer = Some(
+                    RendererKind::parse(&value).ok_or_else(|| format!("unknown renderer '{value}'"))?,
+                );
             }
             "--scale" => {
                 let value = args.next().ok_or("--scale needs a value")?;
-                options.scale = value
-                    .parse()
-                    .map_err(|_| format!("'{value}' is not a scale"))?;
+                options.scale = Some(value.parse().map_err(|_| format!("'{value}' is not a scale"))?);
             }
             "--headless" => {
                 let value = args.next().ok_or("--headless needs a frame count")?;
@@ -102,11 +109,11 @@ pub fn parse() -> Result<Options, String> {
             "--new3ds" => options.new3ds = true,
             "--rasterizer" => {
                 let value = args.next().ok_or("--rasterizer needs a value")?;
-                options.hardware_rasterizer = match value.as_str() {
+                options.hardware_rasterizer = Some(match value.as_str() {
                     "hardware" | "vulkan" | "gpu" => true,
                     "software" | "cpu" => false,
                     other => return Err(format!("unknown rasterizer '{other}'")),
-                };
+                });
             }
             "--recompiled" => {
                 options.recompiled = Some(args.next().ok_or("--recompiled needs a path")?);
@@ -125,11 +132,10 @@ pub fn parse() -> Result<Options, String> {
         }
     }
 
-    if !options.test_pattern {
-        options.rom = rom.ok_or_else(|| {
-            print!("{USAGE}");
-            "no ROM given".to_owned()
-        })?;
+    options.rom = rom;
+    if options.headless.is_some() && options.rom.is_none() && !options.test_pattern {
+        print!("{USAGE}");
+        return Err("--headless needs a game".to_owned());
     }
     Ok(options)
 }

@@ -3,64 +3,68 @@
 use winit::keyboard::{KeyCode, PhysicalKey};
 use zakuro_core::services::hid::{InputState, PadState};
 
-/// a default layout that works on a keyboard without thinking about it.
-pub fn button_for(key: KeyCode) -> Option<PadState> {
-    Some(match key {
-        KeyCode::KeyX => PadState::A,
-        KeyCode::KeyZ => PadState::B,
-        KeyCode::KeyS => PadState::X,
-        KeyCode::KeyA => PadState::Y,
-        KeyCode::KeyQ => PadState::L,
-        KeyCode::KeyW => PadState::R,
-        KeyCode::Enter => PadState::START,
-        KeyCode::Backspace => PadState::SELECT,
-        KeyCode::ArrowUp => PadState::UP,
-        KeyCode::ArrowDown => PadState::DOWN,
-        KeyCode::ArrowLeft => PadState::LEFT,
-        KeyCode::ArrowRight => PadState::RIGHT,
-        _ => return None,
-    })
-}
-
-/// circle pad axes, as (x, y) contributions.
-pub fn circle_for(key: KeyCode) -> Option<(f32, f32)> {
-    Some(match key {
-        KeyCode::KeyI => (0.0, 1.0),
-        KeyCode::KeyK => (0.0, -1.0),
-        KeyCode::KeyJ => (-1.0, 0.0),
-        KeyCode::KeyL => (1.0, 0.0),
-        _ => return None,
-    })
-}
+use crate::settings::Keys;
 
 /// accumulates key state between frames.
 #[derive(Default)]
 pub struct Keyboard {
+    keys: Keys,
     buttons: PadState,
-    circle: (f32, f32),
+    /// the circle pad keys held, up, down, left, right.
+    circle: [bool; 4],
     touch: Option<(u16, u16)>,
 }
 
 impl Keyboard {
+    pub fn new(keys: Keys) -> Keyboard {
+        Keyboard { keys, ..Keyboard::default() }
+    }
+
+    pub fn set_keys(&mut self, keys: Keys) {
+        self.keys = keys;
+        self.release();
+    }
+
+    /// lets go of everything, when the game stops seeing the keyboard.
+    pub fn release(&mut self) {
+        self.buttons = PadState::default();
+        self.circle = [false; 4];
+        self.touch = None;
+    }
+
+    fn button_for(&self, key: KeyCode) -> Option<PadState> {
+        let keys = &self.keys;
+        [
+            (keys.a, PadState::A),
+            (keys.b, PadState::B),
+            (keys.x, PadState::X),
+            (keys.y, PadState::Y),
+            (keys.l, PadState::L),
+            (keys.r, PadState::R),
+            (keys.start, PadState::START),
+            (keys.select, PadState::SELECT),
+            (keys.up, PadState::UP),
+            (keys.down, PadState::DOWN),
+            (keys.left, PadState::LEFT),
+            (keys.right, PadState::RIGHT),
+        ]
+        .into_iter()
+        .find(|&(bound, _)| bound == key)
+        .map(|(_, button)| button)
+    }
+
     pub fn key(&mut self, key: PhysicalKey, pressed: bool) {
         let PhysicalKey::Code(code) = key else {
             return;
         };
-        if let Some(button) = button_for(code) {
+        if let Some(button) = self.button_for(code) {
             self.buttons.set(button, pressed);
         }
-        if let Some((x, y)) = circle_for(code) {
-            // holding two opposite keys cancels out, which is what a real
-            // stick would do.
-            if pressed {
-                self.circle.0 += x;
-                self.circle.1 += y;
-            } else {
-                self.circle.0 -= x;
-                self.circle.1 -= y;
+        let circle = [self.keys.circle_up, self.keys.circle_down, self.keys.circle_left, self.keys.circle_right];
+        for (held, bound) in self.circle.iter_mut().zip(circle) {
+            if bound == code {
+                *held = pressed;
             }
-            self.circle.0 = self.circle.0.clamp(-1.0, 1.0);
-            self.circle.1 = self.circle.1.clamp(-1.0, 1.0);
         }
     }
 
@@ -70,11 +74,40 @@ impl Keyboard {
     }
 
     pub fn state(&self) -> InputState {
+        // holding two opposite keys cancels out, which is what a real stick
+        // would do
+        let axis = |plus: bool, minus: bool| plus as i8 as f32 - minus as i8 as f32;
+        let [up, down, left, right] = self.circle;
         InputState {
             buttons: self.buttons,
-            circle_x: self.circle.0,
-            circle_y: self.circle.1,
+            circle_x: axis(right, left),
+            circle_y: axis(up, down),
             touch: self.touch,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_press_the_buttons_they_are_bound_to() {
+        let mut keyboard = Keyboard::new(Keys { a: KeyCode::KeyP, ..Keys::default() });
+        keyboard.key(PhysicalKey::Code(KeyCode::KeyP), true);
+        assert!(keyboard.state().buttons.contains(PadState::A));
+        keyboard.key(PhysicalKey::Code(KeyCode::KeyX), true);
+        assert!(!keyboard.state().buttons.contains(PadState::B), "X is no longer bound to anything");
+    }
+
+    #[test]
+    fn opposite_circle_keys_cancel_out() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        keyboard.key(PhysicalKey::Code(KeyCode::KeyJ), true);
+        assert_eq!(keyboard.state().circle_x, -1.0);
+        keyboard.key(PhysicalKey::Code(KeyCode::KeyL), true);
+        assert_eq!(keyboard.state().circle_x, 0.0);
+        keyboard.release();
+        assert_eq!(keyboard.state().circle_x, 0.0);
     }
 }
