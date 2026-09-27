@@ -1,0 +1,28 @@
+# builds and tests Zakuro on Linux and Windows, and keeps the Windows program
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sound library headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      - run: cargo test --release --workspace
+      - name: Keep the Windows program
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zakuro-windows
+          path: target/release/zakuro.exe
