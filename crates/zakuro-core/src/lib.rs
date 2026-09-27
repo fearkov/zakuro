@@ -218,6 +218,10 @@ impl System {
 
     /// runs one frame's worth of emulation.
     pub fn run_frame(&mut self) -> FrameOutcome {
+        // HID samples its inputs on its own, whether or not anyone pressed
+        // anything
+        let input = self.services.hid.input;
+        services::hid::update(self, input);
         let deadline = self.cpu.cycles + CYCLES_PER_FRAME;
         while self.cpu.cycles < deadline {
             match self.step(Some(deadline)) {
@@ -559,9 +563,10 @@ impl System {
         std::mem::take(&mut self.services.dsp.output)
     }
 
-    /// feeds one frame of input to HID.
+    /// what the buttons, circle pad and touch screen are doing, which HID
+    /// reports from the next frame on.
     pub fn set_input(&mut self, input: InputState) {
-        services::hid::update(self, input);
+        self.services.hid.input = input;
     }
 
     // -- GPU plumbing -------------------------------------------------------

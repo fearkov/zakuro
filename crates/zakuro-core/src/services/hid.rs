@@ -75,6 +75,8 @@ pub struct HidState {
     pub gyroscope_users: u32,
     pub accelerometer_index: u32,
     pub gyroscope_index: u32,
+    /// the input the frontend gave last.
+    pub input: InputState,
 }
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
