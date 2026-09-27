@@ -1,4 +1,4 @@
-//! hid:USER, buttons, circle pad and touch screen.
+//! hid:USER, buttons, circle pad, touch screen and motion sensors.
 
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
@@ -12,7 +12,15 @@ pub const SHARED_MEMORY_SIZE: u32 = 0x2B0;
 const PAD_BASE: u32 = 0x00;
 const TOUCH_BASE: u32 = 0xA8;
 const ACCELEROMETER_BASE: u32 = 0x108;
-const GYROSCOPE_BASE: u32 = 0x168;
+const GYROSCOPE_BASE: u32 = 0x158;
+
+/// where the motion sensors' samples start in their sections, past the
+/// header and the raw sample, and how many each keeps.
+const MOTION_ENTRIES: u32 = 0x20;
+const ACCELEROMETER_SAMPLES: u32 = 8;
+const GYROSCOPE_SAMPLES: u32 = 32;
+/// what the accelerometer reads for one g.
+const ONE_G: i16 = 512;
 
 bitflags::bitflags! {
     /// button bits exactly as the hardware reports them.
@@ -61,6 +69,12 @@ pub struct HidState {
     pub previous: PadState,
     pub pad_index: u32,
     pub touch_index: u32,
+    /// how many times a title turned each sensor on and not yet off, they
+    /// report only while on.
+    pub accelerometer_users: u32,
+    pub gyroscope_users: u32,
+    pub accelerometer_index: u32,
+    pub gyroscope_index: u32,
 }
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
@@ -83,6 +97,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // EnableAccelerometer / DisableAccelerometer / EnableGyroscopeLow /
         // DisableGyroscopeLow
         0x0011..=0x0014 => {
+            let hid = &mut system.services.hid;
+            match header.command_id() {
+                0x0011 => hid.accelerometer_users += 1,
+                0x0012 => hid.accelerometer_users = hid.accelerometer_users.saturating_sub(1),
+                0x0013 => hid.gyroscope_users += 1,
+                _ => hid.gyroscope_users = hid.gyroscope_users.saturating_sub(1),
+            }
             buffer.reply(&mut system.memory, header.command_id(), &[]);
             true
         }
@@ -229,13 +250,39 @@ pub fn update(system: &mut System, input: InputState) {
         }
     }
 
-    // accelerometer and gyroscope keep a flat, resting sample so that titles
-    // reading them see something plausible rather than noise.
-    put32(system, base + ACCELEROMETER_BASE, 0);
-    put32(system, base + GYROSCOPE_BASE, 0);
-
     let objects = system.services.hid.event_objects.clone();
     for object in objects.iter().take(2) {
         system.kernel.signal_event(*object);
+    }
+
+    // the sensors report the console held still and upright, titles that
+    // turn one on wait for its event
+    let hid = &system.services.hid;
+    if hid.accelerometer_users > 0 {
+        let index = (hid.accelerometer_index + 1) % ACCELEROMETER_SAMPLES;
+        system.services.hid.accelerometer_index = index;
+        motion_sample(system, base + ACCELEROMETER_BASE, index, tick, [0, -ONE_G, 0]);
+        if let Some(&event) = objects.get(2) {
+            system.kernel.signal_event(event);
+        }
+    }
+    let hid = &system.services.hid;
+    if hid.gyroscope_users > 0 {
+        let index = (hid.gyroscope_index + 1) % GYROSCOPE_SAMPLES;
+        system.services.hid.gyroscope_index = index;
+        motion_sample(system, base + GYROSCOPE_BASE, index, tick, [0, 0, 0]);
+        if let Some(&event) = objects.get(3) {
+            system.kernel.signal_event(event);
+        }
+    }
+}
+
+/// writes a motion sensor's sample as both its raw one and entry index.
+fn motion_sample(system: &mut System, section: u32, index: u32, tick: u64, sample: [i16; 3]) {
+    write_section_header(system, section, index, tick);
+    for at in [section + 0x18, section + MOTION_ENTRIES + index * 6] {
+        for (i, value) in sample.iter().enumerate() {
+            put16(system, at + i as u32 * 2, *value as u16);
+        }
     }
 }
