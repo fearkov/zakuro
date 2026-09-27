@@ -10,7 +10,7 @@ I started developing this project in October 2025, before
 
 I first wrote it in C++, but I was learning Rust at the time and noticed there wasn't a working 3DS emulator written in Rust, so I switched.
 
-This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot. On the interpreter alone they run below full speed, but Pokémon Alpha Sapphire runs at full speed with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp). There's no JIT yet.
+This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot. On the interpreter alone they run below full speed, but tested games run at full speed with their code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp). There's no JIT yet.
 
 To install it you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA development files (libasound2-dev on Debian and Ubuntu, alsa-lib on Arch):
 
