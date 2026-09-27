@@ -51,13 +51,16 @@ options:
   --profile                        collect a sampling profile and print it
   --recompiled <path>              run code 3dsrecomp built for the title, a
                                    library or a directory holding <title id>.so
-                                   (default: the one 3dsrecomp build installed
-                                   for it, in ~/.local/share/3dsrecomp)
+                                   (.dll on Windows, default: the one 3dsrecomp
+                                   build installed for it, in the system's
+                                   place for data, ~/.local/share/3dsrecomp or
+                                   %APPDATA%\\3dsrecomp)
   --interpreter                    interpret everything, even with recompiled
                                    code around
   --mute                           play no sound
   --data <dir>                     where saves live (default: the system's
-                                   place for data, ~/.local/share/zakuro)
+                                   place for data, ~/.local/share/zakuro or
+                                   %APPDATA%\\zakuro)
   -h, --help                       show this message
 
 The system font cannot be generated: put a dump at sysdata/shared_font.bin, in

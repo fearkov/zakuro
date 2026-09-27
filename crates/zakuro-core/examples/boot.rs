@@ -138,7 +138,7 @@ fn main() {
         }
         if dump_at.contains(&executed) {
             for (screen, name) in SCREENS {
-                save_screen(&mut system, screen, &format!("/tmp/zakuro-{name}-{executed}.ppm"));
+                save_screen(&mut system, screen, &temp(&format!("zakuro-{name}-{executed}.ppm")));
             }
         }
         if outcome != FrameOutcome::Completed {
@@ -193,7 +193,7 @@ fn main() {
             let len: usize = len.parse().unwrap();
             let mut bytes = vec![0u8; len];
             system.memory.read_bytes(addr, &mut bytes);
-            let path = format!("/tmp/zakuro-dump-0x{addr:08X}.bin");
+            let path = temp(&format!("zakuro-dump-0x{addr:08X}.bin"));
             std::fs::write(&path, &bytes).unwrap();
             println!("dumped 0x{addr:08X}..+0x{len:X} -> {path}");
         }
@@ -267,7 +267,7 @@ fn main() {
     // save what the screens hold, so there is something to look at as well as
     // read.
     for (screen, name) in SCREENS {
-        let path = format!("/tmp/zakuro-{name}.ppm");
+        let path = temp(&format!("zakuro-{name}.ppm"));
         let distinct = save_screen(&mut system, screen, &path);
         let sample: Vec<String> = distinct
             .iter()
@@ -337,6 +337,11 @@ fn save_screen(
         .iter()
         .map(|c| [c[0], c[1], c[2]])
         .collect()
+}
+
+/// a file in the system's temporary directory, /tmp on Linux.
+fn temp(name: &str) -> String {
+    std::env::temp_dir().join(name).display().to_string()
 }
 
 /// parses frame:BUTTON[+BUTTON...] entries separated by commas, where @XxY
