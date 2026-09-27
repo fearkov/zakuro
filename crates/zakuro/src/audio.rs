@@ -10,7 +10,7 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 /// more rides out uneven frames, less answers sooner.
 const TARGET: usize = 3072;
 /// how much a queue that ran dry waits for before it plays again.
-const RESUME: usize = TARGET / 2;
+const RESUME: usize = TARGET / 4;
 /// how much faster or slower than the rates say playback may go to keep
 /// the queue near its target, too little to hear.
 const DRIFT: f64 = 0.005;
@@ -60,10 +60,95 @@ impl Queue {
     }
 }
 
+/// the pieces of sound stretching moves around, about 16 ms, and how far
+/// apart they go out, half of that.
+const GRAIN: usize = 512;
+const HOP: usize = GRAIN / 2;
+/// how far a piece may shift, about 4 ms, to line up with the one before.
+const SEARCH: usize = 128;
+/// sound gets at most twice as long.
+const MOST_STRETCH: f64 = 2.0;
+
+/// time stretching, sound made longer without its pitch changing, for when
+/// the emulation falls behind and the queue would run dry. overlapping
+/// pieces of it go out further apart than they came in, each shifted to
+/// line up with the one before, which is WSOLA.
+struct Stretch {
+    /// what came in and has not gone out yet.
+    input: Vec<[f32; 2]>,
+    /// where in input the next piece is due.
+    position: f64,
+    /// where the last piece came from, none before the first.
+    last: Option<usize>,
+    /// the last piece's second half, which the next one's first adds to.
+    tail: Vec<[f32; 2]>,
+    /// how much longer sound comes out, eased toward what the queue asks.
+    factor: f64,
+    window: Vec<f32>,
+}
+
+impl Stretch {
+    fn new() -> Stretch {
+        // a periodic Hann window, whose halves add up to one
+        let window = (0..GRAIN).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / GRAIN as f32).cos()).collect();
+        Stretch { input: Vec::new(), position: 0.0, last: None, tail: vec![[0.0; 2]; HOP], factor: 1.0, window }
+    }
+
+    /// stretches samples by about factor, passing out what is ready.
+    fn process(&mut self, samples: &[[f32; 2]], factor: f64, out: &mut Vec<[f32; 2]>) {
+        self.input.extend_from_slice(samples);
+        self.factor += (factor - self.factor) * 0.2;
+        let mono = |s: [f32; 2]| s[0] + s[1];
+        loop {
+            let due = self.position as usize;
+            let natural = self.last.map_or(due, |last| last + HOP);
+            if due + SEARCH + GRAIN > self.input.len() || natural + GRAIN > self.input.len() {
+                break;
+            }
+            // the piece around where it is due that most looks like the
+            // last one's continuation, which is where it is due when
+            // nothing is stretched
+            let start = if natural == due {
+                due
+            } else {
+                let template = &self.input[natural..natural + HOP];
+                let score = |candidate: usize| {
+                    let (mut dot, mut energy) = (0.0f32, 1e-9f32);
+                    for (a, &b) in self.input[candidate..candidate + HOP].iter().zip(template) {
+                        dot += mono(*a) * mono(b);
+                        energy += mono(*a) * mono(*a);
+                    }
+                    dot / energy.sqrt()
+                };
+                (due.saturating_sub(SEARCH)..=due + SEARCH).max_by(|&a, &b| score(a).total_cmp(&score(b))).unwrap_or(due)
+            };
+            let piece = &self.input[start..start + GRAIN];
+            for i in 0..HOP {
+                let w = self.window[i];
+                out.push([self.tail[i][0] + piece[i][0] * w, self.tail[i][1] + piece[i][1] * w]);
+            }
+            for i in 0..HOP {
+                let w = self.window[HOP + i];
+                self.tail[i] = [piece[HOP + i][0] * w, piece[HOP + i][1] * w];
+            }
+            self.last = Some(start);
+            self.position += HOP as f64 / self.factor;
+        }
+        // what no piece can reach any more goes
+        let used = (self.position as usize).min(self.last.unwrap_or(0)).saturating_sub(SEARCH);
+        if used > 0 {
+            self.input.drain(..used);
+            self.position -= used as f64;
+            self.last = self.last.map(|last| last - used);
+        }
+    }
+}
+
 pub struct Audio {
     queue: Arc<Mutex<Queue>>,
     /// 0 to 1, applied as samples come in.
     volume: std::cell::Cell<f32>,
+    stretch: std::cell::RefCell<Stretch>,
     _stream: cpal::Stream,
 }
 
@@ -91,7 +176,7 @@ impl Audio {
             other => return Err(format!("the output takes {other} samples, which Zakuro does not make")),
         }?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Audio { queue, volume: std::cell::Cell::new(1.0), _stream: stream })
+        Ok(Audio { queue, volume: std::cell::Cell::new(1.0), stretch: std::cell::RefCell::new(Stretch::new()), _stream: stream })
     }
 
     /// how many times the sound ran dry since the last call.
@@ -103,11 +188,16 @@ impl Audio {
         self.volume.set(volume.clamp(0.0, 1.0));
     }
 
-    /// queues what the console played.
+    /// queues what the console played, stretched when the queue runs low
+    /// so that it plays on rather than stops.
     pub fn push(&self, samples: &[[i16; 2]]) {
-        let Ok(mut queue) = self.queue.lock() else { return };
         let scale = self.volume.get() / 32768.0;
-        queue.samples.extend(samples.iter().map(|s| s.map(|v| v as f32 * scale)));
+        let samples: Vec<[f32; 2]> = samples.iter().map(|s| s.map(|v| v as f32 * scale)).collect();
+        let Ok(mut queue) = self.queue.lock() else { return };
+        let short = TARGET.saturating_sub(queue.samples.len()) as f64 / TARGET as f64;
+        let mut stretched = Vec::with_capacity(samples.len() * 2);
+        self.stretch.borrow_mut().process(&samples, (1.0 + short).min(MOST_STRETCH), &mut stretched);
+        queue.samples.extend(stretched);
         // far ahead, after a stall on the output side, it drops the oldest
         // rather than lag behind the picture
         if queue.samples.len() > TARGET * 4 {
@@ -160,6 +250,51 @@ mod tests {
             last: [0.0; 2],
             underruns: 0,
         }
+    }
+
+    /// a tone at 440 Hz, the console's rate.
+    fn tone(count: usize) -> Vec<[f32; 2]> {
+        (0..count)
+            .map(|i| {
+                let v = (std::f32::consts::TAU * 440.0 * i as f32 / 32728.0).sin() * 0.5;
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// how many times a sound crosses zero going up, which tells its pitch.
+    fn rises(samples: &[[f32; 2]]) -> usize {
+        samples.windows(2).filter(|w| w[0][0] < 0.0 && w[1][0] >= 0.0).count()
+    }
+
+    #[test]
+    fn unstretched_sound_comes_out_as_it_went_in() {
+        let input = tone(20_000);
+        let mut stretch = Stretch::new();
+        let mut out = Vec::new();
+        for chunk in input.chunks(546) {
+            stretch.process(chunk, 1.0, &mut out);
+        }
+        // past the first piece fading in, every sample is the one that came in
+        assert!(out.len() > 18_000);
+        for (a, b) in out[HOP..].iter().zip(&input[HOP..]) {
+            assert!((a[0] - b[0]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn stretched_sound_is_longer_at_the_same_pitch() {
+        let input = tone(32_728);
+        let mut stretch = Stretch::new();
+        let mut out = Vec::new();
+        for chunk in input.chunks(546) {
+            stretch.process(chunk, 1.5, &mut out);
+        }
+        let ratio = out.len() as f64 / input.len() as f64;
+        assert!(ratio > 1.35 && ratio < 1.55, "stretched by {ratio}");
+        // the same number of cycles a second
+        let pitch = rises(&out) as f64 / out.len() as f64 * 32728.0;
+        assert!((pitch - 440.0).abs() < 10.0, "pitch {pitch}");
     }
 
     #[test]
