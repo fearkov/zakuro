@@ -1,7 +1,8 @@
 //! the library, the menu over a game and the settings, drawn with egui.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
 
 use egui::{Align, Color32, Layout, RichText, Vec2};
 use winit::keyboard::KeyCode;
@@ -19,6 +20,7 @@ pub enum Action {
     CancelRecompile(u64),
     ChooseFolder,
     ChooseRecompiler,
+    ChooseBackground,
     Rescan,
     Resume,
     Reset,
@@ -39,6 +41,76 @@ pub struct Menus {
     /// something to tell the user, until they close it.
     pub message: Option<String>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
+    background: Background,
+}
+
+/// the picture behind the library, decoded away from the interface.
+#[derive(Default)]
+struct Background {
+    /// the file shown or being read.
+    path: Option<PathBuf>,
+    texture: Option<egui::TextureHandle>,
+    loading: Option<Receiver<Result<egui::ColorImage, String>>>,
+}
+
+/// the longest side a background is kept at, bigger ones are scaled down.
+const BACKGROUND_SIDE: u32 = 2560;
+
+impl Background {
+    /// the texture for path, starting to read it when it changed, none until
+    /// it is ready or when there is no picture.
+    fn get(&mut self, ctx: &egui::Context, path: Option<&Path>) -> Result<Option<&egui::TextureHandle>, String> {
+        if self.path.as_deref() != path {
+            self.path = path.map(Path::to_owned);
+            self.texture = None;
+            self.loading = path.map(|path| {
+                let (send, receive) = channel();
+                let path = path.to_owned();
+                std::thread::spawn(move || {
+                    let _ = send.send(decode(&path));
+                });
+                receive
+            });
+        }
+        if let Some(receive) = &self.loading {
+            match receive.try_recv() {
+                Ok(image) => {
+                    self.loading = None;
+                    self.texture = Some(ctx.load_texture("library background", image?, egui::TextureOptions::LINEAR));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.loading = None,
+            }
+        }
+        Ok(self.texture.as_ref())
+    }
+}
+
+fn decode(path: &Path) -> Result<egui::ColorImage, String> {
+    let image = image::open(path).map_err(|error| format!("could not open {}, {error}", path.display()))?;
+    let image = if image.width().max(image.height()) > BACKGROUND_SIDE {
+        image.resize(BACKGROUND_SIDE, BACKGROUND_SIDE, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+}
+
+/// the part of a picture that fills an area without stretching it, cutting
+/// off what sticks out on either side.
+fn cover(area: Vec2, picture: [usize; 2]) -> egui::Rect {
+    let (width, height) = (picture[0].max(1) as f32, picture[1].max(1) as f32);
+    let area_ratio = area.x / area.y.max(1.0);
+    let picture_ratio = width / height;
+    if area_ratio > picture_ratio {
+        // wider area, the picture's top and bottom are cut
+        let shown = picture_ratio / area_ratio;
+        egui::Rect::from_min_max(egui::pos2(0.0, (1.0 - shown) / 2.0), egui::pos2(1.0, (1.0 + shown) / 2.0))
+    } else {
+        let shown = area_ratio / picture_ratio;
+        egui::Rect::from_min_max(egui::pos2((1.0 - shown) / 2.0, 0.0), egui::pos2((1.0 + shown) / 2.0, 1.0))
+    }
 }
 
 impl Menus {
@@ -71,7 +143,19 @@ impl Menus {
             });
             ui.add_space(6.0);
         });
+        let background = match self.background.get(ui.ctx(), settings.background.as_deref()) {
+            Ok(texture) => texture.map(|texture| (texture.id(), texture.size())),
+            Err(error) => {
+                self.message = Some(error);
+                None
+            }
+        };
         egui::CentralPanel::default().show(ui, |ui| {
+            if let Some((texture, size)) = background {
+                let area = ui.clip_rect();
+                let alpha = (settings.background_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                ui.painter().image(texture, area, cover(area.size(), size), Color32::from_white_alpha(alpha));
+            }
             if settings.games.is_none() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
@@ -96,7 +180,13 @@ impl Menus {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (index, game) in library.games.iter().enumerate() {
                     let job = jobs.iter().find(|job| job.program_id == game.program_id);
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                    // over a picture, each game gets a backing to keep it
+                    // readable
+                    let mut frame = egui::Frame::group(ui.style());
+                    if background.is_some() {
+                        frame = frame.fill(ui.visuals().panel_fill.gamma_multiply(0.85));
+                    }
+                    frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let icon = game.icon.as_ref().map(|pixels| {
@@ -245,6 +335,25 @@ impl Menus {
             ui.separator();
             ui.heading("Interface");
             ui.checkbox(&mut settings.show_fps, "Show the frame rate");
+            ui.horizontal(|ui| {
+                ui.label("Library background");
+                match &settings.background {
+                    Some(path) => ui.label(path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()),
+                    None => ui.label(RichText::new("none").weak()),
+                };
+                if ui.button("Choose…").clicked() {
+                    actions.push(Action::ChooseBackground);
+                }
+                if settings.background.is_some() && ui.button("Remove").clicked() {
+                    settings.background = None;
+                }
+            });
+            ui.add_enabled(
+                settings.background.is_some(),
+                egui::Slider::new(&mut settings.background_opacity, 0.0..=1.0)
+                    .text("Opacity")
+                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+            );
 
             ui.separator();
             ui.heading("3dsrecomp");
@@ -332,6 +441,30 @@ pub fn key_name(key: KeyCode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_fills_the_area_without_stretching() {
+        // a square picture in a wide area loses its top and bottom
+        let wide = cover(Vec2::new(200.0, 100.0), [100, 100]);
+        assert_eq!((wide.min.x, wide.max.x), (0.0, 1.0));
+        assert_eq!((wide.min.y, wide.max.y), (0.25, 0.75));
+        // and in a tall one its sides
+        let tall = cover(Vec2::new(100.0, 200.0), [100, 100]);
+        assert_eq!((tall.min.x, tall.max.x), (0.25, 0.75));
+        assert_eq!((tall.min.y, tall.max.y), (0.0, 1.0));
+    }
+
+    #[test]
+    fn big_pictures_are_scaled_down_keeping_their_shape() {
+        let path = std::env::temp_dir().join(format!("zakuro-background-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(BACKGROUND_SIDE * 2, BACKGROUND_SIDE, image::Rgba([10, 20, 30, 255])).save(&path).unwrap();
+        let decoded = decode(&path);
+        std::fs::remove_file(&path).ok();
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.size, [BACKGROUND_SIDE as usize, BACKGROUND_SIDE as usize / 2]);
+        assert_eq!(decoded.pixels[0].to_array(), [10, 20, 30, 255]);
+        assert!(decode(Path::new("/nowhere/at/all.png")).is_err());
+    }
 
     #[test]
     fn keys_have_short_names() {

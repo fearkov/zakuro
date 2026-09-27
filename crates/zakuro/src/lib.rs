@@ -574,6 +574,16 @@ impl App {
                     self.library.scan(&folder);
                 }
             }
+            Action::ChooseBackground => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("A picture for the library")
+                    .add_filter("Pictures", &["png", "jpg", "jpeg", "webp", "bmp"])
+                    .pick_file();
+                if let Some(file) = picked {
+                    self.settings.background = Some(file);
+                    self.settings.save();
+                }
+            }
             Action::ChooseRecompiler => {
                 if let Some(file) = rfd::FileDialog::new().set_title("Where 3dsrecomp is").pick_file() {
                     self.settings.recompiler = Some(file);

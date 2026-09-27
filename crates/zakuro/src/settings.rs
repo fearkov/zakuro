@@ -96,6 +96,10 @@ pub struct Settings {
     pub volume: f32,
     pub mute: bool,
     pub show_fps: bool,
+    /// a picture behind the library.
+    pub background: Option<PathBuf>,
+    /// how much of it shows, 0 to 1.
+    pub background_opacity: f32,
     /// 3dsrecomp, to recompile games from the library, found on the path
     /// when not set.
     pub recompiler: Option<PathBuf>,
@@ -112,6 +116,8 @@ impl Default for Settings {
             volume: 1.0,
             mute: false,
             show_fps: false,
+            background: None,
+            background_opacity: 0.35,
             recompiler: None,
             keys: Keys::default(),
         }
