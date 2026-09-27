@@ -305,23 +305,21 @@ impl Gpu {
     ) {
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
-        let output_width = output_dimensions & 0xFFFF;
-        let output_height = output_dimensions >> 16;
         let (input_base, output_base) = (memory.translate(input_paddr), memory.translate(output_paddr));
 
         // flag layout, from the transfer engine's register,
         //   bit 0      flip the input vertically
-        //   bit 1      the input is linear rather than tiled
+        //   bit 1      linear to tiled, tiled to linear without it
         //   bit 3      raw copy, no format conversion
+        //   bit 5      keep the layout, tiled or linear on both sides
         //   bits 8-10  input color format
         //   bits 12-14 output color format
-        //   bit 16     the output is tiled rather than linear
         //   bits 24-25 downscale
         let flip_vertically = flags & 1 != 0;
         let input_linear = flags & (1 << 1) != 0;
+        let output_tiled = input_linear != (flags & (1 << 5) != 0);
         let input_format = ColorFormat::from_raw((flags >> 8) & 7);
         let output_format = ColorFormat::from_raw((flags >> 12) & 7);
-        let output_tiled = flags & (1 << 16) != 0;
         let downscale = (flags >> 24) & 3;
 
         let input_bpp = input_format.bytes_per_pixel();
@@ -332,6 +330,9 @@ impl Gpu {
             2 => (2, 2),
             _ => (1, 1),
         };
+        // the output's size counts input pixels, a downscale shrinks it
+        let output_width = (output_dimensions & 0xFFFF) / scale_x;
+        let output_height = (output_dimensions >> 16) / scale_y;
 
         let copy_width = output_width.min(input_width / scale_x);
         let copy_height = output_height.min(input_height / scale_y);
@@ -1050,9 +1051,10 @@ mod tests {
             }
         }
         let mut gpu = Gpu::new();
-        // linear in and out, RGBA8, 2x2 downscale
-        let flags = (1 << 1) | (2 << 24);
-        gpu.display_transfer(&mut memory, 0x100, 0x180, 4 | (2 << 16), 2 | (1 << 16), flags);
+        // linear in and out, RGBA8, 2x2 downscale, the output's size counts
+        // input pixels
+        let flags = (1 << 1) | (1 << 5) | (2 << 24);
+        gpu.display_transfer(&mut memory, 0x100, 0x180, 4 | (2 << 16), 4 | (2 << 16), flags);
         let red_at = |i: usize| ColorFormat::Rgba8.decode(&memory.0[0x180 + i * 4..0x184 + i * 4])[0];
         assert_eq!([red_at(0), red_at(1)], [50, 100]);
     }

@@ -2253,11 +2253,13 @@ mod tests {
                     assert!(hardware.display_transfer(&mut gpu, &transfer).unwrap());
                     hardware.flush(&mut gpu).unwrap();
                     let flags = flip as u32
+                        | (tiled as u32) << 5
                         | (hardware::format_index(input_format) as u32) << 8
                         | (hardware::format_index(output_format) as u32) << 12
-                        | (tiled as u32) << 16
                         | (downscale as u32) << 24;
-                    let (input_size, output_size) = (SIZE | input_height << 16, width | height << 16);
+                    // the output's size in the register counts input pixels
+                    let output_size = width * scale_x | (height * scale_y) << 16;
+                    let input_size = SIZE | input_height << 16;
                     crate::Gpu::new().display_transfer(&mut cpu, input, OUTPUT, input_size, output_size, flags);
                     let len = (width * height) as usize * output_format.bytes_per_pixel();
                     let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
