@@ -48,14 +48,26 @@ pub fn region_manifest() -> Vec<u8> {
     romfs_build::build(&files)
 }
 
-/// builds the profanity filter archive.
+/// builds the profanity filter archive, a version file and one word list
+/// per language, which titles read as %d.txt. a missing list makes the
+/// filter refuse every name, so each holds a single word nobody types, an
+/// empty one could read as a pattern matching anything.
 pub fn bad_word_list() -> Vec<u8> {
-    // version and word count, both zero, no entries follow.
-    let data = vec![0u8; 8];
-    romfs_build::build(&[BuildFile {
+    let mut files = vec![BuildFile {
         path: "badwordlist_ver.txt".into(),
-        data: data.clone(),
-    }])
+        data: vec![0u8; 8],
+    }];
+    let mut words = Vec::new();
+    for unit in "\u{FEFF}qzxqzxqzxqzx\n".encode_utf16() {
+        words.extend_from_slice(&unit.to_le_bytes());
+    }
+    for language in 0..16 {
+        files.push(BuildFile {
+            path: format!("{language}.txt"),
+            data: words.clone(),
+        });
+    }
+    romfs_build::build(&files)
 }
 
 /// the per-region table of countries, two sections (the second patches the
