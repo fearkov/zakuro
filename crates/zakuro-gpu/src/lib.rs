@@ -524,6 +524,16 @@ impl Gpu {
         Ok(name)
     }
 
+    /// how many times the console's resolution the host's GPU draws at, 1
+    /// when drawing in software.
+    pub fn scale(&self) -> u32 {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_ref() {
+            return hardware.scale();
+        }
+        1
+    }
+
     /// a screen's buffer as the host GPU drew it, at its scale, RGBA with
     /// rows bottom first, and the scale, when it drew it scaled and guest
     /// memory still holds the same picture.

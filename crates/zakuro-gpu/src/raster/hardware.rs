@@ -486,6 +486,11 @@ impl Hardware {
         &self.name
     }
 
+    /// how many times the console's resolution it draws at.
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
     /// draws at a multiple of the console's resolution, before anything is
     /// drawn, when the GPU can scale surfaces, and says the one it took.
     pub fn set_scale(&mut self, scale: u32) -> u32 {

@@ -701,11 +701,18 @@ impl System {
     }
 
     /// reads one screen into a straight RGBA8 buffer for presentation.
-    /// a screen as RGBA at the resolution the host's GPU drew it, and its
-    /// width and height, the console's own when it drew it that way.
+    /// a screen as RGBA at the resolution the host's GPU draws at, and its
+    /// width and height. a picture the GPU did not draw scaled, or the CPU
+    /// changed since, is the console's own grown to it, so the size stays
+    /// the same from frame to frame.
     pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> (Vec<u8>, u32, u32) {
-        let native = self.read_screen(screen);
         let (width, height) = (screen.width(), screen.height());
+        let scale = self.gpu.scale();
+        let native = self.read_screen(screen);
+        if scale == 1 {
+            return (native, width, height);
+        }
+        let native = grow(&native, width, scale);
         let config = self.gpu.framebuffers[match screen {
             zakuro_common::Screen::Top => 0,
             zakuro_common::Screen::Bottom => 1,
@@ -716,13 +723,13 @@ impl System {
         // only plain buffers a row per screen column, as display transfers
         // leave them
         if self.lcd_force_black || address == 0 || (config.stride != 0 && config.stride != height * bpp) {
-            return (native, width, height);
+            return (native, width * scale, height * scale);
         }
         let base = services::gsp::physical_to_virtual(self, address);
         let mut guest = vec![0u8; (width * height * bpp) as usize];
         self.memory.read_bytes(base, &mut guest);
         let Some((image, scale)) = self.gpu.scaled_screen(base, (height, width), format, &guest) else {
-            return (native, width, height);
+            return (native, width * scale, height * scale);
         };
         // the image has a row per column of the screen, bottom first, and
         // its columns run up the screen, as memory has them
@@ -846,4 +853,23 @@ impl GpuMemory for GuestMemory<'_> {
             paddr
         }
     }
+}
+
+/// an RGBA picture of a given width grown by a whole factor, each pixel
+/// repeated.
+fn grow(pixels: &[u8], width: u32, scale: u32) -> Vec<u8> {
+    let (width, scale) = (width as usize, scale as usize);
+    let mut out = Vec::with_capacity(pixels.len() * scale * scale);
+    for row in pixels.chunks_exact(width * 4) {
+        let mut grown = Vec::with_capacity(row.len() * scale);
+        for pixel in row.chunks_exact(4) {
+            for _ in 0..scale {
+                grown.extend_from_slice(pixel);
+            }
+        }
+        for _ in 0..scale {
+            out.extend_from_slice(&grown);
+        }
+    }
+    out
 }

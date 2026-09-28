@@ -177,8 +177,11 @@ impl VulkanPresenter {
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(2)];
+            // a screen's set goes back when its size changes and it is made
+            // again
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
                     .pool_sizes(&sizes)
                     .max_sets(2),
                 None,
@@ -441,7 +444,7 @@ impl VulkanPresenter {
                     image.height,
                 )?,
             );
-            old.destroy(&self.device);
+            old.destroy(&self.device, self.descriptor_pool);
         }
 
         let screen = &mut self.screens[index];
@@ -715,7 +718,7 @@ impl Drop for VulkanPresenter {
         unsafe {
             let _ = self.device.device_wait_idle();
             for screen in std::mem::replace(&mut self.screens, [Screen::null(), Screen::null()]) {
-                screen.destroy(&self.device);
+                screen.destroy(&self.device, self.descriptor_pool);
             }
             self.destroy_swapchain_resources();
             if self.swapchain != vk::SwapchainKHR::null() {
@@ -1249,11 +1252,12 @@ impl Screen {
         })
     }
 
-    fn destroy(self, device: &ash::Device) {
+    fn destroy(self, device: &ash::Device, pool: vk::DescriptorPool) {
         if self.image == vk::Image::null() {
             return;
         }
         unsafe {
+            let _ = device.free_descriptor_sets(pool, &[self.descriptor]);
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
