@@ -45,14 +45,19 @@ pub fn answer(system: &mut System, request: &[u8]) -> [u8; MESSAGE] {
         message[4..8].copy_from_slice(&RESULT_ERROR.to_le_bytes());
         return message;
     }
+    // initializing, shutting down and the rest succeed, whatever was left
+    // in the result the title sent
+    let succeeded = |mut message: [u8; MESSAGE]| {
+        message[4..8].copy_from_slice(&0u32.to_le_bytes());
+        message
+    };
     match command {
-        // initializing, shutting down and the rest succeed as they are
         COMMAND_INIT => {
             system.services.dsp.aac.decoder = None;
-            message
+            succeeded(message)
         }
         COMMAND_DECODE => decode(system, &message),
-        _ => message,
+        _ => succeeded(message),
     }
 }
 
