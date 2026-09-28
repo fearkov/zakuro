@@ -385,6 +385,7 @@ fn create_thread(system: &mut System) {
     system.map_tls_page(id);
 
     let handle = system.kernel.thread_handle(id);
+    log::debug!("svcCreateThread: thread{id} handle 0x{handle:X} priority {priority} arg 0x{arg:08X}");
     system.cpu.regs[0] = 0;
     system.cpu.regs[1] = handle;
 }
@@ -409,12 +410,24 @@ fn exit_process(system: &mut System) {
     system.exited = true;
 }
 
+/// how long a yielding thread steps aside when others are ready, about a
+/// scheduler time slice.
+const YIELD_TICKS: u64 = 20_000;
+
 /// svcSleepThread, r0:r1 = nanoseconds as a signed 64-bit value.
 fn sleep_thread(system: &mut System) {
     let nanos = (system.cpu.regs[0] as u64) | ((system.cpu.regs[1] as u64) << 32);
     let tick = system.cpu.cycles;
-    // a zero sleep is a yield.
-    let ticks = if nanos == 0 { 0 } else { nanos_to_ticks(nanos) };
+    // a zero sleep is a yield, and while other threads are ready the
+    // kernel runs them for a while even when their priority is lower,
+    // titles polling a worker thread that way would spin forever otherwise
+    let ticks = if nanos != 0 {
+        nanos_to_ticks(nanos)
+    } else if system.kernel.others_ready() {
+        YIELD_TICKS
+    } else {
+        0
+    };
     system.kernel.sleep_current(ticks, tick);
     system.cpu.regs[0] = 0;
 }

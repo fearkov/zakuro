@@ -18,6 +18,10 @@ use thread::{Thread, ThreadId, ThreadStatus, WaitResult};
 /// lowest (numerically highest) priority a thread can have.
 pub const LOWEST_PRIORITY: u32 = 0x3F;
 
+/// how long a thread may run without waiting before the threads below it
+/// get a share, four frames.
+const STARVATION_TICKS: u64 = 4 * crate::CYCLES_PER_FRAME;
+
 pub struct Kernel {
     pub objects: ObjectStore,
     pub handles: HandleTable,
@@ -43,6 +47,9 @@ pub struct Kernel {
     /// set when every thread is blocked, so the run loop can idle instead of
     /// spinning.
     pub all_blocked: bool,
+    /// flips while a thread starves the ones below it, handing every other
+    /// slice to them.
+    relief: bool,
 
     /// cached objects backing the pseudo-handles, so that duplicating
     /// CUR_THREAD_HANDLE twice yields the same object.
@@ -66,6 +73,7 @@ impl Kernel {
             linear_base,
             reschedule_pending: false,
             all_blocked: false,
+            relief: false,
             thread_objects: std::collections::HashMap::new(),
             process_object: None,
         }
@@ -175,8 +183,39 @@ impl Kernel {
             self.try_satisfy_wait(id, tick);
         }
 
-        let next = self.pick_next();
+        if let Some(current) = self.current_thread {
+            let thread = &mut self.threads[current as usize];
+            if !thread.is_runnable() {
+                thread.waited = true;
+            }
+        }
+        let mut next = self.pick_next();
         self.all_blocked = next.is_none();
+        // the console runs strictly by priority, but its threads block on
+        // every service request while ours are answered at once, so a thread
+        // spinning on work another does would hang. one that runs this long
+        // without waiting shares the core with the others ready.
+        if let Some(chosen) = next {
+            let thread = &mut self.threads[chosen as usize];
+            if thread.waited {
+                thread.waited = false;
+                thread.running_since = tick;
+            }
+            if tick.saturating_sub(thread.running_since) > STARVATION_TICKS {
+                let priority = thread.priority;
+                self.relief = !self.relief;
+                if self.relief {
+                    next = self.pick_other(chosen, priority).or(next);
+                }
+            }
+        }
+        if let Some(chosen) = next {
+            let thread = &mut self.threads[chosen as usize];
+            if thread.waited {
+                thread.waited = false;
+                thread.running_since = tick;
+            }
+        }
 
         match (self.current_thread, next) {
             (Some(current), Some(next)) if current == next => {
@@ -211,6 +250,16 @@ impl Kernel {
         }
     }
 
+    /// the most urgent runnable thread besides one, at its priority or below.
+    fn pick_other(&self, chosen: ThreadId, priority: u32) -> Option<ThreadId> {
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|&(id, t)| id as ThreadId != chosen && t.is_runnable() && t.priority >= priority)
+            .min_by_key(|(_, t)| t.priority)
+            .map(|(id, _)| id as ThreadId)
+    }
+
     /// the highest-priority runnable thread, round-robining within a priority
     /// by preferring the one after the current thread.
     fn pick_next(&self) -> Option<ThreadId> {
@@ -220,6 +269,16 @@ impl Kernel {
             .filter(|t| t.is_runnable())
             .map(|t| t.priority)
             .min()?;
+
+        // the running thread keeps the core unless something strictly more
+        // urgent is ready, waking a thread of its own priority does not hand
+        // over, only waiting or yielding does
+        if let Some(current) = self.current_thread {
+            let thread = &self.threads[current as usize];
+            if thread.status == ThreadStatus::Running && thread.priority <= best {
+                return Some(current);
+            }
+        }
 
         let count = self.threads.len();
         let start = self.current_thread.map_or(0, |id| id as usize + 1);
@@ -365,6 +424,14 @@ impl Kernel {
         thread.wait_result = None;
         thread.status = ThreadStatus::WaitSync;
         self.reschedule_pending = true;
+    }
+
+    /// whether a thread besides the current one could run.
+    pub fn others_ready(&self) -> bool {
+        self.threads
+            .iter()
+            .enumerate()
+            .any(|(id, thread)| Some(id as ThreadId) != self.current_thread && thread.is_runnable())
     }
 
     pub fn sleep_current(&mut self, ticks: u64, tick: u64) {

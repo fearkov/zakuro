@@ -126,6 +126,10 @@ pub struct Thread {
     pub wait_all: bool,
     /// tick at which a timeout expires. None means wait forever.
     pub wakeup_at: Option<u64>,
+    /// the tick the thread last started running after a wait, and whether
+    /// it has waited since.
+    pub running_since: u64,
+    pub waited: bool,
     /// address this thread is parked on, for arbiter waits.
     pub wait_address: Option<VAddr>,
     /// set when the wait was satisfied, so the syscall knows what to return.
@@ -182,6 +186,8 @@ impl Thread {
             wait_objects: Vec::new(),
             wait_all: false,
             wakeup_at: None,
+            running_since: 0,
+            waited: true,
             wait_address: None,
             wait_result: None,
             wait_syscall: None,
