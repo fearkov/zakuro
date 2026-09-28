@@ -534,7 +534,7 @@ impl System {
     /// everything that happens between frames, vertical blank, input, clock.
     fn end_frame(&mut self) {
         self.frames += 1;
-        if self.frames % hints::SAVE_EVERY == 0 {
+        if self.frames.is_multiple_of(hints::SAVE_EVERY) {
             if let Some(hints) = &mut self.hints {
                 hints.save();
             }
@@ -891,7 +891,7 @@ fn grow(pixels: &[u8], width: u32, scale: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(pixels.len() * scale * scale);
     for row in pixels.chunks_exact(width * 4) {
         let mut grown = Vec::with_capacity(row.len() * scale);
-        for pixel in row.chunks_exact(4) {
+        for pixel in row.as_chunks::<4>().0 {
             for _ in 0..scale {
                 grown.extend_from_slice(pixel);
             }
