@@ -75,6 +75,9 @@ pub struct HidState {
     pub gyroscope_users: u32,
     pub accelerometer_index: u32,
     pub gyroscope_index: u32,
+    /// the tick each section's ring last started over at, and the one
+    /// before, for the pad, touch, accelerometer and gyroscope.
+    pub reset_ticks: [(u64, u64); 4],
     /// the input the frontend gave last.
     pub input: InputState,
 }
@@ -180,14 +183,24 @@ fn put16(system: &mut System, paddr: u32, value: u16) {
     system.memory.write_physical(paddr, &value.to_le_bytes());
 }
 
-/// writes the header every HID section starts with, two timestamps, then the
-/// index of the sample just written.
-fn write_section_header(system: &mut System, section: u32, index: u32, tick: u64) {
-    let tick = tick & 0x7FFF_FFFF_FFFF_FFFF;
-    put32(system, section, tick as u32);
-    put32(system, section + 4, (tick >> 32) as u32);
-    // the second timestamp is the previous update's, so the two differ.
-    let previous = tick.saturating_sub(1);
+/// the sections, in the order their reset ticks are kept.
+const PAD: usize = 0;
+const TOUCH: usize = 1;
+const ACCELEROMETER: usize = 2;
+const GYROSCOPE: usize = 3;
+
+/// writes the header every HID section starts with, the ticks its ring last
+/// started over at, the latest then the one before, and the index of the
+/// sample just written. readers count new samples by the index and take a
+/// changed tick as the ring having come round, so it moves only then.
+fn write_section_header(system: &mut System, section: u32, which: usize, index: u32, tick: u64) {
+    let ticks = &mut system.services.hid.reset_ticks[which];
+    if index == 0 {
+        *ticks = (tick & 0x7FFF_FFFF_FFFF_FFFF, ticks.0);
+    }
+    let (latest, previous) = *ticks;
+    put32(system, section, latest as u32);
+    put32(system, section + 4, (latest >> 32) as u32);
     put32(system, section + 8, previous as u32);
     put32(system, section + 12, (previous >> 32) as u32);
     put32(system, section + 0x10, index);
@@ -218,7 +231,9 @@ pub fn update(system: &mut System, input: InputState) {
     system.services.hid.pad_index = next;
 
     let tick = system.cpu.cycles;
-    write_section_header(system, base + PAD_BASE, next, tick);
+    write_section_header(system, base + PAD_BASE, PAD, next, tick);
+    // the buttons held now, past the header
+    put32(system, base + PAD_BASE + 0x1C, buttons.bits());
 
     // circle pad range is roughly +-150 on hardware.
     let circle_x = (input.circle_x.clamp(-1.0, 1.0) * 150.0) as i16;
@@ -235,7 +250,7 @@ pub fn update(system: &mut System, input: InputState) {
     let touch_index = system.services.hid.touch_index;
     let touch_next = (touch_index + 1) % 8;
     system.services.hid.touch_index = touch_next;
-    write_section_header(system, base + TOUCH_BASE, touch_next, tick);
+    write_section_header(system, base + TOUCH_BASE, TOUCH, touch_next, tick);
     // the touch section's entries start earlier than the pad's, its header
     // has no circle-pad fields to make room for.
     let touch_entry = base + TOUCH_BASE + 0x20 + touch_next * 8;
@@ -263,7 +278,7 @@ pub fn update(system: &mut System, input: InputState) {
     if hid.accelerometer_users > 0 {
         let index = (hid.accelerometer_index + 1) % ACCELEROMETER_SAMPLES;
         system.services.hid.accelerometer_index = index;
-        motion_sample(system, base + ACCELEROMETER_BASE, index, tick, [0, -ONE_G, 0]);
+        motion_sample(system, base + ACCELEROMETER_BASE, ACCELEROMETER, index, tick, [0, -ONE_G, 0]);
         if let Some(&event) = objects.get(2) {
             system.kernel.signal_event(event);
         }
@@ -272,7 +287,7 @@ pub fn update(system: &mut System, input: InputState) {
     if hid.gyroscope_users > 0 {
         let index = (hid.gyroscope_index + 1) % GYROSCOPE_SAMPLES;
         system.services.hid.gyroscope_index = index;
-        motion_sample(system, base + GYROSCOPE_BASE, index, tick, [0, 0, 0]);
+        motion_sample(system, base + GYROSCOPE_BASE, GYROSCOPE, index, tick, [0, 0, 0]);
         if let Some(&event) = objects.get(3) {
             system.kernel.signal_event(event);
         }
@@ -280,8 +295,8 @@ pub fn update(system: &mut System, input: InputState) {
 }
 
 /// writes a motion sensor's sample as both its raw one and entry index.
-fn motion_sample(system: &mut System, section: u32, index: u32, tick: u64, sample: [i16; 3]) {
-    write_section_header(system, section, index, tick);
+fn motion_sample(system: &mut System, section: u32, which: usize, index: u32, tick: u64, sample: [i16; 3]) {
+    write_section_header(system, section, which, index, tick);
     for at in [section + 0x18, section + MOTION_ENTRIES + index * 6] {
         for (i, value) in sample.iter().enumerate() {
             put16(system, at + i as u32 * 2, *value as u16);
