@@ -256,6 +256,10 @@ fn open_host_archive(system: &System, archive_id: u32, path: &[u8]) -> Result<Ho
         let _ = std::fs::create_dir_all(archive.resolve("").unwrap_or_default());
         return Ok(archive);
     }
+    let id = path.get(4..8).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    if archive_id == ARCHIVE_SHARED_EXTDATA && id == PLAY_COINS && !archive.exists() {
+        make_play_coins(&archive)?;
+    }
     if archive.exists() {
         return Ok(archive);
     }
@@ -263,6 +267,25 @@ fn open_host_archive(system: &System, archive_id: u32, path: &[u8]) -> Result<Ho
         ARCHIVE_EXTDATA => errors::FS_NOT_FOUND_INVALID_STATE,
         _ => errors::FS_NOT_FORMATTED,
     })
+}
+
+/// the shared extra data holding the play coins, which every console has
+/// and titles open without ever creating it.
+const PLAY_COINS: u32 = 0xF000_000B;
+
+/// makes the play coins' extra data the way a console that never walked
+/// anywhere has it, a magic, 42 coins, no steps and the date they were
+/// last counted.
+fn make_play_coins(archive: &HostArchive) -> Result<(), ResultCode> {
+    archive.format(FormatInfo::default())?;
+    let mut coins = Vec::with_capacity(20);
+    coins.extend_from_slice(&0x4F00u32.to_le_bytes());
+    coins.extend_from_slice(&42u16.to_le_bytes());
+    coins.extend_from_slice(&[0; 10]);
+    coins.extend_from_slice(&2014u16.to_le_bytes());
+    coins.extend_from_slice(&[12, 29]);
+    let file = archive.resolve("gamecoin.dat")?;
+    std::fs::write(file, coins).map_err(|_| errors::FS_NOT_FORMATTED)
 }
 
 /// the writable archive an archive handle refers to.
