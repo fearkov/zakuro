@@ -98,7 +98,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     }
 
     if system.config.hardware_renderer {
-        match system.gpu.enable_hardware_renderer() {
+        match system.gpu.enable_hardware_renderer(system.config.resolution) {
             Ok(name) => log::info!("drawing on {name} through Vulkan"),
             Err(error) => log::warn!("{error}, drawing in software"),
         }

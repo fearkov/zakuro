@@ -329,6 +329,10 @@ impl Menus {
                     ui.selectable_value(&mut settings.renderer, Renderer::OpenGl, "OpenGL");
                 });
             ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
+            ui.add_enabled(
+                settings.hardware_rasterizer,
+                egui::Slider::new(&mut settings.resolution, 1..=4).text("Resolution").suffix("x"),
+            );
             ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
             ui.label(RichText::new("The presenter changes the next time Zakuro starts, the 3D with the next game.").weak());
 

@@ -513,12 +513,31 @@ impl Gpu {
 
     /// draws on the host's GPU from now on, rather than in software, and
     /// says which GPU that is.
+    /// scale is how many times the console's resolution it draws at, for
+    /// sharper pictures.
     #[cfg(feature = "vulkan")]
-    pub fn enable_hardware_renderer(&mut self) -> Result<String, String> {
-        let hardware = raster::hardware::Hardware::new()?;
-        let name = hardware.name().to_owned();
+    pub fn enable_hardware_renderer(&mut self, scale: u32) -> Result<String, String> {
+        let mut hardware = raster::hardware::Hardware::new()?;
+        let scale = hardware.set_scale(scale);
+        let name = format!("{} at {scale}x", hardware.name());
         self.resources.hardware = Some(hardware);
         Ok(name)
+    }
+
+    /// a screen's buffer as the host GPU drew it, at its scale, RGBA with
+    /// rows bottom first, and the scale, when it drew it scaled and guest
+    /// memory still holds the same picture.
+    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<(Vec<u8>, u32)> {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            match hardware.screen(addr, size, format, guest) {
+                Ok(screen) => return screen.filter(|(_, scale)| *scale > 1),
+                Err(error) => log::error!("the GPU could not show a screen, {error}"),
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (addr, size, format, guest);
+        None
     }
 
     /// makes guest memory right over a range something other than a draw

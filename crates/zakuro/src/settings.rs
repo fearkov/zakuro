@@ -90,6 +90,8 @@ pub struct Settings {
     pub renderer: Renderer,
     /// draw the 3D on the GPU rather than in software.
     pub hardware_rasterizer: bool,
+    /// how many times the console's resolution the GPU draws the 3D at.
+    pub resolution: u32,
     /// run a game's recompiled code when it has some, rather than
     /// interpreting everything.
     pub recompiled: bool,
@@ -112,6 +114,7 @@ impl Default for Settings {
             games: None,
             renderer: Renderer::Vulkan,
             hardware_rasterizer: true,
+            resolution: 3,
             recompiled: true,
             scale: 2,
             volume: 1.0,

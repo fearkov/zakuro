@@ -24,6 +24,8 @@ fn main() {
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().map(Into::into),
         // ZAKURO_RASTERIZER=hardware draws on the host GPU.
         hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
+        // ZAKURO_RESOLUTION=3 draws at three times the console's resolution.
+        resolution: std::env::var("ZAKURO_RESOLUTION").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
         ..Config::default()
     };
     let mut system = match loader::load(&path, config) {
@@ -340,8 +342,7 @@ fn save_screen(
     screen: zakuro_common::Screen,
     path: &str,
 ) -> std::collections::HashSet<[u8; 3]> {
-    let pixels = system.read_screen(screen);
-    let (width, height) = (screen.width() as usize, screen.height() as usize);
+    let (pixels, width, height) = system.read_screen_scaled(screen);
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     for chunk in pixels.as_chunks::<4>().0 {
         ppm.extend_from_slice(&chunk[..3]);

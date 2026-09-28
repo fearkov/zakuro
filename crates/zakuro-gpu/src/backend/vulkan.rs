@@ -161,9 +161,10 @@ impl VulkanPresenter {
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
-                    // nearest keeps the console's pixels crisp when scaled up.
-                    .mag_filter(vk::Filter::NEAREST)
-                    .min_filter(vk::Filter::NEAREST)
+                    // linear, the screens come drawn at up to four times the
+                    // console's resolution and get shrunk as often as grown
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),

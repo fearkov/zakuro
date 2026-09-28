@@ -45,6 +45,8 @@ pub struct Config {
     pub data_dir: Option<std::path::PathBuf>,
     /// draw on the host's GPU through Vulkan, when there is one that can.
     pub hardware_renderer: bool,
+    /// how many times the console's resolution the host's GPU draws at.
+    pub resolution: u32,
 }
 
 impl Default for Config {
@@ -60,6 +62,7 @@ impl Default for Config {
             find_recompiled: false,
             data_dir: None,
             hardware_renderer: false,
+            resolution: 1,
         }
     }
 }
@@ -698,6 +701,44 @@ impl System {
     }
 
     /// reads one screen into a straight RGBA8 buffer for presentation.
+    /// a screen as RGBA at the resolution the host's GPU drew it, and its
+    /// width and height, the console's own when it drew it that way.
+    pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> (Vec<u8>, u32, u32) {
+        let native = self.read_screen(screen);
+        let (width, height) = (screen.width(), screen.height());
+        let config = self.gpu.framebuffers[match screen {
+            zakuro_common::Screen::Top => 0,
+            zakuro_common::Screen::Bottom => 1,
+        }];
+        let address = config.address_left();
+        let format = config.color_format();
+        let bpp = format.bytes_per_pixel() as u32;
+        // only plain buffers a row per screen column, as display transfers
+        // leave them
+        if self.lcd_force_black || address == 0 || (config.stride != 0 && config.stride != height * bpp) {
+            return (native, width, height);
+        }
+        let base = services::gsp::physical_to_virtual(self, address);
+        let mut guest = vec![0u8; (width * height * bpp) as usize];
+        self.memory.read_bytes(base, &mut guest);
+        let Some((image, scale)) = self.gpu.scaled_screen(base, (height, width), format, &guest) else {
+            return (native, width, height);
+        };
+        // the image has a row per column of the screen, bottom first, and
+        // its columns run up the screen, as memory has them
+        let (out_width, out_height) = (width * scale, height * scale);
+        let mut out = vec![0u8; (out_width * out_height * 4) as usize];
+        for x in 0..out_width {
+            let row = (out_width - 1 - x) * out_height;
+            for y in 0..out_height {
+                let at = ((row + out_height - 1 - y) * 4) as usize;
+                let dst = ((y * out_width + x) * 4) as usize;
+                out[dst..dst + 4].copy_from_slice(&image[at..at + 4]);
+            }
+        }
+        (out, out_width, out_height)
+    }
+
     pub fn read_screen(&mut self, screen: zakuro_common::Screen) -> Vec<u8> {
         let index = match screen {
             zakuro_common::Screen::Top => 0,

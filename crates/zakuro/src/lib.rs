@@ -397,6 +397,7 @@ impl App {
             linked: self.linked.filter(|_| !interpret),
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
+            resolution: self.settings.resolution,
             ..Config::default()
         }
     }
@@ -715,14 +716,15 @@ impl App {
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {
         let overlay = self.interface(event_loop);
+        let blank = |screen: Screen| (Vec::new(), screen.width(), screen.height());
         let (top, bottom) = match &mut self.game {
-            Some(game) => (game.system.read_screen(Screen::Top), game.system.read_screen(Screen::Bottom)),
-            None => (Vec::new(), Vec::new()),
+            Some(game) => (game.system.read_screen_scaled(Screen::Top), game.system.read_screen_scaled(Screen::Bottom)),
+            None => (blank(Screen::Top), blank(Screen::Bottom)),
         };
         let Some(backend) = &mut self.backend else { return };
         let result = backend.present(
-            ScreenImage { width: Screen::Top.width(), height: Screen::Top.height(), pixels: &top },
-            ScreenImage { width: Screen::Bottom.width(), height: Screen::Bottom.height(), pixels: &bottom },
+            ScreenImage { width: top.1, height: top.2, pixels: &top.0 },
+            ScreenImage { width: bottom.1, height: bottom.2, pixels: &bottom.0 },
             &overlay,
         );
         match result {

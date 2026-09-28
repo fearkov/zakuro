@@ -140,6 +140,11 @@ struct Surface {
     /// drawn into since guest memory last got the image.
     dirty: bool,
     capture: Option<Capture>,
+    /// when drawing scaled, an image at the console's resolution the
+    /// surface goes through on its way to and from guest memory, and a
+    /// copy of the scaled image for showing it.
+    native: Option<Image>,
+    screen: Option<Capture>,
     /// counts the changes to the image, for the textures copied from it.
     generation: u64,
 }
@@ -156,8 +161,13 @@ impl Surface {
     /// the GPU changed the image.
     fn changed(&mut self) {
         self.dirty = true;
+        self.replaced();
+    }
+
+    /// the image holds something new, the copies of it are old.
+    fn replaced(&mut self) {
         self.generation += 1;
-        if let Some(capture) = &mut self.capture {
+        for capture in [&mut self.capture, &mut self.screen].into_iter().flatten() {
             capture.current = false;
         }
     }
@@ -302,6 +312,10 @@ pub struct Hardware {
     rendering: Option<(usize, Option<usize>)>,
     batch: u64,
     name: String,
+    /// how many times the console's resolution surfaces are drawn at.
+    scale: u32,
+    /// whether the GPU can blit both surface formats, which scaling needs.
+    blits: bool,
 }
 
 impl Hardware {
@@ -407,6 +421,10 @@ impl Hardware {
                 mapped: std::ptr::null_mut(),
                 incoherent: false,
             };
+            let blits = [COLOR_FORMAT, DEPTH_FORMAT].iter().all(|&format| {
+                let features = instance.get_physical_device_format_properties(physical, format).optimal_tiling_features;
+                features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
+            });
             let mut hardware = Hardware {
                 ring: unmade(),
                 spare: Frame { commands: buffers[1], fence: spare_fence, ring: unmade(), pending: None },
@@ -442,6 +460,8 @@ impl Hardware {
                 rendering: None,
                 batch: 0,
                 name,
+                scale: 1,
+                blits,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::UNIFORM_BUFFER
@@ -464,6 +484,15 @@ impl Hardware {
     /// the GPU it draws with.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// draws at a multiple of the console's resolution, before anything is
+    /// drawn, when the GPU can scale surfaces, and says the one it took.
+    pub fn set_scale(&mut self, scale: u32) -> u32 {
+        if self.surfaces.is_empty() && self.blits {
+            self.scale = scale.clamp(1, 4);
+        }
+        self.scale
     }
 
     /// a host visible buffer, mapped for as long as it lives. one the host
@@ -662,7 +691,14 @@ impl Hardware {
                     ),
                 };
                 let usage = usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-                let image = self.image(width, height, format, usage, aspect)?;
+                let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
+                let native = match self.scale {
+                    1 => None,
+                    _ => {
+                        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+                        Some(self.image(width, height, format, usage, aspect)?)
+                    }
+                };
                 self.uploads = true;
                 self.surfaces.push(Surface {
                     image,
@@ -675,6 +711,8 @@ impl Hardware {
                     checked: false,
                     dirty: false,
                     capture: None,
+                    native,
+                    screen: None,
                     generation: 0,
                 });
                 self.surfaces.len() - 1
@@ -711,7 +749,7 @@ impl Hardware {
             (s.width, s.height, s.kind, s.tiled)
         };
         let pixels = (width * height) as u64;
-        let image = self.surfaces[index].image.image;
+        let image = self.surfaces[index].native.as_ref().unwrap_or(&self.surfaces[index].image).image;
         let extent = vk::Extent3D { width, height, depth: 1 };
         let region = |offset: u64, aspect: vk::ImageAspectFlags| {
             vk::BufferImageCopy::default()
@@ -773,13 +811,48 @@ impl Hardware {
                 };
             }
         }
-        self.uploads = true;
-        let surface = &mut self.surfaces[index];
-        surface.generation += 1;
-        if let Some(capture) = &mut surface.capture {
-            capture.current = false;
+        if self.scale > 1 {
+            self.barrier();
+            self.blit(index, true);
         }
+        self.uploads = true;
+        self.surfaces[index].replaced();
         Ok(())
+    }
+
+    /// records a blit between a scaled surface and its image at the
+    /// console's resolution, up or down, taking the nearest pixel either way.
+    fn blit(&self, index: usize, up: bool) {
+        let s = &self.surfaces[index];
+        let Some(native) = &s.native else { return };
+        let aspect = match s.kind {
+            Kind::Color(_) => vk::ImageAspectFlags::COLOR,
+            Kind::Depth(_) => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        };
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1);
+        let corner = |width: u32, height: u32| [vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }];
+        let small = corner(s.width, s.height);
+        let big = corner(s.width * self.scale, s.height * self.scale);
+        let (from, to, from_corner, to_corner) =
+            if up { (native.image, s.image.image, small, big) } else { (s.image.image, native.image, big, small) };
+        let region = [vk::ImageBlit::default()
+            .src_subresource(layers)
+            .src_offsets(from_corner)
+            .dst_subresource(layers)
+            .dst_offsets(to_corner)];
+        // SAFETY: recording, outside rendering, between two images of the
+        // surface's format in the general layout made for transfers
+        unsafe {
+            self.device.cmd_blit_image(
+                self.commands,
+                from,
+                vk::ImageLayout::GENERAL,
+                to,
+                vk::ImageLayout::GENERAL,
+                &region,
+                vk::Filter::NEAREST,
+            )
+        };
     }
 
     /// the texture's image, uploaded the first time it is drawn with.
@@ -1035,10 +1108,7 @@ impl Hardware {
             surface.shadow = filled;
             surface.dirty = false;
             surface.checked = false;
-            surface.generation += 1;
-            if let Some(capture) = &mut surface.capture {
-                capture.current = false;
-            }
+            surface.replaced();
         }
         Ok(())
     }
@@ -1247,6 +1317,8 @@ impl Hardware {
         ];
 
         let commands = self.commands;
+        let scale = self.scale;
+        let (viewport_width, viewport_height) = (width * scale as f32, height * scale as f32);
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
         let test = r[REG_STENCIL_TEST];
         let op = r[REG_STENCIL_OP];
@@ -1260,14 +1332,14 @@ impl Hardware {
             device.cmd_set_viewport(
                 commands,
                 0,
-                &[vk::Viewport { x: 0.0, y: 0.0, width, height, min_depth: 0.0, max_depth: 1.0 }],
+                &[vk::Viewport { x: 0.0, y: 0.0, width: viewport_width, height: viewport_height, min_depth: 0.0, max_depth: 1.0 }],
             );
             device.cmd_set_scissor(
                 commands,
                 0,
                 &[vk::Rect2D {
-                    offset: vk::Offset2D { x: left, y: bottom },
-                    extent: vk::Extent2D { width: (right - left) as u32, height: (top - bottom) as u32 },
+                    offset: vk::Offset2D { x: left * scale as i32, y: bottom * scale as i32 },
+                    extent: vk::Extent2D { width: (right - left) as u32 * scale, height: (top - bottom) as u32 * scale },
                 }],
             );
             // with the test off the PICA still writes depth, which Vulkan
@@ -1302,7 +1374,7 @@ impl Hardware {
         let surface = &self.surfaces[color];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width: surface.width, height: surface.height },
+            extent: vk::Extent2D { width: surface.width * self.scale, height: surface.height * self.scale },
         };
         let attachment = |view: vk::ImageView| {
             vk::RenderingAttachmentInfo::default()
@@ -1388,23 +1460,29 @@ impl Hardware {
                 break (source, target);
             }
         };
+        // drawn scaled, every size and row is that many times more, and the
+        // pixels averaged stay as many
+        let n = self.scale as i32;
         let constants: [i32; 11] = [
-            t.copy.0 as i32,
-            t.copy.1 as i32,
-            t.input_height as i32,
-            t.output_height as i32,
+            t.copy.0 as i32 * n,
+            t.copy.1 as i32 * n,
+            t.input_height as i32 * n,
+            t.output_height as i32 * n,
             t.scale.0 as i32,
             t.scale.1 as i32,
             t.flip as i32,
             format_index(t.input_format),
             format_index(t.output_format),
-            row as i32,
-            input_size.1 as i32,
+            row as i32 * n,
+            input_size.1 as i32 * n,
         ];
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
-        self.dispatch_transfer(views, constants, t.copy)?;
+        self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
         self.surfaces[target].changed();
         self.capture(target)?;
+        if self.scale > 1 {
+            self.capture_screen(target)?;
+        }
         self.submit()?;
         Ok(true)
     }
@@ -1482,7 +1560,7 @@ impl Hardware {
         }
         if !self.copies.contains_key(texture) {
             let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
-            let image = self.image(texture.width, texture.height, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
+            let image = self.image(texture.width * self.scale, texture.height * self.scale, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
             self.copies.insert(*texture, Copied { image, surface: source, generation, used: batch });
         }
         let view = self.copies[texture].image.view;
@@ -1493,9 +1571,11 @@ impl Hardware {
             // so the copy flips them, and its pixels round to the format as
             // memory would have them
             let format = format_index(texture.format);
-            let (width, height) = (texture.width as i32, texture.height as i32);
-            let constants = [width, height, height, height, 1, 1, 1, format, format, row as i32, self.surfaces[source].height as i32];
-            self.dispatch_transfer((self.surfaces[source].image.view, view), constants, (texture.width, texture.height))?;
+            let n = self.scale;
+            let (width, height) = ((texture.width * n) as i32, (texture.height * n) as i32);
+            let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
+            let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height];
+            self.dispatch_transfer((self.surfaces[source].image.view, view), constants, (texture.width * n, texture.height * n))?;
         }
         self.uploads = true;
         if let Some(copy) = self.copies.get_mut(texture) {
@@ -1510,7 +1590,8 @@ impl Hardware {
     /// copied into a buffer and then made into the colors their bytes read
     /// as.
     fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture) -> Result<(), String> {
-        let (width, height) = (self.surfaces[source].width, self.surfaces[source].height);
+        let n = self.scale;
+        let (width, height) = (self.surfaces[source].width * n, self.surfaces[source].height * n);
         let pixels = (width * height) as u64;
         let samples = self.samples(pixels * 5)?;
         let (layout, pipeline) = self.depth_pipeline()?;
@@ -1541,7 +1622,8 @@ impl Hardware {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&target),
         ];
-        let constants = [texture.width as i32, texture.height as i32, width as i32, height as i32, row as i32, (bytes == 4) as i32];
+        let (texture_width, texture_height) = (texture.width * n, texture.height * n);
+        let constants = [texture_width as i32, texture_height as i32, width as i32, height as i32, (row * n) as i32, (bytes == 4) as i32];
         let constants: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
         // SAFETY: recording, outside rendering, from a depth image in the
         // general layout into a buffer big enough for both aspects, then a
@@ -1553,7 +1635,7 @@ impl Hardware {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
-            self.device.cmd_dispatch(self.commands, texture.width.div_ceil(8), texture.height.div_ceil(8), 1);
+            self.device.cmd_dispatch(self.commands, texture_width.div_ceil(8), texture_height.div_ceil(8), 1);
         }
         Ok(())
     }
@@ -1568,8 +1650,13 @@ impl Hardware {
         }
         self.end_rendering();
         self.barrier();
+        if self.scale > 1 {
+            self.blit(index, false);
+            self.barrier();
+        }
         let batch = self.batch;
         let surface = &mut self.surfaces[index];
+        let source = surface.native.as_ref().unwrap_or(&surface.image).image;
         let Some(capture) = surface.capture.as_mut() else { unreachable!("made above") };
         let region = [vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
@@ -1582,18 +1669,70 @@ impl Hardware {
         // SAFETY: recording, outside rendering, into a buffer the size of
         // the image, which the host reads only once this batch is done
         unsafe {
-            self.device.cmd_copy_image_to_buffer(
-                self.commands,
-                surface.image.image,
-                vk::ImageLayout::GENERAL,
-                capture.buffer.buffer,
-                &region,
-            );
+            self.device.cmd_copy_image_to_buffer(self.commands, source, vk::ImageLayout::GENERAL, capture.buffer.buffer, &region);
             self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
         }
         capture.batch = batch;
         capture.current = true;
         Ok(())
+    }
+
+    /// records a copy of a scaled surface as it is, for showing it.
+    fn capture_screen(&mut self, index: usize) -> Result<(), String> {
+        let (width, height) = (self.surfaces[index].width * self.scale, self.surfaces[index].height * self.scale);
+        if self.surfaces[index].screen.is_none() {
+            let buffer = self.buffer((width * height * 4) as u64, vk::BufferUsageFlags::TRANSFER_DST, true)?;
+            self.surfaces[index].screen = Some(Capture { buffer, batch: 0, current: false });
+        }
+        self.end_rendering();
+        self.barrier();
+        let batch = self.batch;
+        let surface = &mut self.surfaces[index];
+        let Some(screen) = surface.screen.as_mut() else { unreachable!("made above") };
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+            .image_extent(vk::Extent3D { width, height, depth: 1 })];
+        let to_host = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        // SAFETY: recording, outside rendering, into a buffer the size of
+        // the image, which the host reads only once this batch is done
+        unsafe {
+            self.device.cmd_copy_image_to_buffer(self.commands, surface.image.image, vk::ImageLayout::GENERAL, screen.buffer.buffer, &region);
+            self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
+        }
+        screen.batch = batch;
+        screen.current = true;
+        Ok(())
+    }
+
+    /// the scaled image of a buffer a display transfer left for a screen,
+    /// RGBA with its rows bottom first, while guest memory still holds what
+    /// the transfer wrote there, and the scale it is at.
+    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8]) -> Result<Option<(Vec<u8>, u32)>, String> {
+        let found = self.surfaces.iter().position(|s| {
+            s.addr == addr && s.width == width && s.height == height && s.kind == Kind::Color(format) && !s.tiled
+        });
+        let Some(index) = found else { return Ok(None) };
+        let s = &self.surfaces[index];
+        if s.dirty || s.shadow.as_slice() != guest {
+            return Ok(None);
+        }
+        let Some(batch) = s.screen.as_ref().filter(|screen| screen.current).map(|screen| screen.batch) else { return Ok(None) };
+        self.wait_for(batch)?;
+        let Some(screen) = self.surfaces[index].screen.as_ref() else { return Ok(None) };
+        let buffer = &screen.buffer;
+        if buffer.incoherent {
+            let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
+            // SAFETY: the memory is mapped and the GPU is done with it
+            unsafe { self.device.invalidate_mapped_memory_ranges(&range) }.map_err(vk_error("invalidate memory"))?;
+        }
+        // SAFETY: the batch that filled the buffer is done, and nothing
+        // writes it again before this returns
+        let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
+        Ok(Some((data.to_vec(), self.scale)))
     }
 
     /// the pipeline display transfers run on, made the first time.
@@ -1838,6 +1977,12 @@ impl Hardware {
 
         let mut offsets = Vec::with_capacity(dirty.len());
         self.barrier();
+        if self.scale > 1 {
+            for &i in &dirty {
+                self.blit(i, false);
+            }
+            self.barrier();
+        }
         let readback = self.readback.as_ref().map_or(vk::Buffer::null(), |b| b.buffer);
         let mut offset = 0;
         for &i in &dirty {
@@ -1857,11 +2002,10 @@ impl Hardware {
                     region(offset + pixels * 4, vk::ImageAspectFlags::STENCIL),
                 ],
             };
+            let image = s.native.as_ref().unwrap_or(&s.image).image;
             // SAFETY: recording, outside rendering, into a buffer big enough
             // for every region
-            unsafe {
-                self.device.cmd_copy_image_to_buffer(self.commands, s.image.image, vk::ImageLayout::GENERAL, readback, &regions)
-            };
+            unsafe { self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, readback, &regions) };
             offsets.push(offset);
             offset += size_of(s);
         }
@@ -1962,9 +2106,12 @@ impl Drop for Hardware {
             }
             for surface in &self.surfaces {
                 self.destroy_image(&surface.image);
+                if let Some(native) = &surface.native {
+                    self.destroy_image(native);
+                }
             }
             self.destroy_image(&self.blank);
-            let captures = self.surfaces.iter().filter_map(|s| s.capture.as_ref().map(|c| &c.buffer));
+            let captures = self.surfaces.iter().flat_map(|s| [&s.capture, &s.screen]).filter_map(|c| c.as_ref().map(|c| &c.buffer));
             let buffers = [Some(&self.ring), Some(&self.spare.ring), self.readback.as_ref()].into_iter().flatten();
             for buffer in buffers.chain(captures) {
                 self.device.destroy_buffer(buffer.buffer, None);
