@@ -1,6 +1,6 @@
 # Zakuro
 
-A WIP HLE Nintendo 3DS emulator written in Rust.
+A WIP HLE Nintendo 3DS emulator written in Rust that uses ahead-of-time (AOT) recompilation instead of a JIT.
 
 <img width="797" height="983" alt="image" src="https://github.com/user-attachments/assets/c18deb0d-3949-4493-83df-0142928d8c2d" />
 
@@ -10,7 +10,7 @@ I started developing this project in October 2025, before
 
 I first wrote it in C++, but I was learning Rust at the time and noticed there wasn't a working 3DS emulator written in Rust, so I switched.
 
-This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot. On the interpreter alone they run below full speed, but tested games run at full speed with their code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp). There's no JIT yet.
+This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot. Instead of translating code while the game runs, like a JIT does, Zakuro runs code recompiled ahead of time by [3dsrecomp](https://github.com/fearkov/3dsrecomp), and tested games run at full speed that way. On the interpreter alone they run below full speed.
 
 Builds for Windows and Linux are on the [releases page](https://github.com/fearkov/zakuro/releases): on Windows, unzip it and run zakuro.exe, and on Linux, extract it and run ./zakuro.
 
