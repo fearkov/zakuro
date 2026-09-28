@@ -2,6 +2,7 @@
 //! the loop that drives them.
 
 pub mod cro;
+pub mod hints;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
@@ -123,6 +124,8 @@ pub struct System {
     /// code recompiled ahead of time, which runs instead of the interpreter
     /// wherever it has something.
     pub recompiled: Option<recompiled::Library>,
+    /// where the title ran in the interpreter despite the library.
+    pub hints: Option<hints::Hints>,
     /// instructions the interpreter ran for want of recompiled code, and
     /// the ones recompiled code ran, to see how much the library covers.
     pub interpreted_instructions: u64,
@@ -187,6 +190,7 @@ impl System {
             next_preempt: PREEMPT_INTERVAL,
             profile: None,
             recompiled: None,
+            hints: None,
             interpreted_instructions: 0,
             recompiled_instructions: 0,
         }
@@ -350,9 +354,20 @@ impl System {
         }
 
         let exit = match self.run_recompiled(deadline) {
-            Some(exit) => exit,
+            Some(exit) => {
+                if let Some(hints) = &mut self.hints {
+                    hints.library_ran();
+                }
+                exit
+            }
             None => {
                 self.interpreted_instructions += 1;
+                let thumb = self.cpu.cpsr.thumb;
+                if let (Some(hints), Some(library)) = (&mut self.hints, &self.recompiled) {
+                    if !library.has_code(pc | thumb as u32) {
+                        hints.interpreted(pc, thumb);
+                    }
+                }
                 self.cpu.step(&mut self.memory)
             }
         };
@@ -519,6 +534,11 @@ impl System {
     /// everything that happens between frames, vertical blank, input, clock.
     fn end_frame(&mut self) {
         self.frames += 1;
+        if self.frames % hints::SAVE_EVERY == 0 {
+            if let Some(hints) = &mut self.hints {
+                hints.save();
+            }
+        }
 
         // refresh the kernel's shared page so the guest's clock advances.
         let tick = self.cpu.cycles;
@@ -851,6 +871,15 @@ impl GpuMemory for GuestMemory<'_> {
             VRAM_VADDR + (paddr - VRAM_PADDR)
         } else {
             paddr
+        }
+    }
+}
+
+impl Drop for System {
+    /// what the interpreter ran lasts past the run.
+    fn drop(&mut self) {
+        if let Some(hints) = &mut self.hints {
+            hints.save();
         }
     }
 }

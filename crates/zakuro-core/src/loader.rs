@@ -92,6 +92,8 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             Ok(library) => {
                 log::info!("running recompiled code from {}, {}", path.display(), library.describe());
                 system.recompiled = Some(library);
+                let text = exheader_text(&title);
+                system.hints = Some(crate::hints::Hints::new(&path, text));
             }
             Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
         }
@@ -106,6 +108,12 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
 
     system.title = Some(title);
     Ok(system)
+}
+
+/// where the executable's code is.
+fn exheader_text(title: &Title) -> std::ops::Range<u32> {
+    let text = &title.exheader.text;
+    text.address..text.address + text.num_pages * PAGE_SIZE
 }
 
 /// the library 3dsrecomp build installed for the title, when the system is
