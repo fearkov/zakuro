@@ -225,7 +225,10 @@ impl System {
         // anything
         let input = self.services.hid.input;
         services::hid::update(self, input);
-        let deadline = self.cpu.cycles + CYCLES_PER_FRAME;
+        // run up to the boundary step() would end the frame at, and end it
+        // here, once, instead of again when the next frame's first step
+        // finds the boundary passed
+        let deadline = self.next_frame_boundary;
         while self.cpu.cycles < deadline {
             match self.step(Some(deadline)) {
                 StepOutcome::Ran => {}
@@ -233,6 +236,7 @@ impl System {
                 StepOutcome::Faulted => return FrameOutcome::Faulted,
             }
         }
+        self.next_frame_boundary = self.cpu.cycles + CYCLES_PER_FRAME;
         self.end_frame();
         FrameOutcome::Completed
     }
