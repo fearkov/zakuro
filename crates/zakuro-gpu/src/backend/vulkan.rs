@@ -174,16 +174,16 @@ impl VulkanPresenter {
         .map_err(vk_fail("creating the sampler"))?;
 
         let descriptor_pool = unsafe {
+            // a screen whose size changes is made again before the old one
+            // goes and gives its set back, so there is room for both
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(2)];
-            // a screen's set goes back when its size changes and it is made
-            // again
+                .descriptor_count(4)];
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
                     .pool_sizes(&sizes)
-                    .max_sets(2),
+                    .max_sets(4),
                 None,
             )
         }
