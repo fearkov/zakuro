@@ -144,7 +144,8 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
         base,
     );
     let slider = system.config.slider_3d;
-    memory::config::init_shared_page(system.memory.phys.shared_page_mut(), model, slider);
+    let clock = system.boot_clock;
+    memory::config::init_shared_page(system.memory.phys.shared_page_mut(), model, slider, clock);
 
     // both pages are read-only to the guest and live in AXI WRAM.
     system.memory.map(

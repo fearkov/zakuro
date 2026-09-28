@@ -105,6 +105,8 @@ pub struct System {
     history_index: usize,
     /// frames completed since boot.
     pub frames: u64,
+    /// the console's clock at boot, in milliseconds since 1900.
+    pub(crate) boot_clock: u64,
     /// cycle count at which the next end-of-frame work is due.
     next_frame_boundary: u64,
     /// cycle count at which the DSP next finishes an audio frame.
@@ -176,6 +178,7 @@ impl System {
             history: [0; HISTORY_LENGTH],
             history_index: 0,
             frames: 0,
+            boot_clock: memory::config::host_clock(),
             next_frame_boundary: CYCLES_PER_FRAME,
             next_audio_frame: CYCLES_PER_AUDIO_FRAME,
             next_preempt: PREEMPT_INTERVAL,
@@ -512,7 +515,7 @@ impl System {
 
         // refresh the kernel's shared page so the guest's clock advances.
         let tick = self.cpu.cycles;
-        memory::config::update_datetime(self.memory.phys.shared_page_mut(), tick);
+        memory::config::update_datetime(self.memory.phys.shared_page_mut(), self.boot_clock, tick);
 
         // fire the expired timers.
         let mut signalled = Vec::new();

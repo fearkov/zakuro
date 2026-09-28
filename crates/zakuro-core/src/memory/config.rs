@@ -3,6 +3,8 @@
 use zakuro_common::memory_map::{CONFIG_MEM_SIZE, SHARED_PAGE_SIZE};
 use zakuro_common::ConsoleModel;
 
+use crate::kernel::thread::ticks_to_nanos;
+
 /// seconds between the 3DS epoch (1900-01-01) and the Unix epoch.
 const EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
 
@@ -54,7 +56,7 @@ pub fn init_config_mem(
 }
 
 /// live state.
-pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32) {
+pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, clock: u64) {
     assert_eq!(page.len(), SHARED_PAGE_SIZE as usize);
     page.fill(0);
 
@@ -62,7 +64,7 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32) {
     page[0x04] = 1; // running hardware, retail product
     page[0x05] = if model.is_new3ds() { 2 } else { 1 };
 
-    update_datetime(page, 0);
+    update_datetime(page, clock, 0);
 
     // a plausible MAC. Games only ever show it or hash it.
     page[0x60..0x66].copy_from_slice(&[0x40, 0xF4, 0x07, 0x00, 0x00, 0x01]);
@@ -75,13 +77,20 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32) {
     page[0xB0] = 0; // no headset
 }
 
-/// refreshes the clock fields.
-pub fn update_datetime(page: &mut [u8], tick: u64) {
+/// the host's clock, in milliseconds since 1900.
+pub fn host_clock() -> u64 {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let date_time = unix + EPOCH_OFFSET_SECONDS * 1000;
+    unix + EPOCH_OFFSET_SECONDS * 1000
+}
+
+/// refreshes the clock fields, the clock at boot moved on by the emulated
+/// ticks since. titles extrapolate from it with the tick, so a clock
+/// following the host's would run backwards whenever emulation ran ahead.
+pub fn update_datetime(page: &mut [u8], boot_clock: u64, tick: u64) {
+    let date_time = boot_clock + ticks_to_nanos(tick) / 1_000_000;
 
     for slot in [0x20usize, 0x40] {
         write_u64(page, slot, date_time);
