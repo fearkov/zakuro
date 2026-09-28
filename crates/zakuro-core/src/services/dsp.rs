@@ -37,6 +37,8 @@ mod command {
 
 /// the pipe a title uses to drive the audio firmware.
 const PIPE_AUDIO: u32 = 2;
+/// the pipe its AAC decoder takes requests on.
+const PIPE_BINARY: u32 = 3;
 const PIPE_COUNT: usize = 8;
 
 /// what the title writes to the audio pipe to change the firmware's state.
@@ -82,6 +84,7 @@ pub struct DspState {
     mixer: super::dsp_mixer::Mixer,
     /// what came out of the speakers since the frontend last took it.
     pub output: Vec<[i16; 2]>,
+    pub(crate) aac: super::dsp_aac::Aac,
 }
 
 /// the most output kept for a frontend that is not taking it, a second.
@@ -182,6 +185,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let source = buffer.get(&mut system.memory, 4);
             let mut data = vec![0u8; size.min(0x1000) as usize];
             system.memory.read_bytes(source, &mut data);
+            log::debug!("dsp: pipe {channel} takes {size} bytes {:02X?}", &data[..data.len().min(32)]);
             write_pipe(system, channel, &data);
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -292,6 +296,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
 
 /// handles a write to a pipe.
 fn write_pipe(system: &mut System, channel: u32, data: &[u8]) {
+    // a request for the AAC decoder, answered at once
+    if channel == PIPE_BINARY && !data.is_empty() {
+        let answer = super::dsp_aac::answer(system, data);
+        system.services.dsp.pipes[PIPE_BINARY as usize] = answer.to_vec();
+        signal_semaphore(system);
+        return;
+    }
     if channel != PIPE_AUDIO || data.is_empty() {
         return;
     }

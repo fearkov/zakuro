@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+symphonia-codec-aac = "0.6"
+symphonia-core = "0.6"
 zakuro-common.workspace = true
 zakuro-cpu.workspace = true
 zakuro-fs.workspace = true

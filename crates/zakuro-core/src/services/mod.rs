@@ -4,6 +4,7 @@ pub mod apt;
 pub mod err;
 pub mod cfg;
 pub mod dsp;
+pub mod dsp_aac;
 pub mod dsp_mixer;
 pub mod dsp_voices;
 pub mod fs;
