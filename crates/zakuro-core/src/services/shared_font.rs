@@ -16,6 +16,10 @@ const GLYPH_SCALE: u16 = 3;
 /// horizontal advance per character, the source glyphs leave a column or
 /// two of their eight blank, so the cell width would space text out.
 const CHARACTER_WIDTH: u8 = 21;
+/// cells sit a pixel apart on the sheet, which is where a font's renderer
+/// looks for each glyph.
+const CELL_STRIDE_X: u16 = CELL_WIDTH as u16 + 1;
+const CELL_STRIDE_Y: u16 = CELL_HEIGHT as u16 + 1;
 const SHEET_WIDTH: u16 = 256;
 const SHEET_HEIGHT: u16 = 256;
 /// 4-bit alpha, the format a real shared font's sheets use.
@@ -56,8 +60,10 @@ pub fn build(base: u32) -> Vec<u8> {
     put32(&mut out, 0x04, 1);
     put32(&mut out, 0x08, total - FONT_OFFSET);
 
-    // CFNT, the file header.
-    write_magic(&mut out, FONT_OFFSET, b"CFNT");
+    // the file header, CFNU rather than CFNT as the console keeps the font,
+    // its pointers already absolute, which the SDK takes as it is instead
+    // of turning offsets into pointers a second time
+    write_magic(&mut out, FONT_OFFSET, b"CFNU");
     put16(&mut out, FONT_OFFSET + 4, 0xFEFF); // little endian
     put16(&mut out, FONT_OFFSET + 6, CFNT_SIZE as u16);
     put32(&mut out, FONT_OFFSET + 8, 0x0300_0000); // version
@@ -91,8 +97,8 @@ pub fn build(base: u32) -> Vec<u8> {
     put32(&mut out, tglp_at + 12, sheet_size);
     put16(&mut out, tglp_at + 16, 1); // one sheet
     put16(&mut out, tglp_at + 18, SHEET_FORMAT_A4);
-    put16(&mut out, tglp_at + 20, SHEET_WIDTH / CELL_WIDTH as u16);
-    put16(&mut out, tglp_at + 22, SHEET_HEIGHT / CELL_HEIGHT as u16);
+    put16(&mut out, tglp_at + 20, SHEET_WIDTH / CELL_STRIDE_X);
+    put16(&mut out, tglp_at + 22, SHEET_HEIGHT / CELL_STRIDE_Y);
     put16(&mut out, tglp_at + 24, SHEET_WIDTH);
     put16(&mut out, tglp_at + 26, SHEET_HEIGHT);
     put32(&mut out, tglp_at + 28, base + sheet_at);
@@ -132,7 +138,7 @@ pub fn relocate(memory: &mut crate::memory::Memory, block: u32, paddr: u32) {
     let header = block + FONT_OFFSET;
     let mut magic = [0u8; 4];
     memory.read_bytes(header, &mut magic);
-    if &magic != b"CFNT" {
+    if &magic != b"CFNU" && &magic != b"CFNT" {
         return;
     }
 
@@ -185,10 +191,11 @@ pub fn relocate(memory: &mut crate::memory::Memory, block: u32, paddr: u32) {
 fn draw_glyph_sheet(out: &mut [u8], sheet_at: u32) {
     use crate::services::glyphs::GLYPHS;
 
-    let columns = SHEET_WIDTH / CELL_WIDTH as u16;
+    let columns = SHEET_WIDTH / CELL_STRIDE_X;
     for (index, glyph) in GLYPHS.iter().enumerate() {
-        let cell_x = (index as u16 % columns) * CELL_WIDTH as u16;
-        let cell_y = (index as u16 / columns) * CELL_HEIGHT as u16;
+        // past the line that starts each cell
+        let cell_x = (index as u16 % columns) * CELL_STRIDE_X + 1;
+        let cell_y = (index as u16 / columns) * CELL_STRIDE_Y + 1;
 
         for (row, bits) in glyph.iter().enumerate() {
             for column in 0..8u16 {
@@ -258,7 +265,7 @@ mod tests {
         let font = build(base);
 
         assert_eq!(read32(&font, 0), 2, "the status word should say loaded");
-        assert_eq!(&font[0x80..0x84], b"CFNT");
+        assert_eq!(&font[0x80..0x84], b"CFNU");
         assert_eq!(read32(&font, FONT_OFFSET + 16), 4, "four sections");
         assert_eq!(
             read32(&font, FONT_OFFSET + 12) as usize,

@@ -967,10 +967,13 @@ fn get_process_info(system: &mut System) {
     let kind = system.cpu.regs[2];
     let value: u64 = match kind {
         // total memory the process has committed.
-        2 | 20 => system
+        2 => system
             .memory
             .phys
             .region_used(system.kernel.memory_region) as u64,
+        // what turns a linear heap address into a physical one, titles
+        // work out the addresses the GPU jumps to with it
+        20 => 0x2000_0000u32.wrapping_sub(system.kernel.linear_base) as u64,
         _ => 0,
     };
     system.cpu.regs[0] = 0;

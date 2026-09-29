@@ -77,7 +77,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         .find_map(|path| std::fs::read(path).ok());
 
     let data = match dump {
-        Some(mut data) if data.len() > 0x84 && &data[0x80..0x84] == b"CFNT" => {
+        Some(mut data) if data.len() > 0x84 && matches!(&data[0x80..0x84], b"CFNU" | b"CFNT") => {
             // a dump taken from a console may have been captured before the
             // system finished loading it, make sure it reads as loaded.
             data[0..4].copy_from_slice(&FONT_STATUS_LOADED.to_le_bytes());
