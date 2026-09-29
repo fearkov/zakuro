@@ -85,7 +85,11 @@ fn main() {
     // ZAKURO_KEYBOARD=Link.
     let typed = std::env::var("ZAKURO_KEYBOARD").unwrap_or_else(|_| "Zakuro".to_owned());
 
+    let profile_from: Option<u64> = std::env::var("ZAKURO_PROFILE_FROM").ok().and_then(|f| f.parse().ok());
     for frame in 0..frames {
+        if profile_from == Some(frame) {
+            system.enable_profiler();
+        }
         if log_from == Some(frame) {
             log::set_max_level(log::LevelFilter::Trace);
             println!("--- verbose logging from frame {frame} ---");
@@ -237,6 +241,14 @@ fn main() {
     }
 
     println!("handles:       {}", system.kernel.handles.len());
+    if std::env::var("ZAKURO_HANDLES").is_ok() {
+        let mut handles: Vec<_> = system.kernel.handles.iter().collect();
+        handles.sort_by_key(|&(handle, _)| handle);
+        for (handle, object) in handles {
+            let kind = system.kernel.objects.get(object).map_or("missing", |o| o.type_name());
+            println!("  0x{handle:08X} {kind} {}", system.kernel.handles.label(handle));
+        }
+    }
     println!(
         "services:      {}",
         system
@@ -275,7 +287,7 @@ fn main() {
         }
     }
 
-    let hot = system.hot_spots(15);
+    let hot = system.hot_spots(std::env::var("ZAKURO_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(15));
     if !hot.is_empty() {
         println!("hot spots:");
         for (thread, pc, hits) in hot {

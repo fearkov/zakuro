@@ -38,12 +38,13 @@ pub fn dispatch(system: &mut System, number: u32) {
             .current()
             .map_or("?".to_owned(), |t| t.name.clone());
         log::trace!(
-            "[{thread}] svc 0x{number:02X} r0={:08X} r1={:08X} r2={:08X} r3={:08X} @0x{:08X}",
+            "[{thread}] svc 0x{number:02X} r0={:08X} r1={:08X} r2={:08X} r3={:08X} @0x{:08X} lr 0x{:08X}",
             system.cpu.regs[0],
             system.cpu.regs[1],
             system.cpu.regs[2],
             system.cpu.regs[3],
             system.cpu.current_pc(),
+            system.cpu.regs[14],
         );
     }
     match number {
