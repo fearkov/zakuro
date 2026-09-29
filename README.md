@@ -2,6 +2,8 @@
 
 A WIP HLE Nintendo 3DS emulator written in Rust that uses ahead-of-time (AOT) recompilation instead of a JIT.
 
+Bug reports, progress and everything else are on the [Discord server](https://discord.gg/7dduXVv2xm).
+
 <p>
   <img width="266" alt="Pokémon Y running in Zakuro" src="docs/screenshots/pokemon-y.png" />
   <img width="266" alt="The Legend of Zelda: Majora's Mask 3D running in Zakuro" src="docs/screenshots/majoras-mask-3d.png" />
