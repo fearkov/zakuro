@@ -3,6 +3,9 @@
 use crate::kernel::ipc::{CommandBuffer, Header};
 use crate::System;
 
+/// what am answers for a title that is not installed.
+const TITLE_NOT_FOUND: u32 = 0xD8A0_83FA;
+
 pub fn handle(
     system: &mut System,
     buffer: &CommandBuffer,
@@ -56,6 +59,24 @@ pub fn handle(
             _ => false,
         },
 
+        // -- Installed titles -----------------------------------------------
+        // no add-on content or update is installed, a title asking about one
+        // hears it is not there instead of reading an empty description
+        "am:app" => match command {
+            // GetDLCContentInfoCount, FindDLCContentInfos, ListDLCContentInfos,
+            // GetDLCTitleInfos and GetPatchTitleInfos
+            0x1001 | 0x1002 | 0x1003 | 0x1005 | 0x1006 | 0x1009 => {
+                buffer.reply_error(&mut system.memory, command, TITLE_NOT_FOUND);
+                true
+            }
+            // ListDataTitleTicketInfos, no tickets
+            0x1007 => {
+                buffer.reply(&mut system.memory, command, &[0]);
+                true
+            }
+            _ => false,
+        },
+
         // -- Wifi connection ------------------------------------------------
         "ac:u" | "ac:i" => match command {
             // GetWifiStatus, 0 = not connected, which is the truth.
@@ -70,6 +91,27 @@ pub fn handle(
             }
             // CloseAsync and friends still have to signal their event.
             0x0005 | 0x0008 => {
+                buffer.reply(&mut system.memory, command, &[]);
+                true
+            }
+            // RegisterDisconnectEvent and SetClientVersion
+            0x0030 | 0x0040 => {
+                buffer.reply(&mut system.memory, command, &[]);
+                true
+            }
+            // IsConnected, no
+            0x003E => {
+                buffer.reply(&mut system.memory, command, &[0]);
+                true
+            }
+            _ => false,
+        },
+
+        // -- Accounts, background downloads and http ------------------------
+        // setting a session up works offline, only its requests need the
+        // network
+        "act:u" | "act:a" | "boss:U" | "boss:P" | "http:C" => match command {
+            0x0001 => {
                 buffer.reply(&mut system.memory, command, &[]);
                 true
             }

@@ -436,6 +436,24 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x0056, &[1]);
             true
         }
+        // GetProgramId(process id), of the only process there is
+        0x0058 => {
+            let id = system.kernel.program_id;
+            buffer.reply(&mut system.memory, command, &[id as u32, (id >> 32) as u32]);
+            true
+        }
+        // CheckNew3DSApp and CheckNew3DS
+        0x0101 | 0x0102 => {
+            let new3ds = system.config.new3ds as u32;
+            buffer.reply(&mut system.memory, command, &[new3ds]);
+            true
+        }
+        // the platform the title runs on, 1 a 3DS, 2 a New 3DS
+        0x0103 => {
+            let platform = if system.config.new3ds { 2 } else { 1 };
+            buffer.reply(&mut system.memory, command, &[platform]);
+            true
+        }
         _ => false,
     }
 }

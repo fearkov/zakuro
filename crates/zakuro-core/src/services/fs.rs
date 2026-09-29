@@ -87,6 +87,9 @@ pub const PATH_UTF16: u32 = 4;
 const SELF_NCCH_ROMFS: u32 = 0;
 const SELF_NCCH_CODE: u32 = 1;
 const SELF_NCCH_EXEFS: u32 = 2;
+/// the RomFS of the title's update, which is its own RomFS while no update
+/// is installed.
+const SELF_NCCH_UPDATE_ROMFS: u32 = 5;
 
 /// OpenFile flags.
 const OPEN_CREATE: u32 = 1 << 2;
@@ -938,7 +941,11 @@ fn open_file(
                     open_ncch_kind(system, kind)
                 }
                 other => {
-                    log::warn!("fs: NCCH archive media type {other} is not implemented");
+                    log::warn!(
+                        "fs: NCCH archive media type {other} is not implemented ({:08X}{:08X})",
+                        archive_path.high_program_id,
+                        archive_path.low_program_id
+                    );
                     None
                 }
             }
@@ -992,6 +999,7 @@ fn system_archive_data(path: NcchArchivePath) -> Vec<u8> {
     match (path.high_program_id, path.low_program_id) {
         (SHARED_DATA_ARCHIVE, SYSTEM_FILE_REGION_MANIFEST) => system_archives::region_manifest(),
         (SYSTEM_DATA_ARCHIVE, SYSTEM_FILE_BAD_WORD_LIST) => system_archives::bad_word_list(),
+        (SHARED_DATA_ARCHIVE, SYSTEM_FILE_MII_DATA) => system_archives::mii_data(),
         _ => Vec::new(),
     }
 }
@@ -999,7 +1007,7 @@ fn system_archive_data(path: NcchArchivePath) -> Vec<u8> {
 fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     match kind {
-        SELF_NCCH_ROMFS => {
+        SELF_NCCH_ROMFS | SELF_NCCH_UPDATE_ROMFS => {
             let romfs = title.romfs.as_ref()?;
             let size = title.ncch.romfs_size.saturating_sub(0x1000);
             let backing = FileBacking::RomImage {

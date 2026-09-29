@@ -70,6 +70,14 @@ pub fn bad_word_list() -> Vec<u8> {
     romfs_build::build(&files)
 }
 
+/// builds the Mii data archive, which holds the models and textures Miis
+/// are drawn from. titles load it whole while starting up and give up when
+/// it is missing, an empty resource file lets them start, with nothing to
+/// draw a Mii from.
+pub fn mii_data() -> Vec<u8> {
+    romfs_build::build(&[BuildFile { path: "CFL_Res.dat".into(), data: vec![0u8; 0x1000] }])
+}
+
 /// the per-region table of countries, two sections (the second patches the
 /// first), then a copy of each section-0 entry's sort order, then a bitmap
 /// of which countries are eShop-locked.

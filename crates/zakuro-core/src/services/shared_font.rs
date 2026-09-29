@@ -49,8 +49,12 @@ pub fn build(base: u32) -> Vec<u8> {
 
     let mut out = vec![0u8; total as usize];
 
-    // the status word a title polls before it touches anything else.
+    // the status word a title polls before it touches anything else, the
+    // region's font, the standard one, and how big the font is, which some
+    // titles read to tell the font from a resource of their own
     put32(&mut out, 0x00, 2);
+    put32(&mut out, 0x04, 1);
+    put32(&mut out, 0x08, total - FONT_OFFSET);
 
     // CFNT, the file header.
     write_magic(&mut out, FONT_OFFSET, b"CFNT");

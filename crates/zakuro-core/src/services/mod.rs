@@ -7,6 +7,7 @@ pub mod dsp;
 pub mod dsp_aac;
 pub mod dsp_mixer;
 pub mod dsp_voices;
+pub mod frd;
 pub mod fs;
 pub mod glyphs;
 pub mod gsp;
@@ -96,6 +97,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "ldr:ro" => ldr_ro::handle(system, &buffer, header),
         "ir:USER" => ir::handle(system, &buffer, header),
         "y2r:u" => y2r::handle(system, &buffer, header),
+        "frd:u" | "frd:a" => frd::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 
@@ -170,8 +172,13 @@ pub fn unimplemented(system: &mut System, buffer: &CommandBuffer, header: Header
             args.join(", ")
         );
     }
-    // reply with one result word of success and nothing else.
+    // reply with one result word of success and nothing else, with the
+    // words after it zeroed, a title reads its outputs from them anyway and
+    // would find what its request left there
     buffer.reply(&mut system.memory, command, &[]);
+    for index in 2..8 {
+        buffer.set(&mut system.memory, index, 0);
+    }
 }
 
 #[cfg(test)]
@@ -207,11 +214,12 @@ mod tests {
         assert_eq!(buffer.get(&mut system.memory, 1), 0xC941_1002);
     }
 
-    /// the other network services keep their explicit "not connected".
+    /// what needs the servers keeps its explicit "not connected".
     #[test]
     fn other_network_services_report_not_connected() {
         let (mut system, buffer) = system_with_thread();
-        buffer.set(&mut system.memory, 0, Header::new(0x0001, 0, 0).0);
+        // frd:u Login
+        buffer.set(&mut system.memory, 0, Header::new(0x0003, 0, 2).0);
 
         handle_request(&mut system, Target::service("frd:u".into(), 0));
 
@@ -219,6 +227,20 @@ mod tests {
             buffer.get(&mut system.memory, 1),
             zakuro_common::result::errors::NOT_CONNECTED.0
         );
+    }
+
+    /// the friend list lives on the console, asking about it works offline.
+    #[test]
+    fn friends_answer_offline() {
+        let (mut system, buffer) = system_with_thread();
+        // frd:u GetFriendKeyList
+        buffer.set(&mut system.memory, 0, Header::new(0x0011, 2, 0).0);
+        buffer.set(&mut system.memory, 2, 20);
+
+        handle_request(&mut system, Target::service("frd:u".into(), 0));
+
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        assert_eq!(buffer.get(&mut system.memory, 2), 0);
     }
 
     /// titles wait on the infrared link's events, which have to be real
