@@ -1,7 +1,8 @@
-//! filling triangles on the host's GPU through Vulkan. the CPU still works
-//! out the geometry the way the software path does, shading, clipping and
-//! culling, and the GPU does what costs, the pixels, texturing, lighting,
-//! the combiners, the tests and blending.
+//! filling triangles on the host's GPU through Vulkan. the GPU runs the
+//! title's vertex shader, clips and culls, then does what costs, the
+//! pixels, texturing, lighting, the combiners, the tests and blending. a
+//! draw with a geometry shader has the CPU work out its triangles the way
+//! the software path does instead.
 //!
 //! guest memory stays where images live between command lists. a buffer a
 //! list draws into goes up to the GPU the first time the list needs it,
@@ -23,8 +24,10 @@ use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BAS
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
+use crate::shader::{ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
 
+const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
@@ -48,6 +51,17 @@ const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328;
 const UNIFORM_SIZE: u64 = (UNIFORM_WORDS * 4) as u64;
 /// 24 lighting tables of 256 entries, each a value and a step.
 const TABLES_SIZE: u64 = 24 * 256 * 8;
+/// a shader program and its operand descriptors.
+const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
+/// the words of what a vertex shader reads besides its program, the float
+/// uniforms, the integer ones, the bools, the entry point, the inputs'
+/// stride and slots, the semantics, the depth map and the viewport.
+const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 16 + 24 + 4 + 4;
+const SHADING_SIZE: u64 = (SHADING_WORDS * 4) as u64;
+/// a semantic no output register carries, which takes its default.
+pub(super) const MISSING: u32 = u32::MAX;
+/// a semantic in an output attribute past the enabled registers, zero.
+pub(super) const ZERO: u32 = u32::MAX - 1;
 
 /// where each combiner stage's registers start.
 const STAGE_REGISTERS: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
@@ -81,10 +95,34 @@ pub(super) struct Draw<'a> {
     /// uses one.
     pub(super) depth: Option<(u32, u32)>,
     pub(super) depth_map: DepthMap,
-    pub(super) triangles: &'a [[Screen; 3]],
+    pub(super) geometry: Geometry<'a>,
     pub(super) textures: &'a [Option<BoundTexture>; 3],
     pub(super) lighting: Option<&'a Lighting>,
     pub(super) tables: &'a Tables,
+}
+
+/// the triangles of a draw.
+#[derive(Clone, Copy)]
+pub(super) enum Geometry<'a> {
+    /// shaded, clipped and culled on the CPU.
+    Triangles(&'a [[Screen; 3]]),
+    /// for the GPU to shade.
+    Shaded(&'a Shading<'a>),
+}
+
+/// vertices the GPU runs the vertex shader over.
+pub(super) struct Shading<'a> {
+    pub(super) unit: &'a ShaderUnit,
+    /// each vertex's input registers.
+    pub(super) inputs: &'a [[Vec4; INPUT_REGISTERS]],
+    /// three inputs a triangle.
+    pub(super) indices: &'a [u32],
+    /// where each varying is in the output registers.
+    pub(super) semantics: [u32; 24],
+    /// left, bottom, width and height.
+    pub(super) viewport: (f32, f32, f32, f32),
+    /// the face culling register.
+    pub(super) cull: u32,
 }
 
 fn vk_error(what: &'static str) -> impl Fn(vk::Result) -> String {
@@ -264,6 +302,8 @@ struct PipelineKey {
     /// red, green, blue and alpha writes, one bit each.
     mask: u32,
     depth: bool,
+    /// the vertex shader runs on the GPU.
+    shaded: bool,
 }
 
 pub struct Hardware {
@@ -285,6 +325,11 @@ pub struct Hardware {
     layout: vk::PipelineLayout,
     vertex_shader: vk::ShaderModule,
     fragment_shader: vk::ShaderModule,
+    shade_shader: vk::ShaderModule,
+    /// whether draws go to shade_shader.
+    shades: bool,
+    /// where the batch copied programs, by their fingerprints.
+    programs: HashMap<u64, u64>,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     /// made the first time a display transfer runs here.
     transfer: Option<Compute>,
@@ -380,7 +425,9 @@ impl Hardware {
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
             let spare_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
 
-            let bindings: Vec<_> = (0..5)
+            // the fragment stages', then the program, what else it reads and
+            // the inputs of the vertex shader
+            let bindings: Vec<_> = (0..8)
                 .map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
@@ -390,7 +437,7 @@ impl Hardware {
                             _ => vk::DescriptorType::STORAGE_BUFFER,
                         })
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                        .stage_flags(if binding < 5 { vk::ShaderStageFlags::FRAGMENT } else { vk::ShaderStageFlags::VERTEX })
                 })
                 .collect();
             let set_layout = device
@@ -413,6 +460,7 @@ impl Hardware {
             };
             let vertex_shader = module(VERTEX_SPIRV)?;
             let fragment_shader = module(FRAGMENT_SPIRV)?;
+            let shade_shader = module(SHADE_SPIRV)?;
 
             let unmade = || Buffer {
                 buffer: vk::Buffer::null(),
@@ -444,6 +492,10 @@ impl Hardware {
                 layout,
                 vertex_shader,
                 fragment_shader,
+                shade_shader,
+                // shading on the CPU instead, to tell the two apart
+                shades: std::env::var_os("ZAKURO_CPU_SHADERS").is_none(),
+                programs: HashMap::new(),
                 pipelines: HashMap::new(),
                 transfer: None,
                 depth: None,
@@ -464,6 +516,7 @@ impl Hardware {
                 blits,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::INDEX_BUFFER
                 | vk::BufferUsageFlags::UNIFORM_BUFFER
                 | vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC;
@@ -484,6 +537,11 @@ impl Hardware {
     /// the GPU it draws with.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// whether it runs vertex shaders.
+    pub(super) fn shades(&self) -> bool {
+        self.shades
     }
 
     /// how many times the console's resolution it draws at.
@@ -944,7 +1002,7 @@ impl Hardware {
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(self.vertex_shader)
+                .module(if key.shaded { self.shade_shader } else { self.vertex_shader })
                 .name(c"main"),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -964,18 +1022,24 @@ impl Hardware {
                     .offset(location * 16)
             })
             .collect();
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+        // the shaded pipeline reads its vertices out of a storage buffer
+        let vertex_input = match key.shaded {
+            true => vk::PipelineVertexInputStateCreateInfo::default(),
+            false => vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes),
+        };
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
-        // the CPU culled already, and clipped what matters, depth comes
-        // from the shader
+        // depth comes from the fragment shader, what the CPU sends it has
+        // been clipped already, what the GPU shades has z clipped to 0..w.
+        // the images run bottom up, so a triangle wound counter-clockwise
+        // with y up is wound clockwise to Vulkan, which culls per draw
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-            .depth_clamp_enable(true)
+            .depth_clamp_enable(!key.shaded)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .line_width(1.0);
         let multisample =
             vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -1021,6 +1085,7 @@ impl Hardware {
             vk::DynamicState::STENCIL_WRITE_MASK,
             vk::DynamicState::STENCIL_REFERENCE,
             vk::DynamicState::BLEND_CONSTANTS,
+            vk::DynamicState::CULL_MODE,
         ];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let color_formats = [COLOR_FORMAT];
@@ -1144,11 +1209,122 @@ impl Hardware {
     }
 
     /// records one draw.
+    /// copies triangles the CPU shaded into the batch, with the target's
+    /// pixels as clip space and w kept for perspective, and says where.
+    fn triangles(&mut self, triangles: &[[Screen; 3]], (width, height): (f32, f32), depth_map: DepthMap) -> Result<u64, String> {
+        let vertex_bytes = (triangles.len() * 3 * VERTEX_SIZE) as u64;
+        let vertex_offset = self.stage(vertex_bytes, 16)?;
+        // a pixel whose center sits exactly on an edge goes to the triangle
+        // on its right, or above it for a flat edge, on the PICA, and in
+        // Vulkan to the one on its right or further down the image, so the
+        // images run bottom up
+        let staging = self.ring(vertex_offset, vertex_bytes);
+        for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(triangles.iter().flatten()) {
+            let w = 1.0 / v.inv_w;
+            let x = v.x / width * 2.0 - 1.0;
+            let y = v.y / height * 2.0 - 1.0;
+            let depth = v.z * depth_map.scale + depth_map.offset;
+            let (c, t, q, view) = (v.color_over_w, v.texcoords_over_w, v.quaternion_over_w, v.view_over_w);
+            let values: [f32; 24] = [
+                x * w,
+                y * w,
+                0.0,
+                w,
+                c[0] * w,
+                c[1] * w,
+                c[2] * w,
+                c[3] * w,
+                t[0][0] * w,
+                t[0][1] * w,
+                t[1][0] * w,
+                t[1][1] * w,
+                t[2][0] * w,
+                t[2][1] * w,
+                depth,
+                0.0,
+                q[0] * w,
+                q[1] * w,
+                q[2] * w,
+                q[3] * w,
+                view[0] * w,
+                view[1] * w,
+                view[2] * w,
+                0.0,
+            ];
+            for (bytes, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+                *bytes = value.to_le_bytes();
+            }
+        }
+        Ok(vertex_offset)
+    }
+
+    /// copies what the vertex shader reads into the batch, and says where
+    /// the program, the rest of what it reads, the inputs and the indices
+    /// went.
+    fn stage_shading(&mut self, shading: &Shading, depth_map: DepthMap) -> Result<[(u64, u64); 4], String> {
+        let unit = shading.unit;
+        let fingerprint = unit.fingerprint();
+        let program = match self.programs.get(&fingerprint) {
+            Some(&offset) => offset,
+            None => {
+                let offset = self.stage(PROGRAM_BYTES, self.storage_alignment)?;
+                let words = unit.program.iter().chain(unit.descriptors.iter());
+                for (out, word) in self.ring(offset, PROGRAM_BYTES).as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                    *out = word.to_le_bytes();
+                }
+                self.programs.insert(fingerprint, offset);
+                offset
+            }
+        };
+
+        // only the input registers the program reads go
+        let read = unit.inputs_read();
+        let registers: Vec<usize> = (0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0).collect();
+        let mut slots = [MISSING; INPUT_REGISTERS];
+        for (slot, &register) in registers.iter().enumerate() {
+            slots[register] = slot as u32;
+        }
+        let mut words = Vec::with_capacity(SHADING_WORDS);
+        words.extend(unit.float_uniforms.iter().flatten().map(|value| value.to_bits()));
+        for [count, start, step, _] in unit.int_uniforms {
+            words.extend([count as u32, start as u32, step as i8 as u32, 0]);
+        }
+        words.extend([unit.bool_uniforms as u32, unit.entry_point, registers.len() as u32, 0]);
+        words.extend(slots);
+        words.extend(shading.semantics);
+        words.extend([depth_map.scale.to_bits(), depth_map.offset.to_bits(), 0, 0]);
+        let (x, y, width, height) = shading.viewport;
+        words.extend([x, y, width, height].map(f32::to_bits));
+        debug_assert_eq!(words.len(), SHADING_WORDS);
+        let uniforms = self.stage(SHADING_SIZE, self.storage_alignment)?;
+        for (out, word) in self.ring(uniforms, SHADING_SIZE).as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+            *out = word.to_le_bytes();
+        }
+
+        let input_bytes = ((shading.inputs.len() * registers.len()).max(1) * 16) as u64;
+        let inputs = self.stage(input_bytes, self.storage_alignment)?;
+        let values = shading.inputs.iter().flat_map(|input| registers.iter().flat_map(move |&r| input[r]));
+        for (out, value) in self.ring(inputs, input_bytes).as_chunks_mut::<4>().0.iter_mut().zip(values) {
+            *out = value.to_le_bytes();
+        }
+
+        let index_bytes = (shading.indices.len() * 4) as u64;
+        let indices = self.stage(index_bytes, 4)?;
+        for (out, index) in self.ring(indices, index_bytes).as_chunks_mut::<4>().0.iter_mut().zip(shading.indices) {
+            *out = index.to_le_bytes();
+        }
+        Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)])
+    }
+
     pub(super) fn draw<M: GpuMemory>(&mut self, memory: &mut M, draw: &Draw) -> Result<(), String> {
         let [left, bottom, right, top] = draw.scissor;
         let (left, bottom) = (left.max(0), bottom.max(0));
         let (right, top) = (right.min(draw.width as i32), top.min(draw.height as i32));
-        if draw.triangles.is_empty() || right <= left || top <= bottom {
+        let empty = match draw.geometry {
+            Geometry::Triangles(triangles) => triangles.is_empty(),
+            Geometry::Shaded(shading) => shading.indices.is_empty(),
+        };
+        if empty || right <= left || top <= bottom {
             return Ok(());
         }
         if self.used > RING_FLUSH {
@@ -1190,54 +1366,16 @@ impl Hardware {
             None => 0,
         };
 
-        // the vertices, with the target's pixels as clip space and w kept
-        // for perspective
-        let vertex_count = draw.triangles.len() * 3;
-        let vertex_bytes = (vertex_count * VERTEX_SIZE) as u64;
-        let vertex_offset = self.stage(vertex_bytes, 16)?;
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
-        // a pixel whose center sits exactly on an edge goes to the triangle
-        // on its right, or above it for a flat edge, on the PICA, and in
-        // Vulkan to the one on its right or further down the image, so the
-        // images run bottom up
-        let staging = self.ring(vertex_offset, vertex_bytes);
-        for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(draw.triangles.iter().flatten()) {
-            let w = 1.0 / v.inv_w;
-            let x = v.x / width * 2.0 - 1.0;
-            let y = v.y / height * 2.0 - 1.0;
-            let depth = v.z * depth_map.scale + depth_map.offset;
-            let (c, t, q, view) = (v.color_over_w, v.texcoords_over_w, v.quaternion_over_w, v.view_over_w);
-            let values: [f32; 24] = [
-                x * w,
-                y * w,
-                0.0,
-                w,
-                c[0] * w,
-                c[1] * w,
-                c[2] * w,
-                c[3] * w,
-                t[0][0] * w,
-                t[0][1] * w,
-                t[1][0] * w,
-                t[1][1] * w,
-                t[2][0] * w,
-                t[2][1] * w,
-                depth,
-                0.0,
-                q[0] * w,
-                q[1] * w,
-                q[2] * w,
-                q[3] * w,
-                view[0] * w,
-                view[1] * w,
-                view[2] * w,
-                0.0,
-            ];
-            for (bytes, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-                *bytes = value.to_le_bytes();
+        let (vertex_count, vertex_offset, shaded) = match draw.geometry {
+            Geometry::Triangles(triangles) => {
+                let count = triangles.len() * 3;
+                (count, self.triangles(triangles, (width, height), depth_map)?, None)
             }
-        }
+            Geometry::Shaded(shading) => (shading.indices.len(), 0, Some(self.stage_shading(shading, depth_map)?)),
+        };
+
 
         let r = draw.registers;
         let mut words = Vec::with_capacity(UNIFORM_WORDS);
@@ -1249,7 +1387,8 @@ impl Hardware {
         for base in TEXTURE_UNIT_BASES {
             words.extend([r[base + 2], r[base], 0, 0]);
         }
-        words.extend([depth_map.w_buffer as u32, draw.lighting.is_some() as u32, 0, 0]);
+        let depth_flags = depth_map.w_buffer as u32 | (shaded.is_some() as u32) << 1;
+        words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
         match draw.lighting {
             Some(lighting) => lighting.pack(&mut words),
             None => words.resize(UNIFORM_WORDS, 0),
@@ -1269,7 +1408,8 @@ impl Hardware {
         let depth_write = writable && mask & (1 << 12) != 0;
         let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
         let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC]);
-        let pipeline = self.pipeline(PipelineKey { blend, mask: color_mask, depth: depth.is_some() })?;
+        let pipeline =
+            self.pipeline(PipelineKey { blend, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some() })?;
 
         if self.uploads {
             self.end_rendering();
@@ -1298,7 +1438,10 @@ impl Hardware {
         });
         let uniform_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(uniform_offset).range(UNIFORM_SIZE)];
         let tables_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(tables).range(TABLES_SIZE)];
-        let writes = [
+        let vertex_infos = shaded.map(|staged| {
+            staged.map(|(offset, range)| [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(offset).range(range)])
+        });
+        let mut writes = vec![
             vk::WriteDescriptorSet::default()
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -1320,10 +1463,38 @@ impl Hardware {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&tables_info),
         ];
+        if let Some(infos) = &vertex_infos {
+            for (binding, info) in (5..).zip(&infos[..3]) {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info),
+                );
+            }
+        }
+        // where the PICA's viewport puts clip space, for what the GPU
+        // shades, the whole target for what the CPU placed on it
+        let (x, y, viewport_width, viewport_height) = match draw.geometry {
+            Geometry::Shaded(shading) => shading.viewport,
+            Geometry::Triangles(_) => (0.0, 0.0, width, height),
+        };
+        let cull = match draw.geometry {
+            Geometry::Shaded(shading) if shading.cull == 1 => vk::CullModeFlags::FRONT,
+            Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::BACK,
+            _ => vk::CullModeFlags::NONE,
+        };
 
         let commands = self.commands;
         let scale = self.scale;
-        let (viewport_width, viewport_height) = (width * scale as f32, height * scale as f32);
+        let viewport = vk::Viewport {
+            x: x * scale as f32,
+            y: y * scale as f32,
+            width: viewport_width * scale as f32,
+            height: viewport_height * scale as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
         let test = r[REG_STENCIL_TEST];
         let op = r[REG_STENCIL_OP];
@@ -1334,11 +1505,8 @@ impl Hardware {
         unsafe {
             let device = &self.device;
             device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_set_viewport(
-                commands,
-                0,
-                &[vk::Viewport { x: 0.0, y: 0.0, width: viewport_width, height: viewport_height, min_depth: 0.0, max_depth: 1.0 }],
-            );
+            device.cmd_set_viewport(commands, 0, &[viewport]);
+            device.cmd_set_cull_mode(commands, cull);
             device.cmd_set_scissor(
                 commands,
                 0,
@@ -1369,8 +1537,16 @@ impl Hardware {
             device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
             device.cmd_set_blend_constants(commands, &constant);
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &writes);
-            device.cmd_bind_vertex_buffers(commands, 0, &[self.ring.buffer], &[vertex_offset]);
-            device.cmd_draw(commands, vertex_count as u32, 1, 0, 0);
+            match vertex_infos {
+                Some(infos) => {
+                    device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, vk::IndexType::UINT32);
+                    device.cmd_draw_indexed(commands, vertex_count as u32, 1, 0, 0, 0);
+                }
+                None => {
+                    device.cmd_bind_vertex_buffers(commands, 0, &[self.ring.buffer], &[vertex_offset]);
+                    device.cmd_draw(commands, vertex_count as u32, 1, 0, 0);
+                }
+            }
         }
         Ok(())
     }
@@ -1875,6 +2051,7 @@ impl Hardware {
         }
         self.used = 0;
         self.tables = None;
+        self.programs.clear();
         self.batch += 1;
 
         // textures nobody drew with for a while go, long after the GPU
@@ -2140,6 +2317,7 @@ impl Drop for Hardware {
             }
             self.device.destroy_shader_module(self.vertex_shader, None);
             self.device.destroy_shader_module(self.fragment_shader, None);
+            self.device.destroy_shader_module(self.shade_shader, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_fence(self.fence, None);

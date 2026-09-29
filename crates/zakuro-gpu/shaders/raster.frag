@@ -40,7 +40,8 @@ layout(std140, set = 0, binding = 3) uniform Draw {
     uvec4 misc;
     // per unit the configuration word and the border color
     uvec4 units[3];
-    // x, a w-buffer, y, lighting is on
+    // x, 1 a w-buffer, 2 depth from the fragment's z, y, lighting is on,
+    // z and w, the depth map's scale and offset
     uvec4 flags;
     // x, the configuration, y, how many lights, z, bump mapping, w, shadow
     uvec4 light_config;
@@ -449,8 +450,12 @@ void main() {
     }
     out_color = color / 255.0;
 
+    // what the GPU shaded maps z/w itself, which the clipper got exactly
     float depth = in_depth;
-    if (flags.x != 0u) {
+    if ((flags.x & 2u) != 0u) {
+        depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
+    }
+    if ((flags.x & 1u) != 0u) {
         depth /= gl_FragCoord.w;
     }
     gl_FragDepth = clamp(depth, 0.0, 1.0);

@@ -89,6 +89,25 @@ impl ShaderUnit {
         }
     }
 
+    /// the input registers the program reads, one bit each, all of them
+    /// until it is prepared.
+    pub fn inputs_read(&self) -> u16 {
+        self.decoded.as_ref().map_or(u16::MAX, |program| program.inputs)
+    }
+
+    /// a hash of the program and its descriptors, the same for the same
+    /// words.
+    pub fn fingerprint(&self) -> u64 {
+        if let Some(program) = &self.decoded {
+            return program.fingerprint;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.program.hash(&mut hasher);
+        self.descriptors.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// starts a float uniform upload at the register the raw value names.
     pub fn set_float_uniform_index(&mut self, raw: u32) {
         self.float_uniform_index = (raw & 0x7F) as usize;
@@ -305,6 +324,8 @@ pub struct Program {
     /// anything writes, one bit each.
     inputs: u16,
     outputs: u16,
+    /// a hash of the words it came from, which the GPU keeps programs by.
+    fingerprint: u64,
 }
 
 impl Program {
@@ -327,7 +348,7 @@ impl Program {
                 outputs |= 1 << op.destination;
             }
         }
-        Program { ops, inputs, outputs }
+        Program { ops, inputs, outputs, fingerprint: unit.fingerprint() }
     }
 }
 

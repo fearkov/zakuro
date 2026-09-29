@@ -390,6 +390,62 @@ fn process_vertices(
     }
 }
 
+/// a draw's vertices, as shader inputs or already through the shaders.
+#[derive(Clone, Copy)]
+enum Vertices<'a> {
+    Unshaded {
+        vertex_shader: &'a ShaderUnit,
+        geometry_shader: &'a ShaderUnit,
+        inputs: &'a [[Vec4; shader::INPUT_REGISTERS]],
+        /// which input each vertex is, when an index buffer repeats them.
+        order: Option<&'a [usize]>,
+    },
+    Shaded(&'a [Vertex]),
+}
+
+impl Vertices<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Vertices::Unshaded { inputs, order, .. } => order.map_or(inputs.len(), <[usize]>::len),
+            Vertices::Shaded(shaded) => shaded.len(),
+        }
+    }
+}
+
+/// where the GPU's vertex shader finds each varying, per semantic
+/// component of position, color, texture coordinates 0, 1 and 2, the
+/// quaternion and the view vector, the output register times four plus
+/// the component, the way to_vertex reads them.
+#[cfg(feature = "vulkan")]
+fn output_semantics(registers: &[u32]) -> [u32; 24] {
+    let map = read_output_map(registers);
+    let mask = registers[REG_VS_OUTPUT_MASK] & 0xFFFF;
+    // the output register behind each attribute, as pack_outputs packs them
+    let enabled: Vec<usize> = (0..shader::OUTPUT_REGISTERS).filter(|r| mask == 0 || mask & (1 << r) != 0).collect();
+    let slot = |slot: Option<(usize, usize)>| match slot {
+        None => hardware::MISSING,
+        Some((attribute, component)) => {
+            enabled.get(attribute).map_or(hardware::ZERO, |&register| (register * 4 + component) as u32)
+        }
+    };
+    let [t0, t1, t2] = map.texcoords;
+    let slots = map
+        .position
+        .map(Some)
+        .into_iter()
+        .chain(map.color)
+        .chain(t0)
+        .chain(t1)
+        .chain(t2)
+        .chain(map.quaternion)
+        .chain(map.view);
+    let mut semantics = [hardware::MISSING; 24];
+    for (semantic, found) in semantics.iter_mut().zip(slots) {
+        *semantic = slot(found);
+    }
+    semantics
+}
+
 /// vertices a draw needs before shading them is worth splitting over threads.
 const PARALLEL_VERTICES: usize = 128;
 /// vertices each thread takes at a time, whole batches of the shader's.
@@ -1211,6 +1267,28 @@ struct DrawState<'a> {
     tables: &'a Tables,
 }
 
+#[cfg(feature = "vulkan")]
+impl DrawState<'_> {
+    /// the draw as the GPU takes it.
+    fn hardware<'a>(&'a self, registers: &'a [u32], geometry: hardware::Geometry<'a>) -> hardware::Draw<'a> {
+        let target = &self.target;
+        hardware::Draw {
+            registers,
+            target: target.addr,
+            format: target.format,
+            width: target.buffer_width,
+            height: target.buffer_height,
+            scissor: [target.left, target.bottom, target.right, target.top],
+            depth: self.depth_stencil.as_ref().map(|d| (d.addr, d.bytes)),
+            depth_map: self.depth_map,
+            geometry,
+            textures: self.textures,
+            lighting: self.lighting.as_ref(),
+            tables: self.tables,
+        }
+    }
+}
+
 /// rasterizes one triangle, texturing and the combiners, then the alpha,
 /// stencil and depth tests in the order the hardware runs them, then
 /// blending and the color write.
@@ -1581,9 +1659,8 @@ pub fn draw<M: GpuMemory>(
         .iter()
         .map(|&vertex_index| fetch_vertex(registers, memory, attribute_base, &layout, fixed_attributes, vertex_index))
         .collect();
-    let shaded = process_vertices(registers, vertex_shader, geometry_shader, &inputs, order.as_deref());
-
-    rasterize(registers, memory, resources, &shaded);
+    let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: order.as_deref() };
+    rasterize(registers, memory, resources, vertices);
     vertex_count
 }
 
@@ -1604,14 +1681,24 @@ pub fn draw_immediate<M: GpuMemory>(
         .iter()
         .map(|attributes| map_inputs(registers, REG_VS_BLOCK, &attributes[..count]))
         .collect();
-    let shaded = process_vertices(registers, vertex_shader, geometry_shader, &inputs, None);
-    rasterize(registers, memory, resources, &shaded)
+    let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: None };
+    rasterize(registers, memory, resources, vertices)
+}
+
+/// the vertices of each triangle out of count of them, for a list, a strip
+/// (1) or a fan (2).
+fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
+    match topology {
+        1 => (2..count).map(|i| if i % 2 == 0 { (i - 2, i - 1, i) } else { (i - 1, i - 2, i) }).collect(),
+        2 => (2..count).map(|i| (0, i - 1, i)).collect(),
+        _ => (0..count / 3).map(|t| (t * 3, t * 3 + 1, t * 3 + 2)).collect(),
+    }
 }
 
 /// assembles shaded vertices into triangles the way the primitive configuration
 /// says, and fills them with the current back-end state.
-fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
-    let vertex_count = shaded.len();
+fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> u32 {
+    let vertex_count = vertices.len();
     // the offset is two signed 10-bit fields.
     let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
     let viewport_x = signed10(registers[REG_VIEWPORT_XY]);
@@ -1718,23 +1805,45 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // 2 = fan, 3 = whatever the geometry shader emitted, which is a list.
     let topology = (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3;
 
-    let triangle_indices: Vec<(usize, usize, usize)> = match topology {
-        1 => (2..shaded.len())
-            .map(|i| {
-                if i % 2 == 0 {
-                    (i - 2, i - 1, i)
-                } else {
-                    (i - 1, i - 2, i)
-                }
-            })
-            .collect(),
-        2 => (2..shaded.len()).map(|i| (0, i - 1, i)).collect(),
-        _ => (0..shaded.len() / 3).map(|t| (t * 3, t * 3 + 1, t * 3 + 2)).collect(),
-    };
-
     // GPUREG_FACECULLING_CONFIG, 0 keeps everything, 1 keeps triangles
     // wound clockwise and 2 counter-clockwise, as seen with y pointing up.
     let cull_mode = registers[REG_FACE_CULLING] & 0x3;
+
+    // the GPU runs the vertex shader itself, unless a geometry shader
+    // comes after it
+    #[cfg(feature = "vulkan")]
+    if let (Vertices::Unshaded { vertex_shader, inputs, order, .. }, Some(hardware)) =
+        (vertices, resources.hardware.as_mut())
+    {
+        let target = &state.target;
+        let whole = target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8);
+        if hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
+            let vertex = |i: usize| order.map_or(i, |order| order[i]) as u32;
+            let indices: Vec<u32> =
+                assemble(topology, vertex_count).into_iter().flat_map(|(a, b, c)| [vertex(a), vertex(b), vertex(c)]).collect();
+            let shading = hardware::Shading {
+                unit: vertex_shader,
+                inputs,
+                indices: &indices,
+                semantics: output_semantics(registers),
+                viewport,
+                cull: cull_mode,
+            };
+            match hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading))) {
+                Ok(()) => return (indices.len() / 3) as u32,
+                Err(error) => log::error!("the GPU could not shade, {error}, shading on the CPU"),
+            }
+        }
+    }
+    let processed;
+    let shaded = match vertices {
+        Vertices::Shaded(shaded) => shaded,
+        Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
+            processed = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
+            &processed[..]
+        }
+    };
+    let triangle_indices = assemble(topology, shaded.len());
 
     let triangle_count = triangle_indices.len();
     let mut clipped_away = 0u32;
@@ -1766,21 +1875,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         let target = &state.target;
         // tiles are whole in any buffer a title really draws into
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
-            let draw = hardware::Draw {
-                registers,
-                target: target.addr,
-                format: target.format,
-                width: target.buffer_width,
-                height: target.buffer_height,
-                scissor: [target.left, target.bottom, target.right, target.top],
-                depth: state.depth_stencil.as_ref().map(|d| (d.addr, d.bytes)),
-                depth_map: state.depth_map,
-                triangles: &triangles,
-                textures: &textures,
-                lighting: state.lighting.as_ref(),
-                tables: &resources.light_tables,
-            };
-            match hardware.draw(memory, &draw) {
+            match hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Triangles(&triangles))) {
                 Ok(()) => return triangle_count as u32,
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
             }
@@ -1794,7 +1889,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         // were not
         if drawn.iter().any(Option::is_some) {
             let hardware = resources.hardware.take();
-            let drawn = rasterize(registers, memory, resources, shaded);
+            let drawn = rasterize(registers, memory, resources, Vertices::Shaded(shaded));
             resources.hardware = hardware;
             return drawn;
         }
@@ -1926,6 +2021,10 @@ mod tests {
     }
 
     /// an 8x8 RGBA8 target with color writes on and a D24S8 buffer beside it.
+    fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
+        rasterize(registers, memory, resources, Vertices::Shaded(shaded))
+    }
+
     fn target_registers() -> Vec<u32> {
         let mut registers = vec![0u32; 0x300];
         registers[REG_VIEWPORT_WIDTH] = float24(4.0);
@@ -1973,9 +2072,9 @@ mod tests {
         registers[REG_DEPTH_COLOR_MASK] |= 1 | (6 << 4) | (1 << 12);
 
         let mut memory = ConsoleMemory::default();
-        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.2, RED));
-        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.8, GREEN));
-        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.3, BLUE));
+        rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.2, RED));
+        rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.8, GREEN));
+        rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.3, BLUE));
         assert!(pixels(&mut memory).iter().all(|&p| p == [0, 255, 0, 255]));
     }
 
@@ -1989,7 +2088,7 @@ mod tests {
         for sample in 0..32 {
             memory.write(DEPTH + sample * 4 + 3, &[1]);
         }
-        let written = rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED));
+        let written = rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED));
         assert_eq!(written, 32);
     }
 
@@ -2005,7 +2104,7 @@ mod tests {
             vertex([1.0, -1.0, -0.5, 1.0]),
             vertex([0.0, 2.0, 0.5, -1.0]),
         ];
-        let written = rasterize(&registers, &mut memory, &mut Resources::default(), &triangle);
+        let written = rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &triangle);
         assert_eq!(written, 64);
     }
 
@@ -2019,7 +2118,7 @@ mod tests {
             ColorFormat::Rgba8.encode([10, 20, 30, 40], &mut raw);
             memory.write(COLOR + i * 4, &raw);
         }
-        rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, [1.0, 1.0, 1.0, 1.0]));
+        rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, [1.0, 1.0, 1.0, 1.0]));
         assert!(pixels(&mut memory).iter().all(|&p| p == [255, 20, 30, 40]));
     }
 
@@ -2038,7 +2137,7 @@ mod tests {
             vertex(1.0, 1.0),
             vertex(-1.0, 1.0),
         ];
-        assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &quad), 64);
+        assert_eq!(rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &quad), 64);
     }
 
     /// a draw big enough to be split over threads covers the same pixels,
@@ -2063,7 +2162,7 @@ mod tests {
             vertex(1.0, 1.0),
             vertex(-1.0, 1.0),
         ];
-        assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &quad), 256 * 256);
+        assert_eq!(rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &quad), 256 * 256);
         for i in 0..256 * 256 {
             let mut raw = [0u8; 4];
             memory.read(BIG_COLOR + i * 4, &mut raw);
@@ -2081,7 +2180,7 @@ mod tests {
             let mut registers = target_registers();
             registers[REG_FACE_CULLING] = mode;
             let mut memory = ConsoleMemory::default();
-            assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &triangle), expected, "mode {mode}");
+            assert_eq!(rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &triangle), expected, "mode {mode}");
         }
     }
 
@@ -2094,7 +2193,7 @@ mod tests {
         registers[REG_VIEWPORT_HEIGHT] = float24(2.0);
         registers[REG_VIEWPORT_XY] = 4 << 16;
         let mut memory = ConsoleMemory::default();
-        assert_eq!(rasterize(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED)), 32);
+        assert_eq!(rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED)), 32);
         for row in 0..8 {
             for x in 0..8 {
                 let index = crate::format::morton_offset(x, row, 8, 1);
@@ -2172,7 +2271,7 @@ mod tests {
         for (left, right) in [(1.5, 3.5), (1.4999967, 3.499992)] {
             let quad = [(left, 1.5), (right, 1.5), (right, 3.5), (left, 1.5), (right, 3.5), (left, 3.5)];
             let mut memory = ConsoleMemory::default();
-            rasterize(&registers, &mut memory, &mut Resources::default(), &quad.map(|(x, y)| corner(x, y)));
+            rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &quad.map(|(x, y)| corner(x, y)));
             // the rows as the window counts them, from the bottom
             let covered: Vec<(u32, u32)> = (0..8)
                 .flat_map(|y| (0..8).map(move |x| (x, y)))
@@ -2228,8 +2327,8 @@ mod tests {
             let cleared = vec![0u8; (SIZE * SIZE * 4) as usize];
             software.write(COLOR, &cleared);
             gpu.write(COLOR, &cleared);
-            rasterize(&registers, &mut software, &mut Resources::default(), &triangle);
-            rasterize(&registers, &mut gpu, &mut resources, &triangle);
+            rasterize_shaded(&registers, &mut software, &mut Resources::default(), &triangle);
+            rasterize_shaded(&registers, &mut gpu, &mut resources, &triangle);
             resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
             differing += (0..SIZE * SIZE)
                 .filter(|i| {
@@ -2241,6 +2340,148 @@ mod tests {
                 .count();
         }
         assert_eq!(differing, 0);
+    }
+
+    /// vertices the GPU shades come out as the CPU shades them, clipped and
+    /// culled the same, through a program with a loop, a call, both kinds
+    /// of if, indexed uniforms and an output past a gap in the mask.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_gpu_shades_like_the_cpu() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const SIZE: u32 = 32;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut unit = ShaderUnit::new();
+        let descriptors = [
+            0xF | IDENTITY,
+            0x8 | IDENTITY,
+            0x4 | IDENTITY,
+            0x2 | IDENTITY,
+            0x1 | IDENTITY,
+            // w, a.w times b.x plus c.y
+            0x1 | 0x1B << 5 | 0x55 << 23,
+            // x, the first source's z
+            0x8 | 0xAA << 5,
+            0xE | IDENTITY,
+            // the second source's x everywhere
+            0xF | 0x1B << 5,
+        ];
+        unit.descriptors[..descriptors.len()].copy_from_slice(&descriptors);
+        let op = |opcode: u32, destination: u32, src1: u32, src2: u32, index: u32, descriptor: u32| {
+            opcode << 26 | destination << 21 | index << 19 | src1 << 12 | src2 << 7 | descriptor
+        };
+        let flow = |opcode: u32, condition: u32, destination: u32, count: u32| {
+            opcode << 26 | condition << 22 | destination << 10 | count
+        };
+        let program = [
+            op(0x12, 0, 0x02, 0, 0, 1),
+            // the matrix at c1 through a0.x, which v2 sets to one
+            op(0x02, 0, 0x20, 0x00, 1, 1),
+            op(0x02, 0, 0x21, 0x00, 1, 2),
+            op(0x02, 0, 0x22, 0x00, 1, 3),
+            op(0x02, 0, 0x23, 0x00, 1, 4),
+            op(0x13, 0x10, 0x2A, 0, 0, 0),
+            // r0 is c5 + c6 + c7
+            flow(0x29, 0, 7, 0),
+            op(0x00, 0x10, 0x25, 0x10, 3, 0),
+            flow(0x27, 0, 10, 1),
+            op(0x08, 2, 0x01, 0x10, 0, 0),
+            op(0x13, 2, 0x01, 0, 0, 0),
+            // c8.x < v1.x and c8.y > v1.y
+            0x2E << 26 | 2 << 24 | 4 << 21 | 0x28 << 12 | 0x01 << 7,
+            flow(0x28, 0b1010, 14, 0),
+            0x38 << 26 | 2 << 24 | 0x01 << 17 | 0x29 << 10 | 0x10 << 5 | 5,
+            flow(0x24, 0, 20, 3),
+            0x22 << 26,
+        ];
+        unit.program[..program.len()].copy_from_slice(&program);
+        unit.program[20] = op(0x0E, 0x11, 0x29, 0, 0, 6);
+        unit.program[21] = op(0x08, 0x12, 0x01, 0x11, 0, 8);
+        unit.program[22] = op(0x0D, 2, 0x12, 0x10, 0, 7);
+        let uniforms = [
+            [0.0; 4],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.3, 1.0],
+            [0.5, 0.1, 0.2, 0.3],
+            [0.2, 0.3, 0.1, 0.3],
+            [0.1, 0.2, 0.4, 0.4],
+            [0.5, 0.5, 0.0, 0.0],
+            [0.3, 0.0, 2.0, 0.0],
+            [0.0; 4],
+        ];
+        unit.float_uniforms[..uniforms.len()].copy_from_slice(&uniforms);
+        unit.int_uniforms[0] = [2, 0, 1, 0];
+        unit.bool_uniforms = 1;
+        unit.prepare();
+
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
+        registers[REG_VIEWPORT_WIDTH] = float24(12.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
+        registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        registers[REG_DEPTHMAP_ENABLE] = 1;
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        registers[REG_VS_OUTPUT_MASK] = 0b101;
+
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let (mut differing, mut drawn, mut deepest) = (0, 0, 0);
+        for case in 0..36 {
+            let (topology, cull) = (case % 3, case / 3 % 3);
+            // half the cases reach past the near and far planes, where the
+            // CPU places the vertices clipping makes on a sixteenth of a
+            // pixel and the GPU the ones it clipped, which moves depth a bit
+            let clipped = case >= 18;
+            let (near, depth_range) = if clipped { (-1.3, 1.6) } else { (-0.7, 0.6) };
+            registers[REG_PRIMITIVE_CONFIG] = topology << 8;
+            registers[REG_FACE_CULLING] = cull;
+            let mut inputs = vec![[shader::ZERO; shader::INPUT_REGISTERS]; 24];
+            for input in &mut inputs {
+                input[0] = [random() * 2.6 - 1.3, random() * 2.6 - 1.3, random() * depth_range + near, 1.0];
+                input[1] = [random(), random(), random(), random()];
+                input[2] = [1.0, 0.0, 0.0, 0.0];
+            }
+            let order: Vec<usize> = (0..12).map(|_| (random() * 24.0) as usize).collect();
+            let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &unit, inputs: &inputs, order: Some(&order) };
+
+            let mut software = ConsoleMemory::default();
+            let mut gpu = ConsoleMemory::default();
+            for memory in [&mut software, &mut gpu] {
+                memory.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                memory.write(DEPTH, &vec![0xFFu8; (SIZE * SIZE * 4) as usize]);
+            }
+            rasterize(&registers, &mut software, &mut Resources::default(), vertices);
+            rasterize(&registers, &mut gpu, &mut resources, vertices);
+            resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
+            for i in 0..SIZE * SIZE {
+                let (mut a, mut b, mut da, mut db) = ([0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4]);
+                software.read(COLOR + i * 4, &mut a);
+                gpu.read(COLOR + i * 4, &mut b);
+                software.read(DEPTH + i * 4, &mut da);
+                gpu.read(DEPTH + i * 4, &mut db);
+                drawn += (a != [0; 4]) as u32;
+                if a.iter().zip(&b).any(|(a, b)| a.abs_diff(*b) > 3) {
+                    differing += 1;
+                } else if !clipped {
+                    let depth = |d: [u8; 4]| u32::from_le_bytes(d) & 0xFF_FFFF;
+                    deepest = deepest.max(depth(da).abs_diff(depth(db)));
+                }
+            }
+        }
+        eprintln!("{differing} of {drawn} drawn pixels differ, depth by up to {deepest}");
+        assert!(drawn > 2000);
+        assert!(differing * 100 < drawn, "{differing} of {drawn} pixels differ");
+        assert!(deepest < 1 << 8, "depth differs by {deepest}");
     }
 
     /// a texture that is rows of a buffer the GPU just drew samples the
@@ -2325,12 +2566,12 @@ mod tests {
             let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
             let mut memory = ConsoleMemory::default();
             for triangle in &triangles {
-                rasterize(&drawing, &mut memory, &mut resources, triangle);
+                rasterize_shaded(&drawing, &mut memory, &mut resources, triangle);
             }
             if back_first {
                 resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
             }
-            rasterize(&sampling, &mut memory, &mut resources, &quad);
+            rasterize_shaded(&sampling, &mut memory, &mut resources, &quad);
             resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
             let mut sampled = vec![0u8; (SIZE * SIZE / 2 * 4) as usize];
             memory.read(TARGET, &mut sampled);
@@ -2376,7 +2617,7 @@ mod tests {
                         view: [0.0; 3],
                     })
                     .collect();
-                rasterize(&registers, &mut drawn, &mut resources, &triangle);
+                rasterize_shaded(&registers, &mut drawn, &mut resources, &triangle);
             }
             // memory gets what the GPU drew, which stays on the GPU too
             resources.hardware.as_mut().unwrap().flush(&mut drawn).unwrap();
