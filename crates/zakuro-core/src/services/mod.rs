@@ -16,6 +16,7 @@ pub mod ir;
 pub mod keyboard;
 pub mod ldr_ro;
 pub mod misc;
+pub mod nfc;
 pub mod shared_font;
 pub mod host_archive;
 pub mod srv;
@@ -64,6 +65,7 @@ pub struct ServiceState {
     pub dsp: dsp::DspState,
     pub ir: ir::IrState,
     pub y2r: y2r::Y2rState,
+    pub nfc: nfc::NfcState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
     pub unimplemented: BTreeMap<(String, u16), u32>,
@@ -98,6 +100,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "ir:USER" => ir::handle(system, &buffer, header),
         "y2r:u" => y2r::handle(system, &buffer, header),
         "frd:u" | "frd:a" => frd::handle(system, &buffer, header),
+        "nfc:u" | "nfc:m" => nfc::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 

@@ -53,9 +53,6 @@ pub struct AptState {
 /// the system has finished loading it.
 const FONT_STATUS_LOADED: u32 = 2;
 
-/// where the shared font block is mapped for the guest.
-const SHARED_FONT_VADDR: u32 = 0x1800_0000;
-
 /// where a dumped shared font is looked for, relative to the working
 /// directory and then to the user's data directory.
 const SHARED_FONT_PATHS: &[&str] = &[
@@ -89,17 +86,24 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         }
         None => {
             // a title does not just use the font, it parses it, an empty block
-            // fails that parse and the title never gets going.
+            // fails that parse and the title never gets going. it is built
+            // again for its address once there is one.
             log::info!("no shared font file found; using the generated ASCII font");
-            crate::services::shared_font::build(SHARED_FONT_VADDR)
+            Vec::new()
         }
     };
+    let generated = data.is_empty();
+    let length = if generated { crate::services::shared_font::build(0).len() } else { data.len() };
 
-    let size = zakuro_common::bits::align_up(data.len() as u32, 0x1000);
+    let size = zakuro_common::bits::align_up(length as u32, 0x1000);
     let block = system
         .memory
         .phys
         .allocate(crate::memory::MemoryRegion::Base, size)?;
+    // the font sits where the linear mapping puts its memory, among the
+    // system's, a title's own linear heap can reach far and never there
+    let address = system.kernel.linear_base + (block.addr - zakuro_common::memory_map::FCRAM_PADDR);
+    let data = if generated { crate::services::shared_font::build(address) } else { data };
 
     let object = system
         .kernel
@@ -119,7 +123,6 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         .create(&mut system.kernel.objects, object, "SharedFont");
 
     // map it where the guest can see it, then copy the font in.
-    let address = SHARED_FONT_VADDR;
     system.memory.map(
         address,
         block.addr,
