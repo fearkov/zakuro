@@ -30,9 +30,9 @@ mod command {
     pub const REGISTER_INTERRUPT_EVENTS: u16 = 0x0015;
     pub const GET_SEMAPHORE_EVENT_HANDLE: u16 = 0x0016;
     pub const SET_SEMAPHORE_MASK: u16 = 0x0017;
-    pub const GET_HEADPHONE_STATUS: u16 = 0x0018;
-    pub const FORCE_HEADPHONE_OUT: u16 = 0x0019;
-    pub const GET_IS_DSP_OCCUPIED: u16 = 0x001A;
+    pub const GET_HEADPHONE_STATUS: u16 = 0x001F;
+    pub const FORCE_HEADPHONE_OUT: u16 = 0x0020;
+    pub const GET_IS_DSP_OCCUPIED: u16 = 0x0021;
 }
 
 /// the pipe a title uses to drive the audio firmware.
