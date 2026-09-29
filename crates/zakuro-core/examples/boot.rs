@@ -94,10 +94,13 @@ fn main() {
             let held = || script.iter().filter(|(start, ..)| (*start..*start + 6).contains(&frame));
             let buttons = held().fold(PadState::empty(), |held, (_, buttons, _)| held | *buttons);
             let touch = held().find_map(|(.., touch)| *touch);
+            // the circle pad's directions push it all the way
+            let axis = |plus: PadState, minus: PadState| buttons.contains(plus) as i8 as f32 - buttons.contains(minus) as i8 as f32;
             system.set_input(InputState {
                 buttons,
                 touch,
-                ..InputState::default()
+                circle_x: axis(PadState::CIRCLE_RIGHT, PadState::CIRCLE_LEFT),
+                circle_y: axis(PadState::CIRCLE_UP, PadState::CIRCLE_DOWN),
             });
         } else if mash_buttons {
             let pressed = frame % 40 < 4;
@@ -145,6 +148,22 @@ fn main() {
         if dump_at.contains(&executed) {
             for (screen, name) in SCREENS {
                 save_screen(&mut system, screen, &temp(&format!("zakuro-{name}-{executed}.ppm")));
+            }
+            // ZAKURO_DUMP_MEM_AT=1 saves the ZAKURO_DUMP_MEM ranges with the
+            // screens too, to watch memory change from frame to frame
+            if std::env::var("ZAKURO_DUMP_MEM_AT").is_ok() {
+                for (addr, len) in std::env::var("ZAKURO_DUMP_MEM").iter().flat_map(|spec| {
+                    spec.split(';')
+                        .filter_map(|range| {
+                            let (addr, len) = range.split_once(',')?;
+                            Some((u32::from_str_radix(addr.trim_start_matches("0x"), 16).ok()?, len.parse::<usize>().ok()?))
+                        })
+                        .collect::<Vec<_>>()
+                }) {
+                    let mut bytes = vec![0u8; len];
+                    system.memory.read_bytes(addr, &mut bytes);
+                    let _ = std::fs::write(temp(&format!("zakuro-dump-0x{addr:08X}-{executed}.bin")), &bytes);
+                }
             }
         }
         if outcome != FrameOutcome::Completed {
@@ -362,7 +381,8 @@ fn temp(name: &str) -> String {
 }
 
 /// parses frame:BUTTON[+BUTTON...] entries separated by commas, where @XxY
-/// touches the bottom screen at X, Y.
+/// touches the bottom screen at X, Y and CUP, CDOWN, CLEFT and CRIGHT push
+/// the circle pad.
 fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
     spec.split(',')
         .filter_map(|entry| {
@@ -386,6 +406,10 @@ fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
                     "DOWN" => PadState::DOWN,
                     "LEFT" => PadState::LEFT,
                     "RIGHT" => PadState::RIGHT,
+                    "CUP" => PadState::CIRCLE_UP,
+                    "CDOWN" => PadState::CIRCLE_DOWN,
+                    "CLEFT" => PadState::CIRCLE_LEFT,
+                    "CRIGHT" => PadState::CIRCLE_RIGHT,
                     other => {
                         eprintln!("unknown button '{other}' in ZAKURO_INPUT");
                         return None;

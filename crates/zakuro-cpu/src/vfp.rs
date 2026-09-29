@@ -348,14 +348,24 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
 /// !top) and VSQRT (second, top) on one register.
 fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: usize) {
     if double {
-        let v = cpu.vfp.get_f64(rm);
-        let result = match (second, top) {
-            (false, false) => v,
-            (false, true) => v.abs(),
-            (true, false) => -v,
-            (true, true) => v.sqrt(),
+        // the moves and sign operations copy bits and flush nothing. titles
+        // pass two singles in a double register, whose bits as a double can
+        // be subnormal, and flushing them would zero the singles
+        let raw = |cpu: &Cpu, index: usize| {
+            (cpu.vfp.regs[(index * 2) & 31] as u64) | (cpu.vfp.regs[(index * 2 + 1) & 31] as u64) << 32
         };
-        cpu.vfp.set_f64(rd, result);
+        let bits = match (second, top) {
+            (false, false) => raw(cpu, rm),
+            (false, true) => raw(cpu, rm) & !(1 << 63),
+            (true, false) => raw(cpu, rm) ^ (1 << 63),
+            (true, true) => {
+                let v = cpu.vfp.get_f64(rm).sqrt();
+                cpu.vfp.set_f64(rd, v);
+                return;
+            }
+        };
+        cpu.vfp.regs[(rd * 2) & 31] = bits as u32;
+        cpu.vfp.regs[(rd * 2 + 1) & 31] = (bits >> 32) as u32;
     } else {
         // the sign operations work on the raw bits so NaN payloads survive.
         let raw = cpu.vfp.regs[rm];

@@ -32,6 +32,29 @@ fn single_precision_arithmetic() {
 }
 
 #[test]
+fn double_moves_keep_two_singles_under_flush_to_zero() {
+    // titles pass two singles in a double register, whose bits read as a
+    // subnormal double when the high one is zero, and flushing zeroes both
+    let Some(r) = run_with(
+        "vmov.f64 d8, d0
+         vneg.f64 d9, d0
+         vabs.f64 d10, d9",
+        |cpu, _| {
+            cpu.vfp.fpscr |= 1 << 24;
+            cpu.vfp.set_f32(0, 2.5);
+            cpu.vfp.set_f32(1, 0.0);
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(r.f32_reg(16), 2.5);
+    assert_eq!(r.f32_reg(18), 2.5);
+    assert!(r.f32_reg(19).is_sign_negative());
+    assert_eq!(r.f32_reg(20), 2.5);
+    assert!(r.f32_reg(21).is_sign_positive());
+}
+
+#[test]
 fn double_precision_arithmetic() {
     let Some(r) = run_with(
         "vadd.f64 d4, d0, d1
