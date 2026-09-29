@@ -4,6 +4,11 @@ A WIP HLE Nintendo 3DS emulator written in Rust that uses ahead-of-time (AOT) re
 
 <img width="797" height="983" alt="image" src="https://github.com/user-attachments/assets/c18deb0d-3949-4493-83df-0142928d8c2d" />
 
+<p>
+  <img width="400" alt="The Legend of Zelda: Majora's Mask 3D running in Zakuro" src="docs/screenshots/majoras-mask-3d.png" />
+  <img width="400" alt="Persona Q running in Zakuro" src="docs/screenshots/persona-q.png" />
+</p>
+
 
 I started developing this project in October 2025, before
 [feargba](https://github.com/fearkov/feargba). 
