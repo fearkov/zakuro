@@ -2,11 +2,10 @@
 
 A WIP HLE Nintendo 3DS emulator written in Rust that uses ahead-of-time (AOT) recompilation instead of a JIT.
 
-<img width="797" height="983" alt="image" src="https://github.com/user-attachments/assets/c18deb0d-3949-4493-83df-0142928d8c2d" />
-
 <p>
-  <img width="400" alt="The Legend of Zelda: Majora's Mask 3D running in Zakuro" src="docs/screenshots/majoras-mask-3d.png" />
-  <img width="400" alt="Persona Q running in Zakuro" src="docs/screenshots/persona-q.png" />
+  <img width="266" alt="Pokémon Y running in Zakuro" src="docs/screenshots/pokemon-y.png" />
+  <img width="266" alt="The Legend of Zelda: Majora's Mask 3D running in Zakuro" src="docs/screenshots/majoras-mask-3d.png" />
+  <img width="266" alt="Persona Q running in Zakuro" src="docs/screenshots/persona-q.png" />
 </p>
 
 
