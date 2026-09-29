@@ -245,10 +245,12 @@ fn map_code(system: &mut System, title: &Title) -> Result<(), LoadError> {
         );
     }
 
-    // BSS follows .data and must start zeroed.
-    if exheader.bss_size > 0 {
-        let bss_start = exheader.data.address + exheader.data.num_pages * PAGE_SIZE;
-        let bss_size = zakuro_common::bits::align_up(exheader.bss_size, PAGE_SIZE);
+    // BSS starts right where .data's bytes end, in the rest of its last page,
+    // and must start zeroed. what does not fit there gets pages of its own.
+    let bss_start = exheader.data.address + exheader.data.num_pages * PAGE_SIZE;
+    let bss_end = exheader.data.address + exheader.data.size + exheader.bss_size;
+    if bss_end > bss_start {
+        let bss_size = zakuro_common::bits::align_up(bss_end - bss_start, PAGE_SIZE);
         let block = system
             .memory
             .phys

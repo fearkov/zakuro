@@ -71,10 +71,11 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, cl
     page[0x66] = 3; // full wifi signal
     page[0x67] = 2; // wifi enabled and connected
 
-    page[0x70..0x74].copy_from_slice(&slider_3d.to_le_bytes());
-    page[0x74] = (slider_3d > 0.0) as u8; // 3D LED
-    page[0x75] = 0x1F; // battery, charged, not charging
-    page[0xB0] = 0; // no headset
+    page[0x80..0x84].copy_from_slice(&slider_3d.to_le_bytes());
+    page[0x84] = (slider_3d > 0.0) as u8; // 3D LED
+    // battery, on the adapter, full and no longer charging
+    page[0x85] = 1 | 5 << 2;
+    page[0xC0] = 0; // no headset
 }
 
 /// the host's clock, in milliseconds since 1900.
@@ -103,6 +104,6 @@ pub fn update_datetime(page: &mut [u8], boot_clock: u64, tick: u64) {
 
 /// updates the 3D slider position, which games poll every frame.
 pub fn set_slider_3d(page: &mut [u8], value: f32) {
-    page[0x70..0x74].copy_from_slice(&value.clamp(0.0, 1.0).to_le_bytes());
-    page[0x74] = (value > 0.0) as u8;
+    page[0x80..0x84].copy_from_slice(&value.clamp(0.0, 1.0).to_le_bytes());
+    page[0x84] = (value > 0.0) as u8;
 }
