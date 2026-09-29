@@ -30,7 +30,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
       - name: Sound library headers
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - run: cargo build --release --locked -p zakuro
       - name: Pack for Windows
         if: runner.os == 'Windows'

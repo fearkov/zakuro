@@ -4,6 +4,7 @@
 
 mod audio;
 mod cli;
+mod gamepad;
 mod gui;
 mod input;
 mod library;
@@ -56,6 +57,7 @@ pub fn run(linked: Option<Linked>) {
 
     let mut app = App {
         keyboard: Keyboard::new(settings.keys.clone()),
+        gamepads: gamepad::Gamepads::new(settings.pad.clone()),
         scale: options.scale.unwrap_or(settings.scale).max(1),
         options,
         settings,
@@ -289,6 +291,7 @@ struct App {
     backend: Option<Backend>,
     window: Option<Window>,
     keyboard: Keyboard,
+    gamepads: gamepad::Gamepads,
     audio: Option<audio::Audio>,
     /// the window's size, times the console's.
     scale: u32,
@@ -432,6 +435,10 @@ impl App {
     fn key(&mut self, event: KeyEvent, consumed: bool) {
         let pressed = event.state == ElementState::Pressed;
         let PhysicalKey::Code(code) = event.physical_key else { return };
+        // Escape leaves a controller binding waiting for a button as it was
+        if pressed && code == KeyCode::Escape && self.menus.rebinding_pad.take().is_some() {
+            return;
+        }
         // a binding waiting for a key takes it, Escape leaves it as it was
         if let (true, Some(index)) = (pressed, self.menus.rebinding) {
             self.menus.rebinding = None;
@@ -466,6 +473,22 @@ impl App {
         // letting go always gets through, so that no button stays held
         if to_game || !pressed {
             self.keyboard.key(event.physical_key, pressed);
+        }
+    }
+
+    /// takes in the controllers' buttons, a binding waiting for one takes
+    /// it, and Home opens and closes the menu over the game.
+    fn poll_gamepads(&mut self) {
+        for button in self.gamepads.poll() {
+            if let Some(index) = self.menus.rebinding_pad.take() {
+                if let Some((_, bound)) = self.settings.pad.all_mut().into_iter().nth(index) {
+                    *bound = button;
+                }
+                self.apply_settings();
+            } else if button == gilrs::Button::Mode && self.game.is_some() {
+                self.menus.menu_open = !self.menus.menu_open;
+                self.keyboard.release();
+            }
         }
     }
 
@@ -504,6 +527,7 @@ impl App {
     fn apply_settings(&mut self) {
         self.settings.save();
         self.keyboard.set_keys(self.settings.keys.clone());
+        self.gamepads.set_buttons(self.settings.pad.clone());
         self.apply_volume();
         if self.options.scale.is_none() && self.settings.scale.max(1) != self.scale {
             self.scale = self.settings.scale.max(1);
@@ -617,6 +641,7 @@ impl App {
         }
         self.library.poll();
         self.poll_jobs();
+        self.poll_gamepads();
 
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
@@ -661,7 +686,7 @@ impl App {
     /// runs one frame of the game.
     fn emulate(&mut self) {
         let Some(game) = &mut self.game else { return };
-        game.system.set_input(self.keyboard.state());
+        game.system.set_input(self.gamepads.apply(self.keyboard.state()));
         let outcome = game.system.run_frame();
         game.count_frame();
         let sound = game.system.take_audio();

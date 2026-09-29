@@ -3,8 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
+use gilrs::Button;
 use serde::{Deserialize, Serialize};
 use winit::keyboard::KeyCode;
+use zakuro_core::services::hid::PadState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,6 +84,83 @@ impl Keys {
     }
 }
 
+/// the controller buttons the console's buttons are on, the face buttons
+/// where the 3DS has them rather than by their letters. the circle pad is
+/// the left stick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PadButtons {
+    pub a: Button,
+    pub b: Button,
+    pub x: Button,
+    pub y: Button,
+    pub l: Button,
+    pub r: Button,
+    pub start: Button,
+    pub select: Button,
+    pub up: Button,
+    pub down: Button,
+    pub left: Button,
+    pub right: Button,
+}
+
+impl Default for PadButtons {
+    fn default() -> Self {
+        PadButtons {
+            a: Button::East,
+            b: Button::South,
+            x: Button::North,
+            y: Button::West,
+            l: Button::LeftTrigger,
+            r: Button::RightTrigger,
+            start: Button::Start,
+            select: Button::Select,
+            up: Button::DPadUp,
+            down: Button::DPadDown,
+            left: Button::DPadLeft,
+            right: Button::DPadRight,
+        }
+    }
+}
+
+impl PadButtons {
+    /// every binding with the name it goes by, to show and change them.
+    pub fn all_mut(&mut self) -> [(&'static str, &mut Button); 12] {
+        [
+            ("A", &mut self.a),
+            ("B", &mut self.b),
+            ("X", &mut self.x),
+            ("Y", &mut self.y),
+            ("L", &mut self.l),
+            ("R", &mut self.r),
+            ("Start", &mut self.start),
+            ("Select", &mut self.select),
+            ("D-pad up", &mut self.up),
+            ("D-pad down", &mut self.down),
+            ("D-pad left", &mut self.left),
+            ("D-pad right", &mut self.right),
+        ]
+    }
+
+    /// each of the console's buttons and the controller button it is on.
+    pub fn map(&self) -> [(PadState, Button); 12] {
+        [
+            (PadState::A, self.a),
+            (PadState::B, self.b),
+            (PadState::X, self.x),
+            (PadState::Y, self.y),
+            (PadState::L, self.l),
+            (PadState::R, self.r),
+            (PadState::START, self.start),
+            (PadState::SELECT, self.select),
+            (PadState::UP, self.up),
+            (PadState::DOWN, self.down),
+            (PadState::LEFT, self.left),
+            (PadState::RIGHT, self.right),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -106,6 +185,7 @@ pub struct Settings {
     /// how much of it shows, 0 to 1.
     pub background_opacity: f32,
     pub keys: Keys,
+    pub pad: PadButtons,
 }
 
 impl Default for Settings {
@@ -123,6 +203,7 @@ impl Default for Settings {
             background: None,
             background_opacity: 0.35,
             keys: Keys::default(),
+            pad: PadButtons::default(),
         }
     }
 }
@@ -179,6 +260,7 @@ mod tests {
     fn settings_come_back_as_they_were_saved() {
         let mut settings = Settings { games: Some("/games".into()), show_fps: true, ..Settings::default() };
         settings.keys.a = KeyCode::KeyK;
+        settings.pad.a = Button::South;
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
     }

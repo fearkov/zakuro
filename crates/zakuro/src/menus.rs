@@ -10,7 +10,8 @@ use zakuro_core::services::keyboard::Request;
 
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
-use crate::settings::{Keys, Renderer, Settings};
+use crate::gamepad::button_name;
+use crate::settings::{Keys, PadButtons, Renderer, Settings};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +41,9 @@ pub struct Menus {
     pub settings_open: bool,
     /// the binding waiting for a key, by its place in Keys::all_mut.
     pub rebinding: Option<usize>,
+    /// the controller binding waiting for a button, by its place in
+    /// PadButtons::all_mut.
+    pub rebinding_pad: Option<usize>,
     /// something to tell the user, until they close it.
     pub message: Option<String>,
     /// what is being typed into the game's keyboard, and what it asked for.
@@ -379,6 +383,7 @@ impl Menus {
                     let text = if self.rebinding == Some(i) { "press a key…".to_owned() } else { key_name(*key) };
                     if ui.add_sized([110.0, 20.0], egui::Button::new(text)).clicked() {
                         self.rebinding = Some(i);
+                        self.rebinding_pad = None;
                     }
                     if i % 2 == 1 {
                         ui.end_row();
@@ -389,10 +394,32 @@ impl Menus {
                 settings.keys = Keys::default();
                 self.rebinding = None;
             }
+
+            ui.separator();
+            ui.heading("Controller");
+            egui::Grid::new("controller").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
+                for (i, (name, button)) in settings.pad.all_mut().into_iter().enumerate() {
+                    ui.label(name);
+                    let text = if self.rebinding_pad == Some(i) { "press a button…" } else { button_name(*button) };
+                    if ui.add_sized([110.0, 20.0], egui::Button::new(text)).clicked() {
+                        self.rebinding_pad = Some(i);
+                        self.rebinding = None;
+                    }
+                    if i % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+            ui.label(RichText::new("The circle pad is the left stick, and Home opens the menu over the game.").weak());
+            if ui.button("Default controller").clicked() {
+                settings.pad = PadButtons::default();
+                self.rebinding_pad = None;
+            }
         });
         self.settings_open = open;
         if !open {
             self.rebinding = None;
+            self.rebinding_pad = None;
         }
         if *settings != before {
             actions.push(Action::Settings);

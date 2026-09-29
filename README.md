@@ -20,7 +20,7 @@ This is a personal experimental project. You can use it to play games, but that 
 
 Builds for Windows and Linux are on the [releases page](https://github.com/fearkov/zakuro/releases): on Windows, unzip it and run zakuro.exe, and on Linux, extract it and run ./zakuro.
 
-To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA development files (libasound2-dev on Debian and Ubuntu, alsa-lib on Arch). On Windows, nothing else is needed:
+To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA and udev development files (libasound2-dev and libudev-dev on Debian and Ubuntu, alsa-lib and systemd-libs on Arch). On Windows, nothing else is needed:
 
     cargo install --git https://github.com/fearkov/zakuro --locked zakuro
 
@@ -43,15 +43,17 @@ No copyrighted data is included. I do not condone piracy, and I will not help yo
 
 Controls:
 
-| 3DS | Keyboard |
-|---|---|
-| A / B / X / Y | X / Z / S / A |
-| L / R | Q / W |
-| Start / Select | Enter / Backspace |
-| D-pad | Arrow keys |
-| Circle pad | I / J / K / L |
-| Touch screen | Mouse (click) |
-| Menu / Pause / Fullscreen | Esc / F1 / F11 |
+| 3DS | Keyboard | Controller |
+|---|---|---|
+| A / B / X / Y | X / Z / S / A | Right / bottom / top / left face buttons |
+| L / R | Q / W | LB / RB (L1 / R1) |
+| Start / Select | Enter / Backspace | Start / Back (Select) |
+| D-pad | Arrow keys | D-pad |
+| Circle pad | I / J / K / L | Left stick |
+| Touch screen | Mouse (click) | |
+| Menu / Pause / Fullscreen | Esc / F1 / F11 | Home |
+
+Keys and controller buttons can be changed in the settings. Xbox, PlayStation, Switch Pro and most other controllers work.
 
 Contributions are welcome. Using AI is fine sometimes, but the code must always be reviewed by a human. Code that is entirely vibecoded will be discarded.
 
