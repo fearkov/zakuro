@@ -1,6 +1,7 @@
 //! high-level service emulation.
 
 pub mod apt;
+pub mod cecd;
 pub mod err;
 pub mod cfg;
 pub mod dsp;
@@ -66,6 +67,7 @@ pub struct ServiceState {
     pub ir: ir::IrState,
     pub y2r: y2r::Y2rState,
     pub nfc: nfc::NfcState,
+    pub cecd: cecd::CecdState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
     pub unimplemented: BTreeMap<(String, u16), u32>,
@@ -101,6 +103,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "y2r:u" => y2r::handle(system, &buffer, header),
         "frd:u" | "frd:a" => frd::handle(system, &buffer, header),
         "nfc:u" | "nfc:m" => nfc::handle(system, &buffer, header),
+        "cecd:u" | "cecd:s" => cecd::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 
@@ -260,6 +263,30 @@ mod tests {
         assert_eq!(buffer.get(&mut system.memory, 1), 0);
         let handle = buffer.get(&mut system.memory, 3);
         assert!(system.kernel.resolve(handle).is_some());
+        assert!(system.services.unimplemented.is_empty());
+    }
+
+    /// a title stopping StreetPass waits on the state changed event, which
+    /// has to be a real one the stop signals.
+    #[test]
+    fn streetpass_stops_and_says_so() {
+        let (mut system, buffer) = system_with_thread();
+        // GetChangeStateEventHandle
+        buffer.set(&mut system.memory, 0, Header::new(0x0010, 0, 0).0);
+        handle_request(&mut system, Target::service("cecd:u".into(), 0));
+        let handle = buffer.get(&mut system.memory, 3);
+        let object = system.kernel.resolve(handle).expect("a real event");
+
+        // Stop
+        buffer.set(&mut system.memory, 0, Header::new(0x000C, 1, 0).0);
+        buffer.set(&mut system.memory, 1, 0xB);
+        handle_request(&mut system, Target::service("cecd:u".into(), 0));
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        let signaled = match system.kernel.objects.get(object) {
+            Some(crate::kernel::object::KObject::Event(event)) => event.signaled,
+            _ => false,
+        };
+        assert!(signaled);
         assert!(system.services.unimplemented.is_empty());
     }
 
