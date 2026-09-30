@@ -24,6 +24,7 @@ Games tested in Zakuro so far, as of v0.2.7. Recompiled means the game was teste
 | The Legend of Zelda: Ocarina of Time 3D | 0004000000033500 | USA | Playable | Yes | |
 | The Legend of Zelda: Majora's Mask 3D | 0004000000125500 | USA | Playable | Yes | |
 | Persona Q: Shadow of the Labyrinth | 0004000000123400 | USA | Playable | Yes | |
+| Monster Hunter 4 Ultimate | 0004000000126300 | USA | Playable | Yes | Needs a build newer than v0.2.7, the screen stayed black before |
 | Yo-kai Watch | 0004000000167800 | EUR | Playable | Yes | Needs v0.2.7 or newer |
 
 Tested a game that isn't here, or found a problem with one that is? Tell us on the [Discord server](https://discord.gg/7dduXVv2xm) or open a [game report](https://github.com/fearkov/zakuro/issues/new?template=game-report.yml).
