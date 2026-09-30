@@ -148,7 +148,7 @@ fn decode_bytes(format: TextureFormat, b: &[u8]) -> [u8; 4] {
         TextureFormat::La8 => [b[1], b[1], b[1], b[0]],
         TextureFormat::Hilo8 => [0, b[1], b[0], 0xFF],
         TextureFormat::L8 => [b[0], b[0], b[0], 0xFF],
-        TextureFormat::A8 => [0xFF, 0xFF, 0xFF, b[0]],
+        TextureFormat::A8 => [0, 0, 0, b[0]],
         TextureFormat::La4 => {
             let l = expand4(b[0] >> 4);
             let a = expand4(b[0] & 0xF);
@@ -164,7 +164,8 @@ fn decode_nibble(format: TextureFormat, nibble: u8) -> [u8; 4] {
             let l = expand4(nibble);
             [l, l, l, 0xFF]
         }
-        TextureFormat::A4 => [0xFF, 0xFF, 0xFF, expand4(nibble)],
+        // alpha alone reads with black color, as in OpenGL ES
+        TextureFormat::A4 => [0, 0, 0, expand4(nibble)],
         _ => [0, 0, 0, 0],
     }
 }
@@ -330,11 +331,13 @@ mod tests {
         assert_eq!(decoded, [0x44, 0x33, 0x22, 0x11]);
     }
 
+    /// alpha alone comes with black color, luminance alone with full alpha.
     #[test]
     fn a4_and_l4_expand_to_full_range() {
-        assert_eq!(decode_nibble(TextureFormat::A4, 0xF), [0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(decode_nibble(TextureFormat::A4, 0x0), [0xFF, 0xFF, 0xFF, 0x00]);
+        assert_eq!(decode_nibble(TextureFormat::A4, 0xF), [0, 0, 0, 0xFF]);
+        assert_eq!(decode_nibble(TextureFormat::A4, 0x0), [0, 0, 0, 0x00]);
         assert_eq!(decode_nibble(TextureFormat::L4, 0xF), [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(decode_bytes(TextureFormat::A8, &[0x80]), [0, 0, 0, 0x80]);
     }
 
     /// builds a diff-mode (diff=1) ETC1 block from named fields, using the
