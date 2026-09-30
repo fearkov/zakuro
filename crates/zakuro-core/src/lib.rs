@@ -48,6 +48,9 @@ pub struct Config {
     pub hardware_renderer: bool,
     /// how many times the console's resolution the host's GPU draws at.
     pub resolution: u32,
+    /// the time the console's clock starts at, in milliseconds since 1900,
+    /// the host's when none, a fixed one makes runs repeat exactly.
+    pub clock: Option<u64>,
 }
 
 impl Default for Config {
@@ -64,6 +67,7 @@ impl Default for Config {
             data_dir: None,
             hardware_renderer: false,
             resolution: 1,
+            clock: None,
         }
     }
 }
@@ -157,6 +161,7 @@ pub enum StepOutcome {
 
 impl System {
     pub fn new(config: Config) -> System {
+        let boot_clock = config.clock.unwrap_or_else(memory::config::host_clock);
         let app_bytes = 64 * 1024 * 1024;
         let mut services = ServiceState::default();
         if let Some(dir) = &config.data_dir {
@@ -184,7 +189,7 @@ impl System {
             history: [0; HISTORY_LENGTH],
             history_index: 0,
             frames: 0,
-            boot_clock: memory::config::host_clock(),
+            boot_clock,
             next_frame_boundary: CYCLES_PER_FRAME,
             next_audio_frame: CYCLES_PER_AUDIO_FRAME,
             next_preempt: PREEMPT_INTERVAL,
