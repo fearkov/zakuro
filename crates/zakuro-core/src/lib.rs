@@ -83,6 +83,9 @@ pub enum FrameOutcome {
     Faulted,
 }
 
+/// a screen's picture as RGBA, and its width and height.
+pub type Screen = (std::sync::Arc<Vec<u8>>, u32, u32);
+
 pub struct System {
     pub cpu: Cpu,
     pub memory: Memory,
@@ -100,6 +103,9 @@ pub struct System {
     pub unimplemented_svcs: BTreeSet<u32>,
     pub services_seen: BTreeSet<String>,
     pub lcd_force_black: bool,
+    /// the last scaled picture each screen showed, kept up while the GPU
+    /// draws the next one.
+    shown: [Option<Screen>; 2],
     /// the dynamic module loader's state.
     pub cro: cro::CroManager,
     /// errors the title reported through err:f, newest last.
@@ -182,6 +188,7 @@ impl System {
             unimplemented_svcs: BTreeSet::new(),
             services_seen: BTreeSet::new(),
             lcd_force_black: false,
+            shown: [None, None],
             cro: cro::CroManager::default(),
             fatal_errors: Vec::new(),
             undefined_seen: BTreeMap::new(),
@@ -729,7 +736,7 @@ impl System {
     /// width and height. a picture the GPU did not draw scaled, or the CPU
     /// changed since, is the console's own grown to it, so the size stays
     /// the same from frame to frame.
-    pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> (std::sync::Arc<Vec<u8>>, u32, u32) {
+    pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> Screen {
         let (width, height) = (screen.width(), screen.height());
         let scale = self.gpu.scale();
         if scale > 1 {
@@ -746,12 +753,13 @@ impl System {
 
     /// the picture the host's GPU drew scaled for a screen, when it is still
     /// what the screen shows.
-    fn scaled_screen(&mut self, screen: zakuro_common::Screen) -> Option<(std::sync::Arc<Vec<u8>>, u32, u32)> {
+    fn scaled_screen(&mut self, screen: zakuro_common::Screen) -> Option<Screen> {
         let (width, height) = (screen.width(), screen.height());
-        let config = self.gpu.framebuffers[match screen {
+        let index = match screen {
             zakuro_common::Screen::Top => 0,
             zakuro_common::Screen::Bottom => 1,
-        }];
+        };
+        let config = self.gpu.framebuffers[index];
         let address = config.address_left();
         let format = config.color_format();
         let bpp = format.bytes_per_pixel() as u32;
@@ -765,8 +773,23 @@ impl System {
         let len = width * height * bpp;
         let mut guest = vec![0u8; len as usize];
         self.memory.read_bytes(base, &mut guest);
-        let (image, scale) = self.gpu.scaled_screen(base, (height, width), format, &guest)?;
-        Some((image, width * scale, height * scale))
+        let mut wait = false;
+        loop {
+            match self.gpu.scaled_screen(base, (height, width), format, &guest, wait) {
+                zakuro_gpu::Scaled::None => return None,
+                zakuro_gpu::Scaled::Ready(image, scale) => {
+                    let shown = (image, width * scale, height * scale);
+                    self.shown[index] = Some(shown.clone());
+                    return Some(shown);
+                }
+                // what the screen showed last stays up while the GPU draws
+                // the next picture, rather than the emulation waiting for it
+                zakuro_gpu::Scaled::Drawing => match &self.shown[index] {
+                    Some(shown) => return Some(shown.clone()),
+                    None => wait = true,
+                },
+            }
+        }
     }
 
     /// reads one screen into a straight RGBA8 buffer for presentation.

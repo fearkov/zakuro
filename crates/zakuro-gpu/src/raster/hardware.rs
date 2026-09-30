@@ -22,6 +22,7 @@ use ash::vk;
 
 use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
 use crate::blend::LogicOp;
+use crate::Scaled;
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
@@ -242,9 +243,6 @@ struct Capture {
     /// it, shown again until a later batch fills it anew and finishes.
     shown: Option<(u64, Arc<Vec<u8>>)>,
 }
-
-/// a screen's picture, upright RGBA, and the scale it is at.
-pub(crate) type Shown = (Arc<Vec<u8>>, u32);
 
 /// a batch's command buffer, the fence the GPU signals once done with it and
 /// the ring it stages in.
@@ -1952,27 +1950,29 @@ impl Hardware {
     /// the scaled image of a buffer a display transfer left for a screen,
     /// upright RGBA the way the screen shows it, while guest memory still
     /// holds what the transfer wrote there, or the GPU has not written it
-    /// back yet, and the scale it is at.
-    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8]) -> Result<Option<Shown>, String> {
+    /// back yet. without wait, a picture the GPU is still drawing is left
+    /// for later.
+    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8], wait: bool) -> Result<Scaled, String> {
         let found = self.surfaces.iter().position(|s| {
             s.addr == addr && s.width == width && s.height == height && s.kind == Kind::Color(format) && !s.tiled
         });
-        let Some(index) = found else { return Ok(None) };
+        let Some(index) = found else { return Ok(Scaled::None) };
         let s = &self.surfaces[index];
         if !s.dirty && s.shadow.as_slice() != guest {
-            return Ok(None);
+            return Ok(Scaled::None);
         }
-        let Some(screen) = s.screen.as_ref().filter(|screen| screen.current) else { return Ok(None) };
+        let Some(screen) = s.screen.as_ref().filter(|screen| screen.current) else { return Ok(Scaled::None) };
         let batch = screen.batch;
-        let shown = screen.shown.clone();
-        match shown {
-            Some((shown, image)) if shown == batch => return Ok(Some((image, self.scale))),
-            // while the GPU draws the new picture, the one before stays up,
-            // rather than the emulation waiting for it
-            Some((_, image)) if !self.finished(batch)? => return Ok(Some((image, self.scale))),
-            _ => self.wait_for(batch)?,
+        if let Some((shown, image)) = &screen.shown {
+            if *shown == batch {
+                return Ok(Scaled::Ready(image.clone(), self.scale));
+            }
         }
-        let Some(screen) = self.surfaces[index].screen.as_mut() else { return Ok(None) };
+        if !wait && !self.finished(batch)? {
+            return Ok(Scaled::Drawing);
+        }
+        self.wait_for(batch)?;
+        let Some(screen) = self.surfaces[index].screen.as_mut() else { return Ok(Scaled::None) };
         let buffer = &screen.buffer;
         if buffer.incoherent {
             let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
@@ -1984,7 +1984,7 @@ impl Hardware {
         let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
         let image = Arc::new(data.to_vec());
         screen.shown = Some((batch, image.clone()));
-        Ok(Some((image, self.scale)))
+        Ok(Scaled::Ready(image, self.scale))
     }
 
     /// the pipeline display transfers run on, made the first time.

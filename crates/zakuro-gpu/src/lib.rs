@@ -94,6 +94,16 @@ struct Immediate {
     /// finished vertices, drawn together before the next change of state.
     vertices: Vec<[shader::Vec4; 16]>,
 }
+/// a scaled screen's picture, as far as the host's GPU has one.
+pub enum Scaled {
+    /// the GPU did not draw what the screen shows, scaled.
+    None,
+    /// the picture, upright RGBA, and the scale it is at.
+    Ready(std::sync::Arc<Vec<u8>>, u32),
+    /// the GPU is still drawing the newest picture.
+    Drawing,
+}
+
 
 pub struct Gpu {
     /// external registers, 0x1EF00000 upwards, indexed by word.
@@ -535,19 +545,21 @@ impl Gpu {
     }
 
     /// a screen's buffer as the host GPU drew it, at its scale, upright
-    /// RGBA the way the screen shows it, and the scale, when it drew it
-    /// scaled and guest memory still holds the same picture.
-    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<(std::sync::Arc<Vec<u8>>, u32)> {
+    /// RGBA the way the screen shows it, when it drew it scaled and guest
+    /// memory still holds the same picture. without wait, a picture the GPU
+    /// is still drawing is left for later.
+    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8], wait: bool) -> Scaled {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
-            match hardware.screen(addr, size, format, guest) {
-                Ok(screen) => return screen.filter(|(_, scale)| *scale > 1),
+            match hardware.screen(addr, size, format, guest, wait) {
+                Ok(Scaled::Ready(_, 1)) => return Scaled::None,
+                Ok(scaled) => return scaled,
                 Err(error) => log::error!("the GPU could not show a screen, {error}"),
             }
         }
         #[cfg(not(feature = "vulkan"))]
-        let _ = (addr, size, format, guest);
-        None
+        let _ = (addr, size, format, guest, wait);
+        Scaled::None
     }
 
     /// makes guest memory right over a range something other than a draw
