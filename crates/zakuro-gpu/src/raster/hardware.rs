@@ -22,7 +22,7 @@ use ash::vk;
 
 use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
 use crate::blend::LogicOp;
-use crate::Scaled;
+use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
@@ -239,9 +239,11 @@ struct Capture {
     batch: u64,
     /// nothing changed the surface since.
     current: bool,
-    /// a screen's picture read out of the buffer, and the batch that filled
-    /// it, shown again until a later batch fills it anew and finishes.
-    shown: Option<(u64, Arc<Vec<u8>>)>,
+    /// a screen shows the surface, so each picture is read out of the
+    /// buffer as its batch finishes, before a later one fills it again.
+    watched: bool,
+    /// the last pictures read out, and the batches that drew them.
+    pictures: VecDeque<(u64, Arc<Vec<u8>>)>,
 }
 
 /// a batch's command buffer, the fence the GPU signals once done with it and
@@ -1868,7 +1870,7 @@ impl Hardware {
         let size = (width * height * 4) as u64;
         if self.surfaces[index].capture.is_none() {
             let buffer = self.buffer(size, vk::BufferUsageFlags::TRANSFER_DST, true)?;
-            self.surfaces[index].capture = Some(Capture { buffer, batch: 0, current: false, shown: None });
+            self.surfaces[index].capture = Some(Capture { buffer, batch: 0, current: false, watched: false, pictures: VecDeque::new() });
         }
         self.end_rendering();
         self.barrier();
@@ -1906,7 +1908,7 @@ impl Hardware {
         let size = (width * height * 4) as u64;
         if self.surfaces[index].screen.is_none() {
             let buffer = self.buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-            self.surfaces[index].screen = Some(Capture { buffer, batch: 0, current: false, shown: None });
+            self.surfaces[index].screen = Some(Capture { buffer, batch: 0, current: false, watched: false, pictures: VecDeque::new() });
         }
         let (layout, pipeline) = self.upright_pipeline()?;
         self.end_rendering();
@@ -1947,33 +1949,58 @@ impl Hardware {
         Ok(())
     }
 
-    /// the scaled image of a buffer a display transfer left for a screen,
-    /// upright RGBA the way the screen shows it, while guest memory still
-    /// holds what the transfer wrote there, or the GPU has not written it
-    /// back yet. without wait, a picture the GPU is still drawing is left
-    /// for later.
-    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8], wait: bool) -> Result<Scaled, String> {
+    /// the newest picture a display transfer left in a buffer for a screen,
+    /// while guest memory still holds what the transfer wrote there, or the
+    /// GPU has not written it back yet. from now on each picture it gets is
+    /// kept as its batch finishes.
+    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
         let found = self.surfaces.iter().position(|s| {
             s.addr == addr && s.width == width && s.height == height && s.kind == Kind::Color(format) && !s.tiled
-        });
-        let Some(index) = found else { return Ok(Scaled::None) };
-        let s = &self.surfaces[index];
+        })?;
+        let s = &mut self.surfaces[found];
         if !s.dirty && s.shadow.as_slice() != guest {
-            return Ok(Scaled::None);
+            return None;
         }
-        let Some(screen) = s.screen.as_ref().filter(|screen| screen.current) else { return Ok(Scaled::None) };
-        let batch = screen.batch;
-        if let Some((shown, image)) = &screen.shown {
-            if *shown == batch {
-                return Ok(Scaled::Ready(image.clone(), self.scale));
-            }
+        let screen = s.screen.as_mut().filter(|screen| screen.current)?;
+        screen.watched = true;
+        Some(ScreenRef { addr, size: (width, height), format, batch: screen.batch })
+    }
+
+    /// a screen's picture upright, RGBA the way the screen shows it, and the
+    /// scale it is at, waiting for the GPU to finish it when it has not yet.
+    /// none once a later picture took its buffer.
+    pub(crate) fn picture(&mut self, screen: ScreenRef) -> Result<Option<Picture>, String> {
+        let (width, height) = screen.size;
+        let find = |surfaces: &[Surface]| {
+            surfaces.iter().position(|s| {
+                s.addr == screen.addr && s.width == width && s.height == height && s.kind == Kind::Color(screen.format) && !s.tiled
+            })
+        };
+        let picture = |surfaces: &[Surface], index: usize| {
+            let capture = surfaces[index].screen.as_ref()?;
+            capture.pictures.iter().find(|(batch, _)| *batch == screen.batch).map(|(_, image)| image.clone())
+        };
+        let Some(index) = find(&self.surfaces) else { return Ok(None) };
+        if let Some(image) = picture(&self.surfaces, index) {
+            return Ok(Some((image, self.scale)));
         }
-        if !wait && !self.finished(batch)? {
-            return Ok(Scaled::Drawing);
+        // the buffer holds it until a later picture is drawn over it
+        if self.surfaces[index].screen.as_ref().is_none_or(|capture| capture.batch != screen.batch) {
+            return Ok(None);
         }
-        self.wait_for(batch)?;
-        let Some(screen) = self.surfaces[index].screen.as_mut() else { return Ok(Scaled::None) };
-        let buffer = &screen.buffer;
+        self.wait_for(screen.batch)?;
+        if let Some(image) = picture(&self.surfaces, index) {
+            return Ok(Some((image, self.scale)));
+        }
+        // its batch finished before a screen showed the surface
+        self.read_picture(index)?;
+        Ok(picture(&self.surfaces, index).map(|image| (image, self.scale)))
+    }
+
+    /// reads the picture a finished batch left in a surface's screen buffer.
+    fn read_picture(&mut self, index: usize) -> Result<(), String> {
+        let Some(capture) = self.surfaces[index].screen.as_mut() else { return Ok(()) };
+        let buffer = &capture.buffer;
         if buffer.incoherent {
             let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
             // SAFETY: the memory is mapped and the GPU is done with it
@@ -1982,9 +2009,11 @@ impl Hardware {
         // SAFETY: the batch that filled the buffer is done, and nothing
         // writes it again before this returns
         let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
-        let image = Arc::new(data.to_vec());
-        screen.shown = Some((batch, image.clone()));
-        Ok(Scaled::Ready(image, self.scale))
+        capture.pictures.push_back((capture.batch, Arc::new(data.to_vec())));
+        while capture.pictures.len() > 2 {
+            capture.pictures.pop_front();
+        }
+        Ok(())
     }
 
     /// the pipeline display transfers run on, made the first time.
@@ -2179,15 +2208,6 @@ impl Hardware {
         Ok(())
     }
 
-    /// whether the GPU is done with a batch, without waiting for it.
-    fn finished(&mut self, batch: u64) -> Result<bool, String> {
-        if batch >= self.batch {
-            return Ok(false);
-        }
-        self.retire_finished()?;
-        Ok(!self.in_flight.iter().any(|frame| frame.pending.is_some_and(|pending| pending <= batch)))
-    }
-
     /// frees the batches the GPU already finished, oldest first.
     fn retire_finished(&mut self) -> Result<(), String> {
         while let Some(frame) = self.in_flight.front() {
@@ -2213,8 +2233,16 @@ impl Hardware {
                 .reset_command_buffer(frame.commands, vk::CommandBufferResetFlags::empty())
                 .map_err(vk_error("reset a command buffer"))?;
         }
-        frame.pending = None;
+        let batch = frame.pending.take();
         self.free.push(frame);
+        // pictures for screens are read out before a later batch can draw
+        // over them
+        for index in 0..self.surfaces.len() {
+            let finished = self.surfaces[index].screen.as_ref().is_some_and(|capture| capture.watched && Some(capture.batch) == batch);
+            if finished {
+                self.read_picture(index)?;
+            }
+        }
         Ok(())
     }
 

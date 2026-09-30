@@ -94,16 +94,19 @@ struct Immediate {
     /// finished vertices, drawn together before the next change of state.
     vertices: Vec<[shader::Vec4; 16]>,
 }
-/// a scaled screen's picture, as far as the host's GPU has one.
-pub enum Scaled {
-    /// the GPU did not draw what the screen shows, scaled.
-    None,
-    /// the picture, upright RGBA, and the scale it is at.
-    Ready(std::sync::Arc<Vec<u8>>, u32),
-    /// the GPU is still drawing the newest picture.
-    Drawing,
-}
 
+/// a screen's picture, upright RGBA, and the scale it is at.
+pub type Picture = (std::sync::Arc<Vec<u8>>, u32);
+
+/// the picture a display transfer left for a screen, drawn scaled by the
+/// host's GPU, to be shown once the GPU finishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenRef {
+    pub(crate) addr: u32,
+    pub(crate) size: (u32, u32),
+    pub(crate) format: ColorFormat,
+    pub(crate) batch: u64,
+}
 
 pub struct Gpu {
     /// external registers, 0x1EF00000 upwards, indexed by word.
@@ -544,22 +547,31 @@ impl Gpu {
         1
     }
 
-    /// a screen's buffer as the host GPU drew it, at its scale, upright
-    /// RGBA the way the screen shows it, when it drew it scaled and guest
-    /// memory still holds the same picture. without wait, a picture the GPU
-    /// is still drawing is left for later.
-    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8], wait: bool) -> Scaled {
+    /// the newest picture the host's GPU drew scaled for a screen's
+    /// buffer, while guest memory still holds the same picture.
+    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut().filter(|hardware| hardware.scale() > 1) {
+            return hardware.screen(addr, size, format, guest);
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (addr, size, format, guest);
+        None
+    }
+
+    /// a screen's picture upright, RGBA the way the screen shows it, and the
+    /// scale it is at, once the GPU finished it.
+    pub fn scaled_picture(&mut self, screen: ScreenRef) -> Option<Picture> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
-            match hardware.screen(addr, size, format, guest, wait) {
-                Ok(Scaled::Ready(_, 1)) => return Scaled::None,
-                Ok(scaled) => return scaled,
+            match hardware.picture(screen) {
+                Ok(picture) => return picture,
                 Err(error) => log::error!("the GPU could not show a screen, {error}"),
             }
         }
         #[cfg(not(feature = "vulkan"))]
-        let _ = (addr, size, format, guest, wait);
-        Scaled::None
+        let _ = screen;
+        None
     }
 
     /// makes guest memory right over a range something other than a draw

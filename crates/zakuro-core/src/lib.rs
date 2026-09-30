@@ -103,9 +103,9 @@ pub struct System {
     pub unimplemented_svcs: BTreeSet<u32>,
     pub services_seen: BTreeSet<String>,
     pub lcd_force_black: bool,
-    /// the last scaled picture each screen showed, kept up while the GPU
-    /// draws the next one.
-    shown: [Option<Screen>; 2],
+    /// the scaled picture each screen had at the last presentation, which
+    /// goes up at the next, once the GPU had a frame's time to draw it.
+    showing: [Option<zakuro_gpu::ScreenRef>; 2],
     /// the dynamic module loader's state.
     pub cro: cro::CroManager,
     /// errors the title reported through err:f, newest last.
@@ -188,7 +188,7 @@ impl System {
             unimplemented_svcs: BTreeSet::new(),
             services_seen: BTreeSet::new(),
             lcd_force_black: false,
-            shown: [None, None],
+            showing: [None, None],
             cro: cro::CroManager::default(),
             fatal_errors: Vec::new(),
             undefined_seen: BTreeMap::new(),
@@ -773,23 +773,15 @@ impl System {
         let len = width * height * bpp;
         let mut guest = vec![0u8; len as usize];
         self.memory.read_bytes(base, &mut guest);
-        let mut wait = false;
-        loop {
-            match self.gpu.scaled_screen(base, (height, width), format, &guest, wait) {
-                zakuro_gpu::Scaled::None => return None,
-                zakuro_gpu::Scaled::Ready(image, scale) => {
-                    let shown = (image, width * scale, height * scale);
-                    self.shown[index] = Some(shown.clone());
-                    return Some(shown);
-                }
-                // what the screen showed last stays up while the GPU draws
-                // the next picture, rather than the emulation waiting for it
-                zakuro_gpu::Scaled::Drawing => match &self.shown[index] {
-                    Some(shown) => return Some(shown.clone()),
-                    None => wait = true,
-                },
-            }
-        }
+        let Some(now) = self.gpu.scaled_screen(base, (height, width), format, &guest) else {
+            self.showing[index] = None;
+            return None;
+        };
+        // what the screen had a presentation ago goes up now, always that
+        // one, so each picture stays up as long as the title kept it
+        let show = self.showing[index].replace(now).unwrap_or(now);
+        let (image, scale) = self.gpu.scaled_picture(show).or_else(|| self.gpu.scaled_picture(now))?;
+        Some((image, width * scale, height * scale))
     }
 
     /// reads one screen into a straight RGBA8 buffer for presentation.
