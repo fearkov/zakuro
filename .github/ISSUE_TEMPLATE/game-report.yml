@@ -1,0 +1,60 @@
+name: Game report
+description: How a game runs in Zakuro
+labels: ["game report"]
+body:
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: The game's name, and its title ID if you know it
+    validations:
+      required: true
+  - type: input
+    id: region
+    attributes:
+      label: Region
+      placeholder: USA, EUR, JPN...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Zakuro version
+      placeholder: v0.2.7
+    validations:
+      required: true
+  - type: dropdown
+    id: recompiled
+    attributes:
+      label: Recompiled
+      description: Whether the game was recompiled from Zakuro's library
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options:
+        - Playable
+        - In-game
+        - Intro
+        - Boots
+        - Nothing
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: How far it got and what went wrong, screenshots help
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: What Zakuro printed in the terminal, if anything looked wrong
+      render: text
