@@ -53,12 +53,22 @@ layout(std140, set = 0, binding = 3) uniform Draw {
     uvec4 lookups[7];
     vec4 global_ambient;
     Light lights[8];
+    // the procedural texture's registers, the configuration, the noise's
+    // u and v and its frequencies, then its table's configuration and
+    // offset
+    uvec4 proctex[2];
 };
 
 layout(std430, set = 0, binding = 4) readonly buffer Tables {
-    // 24 tables of 256 entries, a value and the step to the next
+    // 24 tables of 256 entries, a value and the step to the next, then the
+    // procedural texture's noise, color map and alpha map, 128 entries
+    // each, and its 256 colors and their steps, two pairs an entry
     vec2 tables[];
 };
+
+const uint PROCTEX_MAPS = 24u * 256u;
+const uint PROCTEX_COLORS = PROCTEX_MAPS + 3u * 128u;
+const uint PROCTEX_STEPS = PROCTEX_COLORS + 2u * 256u;
 
 const uint DISTRIBUTION0 = 0u;
 const uint DISTRIBUTION1 = 1u;
@@ -96,6 +106,127 @@ vec4 sample_unit(uint unit, vec2 uv) {
 float lookup(uint table, uint entry, float delta) {
     vec2 value = tables[table * 256u + entry];
     return value.x + value.y * delta;
+}
+
+// a procedural texture map read at a coordinate from 0 to 1
+float proctex_lookup(uint map, float coordinate) {
+    float at = coordinate * 128.0;
+    uint entry = min(uint(max(at, 0.0)), 127u);
+    vec2 value = tables[PROCTEX_MAPS + map * 128u + entry];
+    return value.x + (at - float(entry)) * value.y;
+}
+
+vec4 proctex_color(uint entry, uint base) {
+    return vec4(tables[base + entry * 2u], tables[base + entry * 2u + 1u]);
+}
+
+// a pseudo-random value from -1 to 1 for a point of the noise's grid
+float proctex_random(uint x, uint y) {
+    const uint rows[16] = uint[16](0u, 4u, 10u, 8u, 4u, 9u, 7u, 12u, 5u, 15u, 13u, 14u, 11u, 15u, 2u, 11u);
+    const uint mixes[16] = uint[16](10u, 2u, 15u, 8u, 0u, 7u, 4u, 5u, 5u, 13u, 2u, 6u, 13u, 9u, 3u, 14u);
+    uint u = (((x % 9u + 2u) * 3u) & 0xFu) ^ rows[(x / 9u) & 0xFu];
+    uint v = (((y % 9u + 2u) * 3u) & 0xFu) ^ rows[(y / 9u) & 0xFu];
+    if ((u & 3u) == 1u) {
+        v += 4u;
+    }
+    v ^= (u & 1u) * 6u;
+    v += 10u + u;
+    v &= 0xFu;
+    v ^= mixes[u];
+    return -1.0 + float(v) * 2.0 / 15.0;
+}
+
+float proctex_shift(float other, uint mode, uint clamping) {
+    float amount = clamping == 3u ? 1.0 : 0.5;
+    int o = int(other);
+    if (mode == 1u) {
+        return amount * float((o / 2) % 2);
+    } else if (mode == 2u) {
+        return amount * float(((o + 1) / 2) % 2);
+    }
+    return 0.0;
+}
+
+float proctex_clamp(float c, uint mode) {
+    switch (mode) {
+        case 0u: return c > 1.0 ? 0.0 : c;
+        case 1u: return min(c, 1.0);
+        case 2u: return c - floor(c);
+        case 3u: {
+            int whole = int(c);
+            float part = c - float(whole);
+            return (whole % 2) == 0 ? part : 1.0 - part;
+        }
+        case 4u: return c <= 0.5 ? 0.0 : 1.0;
+        default: return clamp(c, 0.0, 1.0);
+    }
+}
+
+float proctex_combine(float u, float v, uint function) {
+    float len = sqrt(u * u + v * v);
+    switch (function) {
+        case 0u: return u;
+        case 1u: return u * u;
+        case 2u: return v;
+        case 3u: return v * v;
+        case 4u: return (u + v) * 0.5;
+        case 5u: return (u * u + v * v) * 0.5;
+        case 6u: return min(len, 1.0);
+        case 7u: return min(u, v);
+        case 8u: return max(u, v);
+        case 9u: return min(((u + v) * 0.5 + len) * 0.5, 1.0);
+        default: return 0.0;
+    }
+}
+
+// texture 3, made up from its coordinates, as the software rasterizer has it
+vec4 procedural(vec2 uv) {
+    uint config = proctex[0].x;
+    uvec2 clamps = uvec2(config & 7u, (config >> 3) & 7u);
+    float u = abs(uv.x);
+    float v = abs(uv.y);
+    vec2 shifts = vec2(proctex_shift(v, (config >> 16) & 3u, clamps.x), proctex_shift(u, (config >> 18) & 3u, clamps.y));
+    if ((config & (1u << 15)) != 0u) {
+        uint noise_u = proctex[0].y;
+        uint noise_v = proctex[0].z;
+        vec2 frequency = unpackHalf2x16(proctex[0].w);
+        float x = 9.0 * frequency.x * abs(u + float(noise_u >> 16) / 4096.0);
+        float y = 9.0 * frequency.y * abs(v + float(noise_v >> 16) / 4096.0);
+        uint xi = uint(x);
+        uint yi = uint(y);
+        float xf = x - float(xi);
+        float yf = y - float(yi);
+        float g0 = proctex_random(xi, yi) * (xf + yf);
+        float g1 = proctex_random(xi + 1u, yi) * (xf + yf - 1.0);
+        float g2 = proctex_random(xi, yi + 1u) * (xf + yf - 1.0);
+        float g3 = proctex_random(xi + 1u, yi + 1u) * (xf + yf - 2.0);
+        float s = proctex_lookup(0u, xf);
+        float t = proctex_lookup(0u, yf);
+        float noise = mix(mix(g0, g1, s), mix(g2, g3, s), t);
+        u = abs(u + noise * float(int(noise_u << 16) >> 16) / 4095.0);
+        v = abs(v + noise * float(int(noise_v << 16) >> 16) / 4095.0);
+    }
+    u = proctex_clamp(u + shifts.x, clamps.x);
+    v = proctex_clamp(v + shifts.y, clamps.y);
+
+    float coordinate = proctex_lookup(1u, proctex_combine(u, v, (config >> 6) & 0xFu));
+    uint lut = proctex[1].x;
+    float width = float((lut >> 11) & 0xFFu);
+    float at = float(proctex[1].y & 0xFFu) + coordinate * max(width - 1.0, 0.0);
+    uint filtering = lut & 7u;
+    vec4 color;
+    if (filtering == 1u || filtering == 3u || filtering == 5u) {
+        uint entry = min(uint(max(at, 0.0)), 255u);
+        color = proctex_color(entry, PROCTEX_COLORS) + (at - float(entry)) * proctex_color(entry, PROCTEX_STEPS);
+    } else {
+        color = proctex_color(min(uint(max(round(at), 0.0)), 255u), PROCTEX_COLORS);
+    }
+    color = clamp(color / 255.0, 0.0, 1.0);
+    // alpha of its own skips the color table, the map gives it
+    if ((config & (1u << 14)) != 0u) {
+        color.a = clamp(proctex_lookup(2u, proctex_combine(u, v, (config >> 10) & 0xFu)), 0.0, 1.0);
+    }
+    return color;
 }
 
 vec3 rotate(vec4 q, vec3 v) {
@@ -362,6 +493,10 @@ void main() {
     }
     if ((texture_config & 4u) != 0u) {
         textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2);
+    }
+    if ((texture_config & (1u << 10)) != 0u) {
+        uint set = min((texture_config >> 8) & 3u, 2u);
+        textures[3] = procedural(set == 0u ? in_texcoords01.xy : (set == 1u ? in_texcoords01.zw : in_texcoord2));
     }
 
     // without fragment lighting the primary fragment color is the vertex

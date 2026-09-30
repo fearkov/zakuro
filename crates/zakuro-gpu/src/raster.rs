@@ -623,6 +623,7 @@ struct BoundTexture {
 pub struct Resources {
     pub textures: TextureCache,
     pub light_tables: Tables,
+    pub proctex_tables: crate::proctex::Tables,
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
@@ -1266,6 +1267,9 @@ struct DrawState<'a> {
     texture2_uses_coord1: bool,
     lighting: Option<Lighting>,
     tables: &'a Tables,
+    /// texture 3, made up from its coordinates, and its tables.
+    proctex: Option<crate::proctex::ProcTex<'a>>,
+    proctex_tables: &'a crate::proctex::Tables,
 }
 
 #[cfg(feature = "vulkan")]
@@ -1286,6 +1290,8 @@ impl DrawState<'_> {
             textures: self.textures,
             lighting: self.lighting.as_ref(),
             tables: self.tables,
+            proctex: self.proctex.is_some(),
+            proctex_tables: self.proctex_tables,
         }
     }
 }
@@ -1341,7 +1347,7 @@ fn fill_triangle(
     let mut color_surface = color_surface;
     let writes_color = color_surface.is_some();
     let partial_write = writes_color && !target.write.iter().all(|&w| w);
-    let any_texture = state.textures.iter().any(Option::is_some);
+    let any_texture = state.textures.iter().any(Option::is_some) || state.proctex.is_some();
     let mut pixel = [0u8; 4];
 
     for y in min_y..max_y {
@@ -1409,6 +1415,12 @@ fn fill_triangle(
                     let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
                     let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
                     samples[unit] = texture.sample(u, v);
+                }
+                if let Some(proctex) = &state.proctex {
+                    let set = proctex.coordinates;
+                    let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
+                    let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
+                    samples[3] = proctex.sample(u, v);
                 }
             }
 
@@ -1796,6 +1808,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         // the lighting only matters to a draw whose combiners read it.
         lighting: tex_env.reads_lighting().then(|| Lighting::read(registers)).flatten(),
         tables: &resources.light_tables,
+        proctex: crate::proctex::ProcTex::read(registers, &resources.proctex_tables),
+        proctex_tables: &resources.proctex_tables,
     };
     // what the draw writes, which the textures of later draws in the list
     // may be

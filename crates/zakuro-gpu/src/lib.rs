@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod blend;
+pub mod proctex;
 pub mod format;
 pub mod lighting;
 pub mod raster;
@@ -784,6 +785,9 @@ impl Gpu {
 
             lighting::REG_TABLE_DATA..=lighting::REG_TABLE_DATA_END => {
                 self.resources.light_tables.write(&mut self.internal, new);
+            }
+            proctex::REG_TABLE_DATA..=proctex::REG_TABLE_DATA_END => {
+                self.resources.proctex_tables.write(&mut self.internal, new);
             }
             REG_GS_BLOCK..=REG_GS_BLOCK_END => {
                 configure_shader(&mut self.geometry_shader, register - REG_GS_BLOCK, new);
