@@ -710,17 +710,20 @@ impl TextureCache {
     }
 }
 
-/// a quick hash of a texture's bytes, to notice when they change.
+/// a quick hash of a texture's bytes, to notice when they change. four
+/// running hashes side by side, which the CPU works on at once.
 fn fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = bytes.len() as u64;
-    let (words, rest) = bytes.as_chunks::<8>();
-    for &word in words {
-        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517C_C1B7_2722_0A95);
+    const K: u64 = 0x517C_C1B7_2722_0A95;
+    let step = |hash: u64, word: u64| (hash.rotate_left(5) ^ word).wrapping_mul(K);
+    let mut lanes = [bytes.len() as u64, 1, 2, 3];
+    let (blocks, rest) = bytes.as_chunks::<32>();
+    for block in blocks {
+        for (lane, word) in lanes.iter_mut().zip(block.as_chunks::<8>().0) {
+            *lane = step(*lane, u64::from_le_bytes(*word));
+        }
     }
-    for &byte in rest {
-        hash = (hash.rotate_left(5) ^ byte as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
-    }
-    hash
+    let hash = lanes.into_iter().fold(0, step);
+    rest.iter().fold(hash, |hash, &byte| step(hash, byte as u64))
 }
 
 /// how a texture coordinate outside 0..1 is brought back inside.
@@ -1635,20 +1638,6 @@ pub fn draw<M: GpuMemory>(
     let index_short = index_config & 0x8000_0000 != 0;
     let index_base = memory.translate(attribute_base + (index_config & 0x0FFF_FFFF));
 
-    let resolve_index = |memory: &mut M, i: u32| -> u32 {
-        if !indexed {
-            return first_vertex + i;
-        }
-        if index_short {
-            let mut b = [0u8; 2];
-            memory.read(index_base + i * 2, &mut b);
-            u16::from_le_bytes(b) as u32
-        } else {
-            let mut b = [0u8; 1];
-            memory.read(index_base + i, &mut b);
-            b[0] as u32
-        }
-    };
 
     // shade every vertex once.
     log::trace!(
@@ -1660,12 +1649,40 @@ pub fn draw<M: GpuMemory>(
     );
     // an index buffer names most vertices several times, fetch and shade
     // each of them once.
-    let indices: Vec<u32> = (0..vertex_count).map(|i| resolve_index(memory, i)).collect();
+    let indices: Vec<u32> = if indexed {
+        // the whole index buffer at once, a read per index costs far more
+        let size = if index_short { 2 } else { 1 };
+        let len = (vertex_count * size) as usize;
+        let mut bytes = vec![0u8; len];
+        match memory.slice(index_base, len) {
+            Some(slice) => bytes.copy_from_slice(slice),
+            None => memory.read(index_base, &mut bytes),
+        }
+        if index_short {
+            bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32).collect()
+        } else {
+            bytes.iter().map(|&b| b as u32).collect()
+        }
+    } else {
+        (0..vertex_count).map(|i| first_vertex + i).collect()
+    };
     let (unique, order) = if indexed {
-        let mut unique = indices.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        let order: Vec<usize> = indices.iter().map(|index| unique.binary_search(index).unwrap()).collect();
+        // each vertex's place among the unique ones, by a table as long as
+        // the indices go, they are 16 bits at most
+        let last = indices.iter().copied().max().unwrap_or(0) as usize;
+        let mut places = vec![u32::MAX; last + 1];
+        let mut unique = Vec::new();
+        let order: Vec<usize> = indices
+            .iter()
+            .map(|&index| {
+                let place = &mut places[index as usize];
+                if *place == u32::MAX {
+                    *place = unique.len() as u32;
+                    unique.push(index);
+                }
+                *place as usize
+            })
+            .collect();
         (unique, Some(order))
     } else {
         (indices, None)

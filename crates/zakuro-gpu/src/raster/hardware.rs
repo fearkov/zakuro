@@ -1395,9 +1395,16 @@ impl Hardware {
 
         let input_bytes = ((shading.inputs.len() * registers.len()).max(1) * 16) as u64;
         let inputs = self.stage(input_bytes, self.storage_alignment)?;
-        let values = shading.inputs.iter().flat_map(|input| registers.iter().flat_map(move |&r| input[r]));
-        for (out, value) in self.ring(inputs, input_bytes).as_chunks_mut::<4>().0.iter_mut().zip(values) {
-            *out = value.to_le_bytes();
+        let staging = self.ring(inputs, input_bytes);
+        // the inner loop copies a register at a time, simple enough to run
+        // at memory speed, a vertex can have thousands of them
+        let mut out = staging.as_chunks_mut::<16>().0.iter_mut();
+        for input in shading.inputs {
+            for &register in &registers {
+                let Some(slot) = out.next() else { break };
+                let [x, y, z, w] = input[register].map(f32::to_le_bytes);
+                *slot = [x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], w[0], w[1], w[2], w[3]];
+            }
         }
 
         let index_bytes = (shading.indices.len() * 4) as u64;
