@@ -741,7 +741,7 @@ impl App {
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {
         let overlay = self.interface(event_loop);
-        let blank = |screen: Screen| (Vec::new(), screen.width(), screen.height());
+        let blank = |screen: Screen| (std::sync::Arc::new(Vec::new()), screen.width(), screen.height());
         let (top, bottom) = match &mut self.game {
             Some(game) => (game.system.read_screen_scaled(Screen::Top), game.system.read_screen_scaled(Screen::Bottom)),
             None => (blank(Screen::Top), blank(Screen::Bottom)),

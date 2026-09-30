@@ -3,6 +3,7 @@
 pub mod isa;
 mod batch;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use isa::{Instruction, OpCode, OperandDescriptor};
@@ -16,6 +17,9 @@ pub const TEMP_REGISTERS: usize = 16;
 
 /// a four-component vector, which is the only data type the shader has.
 pub type Vec4 = [f32; 4];
+
+/// how many decoded programs a unit keeps before starting over.
+const DECODED_KEPT: usize = 64;
 
 pub const ZERO: Vec4 = [0.0; 4];
 
@@ -38,6 +42,9 @@ pub struct ShaderUnit {
     float_uniform_staging: [u32; 4],
     /// the program decoded, none since it or its descriptors changed.
     decoded: Option<Arc<Program>>,
+    /// programs decoded before, by fingerprint. titles upload the program
+    /// again each time they switch shaders, often the same few.
+    decoded_before: HashMap<u64, Arc<Program>>,
 }
 
 impl Default for ShaderUnit {
@@ -62,31 +69,49 @@ impl ShaderUnit {
             float_uniform_wide: false,
             float_uniform_staging: [0; 4],
             decoded: None,
+            decoded_before: HashMap::new(),
         }
     }
 
     pub fn upload_program(&mut self, word: u32) {
         if self.program_write_offset < PROGRAM_SIZE {
-            self.program[self.program_write_offset] = word;
+            if self.program[self.program_write_offset] != word {
+                self.program[self.program_write_offset] = word;
+                self.decoded = None;
+            }
             self.program_write_offset += 1;
-            self.decoded = None;
         }
     }
 
     pub fn upload_descriptor(&mut self, word: u32) {
         if self.descriptor_write_offset < DESCRIPTOR_SIZE {
-            self.descriptors[self.descriptor_write_offset] = word;
+            if self.descriptors[self.descriptor_write_offset] != word {
+                self.descriptors[self.descriptor_write_offset] = word;
+                self.decoded = None;
+            }
             self.descriptor_write_offset += 1;
-            self.decoded = None;
         }
     }
 
     /// decodes the program, if it changed, before running it on many
     /// vertices.
     pub fn prepare(&mut self) {
-        if self.decoded.is_none() {
-            self.decoded = Some(Arc::new(Program::decode(self)));
+        if self.decoded.is_some() {
+            return;
         }
+        let fingerprint = self.fingerprint();
+        let program = match self.decoded_before.get(&fingerprint) {
+            Some(program) => program.clone(),
+            None => {
+                let program = Arc::new(Program::decode(self));
+                if self.decoded_before.len() >= DECODED_KEPT {
+                    self.decoded_before.clear();
+                }
+                self.decoded_before.insert(fingerprint, program.clone());
+                program
+            }
+        };
+        self.decoded = Some(program);
     }
 
     /// the input registers the program reads, one bit each, all of them
@@ -101,11 +126,8 @@ impl ShaderUnit {
         if let Some(program) = &self.decoded {
             return program.fingerprint;
         }
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.program.hash(&mut hasher);
-        self.descriptors.hash(&mut hasher);
-        hasher.finish()
+        let words = self.program.iter().chain(self.descriptors.iter());
+        words.fold(0, |hash: u64, &word| (hash.rotate_left(5) ^ word as u64).wrapping_mul(0x517C_C1B7_2722_0A95))
     }
 
     /// starts a float uniform upload at the register the raw value names.

@@ -14,7 +14,7 @@
 //! output for the host to read later. recording goes on in a second command
 //! buffer meanwhile, so the CPU rarely waits for the GPU.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -33,12 +33,16 @@ const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
 const DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/depth.comp.spv");
+const UPRIGHT_SPIRV: &[u8] = include_bytes!("../../shaders/upright.comp.spv");
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
 
 /// where a batch keeps its vertices, uniforms and uploads.
-const RING_SIZE: u64 = 128 << 20;
+const RING_SIZE: u64 = 64 << 20;
+/// batches the GPU may be running while the next one is recorded, so the
+/// emulation goes on meanwhile.
+const IN_FLIGHT: usize = 3;
 /// a batch past this much is run before the next draw, so a draw always
 /// finds room.
 const RING_FLUSH: u64 = RING_SIZE / 2;
@@ -234,7 +238,13 @@ struct Capture {
     batch: u64,
     /// nothing changed the surface since.
     current: bool,
+    /// a screen's picture read out of the buffer, and the batch that filled
+    /// it, shown again until a later batch fills it anew and finishes.
+    shown: Option<(u64, Arc<Vec<u8>>)>,
 }
+
+/// a screen's picture, upright RGBA, and the scale it is at.
+pub(crate) type Shown = (Arc<Vec<u8>>, u32);
 
 /// a batch's command buffer, the fence the GPU signals once done with it and
 /// the ring it stages in.
@@ -321,9 +331,11 @@ pub struct Hardware {
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
-    /// the other command buffer, fence and ring, which the batch before
-    /// may still be using.
-    spare: Frame,
+    /// the batches handed to the GPU that it may still be running, oldest
+    /// first.
+    in_flight: VecDeque<Frame>,
+    /// command buffers, fences and rings free for the next batch.
+    free: Vec<Frame>,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     vertex_shader: vk::ShaderModule,
@@ -341,6 +353,8 @@ pub struct Hardware {
     /// made the first time a texture is read out of a depth buffer, with
     /// where the samples go on the way.
     depth: Option<Compute>,
+    /// made the first time a scaled screen is captured.
+    upright: Option<Compute>,
     samples: Option<Local>,
     samplers: HashMap<(bool, Wrap, Wrap), vk::Sampler>,
     ring: Buffer,
@@ -426,11 +440,15 @@ impl Hardware {
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(2),
+                        .command_buffer_count(IN_FLIGHT as u32 + 1),
                 )
                 .map_err(vk_error("allocate a command buffer"))?;
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
-            let spare_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
+            let mut spares = Vec::with_capacity(IN_FLIGHT);
+            for &commands in &buffers[1..] {
+                let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vk_error("create a fence"))?;
+                spares.push((commands, fence));
+            }
 
             // the fragment stages', then the program, what else it reads and
             // the inputs of the vertex shader
@@ -482,7 +500,8 @@ impl Hardware {
             });
             let mut hardware = Hardware {
                 ring: unmade(),
-                spare: Frame { commands: buffers[1], fence: spare_fence, ring: unmade(), pending: None },
+                in_flight: VecDeque::with_capacity(IN_FLIGHT),
+                free: spares.into_iter().map(|(commands, fence)| Frame { commands, fence, ring: unmade(), pending: None }).collect(),
                 blank: Image { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null() },
                 _entry: entry,
                 instance,
@@ -507,6 +526,7 @@ impl Hardware {
                 pipelines: HashMap::new(),
                 transfer: None,
                 depth: None,
+                upright: None,
                 samples: None,
                 samplers: HashMap::new(),
                 used: 0,
@@ -529,7 +549,9 @@ impl Hardware {
                 | vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC;
             hardware.ring = hardware.buffer(RING_SIZE, ring_usage, false)?;
-            hardware.spare.ring = hardware.buffer(RING_SIZE, ring_usage, false)?;
+            for i in 0..hardware.free.len() {
+                hardware.free[i].ring = hardware.buffer(RING_SIZE, ring_usage, false)?;
+            }
             hardware.begin()?;
             hardware.blank = hardware.image(
                 1,
@@ -1848,7 +1870,7 @@ impl Hardware {
         let size = (width * height * 4) as u64;
         if self.surfaces[index].capture.is_none() {
             let buffer = self.buffer(size, vk::BufferUsageFlags::TRANSFER_DST, true)?;
-            self.surfaces[index].capture = Some(Capture { buffer, batch: 0, current: false });
+            self.surfaces[index].capture = Some(Capture { buffer, batch: 0, current: false, shown: None });
         }
         self.end_rendering();
         self.barrier();
@@ -1879,30 +1901,47 @@ impl Hardware {
         Ok(())
     }
 
-    /// records a copy of a scaled surface as it is, for showing it.
+    /// records a copy of a scaled surface turned upright, for showing it.
     fn capture_screen(&mut self, index: usize) -> Result<(), String> {
-        let (width, height) = (self.surfaces[index].width * self.scale, self.surfaces[index].height * self.scale);
+        // a row of the surface is a column of the screen
+        let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
+        let size = (width * height * 4) as u64;
         if self.surfaces[index].screen.is_none() {
-            let buffer = self.buffer((width * height * 4) as u64, vk::BufferUsageFlags::TRANSFER_DST, true)?;
-            self.surfaces[index].screen = Some(Capture { buffer, batch: 0, current: false });
+            let buffer = self.buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+            self.surfaces[index].screen = Some(Capture { buffer, batch: 0, current: false, shown: None });
         }
+        let (layout, pipeline) = self.upright_pipeline()?;
         self.end_rendering();
         self.barrier();
         let batch = self.batch;
         let surface = &mut self.surfaces[index];
         let Some(screen) = surface.screen.as_mut() else { unreachable!("made above") };
-        let region = [vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
-            .image_extent(vk::Extent3D { width, height, depth: 1 })];
+        let source = [vk::DescriptorImageInfo::default().image_view(surface.image.view).image_layout(vk::ImageLayout::GENERAL)];
+        let pixels = [vk::DescriptorBufferInfo::default().buffer(screen.buffer.buffer).offset(0).range(size)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&source),
+            vk::WriteDescriptorSet::default()
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pixels),
+        ];
+        let constants: Vec<u8> = [width as i32, height as i32].iter().flat_map(|c| c.to_le_bytes()).collect();
         let to_host = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-        // SAFETY: recording, outside rendering, into a buffer the size of
-        // the image, which the host reads only once this batch is done
+        // SAFETY: recording, outside rendering, from an image in the general
+        // layout into a buffer the size of the screen, which the host reads
+        // only once this batch is done
         unsafe {
-            self.device.cmd_copy_image_to_buffer(self.commands, surface.image.image, vk::ImageLayout::GENERAL, screen.buffer.buffer, &region);
+            self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
+            self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
+            self.device.cmd_dispatch(self.commands, width.div_ceil(8), height.div_ceil(8), 1);
             self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
         }
         screen.batch = batch;
@@ -1911,20 +1950,29 @@ impl Hardware {
     }
 
     /// the scaled image of a buffer a display transfer left for a screen,
-    /// RGBA with its rows bottom first, while guest memory still holds what
-    /// the transfer wrote there, and the scale it is at.
-    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8]) -> Result<Option<(Vec<u8>, u32)>, String> {
+    /// upright RGBA the way the screen shows it, while guest memory still
+    /// holds what the transfer wrote there, or the GPU has not written it
+    /// back yet, and the scale it is at.
+    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8]) -> Result<Option<Shown>, String> {
         let found = self.surfaces.iter().position(|s| {
             s.addr == addr && s.width == width && s.height == height && s.kind == Kind::Color(format) && !s.tiled
         });
         let Some(index) = found else { return Ok(None) };
         let s = &self.surfaces[index];
-        if s.dirty || s.shadow.as_slice() != guest {
+        if !s.dirty && s.shadow.as_slice() != guest {
             return Ok(None);
         }
-        let Some(batch) = s.screen.as_ref().filter(|screen| screen.current).map(|screen| screen.batch) else { return Ok(None) };
-        self.wait_for(batch)?;
-        let Some(screen) = self.surfaces[index].screen.as_ref() else { return Ok(None) };
+        let Some(screen) = s.screen.as_ref().filter(|screen| screen.current) else { return Ok(None) };
+        let batch = screen.batch;
+        let shown = screen.shown.clone();
+        match shown {
+            Some((shown, image)) if shown == batch => return Ok(Some((image, self.scale))),
+            // while the GPU draws the new picture, the one before stays up,
+            // rather than the emulation waiting for it
+            Some((_, image)) if !self.finished(batch)? => return Ok(Some((image, self.scale))),
+            _ => self.wait_for(batch)?,
+        }
+        let Some(screen) = self.surfaces[index].screen.as_mut() else { return Ok(None) };
         let buffer = &screen.buffer;
         if buffer.incoherent {
             let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
@@ -1934,7 +1982,9 @@ impl Hardware {
         // SAFETY: the batch that filled the buffer is done, and nothing
         // writes it again before this returns
         let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
-        Ok(Some((data.to_vec(), self.scale)))
+        let image = Arc::new(data.to_vec());
+        screen.shown = Some((batch, image.clone()));
+        Ok(Some((image, self.scale)))
     }
 
     /// the pipeline display transfers run on, made the first time.
@@ -1945,6 +1995,17 @@ impl Hardware {
         }
         let transfer = self.transfer.as_ref().expect("made above");
         Ok((transfer.layout, transfer.pipeline))
+    }
+
+    /// the pipeline scaled screens are turned upright with, made the first
+    /// time.
+    fn upright_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
+        if self.upright.is_none() {
+            let bindings = [vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::STORAGE_BUFFER];
+            self.upright = Some(self.compute(UPRIGHT_SPIRV, &bindings, 2 * 4)?);
+        }
+        let upright = self.upright.as_ref().expect("made above");
+        Ok((upright.layout, upright.pipeline))
     }
 
     /// the pipeline textures are read out of depth buffers with, made the
@@ -2045,16 +2106,18 @@ impl Hardware {
     }
 
     /// hands the batch being recorded to the GPU without waiting for it.
-    /// recording goes on in the other command buffer, once the GPU is done
-    /// with the batch before.
+    /// recording goes on in another command buffer, once the GPU is done
+    /// with the batch that used it last.
     fn submit(&mut self) -> Result<(), String> {
         if !self.recording {
             return Ok(());
         }
         self.end_rendering();
-        self.wait()?;
-        // SAFETY: the command buffer is recording and gets submitted once,
-        // the spare one is not in use any more
+        self.retire_finished()?;
+        if self.free.is_empty() {
+            self.retire_oldest()?;
+        }
+        // SAFETY: the command buffer is recording and gets submitted once
         unsafe {
             self.device.end_command_buffer(self.commands).map_err(vk_error("end a command buffer"))?;
             let buffers = [self.commands];
@@ -2062,11 +2125,14 @@ impl Hardware {
             self.device.queue_submit(self.queue, &submit, self.fence).map_err(vk_error("submit"))?;
         }
         self.recording = false;
-        std::mem::swap(&mut self.commands, &mut self.spare.commands);
-        std::mem::swap(&mut self.fence, &mut self.spare.fence);
-        std::mem::swap(&mut self.ring, &mut self.spare.ring);
-        self.spare.pending = Some(self.batch);
-
+        let next = self.free.pop().expect("a frame was freed above");
+        let submitted = Frame {
+            commands: std::mem::replace(&mut self.commands, next.commands),
+            fence: std::mem::replace(&mut self.fence, next.fence),
+            ring: std::mem::replace(&mut self.ring, next.ring),
+            pending: Some(self.batch),
+        };
+        self.in_flight.push_back(submitted);
         for surface in &mut self.surfaces {
             surface.checked = false;
         }
@@ -2095,16 +2161,8 @@ impl Hardware {
 
     /// waits for the GPU to finish everything handed to it.
     fn wait(&mut self) -> Result<(), String> {
-        if self.spare.pending.take().is_some() {
-            // SAFETY: the fence belongs to the batch submitted last, and the
-            // command buffer is reset only once the GPU is done with it
-            unsafe {
-                self.device.wait_for_fences(&[self.spare.fence], true, u64::MAX).map_err(vk_error("wait for the GPU"))?;
-                self.device.reset_fences(&[self.spare.fence]).map_err(vk_error("reset a fence"))?;
-                self.device
-                    .reset_command_buffer(self.spare.commands, vk::CommandBufferResetFlags::empty())
-                    .map_err(vk_error("reset a command buffer"))?;
-            }
+        while !self.in_flight.is_empty() {
+            self.retire_oldest()?;
         }
         Ok(())
     }
@@ -2115,9 +2173,48 @@ impl Hardware {
         if batch == self.batch {
             self.submit()?;
         }
-        if self.spare.pending.is_some_and(|pending| pending <= batch) {
-            self.wait()?;
+        while self.in_flight.front().is_some_and(|frame| frame.pending.is_some_and(|pending| pending <= batch)) {
+            self.retire_oldest()?;
         }
+        Ok(())
+    }
+
+    /// whether the GPU is done with a batch, without waiting for it.
+    fn finished(&mut self, batch: u64) -> Result<bool, String> {
+        if batch >= self.batch {
+            return Ok(false);
+        }
+        self.retire_finished()?;
+        Ok(!self.in_flight.iter().any(|frame| frame.pending.is_some_and(|pending| pending <= batch)))
+    }
+
+    /// frees the batches the GPU already finished, oldest first.
+    fn retire_finished(&mut self) -> Result<(), String> {
+        while let Some(frame) = self.in_flight.front() {
+            // SAFETY: a fence of ours, submitted with its batch
+            let done = unsafe { self.device.get_fence_status(frame.fence) }.map_err(vk_error("ask the GPU"))?;
+            if !done {
+                break;
+            }
+            self.retire_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// waits for the oldest batch in flight and frees what it used.
+    fn retire_oldest(&mut self) -> Result<(), String> {
+        let Some(mut frame) = self.in_flight.pop_front() else { return Ok(()) };
+        // SAFETY: the fence belongs to the batch, and the command buffer is
+        // reset only once the GPU is done with it
+        unsafe {
+            self.device.wait_for_fences(&[frame.fence], true, u64::MAX).map_err(vk_error("wait for the GPU"))?;
+            self.device.reset_fences(&[frame.fence]).map_err(vk_error("reset a fence"))?;
+            self.device
+                .reset_command_buffer(frame.commands, vk::CommandBufferResetFlags::empty())
+                .map_err(vk_error("reset a command buffer"))?;
+        }
+        frame.pending = None;
+        self.free.push(frame);
         Ok(())
     }
 
@@ -2315,12 +2412,13 @@ impl Drop for Hardware {
             }
             self.destroy_image(&self.blank);
             let captures = self.surfaces.iter().flat_map(|s| [&s.capture, &s.screen]).filter_map(|c| c.as_ref().map(|c| &c.buffer));
-            let buffers = [Some(&self.ring), Some(&self.spare.ring), self.readback.as_ref()].into_iter().flatten();
+            let rings = self.free.iter().chain(&self.in_flight).map(|frame| &frame.ring);
+            let buffers = [Some(&self.ring), self.readback.as_ref()].into_iter().flatten().chain(rings);
             for buffer in buffers.chain(captures) {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
-            for compute in [&self.transfer, &self.depth].into_iter().flatten() {
+            for compute in [&self.transfer, &self.depth, &self.upright].into_iter().flatten() {
                 self.device.destroy_pipeline(compute.pipeline, None);
                 self.device.destroy_pipeline_layout(compute.layout, None);
                 self.device.destroy_descriptor_set_layout(compute.set_layout, None);
@@ -2342,7 +2440,9 @@ impl Drop for Hardware {
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_fence(self.fence, None);
-            self.device.destroy_fence(self.spare.fence, None);
+            for frame in self.free.iter().chain(&self.in_flight) {
+                self.device.destroy_fence(frame.fence, None);
+            }
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);

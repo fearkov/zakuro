@@ -534,10 +534,10 @@ impl Gpu {
         1
     }
 
-    /// a screen's buffer as the host GPU drew it, at its scale, RGBA with
-    /// rows bottom first, and the scale, when it drew it scaled and guest
-    /// memory still holds the same picture.
-    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<(Vec<u8>, u32)> {
+    /// a screen's buffer as the host GPU drew it, at its scale, upright
+    /// RGBA the way the screen shows it, and the scale, when it drew it
+    /// scaled and guest memory still holds the same picture.
+    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<(std::sync::Arc<Vec<u8>>, u32)> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             match hardware.screen(addr, size, format, guest) {

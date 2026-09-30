@@ -725,19 +725,29 @@ impl System {
         ]
     }
 
-    /// reads one screen into a straight RGBA8 buffer for presentation.
     /// a screen as RGBA at the resolution the host's GPU draws at, and its
     /// width and height. a picture the GPU did not draw scaled, or the CPU
     /// changed since, is the console's own grown to it, so the size stays
     /// the same from frame to frame.
-    pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> (Vec<u8>, u32, u32) {
+    pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> (std::sync::Arc<Vec<u8>>, u32, u32) {
         let (width, height) = (screen.width(), screen.height());
         let scale = self.gpu.scale();
+        if scale > 1 {
+            if let Some(scaled) = self.scaled_screen(screen) {
+                return scaled;
+            }
+        }
         let native = self.read_screen(screen);
         if scale == 1 {
-            return (native, width, height);
+            return (std::sync::Arc::new(native), width, height);
         }
-        let native = grow(&native, width, scale);
+        (std::sync::Arc::new(grow(&native, width, scale)), width * scale, height * scale)
+    }
+
+    /// the picture the host's GPU drew scaled for a screen, when it is still
+    /// what the screen shows.
+    fn scaled_screen(&mut self, screen: zakuro_common::Screen) -> Option<(std::sync::Arc<Vec<u8>>, u32, u32)> {
+        let (width, height) = (screen.width(), screen.height());
         let config = self.gpu.framebuffers[match screen {
             zakuro_common::Screen::Top => 0,
             zakuro_common::Screen::Bottom => 1,
@@ -748,29 +758,18 @@ impl System {
         // only plain buffers a row per screen column, as display transfers
         // leave them
         if self.lcd_force_black || address == 0 || (config.stride != 0 && config.stride != height * bpp) {
-            return (native, width * scale, height * scale);
+            return None;
         }
+        // no sync first, that would wait for the GPU to finish the picture
         let base = services::gsp::physical_to_virtual(self, address);
-        let mut guest = vec![0u8; (width * height * bpp) as usize];
+        let len = width * height * bpp;
+        let mut guest = vec![0u8; len as usize];
         self.memory.read_bytes(base, &mut guest);
-        let Some((image, scale)) = self.gpu.scaled_screen(base, (height, width), format, &guest) else {
-            return (native, width * scale, height * scale);
-        };
-        // the image has a row per column of the screen, bottom first, and
-        // its columns run up the screen, as memory has them
-        let (out_width, out_height) = (width * scale, height * scale);
-        let mut out = vec![0u8; (out_width * out_height * 4) as usize];
-        for x in 0..out_width {
-            let row = (out_width - 1 - x) * out_height;
-            for y in 0..out_height {
-                let at = ((row + out_height - 1 - y) * 4) as usize;
-                let dst = ((y * out_width + x) * 4) as usize;
-                out[dst..dst + 4].copy_from_slice(&image[at..at + 4]);
-            }
-        }
-        (out, out_width, out_height)
+        let (image, scale) = self.gpu.scaled_screen(base, (height, width), format, &guest)?;
+        Some((image, width * scale, height * scale))
     }
 
+    /// reads one screen into a straight RGBA8 buffer for presentation.
     pub fn read_screen(&mut self, screen: zakuro_common::Screen) -> Vec<u8> {
         let index = match screen {
             zakuro_common::Screen::Top => 0,

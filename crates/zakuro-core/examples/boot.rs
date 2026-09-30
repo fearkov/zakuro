@@ -145,7 +145,7 @@ fn main() {
         }
         if present {
             for (screen, _) in SCREENS {
-                std::hint::black_box(system.read_screen(screen));
+                std::hint::black_box(system.read_screen_scaled(screen));
             }
         }
         frame_times.push(frame_start.elapsed());
