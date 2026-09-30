@@ -1749,7 +1749,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let target_addr = memory.translate(color_buffer_raw);
     // the format sits in bits 16-18 of the register, not the low bits, the low
     // half holds how many bytes a pixel takes.
-    let target_format = ColorFormat::from_raw((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
+    let target_format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
     // the buffer's real size, which the tile addressing uses, it is often
     // padded past the viewport, and tiling at the viewport's width instead
     // reads back as the image repeating down the screen.
@@ -2639,7 +2639,7 @@ mod tests {
             registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
             registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
             registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
-            registers[REG_COLOR_BUFFER_FORMAT] = (hardware::format_index(input_format) as u32) << 16;
+            registers[REG_COLOR_BUFFER_FORMAT] = input_format.color_buffer_raw() << 16;
             // triangles in all sorts of colors over each other
             let mut drawn = ConsoleMemory::default();
             for _ in 0..40 {

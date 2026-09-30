@@ -763,17 +763,18 @@ impl System {
         let address = config.address_left();
         let format = config.color_format();
         let bpp = format.bytes_per_pixel() as u32;
-        // only plain buffers a row per screen column, as display transfers
-        // leave them
-        if self.lcd_force_black || address == 0 || (config.stride != 0 && config.stride != height * bpp) {
+        // plain buffers a row per screen column, as display transfers leave
+        // them, rows can be longer than the screen
+        let stride = if config.stride == 0 { height * bpp } else { config.stride };
+        if self.lcd_force_black || address == 0 || !stride.is_multiple_of(bpp) || stride < height * bpp {
             return None;
         }
         // no sync first, that would wait for the GPU to finish the picture
         let base = services::gsp::physical_to_virtual(self, address);
-        let len = width * height * bpp;
+        let len = width * stride;
         let mut guest = vec![0u8; len as usize];
         self.memory.read_bytes(base, &mut guest);
-        let Some(now) = self.gpu.scaled_screen(base, (height, width), format, &guest) else {
+        let Some(now) = self.gpu.scaled_screen(base, (height, width), stride / bpp, format, &guest) else {
             self.showing[index] = None;
             return None;
         };

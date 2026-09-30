@@ -2032,17 +2032,28 @@ impl Hardware {
     /// while guest memory still holds what the transfer wrote there, or the
     /// GPU has not written it back yet. from now on each picture it gets is
     /// kept as its batch finishes.
-    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
+    pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
+        // the buffer the screen is rows of, maybe some rows into it
+        let row_bytes = stride * Kind::Color(format).bytes();
         let found = self.surfaces.iter().position(|s| {
-            s.addr == addr && s.width == width && s.height == height && s.kind == Kind::Color(format) && !s.tiled
+            s.kind == Kind::Color(format)
+                && !s.tiled
+                && s.width == stride
+                && stride >= width
+                && addr >= s.addr
+                && (addr - s.addr).is_multiple_of(row_bytes)
+                && (addr - s.addr) / row_bytes + height <= s.height
         })?;
         let s = &mut self.surfaces[found];
-        if s.dirty.is_none() && s.shadow.as_slice() != guest {
+        let first = (addr - s.addr) / row_bytes;
+        let shown = s.shadow.get((first * row_bytes) as usize..((first + height) * row_bytes) as usize);
+        if s.dirty.is_none() && shown != Some(guest) {
             return None;
         }
+        let (surface, size) = (s.addr, (s.width, s.height));
         let screen = s.screen.as_mut().filter(|screen| screen.current)?;
         screen.watched = true;
-        Some(ScreenRef { addr, size: (width, height), format, batch: screen.batch })
+        Some(ScreenRef { addr: surface, size, format, batch: screen.batch, rows: (first, height), columns: width })
     }
 
     /// a screen's picture upright, RGBA the way the screen shows it, and the
@@ -2060,8 +2071,10 @@ impl Hardware {
             capture.pictures.iter().find(|(batch, _)| *batch == screen.batch).map(|(_, image)| image.clone())
         };
         let Some(index) = find(&self.surfaces) else { return Ok(None) };
+        let scale = self.scale;
+        let crop = |image: Arc<Vec<u8>>| Some((crop(image, screen, scale), scale));
         if let Some(image) = picture(&self.surfaces, index) {
-            return Ok(Some((image, self.scale)));
+            return Ok(crop(image));
         }
         // the buffer holds it until a later picture is drawn over it
         if self.surfaces[index].screen.as_ref().is_none_or(|capture| capture.batch != screen.batch) {
@@ -2069,11 +2082,11 @@ impl Hardware {
         }
         self.wait_for(screen.batch)?;
         if let Some(image) = picture(&self.surfaces, index) {
-            return Ok(Some((image, self.scale)));
+            return Ok(crop(image));
         }
         // its batch finished before a screen showed the surface
         self.read_picture(index)?;
-        Ok(picture(&self.surfaces, index).map(|image| (image, self.scale)))
+        Ok(picture(&self.surfaces, index).and_then(crop))
     }
 
     /// reads the picture a finished batch left in a surface's screen buffer.
@@ -2566,6 +2579,25 @@ impl Drop for Hardware {
 // SAFETY: the mapped pointers belong to buffers only this value uses, and
 // Vulkan handles may move between threads
 unsafe impl Send for Hardware {}
+
+/// the part of a buffer's upright picture a screen shows. a row of the
+/// buffer is a column of the picture, and a row's first pixels are the
+/// bottom of the screen, a longer row reaches past its top.
+fn crop(image: Arc<Vec<u8>>, screen: ScreenRef, scale: u32) -> Arc<Vec<u8>> {
+    let (row_pixels, rows) = screen.size;
+    let (first, count) = screen.rows;
+    if first == 0 && count == rows && screen.columns == row_pixels {
+        return image;
+    }
+    let width = (rows * scale) as usize;
+    let (left, right) = ((first * scale) as usize, ((first + count) * scale) as usize);
+    let (top, bottom) = (((row_pixels - screen.columns) * scale) as usize, (row_pixels * scale) as usize);
+    let mut out = Vec::with_capacity((right - left) * (bottom - top) * 4);
+    for y in top..bottom {
+        out.extend_from_slice(&image[(y * width + left) * 4..(y * width + right) * 4]);
+    }
+    Arc::new(out)
+}
 
 /// the Vulkan logic op for one of the PICA's.
 fn logic_op(op: LogicOp) -> vk::LogicOp {

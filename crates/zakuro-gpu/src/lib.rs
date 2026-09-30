@@ -103,10 +103,16 @@ pub type Picture = (std::sync::Arc<Vec<u8>>, u32);
 /// host's GPU, to be shown once the GPU finishes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenRef {
+    /// the buffer the transfer drew, its address and size.
     pub(crate) addr: u32,
     pub(crate) size: (u32, u32),
     pub(crate) format: ColorFormat,
     pub(crate) batch: u64,
+    /// the rows of it the screen shows, the first and how many, and how
+    /// many pixels of each row, a buffer can have longer rows than the
+    /// screen and start the screen a few rows in.
+    pub(crate) rows: (u32, u32),
+    pub(crate) columns: u32,
 }
 
 pub struct Gpu {
@@ -549,14 +555,16 @@ impl Gpu {
     }
 
     /// the newest picture the host's GPU drew scaled for a screen's
-    /// buffer, while guest memory still holds the same picture.
-    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
+    /// buffer, while guest memory still holds the same picture. size is the
+    /// pixels of a row the screen shows and its rows, stride the pixels a
+    /// row takes in memory.
+    pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut().filter(|hardware| hardware.scale() > 1) {
-            return hardware.screen(addr, size, format, guest);
+            return hardware.screen(addr, size, stride, format, guest);
         }
         #[cfg(not(feature = "vulkan"))]
-        let _ = (addr, size, format, guest);
+        let _ = (addr, size, stride, format, guest);
         None
     }
 

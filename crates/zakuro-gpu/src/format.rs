@@ -11,6 +11,7 @@ pub enum ColorFormat {
 }
 
 impl ColorFormat {
+    /// the format a screen or a display transfer names.
     pub fn from_raw(value: u32) -> ColorFormat {
         match value & 7 {
             0 => ColorFormat::Rgba8,
@@ -18,6 +19,27 @@ impl ColorFormat {
             2 => ColorFormat::Rgb565,
             3 => ColorFormat::Rgb5A1,
             _ => ColorFormat::Rgba4,
+        }
+    }
+
+    /// the format a color buffer names, where 2 and 3 are the other way
+    /// around from screens and transfers.
+    pub fn from_color_buffer(value: u32) -> ColorFormat {
+        match value & 7 {
+            2 => ColorFormat::Rgb5A1,
+            3 => ColorFormat::Rgb565,
+            other => ColorFormat::from_raw(other),
+        }
+    }
+
+    /// the number a color buffer has for the format.
+    pub fn color_buffer_raw(self) -> u32 {
+        match self {
+            ColorFormat::Rgba8 => 0,
+            ColorFormat::Rgb8 => 1,
+            ColorFormat::Rgb5A1 => 2,
+            ColorFormat::Rgb565 => 3,
+            ColorFormat::Rgba4 => 4,
         }
     }
 
@@ -140,6 +162,17 @@ pub const fn morton_offset(x: u32, y: u32, width: u32, bytes_per_pixel: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// color buffers number 5-6-5 and 5-5-5-1 the other way around from
+    /// screens and transfers.
+    #[test]
+    fn color_buffers_have_their_own_numbers() {
+        assert_eq!(ColorFormat::from_color_buffer(3), ColorFormat::Rgb565);
+        assert_eq!(ColorFormat::from_raw(3), ColorFormat::Rgb5A1);
+        for format in [ColorFormat::Rgba8, ColorFormat::Rgb8, ColorFormat::Rgb565, ColorFormat::Rgb5A1, ColorFormat::Rgba4] {
+            assert_eq!(ColorFormat::from_color_buffer(format.color_buffer_raw()), format);
+        }
+    }
 
     #[test]
     fn morton_covers_a_tile_exactly_once() {
