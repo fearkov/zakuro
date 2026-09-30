@@ -187,6 +187,17 @@ fn main() {
     }
     println!("\n--- result ---");
     println!("outcome:       {outcome:?} after {executed} frames in {elapsed:.2?}");
+    // ZAKURO_SLOW=25 lists the frames that took longer than 25 ms, to see
+    // when a stutter happens
+    if let Some(limit) = std::env::var("ZAKURO_SLOW").ok().and_then(|ms| ms.parse::<f64>().ok()) {
+        let slow: Vec<String> = frame_times
+            .iter()
+            .enumerate()
+            .filter(|(_, time)| time.as_secs_f64() * 1000.0 > limit)
+            .map(|(frame, time)| format!("{}:{:.0}", frame + 1, time.as_secs_f64() * 1000.0))
+            .collect();
+        println!("slow frames:   {}", slow.join(" "));
+    }
     if !frame_times.is_empty() {
         frame_times.sort_unstable();
         let at = |part: f64| frame_times[((frame_times.len() - 1) as f64 * part) as usize].as_secs_f64() * 1000.0;
