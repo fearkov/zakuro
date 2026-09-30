@@ -78,6 +78,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             );
             match result {
                 Ok(fix_size) => {
+                    copy_back(system, base, size);
                     shrink(system, base, if fix_size == 0 { size } else { fix_size });
                     if let (Some(library), Some(module)) = (&mut system.recompiled, system.cro.modules.last()) {
                         library.place(&module.name, module.base);
@@ -139,6 +140,16 @@ fn copy_in(system: &mut System, address: u32, source: u32, size: u32) -> u32 {
     system.memory.map(address, block.addr, block.size, Permission::RW | Permission::EXECUTE, MemoryState::Code);
     system.cro.copies.insert(address, crate::cro::Copy { buffer: source, block, fixed: size });
     address
+}
+
+/// puts the module as ldr:ro left it into the title's buffer as well, the
+/// title copies the module's data, relocated, out of its buffer once
+/// LoadCRO returns, and on the console the two are the same memory then.
+fn copy_back(system: &mut System, address: u32, size: u32) {
+    let Some(copy) = system.cro.copies.get(&address).copied() else { return };
+    let mut bytes = vec![0u8; size as usize];
+    system.memory.read_bytes(address, &mut bytes);
+    system.memory.write_bytes(copy.buffer, &bytes);
 }
 
 /// keeps what fixing left of a module and lets the rest of its memory go,
