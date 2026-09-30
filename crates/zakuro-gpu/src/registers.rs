@@ -47,6 +47,8 @@ pub const REG_TEV_STAGE0: usize = 0x00C0;
 pub const REG_TEV_STAGE_STRIDE: usize = 8;
 
 pub const REG_BLEND_FUNC: usize = 0x0101;
+/// GPUREG_LOGIC_OP, what the output merger does when it is not blending.
+pub const REG_LOGIC_OP: usize = 0x0102;
 /// selects blending or logic-op output, bit 8 turns the blender on.
 pub const REG_COLOR_OPERATION: usize = 0x0100;
 pub const REG_ALPHA_TEST: usize = 0x0104;

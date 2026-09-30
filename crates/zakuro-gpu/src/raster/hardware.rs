@@ -21,6 +21,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
+use crate::blend::LogicOp;
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
@@ -299,6 +300,8 @@ struct Texture {
 struct PipelineKey {
     /// the blend function register, when blending.
     blend: Option<u32>,
+    /// the logic op, when one other than copy is in use.
+    logic_op: Option<LogicOp>,
     /// red, green, blue and alpha writes, one bit each.
     mask: u32,
     depth: bool,
@@ -328,6 +331,8 @@ pub struct Hardware {
     shade_shader: vk::ShaderModule,
     /// whether draws go to shade_shader.
     shades: bool,
+    /// whether the device does logic ops.
+    logic_ops: bool,
     /// where the batch copied programs, by their fingerprints.
     programs: HashMap<u64, u64>,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
@@ -390,7 +395,9 @@ impl Hardware {
         let priorities = [1.0];
         let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
         let extensions = [ash::khr::push_descriptor::NAME.as_ptr()];
-        let features = vk::PhysicalDeviceFeatures::default().depth_clamp(true);
+        // SAFETY: as above
+        let logic_ops = unsafe { instance.get_physical_device_features(physical) }.logic_op == vk::TRUE;
+        let features = vk::PhysicalDeviceFeatures::default().depth_clamp(true).logic_op(logic_ops);
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
@@ -495,6 +502,7 @@ impl Hardware {
                 shade_shader,
                 // shading on the CPU instead, to tell the two apart
                 shades: std::env::var_os("ZAKURO_CPU_SHADERS").is_none(),
+                logic_ops,
                 programs: HashMap::new(),
                 pipelines: HashMap::new(),
                 transfer: None,
@@ -1072,7 +1080,10 @@ impl Hardware {
                 .dst_alpha_blend_factor(factor(config >> 28));
         }
         let attachments = [attachment];
-        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+        let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+        if let Some(op) = key.logic_op {
+            blend = blend.logic_op_enable(true).logic_op(logic_op(op));
+        }
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
@@ -1408,8 +1419,18 @@ impl Hardware {
         let depth_write = writable && mask & (1 << 12) != 0;
         let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
         let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC]);
-        let pipeline =
-            self.pipeline(PipelineKey { blend, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some() })?;
+        let mut logic_op = LogicOp::read(r);
+        let mut color_mask = color_mask;
+        if !self.logic_ops {
+            // without logic ops, a draw that keeps the colors can still just
+            // not write them
+            if logic_op == Some(LogicOp::Noop) {
+                color_mask = 0;
+            }
+            logic_op = None;
+        }
+        let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some() };
+        let pipeline = self.pipeline(key)?;
 
         if self.uploads {
             self.end_rendering();
@@ -2332,6 +2353,28 @@ impl Drop for Hardware {
 // SAFETY: the mapped pointers belong to buffers only this value uses, and
 // Vulkan handles may move between threads
 unsafe impl Send for Hardware {}
+
+/// the Vulkan logic op for one of the PICA's.
+fn logic_op(op: LogicOp) -> vk::LogicOp {
+    match op {
+        LogicOp::Clear => vk::LogicOp::CLEAR,
+        LogicOp::And => vk::LogicOp::AND,
+        LogicOp::AndReverse => vk::LogicOp::AND_REVERSE,
+        LogicOp::Copy => vk::LogicOp::COPY,
+        LogicOp::Set => vk::LogicOp::SET,
+        LogicOp::CopyInverted => vk::LogicOp::COPY_INVERTED,
+        LogicOp::Noop => vk::LogicOp::NO_OP,
+        LogicOp::Invert => vk::LogicOp::INVERT,
+        LogicOp::Nand => vk::LogicOp::NAND,
+        LogicOp::Or => vk::LogicOp::OR,
+        LogicOp::Nor => vk::LogicOp::NOR,
+        LogicOp::Xor => vk::LogicOp::XOR,
+        LogicOp::Equivalent => vk::LogicOp::EQUIVALENT,
+        LogicOp::AndInverted => vk::LogicOp::AND_INVERTED,
+        LogicOp::OrReverse => vk::LogicOp::OR_REVERSE,
+        LogicOp::OrInverted => vk::LogicOp::OR_INVERTED,
+    }
+}
 
 /// the device to draw with and its graphics queue family, a discrete GPU
 /// when there is one.

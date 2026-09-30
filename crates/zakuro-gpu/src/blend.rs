@@ -178,6 +178,80 @@ impl Blend {
     }
 }
 
+/// what the output merger does with a fragment and the pixel under it when
+/// it is not blending, bit by bit, in the PICA's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogicOp {
+    Clear,
+    And,
+    AndReverse,
+    Copy,
+    Set,
+    CopyInverted,
+    Noop,
+    Invert,
+    Nand,
+    Or,
+    Nor,
+    Xor,
+    Equivalent,
+    AndInverted,
+    OrReverse,
+    OrInverted,
+}
+
+impl LogicOp {
+    const ALL: [LogicOp; 16] = [
+        LogicOp::Clear,
+        LogicOp::And,
+        LogicOp::AndReverse,
+        LogicOp::Copy,
+        LogicOp::Set,
+        LogicOp::CopyInverted,
+        LogicOp::Noop,
+        LogicOp::Invert,
+        LogicOp::Nand,
+        LogicOp::Or,
+        LogicOp::Nor,
+        LogicOp::Xor,
+        LogicOp::Equivalent,
+        LogicOp::AndInverted,
+        LogicOp::OrReverse,
+        LogicOp::OrInverted,
+    ];
+
+    /// the logic op in use, none when the output merger blends or simply
+    /// copies, which leaves the fragment as it is.
+    pub fn read(registers: &[u32]) -> Option<LogicOp> {
+        if registers[REG_COLOR_OPERATION] & 0x100 != 0 {
+            return None;
+        }
+        Some(LogicOp::ALL[(registers[REG_LOGIC_OP] & 0xF) as usize]).filter(|&op| op != LogicOp::Copy)
+    }
+
+    /// combines a channel of the fragment with the one in the buffer.
+    pub fn apply(self, source: u8, dest: u8) -> u8 {
+        match self {
+            LogicOp::Clear => 0,
+            LogicOp::And => source & dest,
+            LogicOp::AndReverse => source & !dest,
+            LogicOp::Copy => source,
+            LogicOp::Set => 0xFF,
+            LogicOp::CopyInverted => !source,
+            LogicOp::Noop => dest,
+            LogicOp::Invert => !dest,
+            LogicOp::Nand => !(source & dest),
+            LogicOp::Or => source | dest,
+            LogicOp::Nor => !(source | dest),
+            LogicOp::Xor => source ^ dest,
+            LogicOp::Equivalent => !(source ^ dest),
+            LogicOp::AndInverted => !source & dest,
+            LogicOp::OrReverse => source | !dest,
+            LogicOp::OrInverted => !source | dest,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +280,22 @@ mod tests {
         let blend = Blend::read(&registers(0x1111_0000)).unwrap();
         let out = blend.apply([0.25, 0.25, 0.25, 1.0], [0.5, 0.5, 0.5, 1.0]);
         assert!((out[0] - 0.75).abs() < 1e-5, "red {}", out[0]);
+    }
+
+    /// shadow volumes mark the stencil buffer with a logic op that leaves
+    /// the colors alone.
+    #[test]
+    fn noop_keeps_the_buffer() {
+        let mut registers = registers(0);
+        registers[REG_COLOR_OPERATION] = 0;
+        registers[REG_LOGIC_OP] = 6;
+        let op = LogicOp::read(&registers).unwrap();
+        assert_eq!(op, LogicOp::Noop);
+        assert_eq!(op.apply(0x00, 0x7F), 0x7F);
+        registers[REG_LOGIC_OP] = 3;
+        assert!(LogicOp::read(&registers).is_none());
+        registers[REG_LOGIC_OP] = 11;
+        assert_eq!(LogicOp::read(&registers).unwrap().apply(0xF0, 0x3C), 0xCC);
     }
 
     #[test]

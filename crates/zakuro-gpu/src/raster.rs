@@ -1260,6 +1260,7 @@ struct DrawState<'a> {
     tex_env: crate::tev::TexEnv,
     alpha_test: Option<AlphaTest>,
     blend: Option<crate::blend::Blend>,
+    logic_op: Option<crate::blend::LogicOp>,
     textures: &'a [Option<BoundTexture>; 3],
     /// texture unit 2 can read coordinate set 1 instead of its own.
     texture2_uses_coord1: bool,
@@ -1457,7 +1458,7 @@ fn fill_triangle(
             // combine with what is already in the buffer, the way the output
             // merger is configured to, and keep the channels the draw may not
             // change.
-            if state.blend.is_some() || partial_write {
+            if state.blend.is_some() || state.logic_op.is_some() || partial_write {
                 pixel[..bpp].copy_from_slice(surface.at(index));
                 let existing = target.format.decode(&pixel[..bpp]);
                 if let Some(blend) = &state.blend {
@@ -1466,6 +1467,8 @@ fn fill_triangle(
                         existing.map(|c| c as f32 / 255.0),
                     );
                     rgba = blended.map(|c| (c * 255.0) as u8);
+                } else if let Some(op) = state.logic_op {
+                    rgba = std::array::from_fn(|channel| op.apply(rgba[channel], existing[channel]));
                 }
                 for channel in 0..4 {
                     if !target.write[channel] {
@@ -1787,6 +1790,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         tex_env,
         alpha_test: AlphaTest::read(registers),
         blend: crate::blend::Blend::read(registers),
+        logic_op: crate::blend::LogicOp::read(registers),
         textures: &textures,
         texture2_uses_coord1: registers[REG_TEXTURE_CONFIG] & (1 << 13) != 0,
         // the lighting only matters to a draw whose combiners read it.
@@ -2036,6 +2040,7 @@ mod tests {
         registers[REG_COLOR_BUFFER_WRITE] = 0xF;
         registers[REG_DEPTH_STENCIL_WRITE] = 0x3;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8;
+        registers[REG_LOGIC_OP] = 3;
         registers
     }
 

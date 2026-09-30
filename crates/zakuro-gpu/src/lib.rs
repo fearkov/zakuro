@@ -903,6 +903,7 @@ mod tests {
         // color writes allowed, all four channels.
         write(REG_COLOR_BUFFER_WRITE, 0xF);
         write(REG_DEPTH_COLOR_MASK, 0xF << 8);
+        write(REG_LOGIC_OP, 3);
         gpu
     }
 
