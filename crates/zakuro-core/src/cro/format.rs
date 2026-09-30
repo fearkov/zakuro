@@ -10,7 +10,10 @@ pub mod header {
     pub const PREVIOUS_CRO: u32 = 0x08C;
     pub const FILE_SIZE: u32 = 0x090;
     pub const BSS_SIZE: u32 = 0x094;
-    pub const FIX_SIZE: u32 = 0x0A4;
+    /// how much of the module is left once it is fixed.
+    pub const FIXED_SIZE: u32 = 0x098;
+    /// the function every import points at while nothing provides it.
+    pub const ON_UNRESOLVED_SEGMENT_TAG: u32 = 0x0AC;
 
     /// the first field holding an offset that becomes an address on rebase.
     pub const FIRST_REBASED: u32 = 0x0B0;

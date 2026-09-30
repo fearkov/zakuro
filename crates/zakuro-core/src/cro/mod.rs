@@ -33,6 +33,19 @@ pub struct CroManager {
     pub modules: Vec<Module>,
     /// imports we could not resolve, for diagnostics.
     pub unresolved: Vec<String>,
+    /// modules ldr:ro gave memory of their own, by where they run, the
+    /// buffer the title loaded them from, the memory and how much of the
+    /// module fixing left.
+    pub copies: HashMap<VAddr, Copy>,
+}
+
+/// a module running from memory of its own rather than from the title's
+/// buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct Copy {
+    pub buffer: VAddr,
+    pub block: crate::memory::physical::PhysicalBlock,
+    pub fixed: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +177,43 @@ fn apply_relocation_batch(
 fn batch_is_resolved(memory: &mut Memory, batch: VAddr) -> bool {
     memory.read8(batch + 6) != 0
 }
+
+/// the module's own handler for imports nothing provides, which they point
+/// at until something does and again once it goes.
+fn unresolved_symbol(memory: &mut Memory, base: VAddr) -> VAddr {
+    let tag = SegmentTag(field(memory, base, header::ON_UNRESOLVED_SEGMENT_TAG));
+    tag_to_address(memory, base, tag).unwrap_or(0)
+}
+
+/// the size of one entry of each table the header lists from the module
+/// name on, one for the ones counted in bytes.
+const TABLE_ENTRY_SIZES: [u32; 15] = [
+    1,
+    SEGMENT_ENTRY_SIZE,
+    EXPORT_NAMED_SYMBOL_ENTRY_SIZE,
+    EXPORT_INDEXED_SYMBOL_ENTRY_SIZE,
+    1,
+    EXPORT_TREE_ENTRY_SIZE,
+    IMPORT_MODULE_ENTRY_SIZE,
+    RELOCATION_ENTRY_SIZE,
+    IMPORT_NAMED_SYMBOL_ENTRY_SIZE,
+    IMPORT_INDEXED_SYMBOL_ENTRY_SIZE,
+    IMPORT_ANONYMOUS_SYMBOL_ENTRY_SIZE,
+    1,
+    8,
+    RELOCATION_ENTRY_SIZE,
+    RELOCATION_ENTRY_SIZE,
+];
+
+/// the first table each fix level drops, what comes after it goes too.
+/// level 1 drops what only loading needed, 2 the imports as well and 3 the
+/// exports.
+const FIX_BARRIERS: [u32; 4] = [
+    header::SIZE,
+    header::STATIC_ANONYMOUS_SYMBOL_TABLE_OFFSET,
+    header::IMPORT_MODULE_TABLE_OFFSET,
+    header::EXPORT_NAMED_SYMBOL_TABLE_OFFSET,
+];
 
 // ---------------------------------------------------------------------------
 // Rebasing
@@ -366,14 +416,57 @@ impl CroManager {
         }
     }
 
-    /// marks every external relocation batch unresolved, which is the state a
-    /// freshly loaded module starts in.
+    /// points every import at the module's unresolved handler and marks it
+    /// unresolved, which is the state a freshly loaded module starts in.
     fn reset_external_relocations(&self, memory: &mut Memory, base: VAddr) {
+        let unresolved = unresolved_symbol(memory, base);
         let table = field(memory, base, header::EXTERNAL_RELOCATION_TABLE_OFFSET);
         let count = field(memory, base, header::EXTERNAL_RELOCATION_NUM);
         for index in 0..count {
-            memory.write8(table + index * RELOCATION_ENTRY_SIZE + 6, 0);
+            let entry = table + index * RELOCATION_ENTRY_SIZE;
+            if unresolved != 0 {
+                let tag = SegmentTag(memory.read32(entry));
+                let kind = RelocationType::from_raw(memory.read8(entry + 4));
+                let addend = memory.read32(entry + 8);
+                if let Some(target) = tag_to_address(memory, base, tag) {
+                    apply_relocation(memory, target, kind, addend, unresolved, target);
+                }
+            }
+            memory.write8(entry + 6, 0);
         }
+    }
+
+    /// drops the tables the fix level says the module no longer needs, so
+    /// the title can take back the memory they are in, and returns how much
+    /// of the module is left.
+    fn fix(&self, memory: &mut Memory, base: VAddr, size: u32, level: u32) -> u32 {
+        let Some(&barrier) = FIX_BARRIERS.get(level as usize).filter(|_| level != 0) else {
+            return 0;
+        };
+        // what is kept ends with the code or the last table before the barrier
+        let mut end = field(memory, base, header::CODE_OFFSET) + field(memory, base, header::CODE_SIZE);
+        let mut offset = header::MODULE_NAME_OFFSET;
+        for entry_size in TABLE_ENTRY_SIZES {
+            let table = field(memory, base, offset);
+            let count = field(memory, base, offset + 4);
+            if offset < barrier {
+                if count != 0 {
+                    end = end.max(table + count * entry_size);
+                }
+            } else {
+                set_field(memory, base, offset + 4, 0);
+            }
+            offset += 8;
+        }
+        let fixed = zakuro_common::bits::align_up(end.saturating_sub(base), 0x1000).min(size);
+        // the dropped tables point where the module now ends, and are empty
+        let mut offset = barrier;
+        while offset <= header::STATIC_RELOCATION_TABLE_OFFSET {
+            set_field(memory, base, offset, base + fixed);
+            offset += 8;
+        }
+        set_field(memory, base, header::FIXED_SIZE, fixed);
+        fixed
     }
 
     /// builds the symbol index for a module that has just been rebased.
@@ -419,12 +512,12 @@ impl CroManager {
 
     // -- linking ------------------------------------------------------------
 
-    /// looks a symbol up in every module that has been loaded, newest first,
-    /// then in the static module.
+    /// looks a symbol up in the static module, then in the modules linked
+    /// automatically in the order they were loaded, as ldr:ro does.
     fn lookup(&self, name: &str) -> Option<VAddr> {
         self.modules
             .iter()
-            .rev()
+            .filter(|module| module.auto_link)
             .find_map(|module| module.exports.get(name).copied())
     }
 
@@ -626,6 +719,7 @@ impl CroManager {
         bss_segment: VAddr,
         bss_segment_size: u32,
         auto_link: bool,
+        fix_level: u32,
     ) -> Result<u32> {
         self.rebase(
             memory,
@@ -667,9 +761,9 @@ impl CroManager {
             self.modules.len()
         );
 
-        // the guest reads the fixed size back to learn how much of its buffer
-        // it may reuse.
-        Ok(field(memory, base, header::FIX_SIZE))
+        // the guest learns from the fixed size how much of its buffer it may
+        // take back.
+        Ok(self.fix(memory, base, size, fix_level))
     }
 
     /// ldr:ro UnloadCRO.
@@ -680,25 +774,53 @@ impl CroManager {
         let module = self.modules.remove(index);
         log::debug!("ldr:ro: unloaded '{}'", module.name);
 
-        // anything that linked against it has to go back to unresolved, or it
-        // would keep calling into memory the guest is about to reuse.
-        for other in self.modules.clone() {
+        // anything that linked against it goes back to its own unresolved
+        // handler, or it would keep calling into memory the guest is about to
+        // reuse. named imports go by the name, the ones by index and the
+        // anonymous ones by the module they name.
+        for other in self.modules.clone().iter().filter(|other| other.auto_link) {
             let other_base = other.base;
+            let unresolved = unresolved_symbol(memory, other_base);
+            let reset = |memory: &mut Memory, batch: VAddr| {
+                if batch != 0 && batch_is_resolved(memory, batch) {
+                    apply_relocation_batch(memory, other_base, batch, unresolved, false);
+                }
+            };
+
             let table = field(memory, other_base, header::IMPORT_NAMED_SYMBOL_TABLE_OFFSET);
             let count = field(memory, other_base, header::IMPORT_NAMED_SYMBOL_NUM);
             for i in 0..count {
                 let entry = table + i * IMPORT_NAMED_SYMBOL_ENTRY_SIZE;
-                let batch = memory.read32(entry + 4);
-                if batch == 0 || !batch_is_resolved(memory, batch) {
+                let name_address = memory.read32(entry);
+                let name = read_string(memory, name_address);
+                if module.exports.contains_key(&name) {
+                    let batch = memory.read32(entry + 4);
+                    reset(memory, batch);
+                }
+            }
+
+            let table = field(memory, other_base, header::IMPORT_MODULE_TABLE_OFFSET);
+            let count = field(memory, other_base, header::IMPORT_MODULE_NUM);
+            for i in 0..count {
+                let entry = table + i * IMPORT_MODULE_ENTRY_SIZE;
+                let name_address = memory.read32(entry);
+                if read_string(memory, name_address) != module.name {
                     continue;
                 }
-                let name_address = memory.read32(entry);
-            let name = read_string(memory, name_address);
-                if module.exports.contains_key(&name) {
-                    apply_relocation_batch(memory, other_base, batch, 0, false);
+                let tables = [
+                    (memory.read32(entry + 4), memory.read32(entry + 8), IMPORT_INDEXED_SYMBOL_ENTRY_SIZE),
+                    (memory.read32(entry + 12), memory.read32(entry + 16), IMPORT_ANONYMOUS_SYMBOL_ENTRY_SIZE),
+                ];
+                for (table, count, entry_size) in tables {
+                    for j in 0..count {
+                        let batch = memory.read32(table + j * entry_size + 4);
+                        reset(memory, batch);
+                    }
                 }
             }
         }
+
+        unrebase(memory, base);
     }
 
     /// number of modules currently linked, for the diagnostics overlay.
@@ -720,6 +842,19 @@ fn rebase_table(
     entry_size: u32,
     offsets: &[u32],
 ) {
+    move_table(memory, base, table_field, count_field, entry_size, offsets, true);
+}
+
+/// turns the offsets a table's entries hold into addresses, or back.
+fn move_table(
+    memory: &mut Memory,
+    base: VAddr,
+    table_field: u32,
+    count_field: u32,
+    entry_size: u32,
+    offsets: &[u32],
+    forward: bool,
+) {
     let table = field(memory, base, table_field);
     let count = field(memory, base, count_field);
     if table == 0 {
@@ -730,8 +865,52 @@ fn rebase_table(
         for &offset in offsets {
             let value = memory.read32(entry + offset);
             if value != 0 {
-                memory.write32(entry + offset, value + base);
+                let moved = if forward { value.wrapping_add(base) } else { value.wrapping_sub(base) };
+                memory.write32(entry + offset, moved);
             }
         }
     }
+}
+
+/// the tables whose entries point elsewhere in the module, and where in an
+/// entry the pointers are.
+const POINTER_TABLES: [(u32, u32, u32, &[u32]); 5] = [
+    (header::EXPORT_NAMED_SYMBOL_TABLE_OFFSET, header::EXPORT_NAMED_SYMBOL_NUM, EXPORT_NAMED_SYMBOL_ENTRY_SIZE, &[0]),
+    (header::IMPORT_MODULE_TABLE_OFFSET, header::IMPORT_MODULE_NUM, IMPORT_MODULE_ENTRY_SIZE, &[0, 4, 12]),
+    (header::IMPORT_NAMED_SYMBOL_TABLE_OFFSET, header::IMPORT_NAMED_SYMBOL_NUM, IMPORT_NAMED_SYMBOL_ENTRY_SIZE, &[0, 4]),
+    (header::IMPORT_INDEXED_SYMBOL_TABLE_OFFSET, header::IMPORT_INDEXED_SYMBOL_NUM, IMPORT_INDEXED_SYMBOL_ENTRY_SIZE, &[4]),
+    (header::IMPORT_ANONYMOUS_SYMBOL_TABLE_OFFSET, header::IMPORT_ANONYMOUS_SYMBOL_NUM, IMPORT_ANONYMOUS_SYMBOL_ENTRY_SIZE, &[4]),
+];
+
+/// puts a module back the way its file has it, offsets rather than
+/// addresses, which is how ldr:ro hands the buffer back to the title.
+fn unrebase(memory: &mut Memory, base: VAddr) {
+    for (table, count, entry_size, offsets) in POINTER_TABLES {
+        move_table(memory, base, table, count, entry_size, offsets, false);
+    }
+
+    let segment_num = field(memory, base, header::SEGMENT_NUM);
+    for index in 0..segment_num {
+        let Some(mut entry) = segment(memory, base, index) else { continue };
+        entry.offset = match entry.kind {
+            SegmentType::Bss => 0,
+            _ if entry.offset != 0 => entry.offset.wrapping_sub(base),
+            _ => 0,
+        };
+        set_segment(memory, base, index, &entry);
+    }
+
+    let name_offset = field(memory, base, header::NAME_OFFSET);
+    if name_offset != 0 {
+        set_field(memory, base, header::NAME_OFFSET, name_offset.wrapping_sub(base));
+    }
+    let mut offset_field = header::FIRST_REBASED;
+    while offset_field <= header::LAST_REBASED {
+        let value = field(memory, base, offset_field);
+        if value != 0 {
+            set_field(memory, base, offset_field, value.wrapping_sub(base));
+        }
+        offset_field += 8;
+    }
+    set_field(memory, base, header::FIXED_SIZE, 0);
 }
