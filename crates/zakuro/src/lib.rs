@@ -77,6 +77,7 @@ pub fn run(linked: Option<Linked>) {
         last_title_update: Instant::now(),
         next_frame: Instant::now(),
         skipped: 0,
+        shown: 0,
         paused: false,
         stop: false,
     };
@@ -311,6 +312,8 @@ struct App {
     next_frame: Instant,
     /// frames in a row not shown while catching up.
     skipped: u32,
+    /// frames shown since the title was last updated.
+    shown: u32,
     /// stopped with F1, without the menu.
     paused: bool,
     stop: bool,
@@ -704,10 +707,16 @@ impl App {
         } else {
             self.skipped = 0;
             self.present(event_loop);
+            self.shown += 1;
         }
 
         if self.last_title_update.elapsed() >= Duration::from_millis(500) {
+            let shown = self.shown as f32 / self.last_title_update.elapsed().as_secs_f32();
+            self.shown = 0;
             self.last_title_update = Instant::now();
+            if let Some(game) = &self.game {
+                log::debug!(target: "zakuro::fps", "{:.1} frames emulated and {shown:.1} shown a second", game.fps);
+            }
             if let Some(window) = &self.window {
                 let title = match &self.game {
                     Some(game) => format!("Zakuro - {} - {}", game.name, game.system.status_line()),
