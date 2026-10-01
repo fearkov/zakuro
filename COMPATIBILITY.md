@@ -1,6 +1,6 @@
 # Compatibility
 
-Games tested in Zakuro so far, as of v0.2.7. Recompiled means the game was tested with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which is how it runs at full speed; without it, it runs in the interpreter, slower.
+Games tested in Zakuro so far, as of v0.2.8. Recompiled means the game was tested with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which is how it runs at full speed; without it, it runs in the interpreter, slower.
 
 | Status | Meaning |
 |---|---|
@@ -24,8 +24,8 @@ Games tested in Zakuro so far, as of v0.2.7. Recompiled means the game was teste
 | The Legend of Zelda: Ocarina of Time 3D | 0004000000033500 | USA | Playable | Yes | |
 | The Legend of Zelda: Majora's Mask 3D | 0004000000125500 | USA | Playable | Yes | |
 | Persona Q: Shadow of the Labyrinth | 0004000000123400 | USA | Playable | Yes | |
-| Animal Crossing: New Leaf | 0004000000086300 | USA | Playable | Yes | Needs a build newer than v0.2.7, colors came out wrong and the picture at low resolution before |
-| Monster Hunter 4 Ultimate | 0004000000126300 | USA | Playable | Yes | Needs a build newer than v0.2.7, the screen stayed black before |
+| Animal Crossing: New Leaf | 0004000000086300 | USA | Playable | Yes | Needs v0.2.8 or newer, colors came out wrong and the picture at low resolution before |
+| Monster Hunter 4 Ultimate | 0004000000126300 | USA | Playable | Yes | Needs v0.2.8 or newer, the screen stayed black before |
 | Yo-kai Watch | 0004000000167800 | EUR | Playable | Yes | Needs v0.2.7 or newer |
 
 Tested a game that isn't here, or found a problem with one that is? Tell us on the [Discord server](https://discord.gg/7dduXVv2xm) or open a [game report](https://github.com/fearkov/zakuro/issues/new?template=game-report.yml).
