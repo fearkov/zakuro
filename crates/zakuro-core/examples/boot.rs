@@ -31,6 +31,15 @@ fn main() {
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),
         ..Config::default()
     };
+    // ZAKURO_REPLAY=file plays back what ZAKURO_RECORD wrote down in the
+    // frontend, from the same clock
+    let mut replay = std::env::var_os("ZAKURO_REPLAY").map(|file| {
+        zakuro_core::replay::Replay::open(std::path::Path::new(&file)).unwrap_or_else(|error| {
+            eprintln!("could not read {}: {error}", file.to_string_lossy());
+            std::process::exit(1);
+        })
+    });
+    let config = Config { clock: replay.as_ref().map(|replay| replay.clock()).or(config.clock), ..config };
     let mut system = match loader::load(&path, config) {
         Ok(system) => system,
         Err(e) => {
@@ -97,7 +106,9 @@ fn main() {
             log::set_max_level(log::LevelFilter::Trace);
             println!("--- verbose logging from frame {frame} ---");
         }
-        if !script.is_empty() {
+        if let Some(replay) = &mut replay {
+            system.set_input(replay.input(frame));
+        } else if !script.is_empty() {
             let held = || script.iter().filter(|(start, ..)| (*start..*start + 6).contains(&frame));
             let buttons = held().fold(PadState::empty(), |held, (_, buttons, _)| held | *buttons);
             let touch = held().find_map(|(.., touch)| *touch);

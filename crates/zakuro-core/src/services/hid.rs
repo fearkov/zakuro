@@ -48,7 +48,7 @@ bitflags::bitflags! {
 }
 
 /// what the frontend feeds in each frame.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct InputState {
     pub buttons: PadState,
     /// circle pad, -1.0 to 1.0 on each axis.

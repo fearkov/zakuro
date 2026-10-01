@@ -252,6 +252,9 @@ struct Running {
     system: System,
     path: PathBuf,
     name: String,
+    /// the inputs written down, ZAKURO_RECORD=file, for playing the run
+    /// back.
+    recorder: Option<zakuro_core::replay::Recorder>,
     /// frames run since counting_since, for the frame rate.
     frames: u32,
     counting_since: Instant,
@@ -260,7 +263,7 @@ struct Running {
 
 impl Running {
     fn new(system: System, path: PathBuf, name: String) -> Running {
-        Running { system, path, name, frames: 0, counting_since: Instant::now(), fps: 0.0 }
+        Running { system, path, name, recorder: None, frames: 0, counting_since: Instant::now(), fps: 0.0 }
     }
 
     fn count_frame(&mut self) {
@@ -409,7 +412,14 @@ impl App {
     fn play(&mut self, path: &Path) -> Result<(), String> {
         // the old game and what it holds on the GPU go first
         self.game = None;
-        let system = loader::load(path, self.config()).map_err(|error| format!("could not open {}, {error}", path.display()))?;
+        let mut config = self.config();
+        // a recording starts the clock at a known time, for playing it back
+        let record = std::env::var_os("ZAKURO_RECORD").map(PathBuf::from);
+        let clock = zakuro_core::memory::config::host_clock();
+        if record.is_some() {
+            config.clock = Some(clock);
+        }
+        let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
         let name = self
             .library
             .games
@@ -418,7 +428,17 @@ impl App {
             .map(|game| game.name.clone())
             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .unwrap_or_default();
-        self.game = Some(Running::new(system, path.to_owned(), name));
+        let mut game = Running::new(system, path.to_owned(), name);
+        if let Some(record) = record {
+            match zakuro_core::replay::Recorder::create(&record, clock) {
+                Ok(recorder) => {
+                    log::info!("recording the inputs to {}", record.display());
+                    game.recorder = Some(recorder);
+                }
+                Err(error) => log::warn!("could not record to {}, {error}", record.display()),
+            }
+        }
+        self.game = Some(game);
         self.menus.menu_open = false;
         self.keyboard.release();
         self.paused = false;
@@ -686,7 +706,11 @@ impl App {
     /// runs one frame of the game.
     fn emulate(&mut self) {
         let Some(game) = &mut self.game else { return };
-        game.system.set_input(self.gamepads.apply(self.keyboard.state()));
+        let input = self.gamepads.apply(self.keyboard.state());
+        if let Some(recorder) = &mut game.recorder {
+            recorder.record(input);
+        }
+        game.system.set_input(input);
         let outcome = game.system.run_frame();
         game.count_frame();
         let sound = game.system.take_audio();
