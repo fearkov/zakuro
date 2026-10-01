@@ -14,7 +14,7 @@ pub mod texture;
 
 use format::ColorFormat;
 use registers::*;
-pub use backend::{layout, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenImage, Viewport};
+pub use backend::{layout, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
 
 /// how the GPU reaches guest memory.
@@ -903,7 +903,7 @@ mod tests {
         }
         let bits = value.to_bits();
         let sign = bits >> 31;
-        let exponent = ((bits >> 23) & 0xFF) - 127 + 63;
+        let exponent = ((bits >> 23) & 0xFF) + 63 - 127;
         (sign << 23) | (exponent << 16) | ((bits >> 7) & 0xFFFF)
     }
 
