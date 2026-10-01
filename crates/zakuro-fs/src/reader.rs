@@ -64,6 +64,22 @@ impl<'a> Reader<'a> {
         ]))
     }
 
+    /// the big-endian reads, for the TMD's fields.
+    pub fn u16_be(&self, offset: usize) -> Result<u16, FsError> {
+        let b = self.bytes(offset, 2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    pub fn u32_be(&self, offset: usize) -> Result<u32, FsError> {
+        let b = self.bytes(offset, 4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn u64_be(&self, offset: usize) -> Result<u64, FsError> {
+        let b = self.bytes(offset, 8)?;
+        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+
     pub fn magic(&self, offset: usize, expected: &[u8; 4]) -> Result<(), FsError> {
         let got = self.bytes(offset, 4)?;
         if got != expected {

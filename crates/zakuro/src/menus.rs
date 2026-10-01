@@ -182,7 +182,7 @@ impl Menus {
                 return;
             }
             if library.games.is_empty() {
-                ui.label("No .3ds, .cci or .cxi files in that folder.");
+                ui.label("No .3ds, .cci, .cxi or .cia files in that folder.");
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {

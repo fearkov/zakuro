@@ -1,6 +1,8 @@
-//! ROM container parsing, NCSD cartridge images, NCCH partitions, ExeFS, RomFS
-//! and the BLZ compression the CTR SDK applies to .code.
+//! ROM container parsing, NCSD cartridge images, CIA archives, NCCH
+//! partitions, ExeFS, RomFS and the BLZ compression the CTR SDK applies to
+//! .code.
 
+pub mod cia;
 pub mod exefs;
 pub mod lz77;
 pub mod ncch;
@@ -13,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
+pub use cia::Cia;
 pub use exefs::ExeFs;
 pub use ncch::{CodeSetInfo, ExHeader, MemoryType, NcchHeader, SystemMode};
 pub use ncsd::Ncsd;
@@ -41,6 +44,15 @@ pub enum FsError {
 
     #[error("this NCCH is encrypted (crypto method 0x{0:02X}); Zakuro needs a decrypted dump")]
     Encrypted(u8),
+
+    #[error("this .cia is encrypted; Zakuro needs a decrypted one")]
+    EncryptedCia,
+
+    #[error("this .cia is {0}, not a game")]
+    NotAGame(&'static str),
+
+    #[error("malformed CIA: {0}")]
+    BadCia(&'static str),
 
     #[error("ExeFS has no .code section")]
     NoCode,
@@ -113,6 +125,10 @@ impl Title {
                 ncsd.image_size / (1024 * 1024)
             );
             ncsd.executable_partition()?.offset
+        } else if Cia::detect(data) {
+            let cia = Cia::parse(data)?;
+            log::info!("CIA archive, title {:016X}", cia.title_id);
+            cia.executable.0
         } else if NcchHeader::detect(data) {
             0
         } else {

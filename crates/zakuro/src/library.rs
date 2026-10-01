@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 /// file endings of games Zakuro opens.
-const GAME_FILES: [&str; 3] = ["3ds", "cci", "cxi"];
+const GAME_FILES: [&str; 4] = ["3ds", "cci", "cxi", "cia"];
 /// the icon's side, in pixels.
 pub const ICON_SIZE: usize = 48;
 
