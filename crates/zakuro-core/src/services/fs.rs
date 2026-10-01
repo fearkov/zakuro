@@ -153,6 +153,9 @@ pub struct FsState {
     pub directories: HashMap<u32, OpenDirectory>,
     pub next_directory: u32,
     pub priority: u32,
+    /// the tick each medium, the game's and the SD card, is busy until. a
+    /// medium reads one request after another.
+    pub busy_until: [u64; 2],
 }
 
 impl Default for FsState {
@@ -165,6 +168,7 @@ impl Default for FsState {
             next_file: 0,
             directories: HashMap::new(),
             next_directory: 0,
+            busy_until: [0; 2],
             priority: 0,
         }
     }
@@ -742,9 +746,17 @@ fn file_command(
             buffer.set(&mut system.memory, 2, read);
             buffer.set(&mut system.memory, 3, (size << 4) | 0xC);
             buffer.set(&mut system.memory, 4, dest);
-            // the thread waits as long as the console would take
+            // the thread waits as long as the console would take, after the
+            // reads the medium is still busy with
+            let medium = match &backing {
+                Some(FileBacking::Host(_)) => 1,
+                _ => 0,
+            };
             let tick = system.cpu.cycles;
-            system.kernel.sleep_current(nanos_to_ticks(read_delay(read)), tick);
+            let busy = &mut system.services.fs.busy_until[medium];
+            *busy = (*busy).max(tick) + nanos_to_ticks(read_delay(read));
+            let wait = *busy - tick;
+            system.kernel.sleep_current(wait, tick);
             true
         }
         // write(offset u64, size, flags, <mapped buffer>)

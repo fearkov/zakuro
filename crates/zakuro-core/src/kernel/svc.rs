@@ -386,7 +386,9 @@ fn create_thread(system: &mut System) {
     system.map_tls_page(id);
 
     let handle = system.kernel.thread_handle(id);
-    log::debug!("svcCreateThread: thread{id} handle 0x{handle:X} priority {priority} arg 0x{arg:08X}");
+    log::debug!(
+        "svcCreateThread: thread{id} handle 0x{handle:X} priority {priority} core {processor_id} entry 0x{entry:08X} arg 0x{arg:08X} stack 0x{stack_top:08X}"
+    );
     system.cpu.regs[0] = 0;
     system.cpu.regs[1] = handle;
 }
