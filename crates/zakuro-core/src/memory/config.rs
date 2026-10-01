@@ -78,13 +78,15 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, cl
     page[0xC0] = 0; // no headset
 }
 
-/// the host's clock, in milliseconds since 1900.
+/// the host's local time, in milliseconds since 1900.
 pub fn host_clock() -> u64 {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    unix + EPOCH_OFFSET_SECONDS * 1000
+    // the console keeps the local time, not UTC
+    let local = chrono::Local::now().offset().local_minus_utc() as i64 * 1000;
+    (unix as i64 + local) as u64 + EPOCH_OFFSET_SECONDS * 1000
 }
 
 /// refreshes the clock fields, the clock at boot moved on by the emulated
@@ -106,4 +108,18 @@ pub fn update_datetime(page: &mut [u8], boot_clock: u64, tick: u64) {
 pub fn set_slider_3d(page: &mut [u8], value: f32) {
     page[0x80..0x84].copy_from_slice(&value.clamp(0.0, 1.0).to_le_bytes());
     page[0x84] = (value > 0.0) as u8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the clock starts at the local time, which is what the console shows.
+    #[test]
+    fn the_clock_is_local() {
+        let utc = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let offset = chrono::Local::now().offset().local_minus_utc() as i64 * 1000;
+        let clock = host_clock() as i64 - EPOCH_OFFSET_SECONDS as i64 * 1000;
+        assert!((clock - utc - offset).abs() < 1000);
+    }
 }
