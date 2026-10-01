@@ -27,7 +27,9 @@ Games tested in Zakuro so far, as of v0.2.9. Recompiled means the game was teste
 | Persona Q: Shadow of the Labyrinth | 0004000000123400 | USA | Playable | Yes | |
 | Animal Crossing: New Leaf | 0004000000086300 | USA | Playable | Yes | Needs v0.2.9 or newer, you got stuck, all black, after getting off the train before |
 | Monster Hunter 4 Ultimate | 0004000000126300 | USA | Playable | Yes | Needs v0.2.8 or newer, the screen stayed black before |
+| Monster Hunter XX | 0004000000197100 | JPN | In-game | Yes | Runs, with bugs |
 | Yo-kai Watch | 0004000000167800 | EUR | Playable | Yes | Needs v0.2.7 or newer |
 | Fire Emblem Fates: Special Edition | 0004000000179800 | USA | In-game | Yes | Runs, with bugs |
+| Bloodstained: Curse of the Moon | 00040000001D3A00 | JPN | Playable | Yes | Needs a build newer than v0.2.9, it crashed while loading and ran slow at 4x before |
 
 Tested a game that isn't here, or found a problem with one that is? Tell us on the [Discord server](https://discord.gg/7dduXVv2xm) or open a [game report](https://github.com/fearkov/zakuro/issues/new?template=game-report.yml).
