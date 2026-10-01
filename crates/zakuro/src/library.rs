@@ -17,6 +17,8 @@ pub struct Game {
     pub icon: Option<Vec<u8>>,
     /// 3dsrecomp installed code for it.
     pub recompiled: bool,
+    /// why it can't be played, when it can't, an encrypted dump say.
+    pub problem: Option<String>,
 }
 
 /// the games in the chosen folder, found in the background.
@@ -74,25 +76,63 @@ fn scan(folder: &Path) -> Vec<Game> {
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| GAME_FILES.contains(&extension.to_ascii_lowercase().as_str()))
         })
-        .filter_map(|path| read_game(&path))
+        .map(|path| read_game(&path))
         .collect();
-    games.sort_by_key(|game| game.name.to_lowercase());
+    // the ones that can't be played go last
+    games.sort_by_key(|game| (game.problem.is_some(), game.name.to_lowercase()));
     games
 }
 
-fn read_game(path: &Path) -> Option<Game> {
-    let title = zakuro_fs::Title::load(path).map_err(|error| log::debug!("skipping {}, {error}", path.display())).ok()?;
+fn read_game(path: &Path) -> Game {
+    let file_name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    let empty = std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0);
+    let loaded = if empty { Err(None) } else { zakuro_fs::Title::load(path).map_err(Some) };
+    let title = match loaded {
+        Ok(title) => title,
+        Err(error) => {
+            log::debug!("can't play {}", path.display());
+            let problem = match error {
+                Some(error) => problem(&error),
+                None => "Empty, its download may not have finished".to_owned(),
+            };
+            return Game {
+                path: path.to_owned(),
+                name: file_name,
+                publisher: String::new(),
+                program_id: 0,
+                icon: None,
+                recompiled: false,
+                problem: Some(problem),
+            };
+        }
+    };
     let program_id = title.program_id();
     let smdh = title.exefs_file("icon").and_then(Smdh::parse);
-    let file_name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
-    Some(Game {
+    Game {
         path: path.to_owned(),
         name: smdh.as_ref().map(|s| s.name.clone()).filter(|name| !name.is_empty()).unwrap_or(file_name),
         publisher: smdh.as_ref().map(|s| s.publisher.clone()).unwrap_or_default(),
         program_id,
         icon: smdh.map(|s| s.icon),
         recompiled: zakuro_core::recompiled::installed(program_id).is_some(),
-    })
+        problem: None,
+    }
+}
+
+/// what the library says about a file it can't play.
+fn problem(error: &zakuro_fs::FsError) -> String {
+    use zakuro_fs::FsError;
+    match error {
+        FsError::Encrypted(_) | FsError::EncryptedCia => "Encrypted, Zakuro needs a decrypted dump".to_owned(),
+        FsError::NotAGame(what) => {
+            let mut what = what.to_string();
+            if let Some(first) = what.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{what}, not a game. Zakuro can't install updates or DLC yet")
+        }
+        _ => format!("Can't be read, {error}"),
+    }
 }
 
 /// the part of a title's icon file the library shows.
@@ -169,6 +209,15 @@ fn decode_icon(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_that_cant_be_played_say_why() {
+        assert_eq!(problem(&zakuro_fs::FsError::EncryptedCia), "Encrypted, Zakuro needs a decrypted dump");
+        assert_eq!(
+            problem(&zakuro_fs::FsError::NotAGame("an update")),
+            "An update, not a game. Zakuro can't install updates or DLC yet"
+        );
+    }
 
     #[test]
     fn titles_are_read_in_english_first() {

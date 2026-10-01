@@ -216,6 +216,10 @@ impl Menus {
                                 if !game.publisher.is_empty() {
                                     ui.label(&game.publisher);
                                 }
+                                if let Some(problem) = &game.problem {
+                                    ui.label(RichText::new(problem).color(Color32::from_rgb(230, 160, 80)));
+                                    return;
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(format!("{:016X}", game.program_id)).weak().monospace());
                                     if game.recompiled {
@@ -223,6 +227,9 @@ impl Menus {
                                     }
                                 });
                             });
+                            if game.problem.is_some() {
+                                return;
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button(RichText::new("▶ Play").size(15.0)).clicked() {
                                     actions.push(Action::Play(game.path.clone()));
