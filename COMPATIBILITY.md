@@ -1,6 +1,6 @@
 # Compatibility
 
-Games tested in Zakuro so far, as of v0.2.9. Recompiled means the game was tested with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which is how it runs at full speed; without it, it runs in the interpreter, slower.
+Games tested in Zakuro so far, as of v0.2.10. Recompiled means the game was tested with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which is how it runs at full speed; without it, it runs in the interpreter, slower.
 
 | Status | Meaning |
 |---|---|
@@ -30,6 +30,6 @@ Games tested in Zakuro so far, as of v0.2.9. Recompiled means the game was teste
 | Monster Hunter XX | 0004000000197100 | JPN | In-game | Yes | Runs, with bugs |
 | Yo-kai Watch | 0004000000167800 | EUR | Playable | Yes | Needs v0.2.7 or newer |
 | Fire Emblem Fates: Special Edition | 0004000000179800 | USA | In-game | Yes | Runs, with bugs |
-| Bloodstained: Curse of the Moon | 00040000001D3A00 | JPN | Playable | Yes | Needs a build newer than v0.2.9, it crashed while loading and ran slow at 4x before |
+| Bloodstained: Curse of the Moon | 00040000001D3A00 | JPN | Playable | Yes | Needs v0.2.10 or newer, it crashed while loading and ran slow at 4x before |
 
 Tested a game that isn't here, or found a problem with one that is? Tell us on the [Discord server](https://discord.gg/7dduXVv2xm) or open a [game report](https://github.com/fearkov/zakuro/issues/new?template=game-report.yml).
