@@ -16,12 +16,28 @@ void main() {
 }
 "#;
 
+// a screen bigger than the window shows it is averaged over every texel a
+// pixel covers, the way the Vulkan presenter does it.
 const FRAGMENT_SHADER: &str = r#"#version 330 core
 in vec2 uv;
 out vec4 color;
 uniform sampler2D screen;
 void main() {
-    color = vec4(texture(screen, uv).rgb, 1.0);
+    vec2 size = vec2(textureSize(screen, 0));
+    vec2 covered = fwidth(uv) * size;
+    if (max(covered.x, covered.y) <= 1.0) {
+        color = vec4(texture(screen, uv).rgb, 1.0);
+        return;
+    }
+    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < taps.y; y++) {
+        for (int x = 0; x < taps.x; x++) {
+            vec2 offset = ((vec2(x, y) + 0.5) / vec2(taps) - 0.5) * covered / size;
+            sum += texture(screen, uv + offset).rgb;
+        }
+    }
+    color = vec4(sum / float(taps.x * taps.y), 1.0);
 }
 "#;
 
