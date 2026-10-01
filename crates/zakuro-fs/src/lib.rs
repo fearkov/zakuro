@@ -54,6 +54,9 @@ pub enum FsError {
     #[error("malformed CIA: {0}")]
     BadCia(&'static str),
 
+    #[error("the RomFS can't be read, the dump is still partly encrypted or damaged: {0}")]
+    UnreadableRomFs(String),
+
     #[error("ExeFS has no .code section")]
     NoCode,
 
@@ -148,14 +151,12 @@ impl Title {
         let exefs_offset = ncch_offset + ncch.exefs_offset;
         let exefs = ExeFs::parse(&data[exefs_offset as usize..])?;
 
+        // a game reads its data from the RomFS, without one that reads it
+        // stops on its first file
         let romfs = if ncch.has_romfs() {
-            match RomFs::parse(data, ncch_offset + ncch.romfs_offset) {
-                Ok(fs) => Some(fs),
-                Err(e) => {
-                    log::warn!("failed to parse RomFS: {e}");
-                    None
-                }
-            }
+            let fs = RomFs::parse(data, ncch_offset + ncch.romfs_offset)
+                .map_err(|error| FsError::UnreadableRomFs(error.to_string()))?;
+            Some(fs)
         } else {
             None
         };

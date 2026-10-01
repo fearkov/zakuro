@@ -124,6 +124,7 @@ fn problem(error: &zakuro_fs::FsError) -> String {
     use zakuro_fs::FsError;
     match error {
         FsError::Encrypted(_) | FsError::EncryptedCia => "Encrypted, Zakuro needs a decrypted dump".to_owned(),
+        FsError::UnreadableRomFs(_) => "Partly encrypted or damaged, it needs dumping again".to_owned(),
         FsError::NotAGame(what) => {
             let mut what = what.to_string();
             if let Some(first) = what.get_mut(..1) {
