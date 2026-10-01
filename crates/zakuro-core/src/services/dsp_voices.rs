@@ -767,7 +767,7 @@ mod tests {
     /// samples between them filled in.
     #[test]
     fn pcm16_is_read_and_interpolated() {
-        let bytes: Vec<u8> = (0..400i16).flat_map(|i| (i * 100).to_le_bytes()).collect();
+        let bytes: Vec<u8> = (0..400i16).flat_map(|i| i.wrapping_mul(100).to_le_bytes()).collect();
         let mut memory = Samples(bytes);
         let mut voice = voice_with(&[(1, 400)]);
         voice.rate = 0.5;
