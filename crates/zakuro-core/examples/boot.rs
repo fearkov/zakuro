@@ -148,8 +148,13 @@ fn main() {
             });
         }
         let frame_start = std::time::Instant::now();
+        let faults = system.memory.fault_summary().len();
         outcome = system.run_frame();
         executed = frame + 1;
+        // when a new unmapped page is touched, which frame it was
+        if system.memory.fault_summary().len() != faults {
+            println!("frame {executed}: touched an unmapped page");
+        }
         if let Some(request) = system.keyboard_request() {
             let confirm = request.buttons.len() - 1;
             system.answer_keyboard(&typed, confirm);
