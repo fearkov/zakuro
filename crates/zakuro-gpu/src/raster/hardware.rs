@@ -256,6 +256,25 @@ impl Surface {
     }
 }
 
+/// how much a surface holds the latest of its memory, of those over the
+/// same rows, what the GPU drew and guest memory lacks first, then the
+/// taller, which titles draw a shorter buffer into the start of.
+fn newest(surface: &Surface) -> (bool, u32) {
+    (surface.dirty.is_some(), surface.height)
+}
+
+/// the rows of memory of a tiled surface a fill covers, when it covers some
+/// of its rows of tiles whole but not all of them.
+fn rows_filled(surface: &Surface, addr: u32, len: u32) -> Option<(u32, u32)> {
+    let row = surface.row_bytes() as u64;
+    let start = (addr as u64).max(surface.addr as u64) - surface.addr as u64;
+    let end = (addr as u64 + len as u64).min(surface.addr as u64 + surface.size() as u64);
+    let end = end.checked_sub(surface.addr as u64)?;
+    let whole = |offset: u64| offset.is_multiple_of(row * 8);
+    let partial = start > 0 || end < surface.size() as u64;
+    (surface.tiled && end > start && partial && whole(start) && whole(end)).then(|| ((start / row) as u32, (end / row) as u32))
+}
+
 /// where a pixel's bytes are in a buffer of guest memory, from its start.
 fn pixel_offset(tiled: bool, x: u32, y: u32, width: u32, bpp: u32) -> usize {
     if tiled {
@@ -803,6 +822,72 @@ impl Hardware {
 
     /// the surface for a guest buffer, matching guest memory over the rows
     /// of memory given, or all of them.
+    /// clears rows of memory of a surface to one pixel, on the GPU.
+    fn clear_rows(&mut self, index: usize, rows: (u32, u32), pixel: &[u8]) -> Result<(), String> {
+        let surface = &self.surfaces[index];
+        let (width, height, kind, view) = (surface.width, surface.height, surface.kind, surface.image.view);
+        let scale = self.scale;
+        self.begin()?;
+        self.end_rendering();
+        self.barrier();
+        let attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width: width * scale, height: height * scale } };
+        let info = vk::RenderingInfo::default().render_area(area).layer_count(1);
+        let (info, clear) = match kind {
+            Kind::Color(format) => {
+                let rgba = format.decode(pixel).map(|c| c as f32 / 255.0);
+                let clear = vk::ClearAttachment::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .color_attachment(0)
+                    .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: rgba } });
+                (info.color_attachments(&attachment), clear)
+            }
+            Kind::Depth(sample) => {
+                let (depth, stencil) = match sample {
+                    2 => (((u16::from_le_bytes([pixel[0], pixel[1]]) as u64 * 0xFF_FFFF + 0x7FFF) / 0xFFFF) as u32, 0),
+                    3 => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), 0),
+                    _ => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), pixel[3] as u32),
+                };
+                let value = vk::ClearDepthStencilValue { depth: depth as f32 / 16_777_215.0, stencil };
+                let clear = vk::ClearAttachment::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+                    .clear_value(vk::ClearValue { depth_stencil: value });
+                (info.depth_attachment(&attachment[0]).stencil_attachment(&attachment[0]), clear)
+            }
+        };
+        // rows of memory run down from the window's top, which is the
+        // image's last row
+        let rect = [vk::ClearRect::default()
+            .rect(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: ((height - rows.1) * scale) as i32 },
+                extent: vk::Extent2D { width: width * scale, height: (rows.1 - rows.0) * scale },
+            })
+            .layer_count(1)];
+        // SAFETY: recording, outside rendering, on an image in the general
+        // layout made to be rendered into, the rectangle inside it
+        unsafe {
+            self.device.cmd_begin_rendering(self.commands, &info);
+            self.device.cmd_clear_attachments(self.commands, &[clear], &rect);
+            self.device.cmd_end_rendering(self.commands);
+        }
+        self.uploads = true;
+        Ok(())
+    }
+
+    /// the height of the tallest surface of a kind at an address and width,
+    /// at least height, the one a draw of that height goes into.
+    fn taller(&self, addr: u32, kind: Kind, width: u32, height: u32) -> u32 {
+        self.surfaces
+            .iter()
+            .filter(|s| s.addr == addr && s.kind == kind && s.tiled && s.width == width)
+            .map(|s| s.height)
+            .fold(height, u32::max)
+    }
+
     fn surface_rows<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -1214,6 +1299,28 @@ impl Hardware {
         for index in 0..self.surfaces.len() {
             let surface = &self.surfaces[index];
             let size = surface.size() as usize;
+            if let Some(rows) = rows_filled(surface, addr, bytes.len() as u32) {
+                // whole rows of tiles of it, cleared on the GPU, the rest of
+                // what it drew stays there
+                let row = surface.row_bytes() as usize;
+                let at = (surface.addr as usize + rows.0 as usize * row) - addr as usize;
+                let filled = &bytes[at..at + (rows.1 - rows.0) as usize * row];
+                let bpp = surface.kind.bytes() as usize;
+                if filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
+                    let pixel = filled[..bpp].to_vec();
+                    let filled = filled.to_vec();
+                    self.clear_rows(index, rows, &pixel)?;
+                    let surface = &mut self.surfaces[index];
+                    let range = rows.0 as usize * row..rows.1 as usize * row;
+                    if let Some(shadow) = surface.shadow.get_mut(range) {
+                        shadow.copy_from_slice(&filled);
+                    }
+                    surface.replaced();
+                } else {
+                    self.surfaces[index].checked = false;
+                }
+                continue;
+            }
             if surface.addr < addr || surface.addr as u64 + size as u64 > end {
                 continue;
             }
@@ -1286,12 +1393,15 @@ impl Hardware {
 
     /// a fill is about to write a range, whatever the GPU drew over the part
     /// of a buffer it leaves alone has to come down first.
-    pub(crate) fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+    pub(crate) fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, width: u32) -> Result<(), String> {
         let end = addr as u64 + len as u64;
+        // whole rows of tiles get cleared on the GPU, when the pattern lines
+        // up with the pixels
+        let cleared = |s: &Surface| s.kind.bytes().is_multiple_of(width) && rows_filled(s, addr, len).is_some();
         let partial: Vec<usize> = (0..self.surfaces.len())
             .filter(|&i| {
                 let s = &self.surfaces[i];
-                s.dirty_overlaps(addr, len) && (s.addr < addr || s.addr as u64 + s.size() as u64 > end)
+                s.dirty_overlaps(addr, len) && (s.addr < addr || s.addr as u64 + s.size() as u64 > end) && !cleared(s)
             })
             .collect();
         if !partial.is_empty() {
@@ -1434,9 +1544,19 @@ impl Hardware {
         // the rows of memory the draw can touch, window rows run up from the
         // bottom of the buffer
         let rows = ((draw.height as i32 - top) as u32, (draw.height as i32 - bottom) as u32);
+        // titles draw both screens into one buffer, the bottom one into the
+        // start of the top one's memory. a taller buffer over the same memory
+        // takes the draw, its first rows of memory are the window's top rows,
+        // so the window goes up by the rows it lacks
+        let height = self.taller(draw.target, Kind::Color(draw.format), draw.width, draw.height);
+        let height = match draw.depth {
+            Some((addr, bytes)) if self.taller(addr, Kind::Depth(bytes), draw.width, draw.height) != height => draw.height,
+            _ => height,
+        };
+        let raise = (height - draw.height) as i32;
         // a flush looking one of them up drops what the other had checked
         let (color, depth) = loop {
-            let size = (draw.width, draw.height);
+            let size = (draw.width, height);
             let color = self.surface_rows(memory, draw.target, size, Kind::Color(draw.format), true, Some(rows))?;
             let depth = match draw.depth {
                 Some((addr, bytes)) => Some(self.surface_rows(memory, addr, size, Kind::Depth(bytes), true, Some(rows))?),
@@ -1446,6 +1566,7 @@ impl Hardware {
                 break (color, depth);
             }
         };
+        let (bottom, top) = (bottom + raise, top + raise);
 
         let mut views = [self.blank.view; 3];
         let mut samplers = [vk::Sampler::null(); 3];
@@ -1601,6 +1722,7 @@ impl Hardware {
             Geometry::Shaded(shading) => shading.viewport,
             Geometry::Triangles(_) => (0.0, 0.0, width, height),
         };
+        let y = y + raise as f32;
         let cull = match draw.geometry {
             Geometry::Shaded(shading) if shading.cull == 1 => vk::CullModeFlags::FRONT,
             Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::BACK,
@@ -1745,7 +1867,9 @@ impl Hardware {
             .surfaces
             .iter()
             .filter(|s| s.kind == input_kind && s.tiled && s.width == t.input_width)
-            .find_map(|s| Some((s.addr, (s.width, s.height), row_in(s)?)))
+            .filter_map(|s| Some((s, row_in(s)?)))
+            .max_by_key(|(s, _)| newest(s))
+            .map(|(s, row)| (s.addr, (s.width, s.height), row))
         else {
             return Ok(false);
         };
@@ -1832,14 +1956,15 @@ impl Hardware {
         };
         let kinds = [Some(Kind::Color(texture.format)), depth];
         let tile_rows = 8 * texture.width * Kind::Color(texture.format).bytes();
-        self.surfaces
-            .iter()
-            .position(|s| {
+        (0..self.surfaces.len())
+            .filter(|&i| {
+                let s = &self.surfaces[i];
                 kinds.contains(&Some(s.kind)) && s.tiled && s.width == texture.width && {
                     let offset = texture.addr.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0);
                     offset.is_some_and(|offset| offset / tile_rows * 8 + texture.height <= s.height)
                 }
             })
+            .max_by_key(|&i| newest(&self.surfaces[i]))
             .map(|index| (index, (texture.addr - self.surfaces[index].addr) / tile_rows * 8))
     }
 

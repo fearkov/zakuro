@@ -283,7 +283,7 @@ impl Gpu {
         let address = memory.translate(start);
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
-            if let Err(error) = hardware.before_fill(memory, address, length as u32) {
+            if let Err(error) = hardware.before_fill(memory, address, length as u32, if matches!(width, 2 | 3) { width } else { 4 }) {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
