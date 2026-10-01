@@ -23,9 +23,11 @@ Games tested in Zakuro so far, as of v0.2.9. Recompiled means the game was teste
 | Super Smash Bros. for Nintendo 3DS | 00040000000EDF00 | USA | Playable | Yes | |
 | The Legend of Zelda: Ocarina of Time 3D | 0004000000033500 | USA | Playable | Yes | |
 | The Legend of Zelda: Majora's Mask 3D | 0004000000125500 | USA | Playable | Yes | |
+| The Legend of Zelda: A Link Between Worlds | 00040000000EC300 | USA | Playable | Yes | |
 | Persona Q: Shadow of the Labyrinth | 0004000000123400 | USA | Playable | Yes | |
 | Animal Crossing: New Leaf | 0004000000086300 | USA | Playable | Yes | Needs v0.2.9 or newer, you got stuck, all black, after getting off the train before |
 | Monster Hunter 4 Ultimate | 0004000000126300 | USA | Playable | Yes | Needs v0.2.8 or newer, the screen stayed black before |
 | Yo-kai Watch | 0004000000167800 | EUR | Playable | Yes | Needs v0.2.7 or newer |
+| Fire Emblem Fates: Special Edition | 0004000000179800 | USA | In-game | Yes | Runs, with bugs |
 
 Tested a game that isn't here, or found a problem with one that is? Tell us on the [Discord server](https://discord.gg/7dduXVv2xm) or open a [game report](https://github.com/fearkov/zakuro/issues/new?template=game-report.yml).
