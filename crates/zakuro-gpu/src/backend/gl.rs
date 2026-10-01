@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use glow::HasContext;
 
-use super::{layout, Overlay, OverlayVertex, PresentError, Presenter, ScreenImage, Viewport};
+use super::{layout, Overlay, OverlayVertex, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
 
 const VERTEX_SHADER: &str = r#"#version 330 core
 // a single oversized triangle covers the viewport with no vertex buffer.
@@ -70,6 +70,7 @@ pub struct GlPresenter {
     /// tex_sub_image_2d when nothing changed.
     sizes: [(u32, u32); 2],
     window: (u32, u32),
+    arrangement: ScreenLayout,
 }
 
 impl GlPresenter {
@@ -133,6 +134,7 @@ impl GlPresenter {
             textures: [textures[0], textures[1]],
             sizes: [(0, 0); 2],
             window,
+            arrangement: ScreenLayout::default(),
         })
     }
 
@@ -217,12 +219,12 @@ impl Presenter for GlPresenter {
             }
         }
 
-        let (top_viewport, bottom_viewport) = layout(self.window.0, self.window.1);
+        let (top_viewport, bottom_viewport) = layout(self.window.0, self.window.1, self.arrangement);
         if !top.is_empty() {
             self.draw_screen(0, top_viewport);
         }
-        if !bottom.is_empty() {
-            self.draw_screen(1, bottom_viewport);
+        if let Some(viewport) = bottom_viewport.filter(|_| !bottom.is_empty()) {
+            self.draw_screen(1, viewport);
         }
 
         unsafe {
@@ -234,6 +236,10 @@ impl Presenter for GlPresenter {
 
     fn resize(&mut self, width: u32, height: u32) {
         self.window = (width.max(1), height.max(1));
+    }
+
+    fn set_layout(&mut self, arrangement: ScreenLayout) {
+        self.arrangement = arrangement;
     }
 }
 

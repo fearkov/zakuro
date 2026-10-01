@@ -6,7 +6,7 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::vulkan_overlay::OverlayPainter;
-use super::{layout, Overlay, PresentError, Presenter, ScreenImage, Viewport};
+use super::{layout, Overlay, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
@@ -77,6 +77,7 @@ pub struct VulkanPresenter {
     /// what is drawn over the screens, none only while being dropped.
     overlay: Option<OverlayPainter>,
     window: (u32, u32),
+    arrangement: ScreenLayout,
     /// set when the swapchain no longer matches the window.
     stale: bool,
 }
@@ -291,6 +292,7 @@ impl VulkanPresenter {
             screens,
             overlay: Some(overlay),
             window: size,
+            arrangement: ScreenLayout::default(),
             stale: false,
         };
 
@@ -554,8 +556,9 @@ impl VulkanPresenter {
                 self.pipeline,
             );
 
-            let (top, bottom) = layout(self.extent.width, self.extent.height);
-            for (screen, viewport) in self.screens.iter().zip([top, bottom]) {
+            let (top, bottom) = layout(self.extent.width, self.extent.height, self.arrangement);
+            for (screen, viewport) in self.screens.iter().zip([Some(top), bottom]) {
+                let Some(viewport) = viewport else { continue };
                 if !screen.initialized && !screen.dirty {
                     continue;
                 }
@@ -710,6 +713,10 @@ impl Presenter for VulkanPresenter {
     fn resize(&mut self, width: u32, height: u32) {
         self.window = (width.max(1), height.max(1));
         self.stale = true;
+    }
+
+    fn set_layout(&mut self, arrangement: ScreenLayout) {
+        self.arrangement = arrangement;
     }
 }
 

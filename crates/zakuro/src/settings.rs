@@ -7,12 +7,49 @@ use gilrs::Button;
 use serde::{Deserialize, Serialize};
 use winit::keyboard::KeyCode;
 use zakuro_core::services::hid::PadState;
+use zakuro_gpu::ScreenLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Renderer {
     Vulkan,
     OpenGl,
+}
+
+/// how the screens are arranged in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Screens {
+    #[default]
+    Stacked,
+    SideBySide,
+    TopOnly,
+}
+
+impl Screens {
+    pub const ALL: [Screens; 3] = [Screens::Stacked, Screens::SideBySide, Screens::TopOnly];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Screens::Stacked => "Top over bottom",
+            Screens::SideBySide => "Side by side",
+            Screens::TopOnly => "Top screen only",
+        }
+    }
+
+    pub fn screens(self) -> ScreenLayout {
+        match self {
+            Screens::Stacked => ScreenLayout::Stacked,
+            Screens::SideBySide => ScreenLayout::SideBySide,
+            Screens::TopOnly => ScreenLayout::TopOnly,
+        }
+    }
+
+    /// the one after it, going round.
+    pub fn next(self) -> Screens {
+        let at = Screens::ALL.iter().position(|&layout| layout == self).unwrap_or(0);
+        Screens::ALL[(at + 1) % Screens::ALL.len()]
+    }
 }
 
 /// the keys the console's buttons and circle pad are on.
@@ -176,6 +213,7 @@ pub struct Settings {
     pub recompiled: bool,
     /// window size, times the console's.
     pub scale: u32,
+    pub layout: Screens,
     /// 0 to 1.
     pub volume: f32,
     pub mute: bool,
@@ -197,6 +235,7 @@ impl Default for Settings {
             resolution: 3,
             recompiled: true,
             scale: 2,
+            layout: Screens::Stacked,
             volume: 1.0,
             mute: false,
             show_fps: false,
@@ -258,7 +297,8 @@ mod tests {
 
     #[test]
     fn settings_come_back_as_they_were_saved() {
-        let mut settings = Settings { games: Some("/games".into()), show_fps: true, ..Settings::default() };
+        let mut settings =
+            Settings { games: Some("/games".into()), show_fps: true, layout: Screens::TopOnly, ..Settings::default() };
         settings.keys.a = KeyCode::KeyK;
         settings.pad.a = Button::South;
         let text = toml::to_string_pretty(&settings).unwrap();
@@ -272,5 +312,15 @@ mod tests {
         assert_eq!(settings.keys.a, KeyCode::KeyK);
         assert_eq!(settings.keys.b, Keys::default().b);
         assert_eq!(settings.scale, 2);
+        assert_eq!(settings.layout, Screens::Stacked);
+    }
+
+    #[test]
+    fn layouts_go_round() {
+        let mut layout = Screens::Stacked;
+        for _ in 0..Screens::ALL.len() {
+            layout = layout.next();
+        }
+        assert_eq!(layout, Screens::Stacked);
     }
 }

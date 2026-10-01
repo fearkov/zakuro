@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{Keys, PadButtons, Renderer, Settings};
+use crate::settings::{Keys, PadButtons, Renderer, Screens, Settings};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +338,12 @@ impl Menus {
                 egui::Slider::new(&mut settings.resolution, 1..=4).text("Resolution").suffix("x"),
             );
             ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
+            egui::ComboBox::from_label("Screens").selected_text(settings.layout.name()).show_ui(ui, |ui| {
+                for layout in Screens::ALL {
+                    ui.selectable_value(&mut settings.layout, layout, layout.name());
+                }
+            });
+            ui.label(RichText::new("F9 switches them while playing. With the top screen alone there is nothing to touch.").weak());
             ui.label(RichText::new("The presenter changes the next time Zakuro starts, the 3D with the next game.").weak());
 
             ui.separator();

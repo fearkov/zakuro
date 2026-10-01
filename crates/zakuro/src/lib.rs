@@ -32,7 +32,7 @@ use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
 use recompile::{Job, Stage};
-use settings::{Renderer, Settings};
+use settings::{Renderer, Screens, Settings};
 
 pub use zakuro_core::recompiled::Linked;
 
@@ -59,6 +59,7 @@ pub fn run(linked: Option<Linked>) {
         keyboard: Keyboard::new(settings.keys.clone()),
         gamepads: gamepad::Gamepads::new(settings.pad.clone()),
         scale: options.scale.unwrap_or(settings.scale).max(1),
+        layout: settings.layout,
         options,
         settings,
         linked,
@@ -298,6 +299,8 @@ struct App {
     audio: Option<audio::Audio>,
     /// the window's size, times the console's.
     scale: u32,
+    /// how the screens are arranged.
+    layout: Screens,
     /// the left button is down, and where the pointer is, in window pixels.
     mouse_down: bool,
     cursor: (f32, f32),
@@ -327,7 +330,7 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let size = winit::dpi::LogicalSize::new(400 * self.scale, 480 * self.scale);
+        let size = self.window_size();
         let attributes = Window::default_attributes().with_title("Zakuro").with_inner_size(size);
         let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
             Renderer::Vulkan => RendererKind::Vulkan,
@@ -343,8 +346,9 @@ impl ApplicationHandler for App {
             Backend::create(event_loop, attributes, RendererKind::OpenGl)
         });
         match backend {
-            Ok((window, backend)) => {
+            Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
+                backend.set_layout(self.layout.screens());
                 self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
@@ -481,6 +485,10 @@ impl App {
                     self.paused = !self.paused;
                     log::info!("{}", if self.paused { "paused" } else { "resumed" });
                 }
+                KeyCode::F9 => {
+                    self.settings.layout = self.settings.layout.next();
+                    self.apply_settings();
+                }
                 KeyCode::F11 => self.toggle_fullscreen(),
                 _ => {}
             }
@@ -521,7 +529,12 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height);
+        let (_, bottom) = layout(size.width, size.height, self.layout.screens());
+        // with the top screen alone there is nothing to touch
+        let Some(bottom) = bottom else {
+            self.keyboard.touch(None);
+            return;
+        };
         let x = self.cursor.0 - bottom.x;
         let y = self.cursor.1 - bottom.y;
         let inside = x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height;
@@ -549,12 +562,23 @@ impl App {
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
         self.apply_volume();
-        if self.options.scale.is_none() && self.settings.scale.max(1) != self.scale {
-            self.scale = self.settings.scale.max(1);
+        let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
+        if scale != self.scale || self.settings.layout != self.layout {
+            self.scale = scale;
+            self.layout = self.settings.layout;
+            if let Some(backend) = &mut self.backend {
+                backend.set_layout(self.layout.screens());
+            }
             if let Some(window) = &self.window {
-                let _ = window.request_inner_size(winit::dpi::LogicalSize::new(400 * self.scale, 480 * self.scale));
+                let _ = window.request_inner_size(self.window_size());
             }
         }
+    }
+
+    /// the window size that fits the screens at the chosen scale.
+    fn window_size(&self) -> winit::dpi::LogicalSize<u32> {
+        let (width, height) = self.layout.screens().size();
+        winit::dpi::LogicalSize::new(width * self.scale, height * self.scale)
     }
 
     fn recompile(&mut self, index: usize) {

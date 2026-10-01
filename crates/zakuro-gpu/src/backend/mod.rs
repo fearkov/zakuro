@@ -73,16 +73,39 @@ pub struct Viewport {
     pub height: f32,
 }
 
-/// works out where the two screens go inside a window, keeping the 3DS's
-/// aspect ratio and centring the bottom screen under the top one.
-pub fn layout(window_width: u32, window_height: u32) -> (Viewport, Viewport) {
-    // the console is 400x240 over 320x240, so the combined image is 400x480.
-    const TOTAL_WIDTH: f32 = 400.0;
-    const TOTAL_HEIGHT: f32 = 480.0;
+/// how the screens are arranged in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScreenLayout {
+    /// the top screen over the bottom one, as on the console.
+    #[default]
+    Stacked,
+    /// next to each other, the top screen on the left.
+    SideBySide,
+    /// the top screen alone.
+    TopOnly,
+}
 
-    let scale = (window_width as f32 / TOTAL_WIDTH).min(window_height as f32 / TOTAL_HEIGHT);
-    let offset_x = (window_width as f32 - TOTAL_WIDTH * scale) / 2.0;
-    let offset_y = (window_height as f32 - TOTAL_HEIGHT * scale) / 2.0;
+impl ScreenLayout {
+    /// the size the screens take up together at the console's resolution.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            ScreenLayout::Stacked => (400, 480),
+            ScreenLayout::SideBySide => (720, 240),
+            ScreenLayout::TopOnly => (400, 240),
+        }
+    }
+}
+
+/// works out where the screens go inside a window, keeping the 3DS's
+/// aspect ratio and centring them. the bottom screen has no place when only
+/// the top one shows.
+pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout) -> (Viewport, Option<Viewport>) {
+    let (total_width, total_height) = arrangement.size();
+    let (total_width, total_height) = (total_width as f32, total_height as f32);
+
+    let scale = (window_width as f32 / total_width).min(window_height as f32 / total_height);
+    let offset_x = (window_width as f32 - total_width * scale) / 2.0;
+    let offset_y = (window_height as f32 - total_height * scale) / 2.0;
 
     let top = Viewport {
         x: offset_x,
@@ -90,12 +113,21 @@ pub fn layout(window_width: u32, window_height: u32) -> (Viewport, Viewport) {
         width: 400.0 * scale,
         height: 240.0 * scale,
     };
-    let bottom = Viewport {
+    let bottom = match arrangement {
         // the bottom screen is narrower, so it is centered under the top one.
-        x: offset_x + 40.0 * scale,
-        y: offset_y + 240.0 * scale,
-        width: 320.0 * scale,
-        height: 240.0 * scale,
+        ScreenLayout::Stacked => Some(Viewport {
+            x: offset_x + 40.0 * scale,
+            y: offset_y + 240.0 * scale,
+            width: 320.0 * scale,
+            height: 240.0 * scale,
+        }),
+        ScreenLayout::SideBySide => Some(Viewport {
+            x: offset_x + 400.0 * scale,
+            y: offset_y,
+            width: 320.0 * scale,
+            height: 240.0 * scale,
+        }),
+        ScreenLayout::TopOnly => None,
     };
     (top, bottom)
 }
@@ -121,6 +153,9 @@ pub trait Presenter {
 
     /// the window changed size.
     fn resize(&mut self, width: u32, height: u32);
+
+    /// how the screens are arranged from the next frame on.
+    fn set_layout(&mut self, arrangement: ScreenLayout);
 }
 
 #[cfg(test)]
@@ -130,7 +165,8 @@ mod tests {
     #[test]
     fn layout_keeps_the_aspect_ratio_and_centers() {
         // a window exactly 400x480 needs no scaling or offset.
-        let (top, bottom) = layout(400, 480);
+        let (top, bottom) = layout(400, 480, ScreenLayout::Stacked);
+        let bottom = bottom.unwrap();
         assert_eq!(top.x, 0.0);
         assert_eq!(top.y, 0.0);
         assert_eq!(top.width, 400.0);
@@ -139,13 +175,28 @@ mod tests {
         assert_eq!(bottom.width, 320.0);
 
         // doubling both dimensions doubles the scale.
-        let (top, _) = layout(800, 960);
+        let (top, _) = layout(800, 960, ScreenLayout::Stacked);
         assert_eq!(top.width, 800.0);
         assert_eq!(top.height, 480.0);
 
         // a window that is too wide letterboxes horizontally.
-        let (top, _) = layout(1000, 480);
+        let (top, _) = layout(1000, 480, ScreenLayout::Stacked);
         assert_eq!(top.width, 400.0);
         assert_eq!(top.x, 300.0);
+    }
+
+    #[test]
+    fn the_other_layouts_place_the_screens_their_way() {
+        // side by side, the bottom screen starts where the top one ends
+        let (top, bottom) = layout(1440, 480, ScreenLayout::SideBySide);
+        let bottom = bottom.unwrap();
+        assert_eq!((top.x, top.y, top.width), (0.0, 0.0, 800.0));
+        assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (800.0, 0.0, 640.0, 480.0));
+
+        // the top screen alone fills a window of its shape, and a taller
+        // one centers it
+        let (top, bottom) = layout(800, 960, ScreenLayout::TopOnly);
+        assert!(bottom.is_none());
+        assert_eq!((top.x, top.y, top.width, top.height), (0.0, 240.0, 800.0, 480.0));
     }
 }
