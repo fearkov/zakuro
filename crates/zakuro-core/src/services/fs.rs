@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use zakuro_common::result::{errors, ResultCode};
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
+use crate::kernel::thread::nanos_to_ticks;
 use crate::services::host_archive::{self, DirectoryEntry, FormatInfo, HostArchive};
 use crate::kernel::object::{ClientSession, KObject};
 use crate::services::Target;
@@ -741,6 +742,9 @@ fn file_command(
             buffer.set(&mut system.memory, 2, read);
             buffer.set(&mut system.memory, 3, (size << 4) | 0xC);
             buffer.set(&mut system.memory, 4, dest);
+            // the thread waits as long as the console would take
+            let tick = system.cpu.cycles;
+            system.kernel.sleep_current(nanos_to_ticks(read_delay(read)), tick);
             true
         }
         // write(offset u64, size, flags, <mapped buffer>)
@@ -1036,6 +1040,15 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
             None
         }
     }
+}
+
+/// how long a read of length bytes takes on the console, in nanoseconds,
+/// the numbers Citra measured reading a game card on an Old 3DS. titles
+/// that load on a worker thread count on their other threads getting
+/// ahead meanwhile, Animal Crossing runs out of memory when a load is
+/// done before it asks.
+fn read_delay(length: u32) -> u64 {
+    (u64::from(length) * 94 + 582_778).max(663_124)
 }
 
 fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u32) -> u32 {
