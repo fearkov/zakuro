@@ -307,11 +307,13 @@ fn map_memory_block(system: &mut System) {
 
     let (paddr, size) = (block.paddr, block.size);
     let addr = if addr == 0 {
-        // let the kernel choose, stack the block after whatever is already in
-        // the shared memory region.
-        let base = SHARED_MEMORY_VADDR;
-        let mut candidate = base;
-        while system.memory.mapping_at(candidate).is_some() {
+        // let the kernel choose, the first place in the shared memory region
+        // the whole block fits, a big one mapped over the next block along
+        // would hide it
+        let pages = size.div_ceil(PAGE_SIZE);
+        let free = |at: u32| (0..pages).all(|page| system.memory.mapping_at(at + page * PAGE_SIZE).is_none());
+        let mut candidate = SHARED_MEMORY_VADDR;
+        while !free(candidate) {
             candidate += PAGE_SIZE;
         }
         candidate
