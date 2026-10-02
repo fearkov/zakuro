@@ -19,11 +19,10 @@ use super::{Op, Operand, Program, ShaderUnit, PROGRAM_SIZE};
 /// the semantics shade.vert's main reads, one per output component.
 pub(crate) const SEMANTICS: usize = 24;
 
-/// executed instructions after which shade.vert gives up on a program.
-/// the translation counts them a run at a time, so a program running that
-/// long can stop a few instructions later than interpreted. that takes one
-/// that never ends, or loops in loops tens of thousands of times for every
-/// vertex, which the console's GPU could never keep up with either.
+/// executed instructions after which shade.vert gives up on a program. the
+/// translation counts a run's at its start, and stops a run that crosses
+/// the limit before it writes an output shade.vert would not have, what it
+/// ran past the limit until then only touching what no one reads after.
 const BUDGET: u32 = 0x10000;
 
 /// the address an end sends execution to, past any block's end.
@@ -238,7 +237,15 @@ impl<'a> Translator<'a> {
             let (length, body, exit) = (run.length(), run.body.clone(), run.exit);
             let _ = writeln!(out, "        case {start}u:");
             let _ = writeln!(out, "            budget += {length}u;");
-            for address in body {
+            for (i, address) in (0u32..).zip(body) {
+                // shade.vert runs instruction i of the run only while the
+                // budget before the run plus i is under the limit
+                let op = &self.ops[address as usize];
+                if i > 0 && op.opcode.writes() && op.destination < 0x10 {
+                    let _ = writeln!(out, "            if (budget >= {}u) {{", BUDGET + length - i);
+                    out.push_str("                return;\n");
+                    out.push_str("            }\n");
+                }
                 self.instruction(out, address, "            ");
             }
             match exit {

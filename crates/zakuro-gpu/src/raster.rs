@@ -2688,6 +2688,25 @@ mod tests {
         });
     }
 
+    /// programs that run on until the interpreter gives up on them, a body
+    /// writing the color repeated by a jump back, stop at the same
+    /// instruction translated, however long the body, so the color comes
+    /// out the same to the bit.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn programs_that_never_end_draw_like_the_interpreter() {
+        draws_like_the_interpreter(60, 60, 23, |random| {
+            let body = 1 + random.next() % 9;
+            let mut program = vec![0x13 << 26];
+            program.extend((0..body).map(|_| random.arithmetic()));
+            // back to the body's start when its boolean says so, which half
+            // the time is always
+            program.push((0x2D << 26) | ((random.next() % 16) << 22) | (1 << 10) | (random.next() % 2));
+            program.push(0x22 << 26);
+            program
+        });
+    }
+
     /// programs laid out the way the SDK's compiler lays them out, a main
     /// part calling subroutines after its end, each running into the next
     /// one where its call ends it, with ifs, loops, breaks and calls of
