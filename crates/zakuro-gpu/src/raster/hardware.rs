@@ -354,8 +354,6 @@ struct Capture {
     pictures: VecDeque<(u64, Arc<Vec<u8>>)>,
 }
 
-/// a batch's command buffer, the fence the GPU signals once done with it and
-/// the ring it stages in.
 /// kinds of work the GPU does, to tell where its time goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
@@ -367,9 +365,18 @@ enum Work {
     Capture,
     Copy,
     Download,
+    Barrier,
 }
 
-const WORK_NAMES: [&str; 8] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download"];
+const WORK_NAMES: [&str; 9] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download", "barrier"];
+
+/// what the pipeline statistics count, in the order the results come.
+const STATISTICS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFlags::from_raw(
+    vk::QueryPipelineStatisticFlags::VERTEX_SHADER_INVOCATIONS.as_raw()
+        | vk::QueryPipelineStatisticFlags::CLIPPING_PRIMITIVES.as_raw()
+        | vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS.as_raw()
+        | vk::QueryPipelineStatisticFlags::COMPUTE_SHADER_INVOCATIONS.as_raw(),
+);
 /// timestamps a batch can take.
 const TIMESTAMPS: u32 = 4096;
 /// batches the times are added up over before they are logged.
@@ -384,12 +391,20 @@ struct Timing {
     pools: HashMap<vk::CommandBuffer, (vk::QueryPool, Vec<Work>)>,
     current: Work,
     /// milliseconds per kind of work.
-    totals: [f64; 8],
+    totals: [f64; WORK_NAMES.len()],
     batches: u32,
     barriers: u64,
     renderings: u64,
+    draws: u64,
+    /// each command buffer's pipeline statistics, when the device keeps
+    /// them, and the vertices, primitives past clipping, fragments and
+    /// compute invocations they added up to.
+    statistics: Option<HashMap<vk::CommandBuffer, vk::QueryPool>>,
+    counts: [u64; 4],
 }
 
+/// a batch's command buffer, the fence the GPU signals once done with it and
+/// the ring it stages in.
 struct Frame {
     commands: vk::CommandBuffer,
     fence: vk::Fence,
@@ -910,8 +925,12 @@ pub struct Hardware {
     /// whether the GPU can blit both surface formats, which scaling needs.
     blits: bool,
     timing: Option<Timing>,
-    barriers: std::cell::Cell<u64>,
+    barriers: u64,
+    /// whether anything that writes memory was recorded since the last
+    /// barrier, without which another one adds nothing.
+    unfenced: bool,
     renderings: u64,
+    draws: u64,
     /// the pipelines compiled before, kept on disk between runs, so a
     /// combination of fragment stages seen once does not stall again.
     pipeline_cache: vk::PipelineCache,
@@ -945,8 +964,14 @@ impl Hardware {
         let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
         let extensions = [ash::khr::push_descriptor::NAME.as_ptr()];
         // SAFETY: as above
-        let logic_ops = unsafe { instance.get_physical_device_features(physical) }.logic_op == vk::TRUE;
-        let features = vk::PhysicalDeviceFeatures::default().depth_clamp(true).logic_op(logic_ops);
+        let supported = unsafe { instance.get_physical_device_features(physical) };
+        let logic_ops = supported.logic_op == vk::TRUE;
+        // what the GPU shades counted along with its times
+        let statistics = std::env::var_os("ZAKURO_GPU_TIMES").is_some() && supported.pipeline_statistics_query == vk::TRUE;
+        let features = vk::PhysicalDeviceFeatures::default()
+            .depth_clamp(true)
+            .logic_op(logic_ops)
+            .pipeline_statistics_query(statistics);
         // the cache control, to make a pipeline only when the cache on disk
         // has it, every Vulkan 1.3 device does
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -1104,13 +1129,18 @@ impl Hardware {
                         period: properties.limits.timestamp_period as f64,
                         pools: HashMap::new(),
                         current: Work::Other,
-                        totals: [0.0; 8],
+                        totals: [0.0; WORK_NAMES.len()],
                         batches: 0,
                         barriers: 0,
                         renderings: 0,
+                        draws: 0,
+                        statistics: statistics.then(HashMap::new),
+                        counts: [0; 4],
                     }),
-                barriers: std::cell::Cell::new(0),
+                barriers: 0,
+                unfenced: true,
                 renderings: 0,
+                draws: 0,
                 pipeline_cache,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
@@ -1286,6 +1316,7 @@ impl Hardware {
             self.recording = true;
             self.start_timing()?;
             // the batch before may still be running
+            self.unfenced = true;
             self.barrier();
         }
         Ok(())
@@ -1314,6 +1345,26 @@ impl Hardware {
             self.device.cmd_reset_query_pool(commands, pool, 0, TIMESTAMPS);
             self.device.cmd_write_timestamp2(commands, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 0);
         }
+        if let Some(statistics) = &mut timing.statistics {
+            let pool = match statistics.get(&commands) {
+                Some(&pool) => pool,
+                None => {
+                    let info = vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::PIPELINE_STATISTICS)
+                        .query_count(1)
+                        .pipeline_statistics(STATISTICS);
+                    // SAFETY: a pool of ours, made once per command buffer
+                    let pool = unsafe { self.device.create_query_pool(&info, None) }.map_err(vk_error("create a query pool"))?;
+                    statistics.insert(commands, pool);
+                    pool
+                }
+            };
+            // SAFETY: recording, outside rendering, ended before submitting
+            unsafe {
+                self.device.cmd_reset_query_pool(commands, pool, 0, 1);
+                self.device.cmd_begin_query(commands, pool, 0, vk::QueryControlFlags::empty());
+            }
+        }
         Ok(())
     }
 
@@ -1337,8 +1388,9 @@ impl Hardware {
 
     /// adds up a finished batch's times, and logs them every so many.
     fn add_times(&mut self, commands: vk::CommandBuffer) -> Result<(), String> {
-        let barriers = self.barriers.take();
+        let barriers = std::mem::take(&mut self.barriers);
         let renderings = std::mem::take(&mut self.renderings);
+        let draws = std::mem::take(&mut self.draws);
         let Some(timing) = &mut self.timing else { return Ok(()) };
         let Some((pool, marks)) = timing.pools.get_mut(&commands) else { return Ok(()) };
         if !marks.is_empty() {
@@ -1354,8 +1406,21 @@ impl Hardware {
             }
             marks.clear();
         }
+        if let Some(&pool) = timing.statistics.as_ref().and_then(|statistics| statistics.get(&commands)) {
+            let mut values = [[0u64; 4]];
+            // SAFETY: the batch finished, its fence was waited for
+            unsafe {
+                self.device
+                    .get_query_pool_results(pool, 0, &mut values, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
+                    .map_err(vk_error("read pipeline statistics"))?;
+            }
+            for (count, value) in timing.counts.iter_mut().zip(values[0]) {
+                *count += value;
+            }
+        }
         timing.barriers += barriers;
         timing.renderings += renderings;
+        timing.draws += draws;
         timing.batches += 1;
         if timing.batches == TIMED_BATCHES {
             let total: f64 = timing.totals.iter().sum();
@@ -1365,31 +1430,54 @@ impl Hardware {
                 .filter(|&(_, ms)| ms > 0.0)
                 .map(|(name, ms)| format!("{name} {ms:.1}"))
                 .collect();
+            let shaded = match timing.statistics {
+                Some(_) => {
+                    let millions = timing.counts.map(|count| count as f64 / 1e6);
+                    format!(
+                        ", shaded {:.2}M vertices, {:.2}M primitives, {:.2}M fragments, {:.2}M compute",
+                        millions[0], millions[1], millions[2], millions[3]
+                    )
+                }
+                None => String::new(),
+            };
             log::info!(
                 target: "zakuro_gpu::times",
-                "GPU over {TIMED_BATCHES} batches: {total:.1} ms, {}, {} barriers, {} render passes",
+                "GPU over {TIMED_BATCHES} batches: {total:.1} ms, {}, {} barriers, {} render passes, {} draws{shaded}",
                 parts.join(", "),
                 timing.barriers,
-                timing.renderings
+                timing.renderings,
+                timing.draws
             );
-            timing.totals = [0.0; 8];
+            timing.totals = [0.0; WORK_NAMES.len()];
             timing.batches = 0;
             timing.barriers = 0;
             timing.renderings = 0;
+            timing.draws = 0;
+            timing.counts = [0; 4];
         }
         Ok(())
     }
 
-    /// makes everything recorded so far visible to everything after it.
-    fn barrier(&self) {
+    /// makes everything recorded so far visible to everything after it,
+    /// unless nothing was recorded since the last time.
+    fn barrier(&mut self) {
+        if !std::mem::take(&mut self.unfenced) {
+            return;
+        }
         let barrier = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
-        self.barriers.set(self.barriers.get() + 1);
+        self.barriers += 1;
+        // what it takes is timed on its own, then the work before goes on
+        let work = self.timing.as_ref().map(|timing| timing.current);
+        self.mark(Work::Barrier, false);
         // SAFETY: recording is on whenever this is called
         unsafe { self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
+        if let Some(work) = work {
+            self.mark(work, false);
+        }
     }
 
     fn end_rendering(&mut self) {
@@ -1480,6 +1568,7 @@ impl Hardware {
         // SAFETY: recording, outside rendering, on an image in the general
         // layout made to be rendered into, the rectangle inside it
         unsafe {
+            self.unfenced = true;
             self.device.cmd_begin_rendering(self.commands, &info);
             self.device.cmd_clear_attachments(self.commands, &[clear], &rect);
             self.device.cmd_end_rendering(self.commands);
@@ -1612,6 +1701,7 @@ impl Hardware {
                 let regions = [region(offset, vk::ImageAspectFlags::COLOR)];
                 // SAFETY: recording, and the regions lie inside the ring
                 unsafe {
+                    self.unfenced = true;
                     self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image, vk::ImageLayout::GENERAL, &regions)
                 };
             }
@@ -1646,6 +1736,7 @@ impl Hardware {
                 let regions = [region(depths, vk::ImageAspectFlags::DEPTH), region(stencils, vk::ImageAspectFlags::STENCIL)];
                 // SAFETY: as above
                 unsafe {
+                    self.unfenced = true;
                     self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image, vk::ImageLayout::GENERAL, &regions)
                 };
             }
@@ -1661,7 +1752,7 @@ impl Hardware {
 
     /// records a blit between a scaled surface and its image at the
     /// console's resolution, up or down, taking the nearest pixel either way.
-    fn blit(&self, index: usize, up: bool) {
+    fn blit(&mut self, index: usize, up: bool) {
         let s = &self.surfaces[index];
         let Some(native) = &s.native else { return };
         let aspect = match s.kind {
@@ -1682,6 +1773,7 @@ impl Hardware {
         // SAFETY: recording, outside rendering, between two images of the
         // surface's format in the general layout made for transfers
         unsafe {
+            self.unfenced = true;
             self.device.cmd_blit_image(
                 self.commands,
                 from,
@@ -1722,6 +1814,7 @@ impl Hardware {
             .image_extent(vk::Extent3D { width: bound.width, height: bound.height, depth: 1 })];
         // SAFETY: recording, the region lies inside the ring and the image
         unsafe {
+            self.unfenced = true;
             self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image.image, vk::ImageLayout::GENERAL, &regions)
         };
         self.uploads = true;
@@ -1931,6 +2024,7 @@ impl Hardware {
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
                             .level_count(1)
                             .layer_count(1)];
+                        self.unfenced = true;
                         self.device.cmd_clear_color_image(self.commands, image, vk::ImageLayout::GENERAL, &color, &range);
                     }
                     Kind::Depth(sample) => {
@@ -1947,6 +2041,7 @@ impl Hardware {
                             .aspect_mask(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
                             .level_count(1)
                             .layer_count(1)];
+                        self.unfenced = true;
                         self.device.cmd_clear_depth_stencil_image(self.commands, image, vk::ImageLayout::GENERAL, &value, &range);
                     }
                 }
@@ -2515,6 +2610,7 @@ impl Hardware {
             device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
             device.cmd_set_blend_constants(commands, &constant);
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &writes);
+            self.draws += 1;
             match vertex_infos {
                 Some(infos) => {
                     device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, vk::IndexType::UINT32);
@@ -2551,6 +2647,7 @@ impl Hardware {
         }
         // SAFETY: recording, outside rendering, with images in the general
         // layout
+        self.unfenced = true;
         unsafe { self.device.cmd_begin_rendering(self.commands, &info) };
         self.rendering = Some((color, depth));
     }
@@ -2674,6 +2771,7 @@ impl Hardware {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            self.unfenced = true;
             self.device.cmd_dispatch(self.commands, size.0.div_ceil(8), size.1.div_ceil(8), 1);
         }
         Ok(())
@@ -2795,11 +2893,13 @@ impl Hardware {
         // barrier before the shader reads it
         unsafe {
             let image = self.surfaces[source].image.image;
+            self.unfenced = true;
             self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, samples, &regions);
             self.barrier();
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
+            self.unfenced = true;
             self.device.cmd_dispatch(self.commands, texture_width.div_ceil(8), texture_height.div_ceil(8), 1);
         }
         Ok(())
@@ -2835,6 +2935,7 @@ impl Hardware {
         // SAFETY: recording, outside rendering, into a buffer the size of
         // the image, which the host reads only once this batch is done
         unsafe {
+            self.unfenced = true;
             self.device.cmd_copy_image_to_buffer(self.commands, source, vk::ImageLayout::GENERAL, capture.buffer.buffer, &region);
             self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
         }
@@ -2884,6 +2985,7 @@ impl Hardware {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
+            self.unfenced = true;
             self.device.cmd_dispatch(self.commands, width.div_ceil(8), height.div_ceil(8), 1);
             self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
         }
@@ -3099,6 +3201,10 @@ impl Hardware {
         }
         self.end_rendering();
         self.mark(Work::Other, true);
+        if let Some(&pool) = self.timing.as_ref().and_then(|timing| timing.statistics.as_ref()?.get(&self.commands)) {
+            // SAFETY: begun when the batch began, outside rendering
+            unsafe { self.device.cmd_end_query(self.commands, pool, 0) };
+        }
         self.retire_finished()?;
         if self.free.is_empty() {
             self.retire_oldest()?;
@@ -3292,6 +3398,7 @@ impl Hardware {
             let image = s.native.as_ref().unwrap_or(&s.image).image;
             // SAFETY: recording, outside rendering, into a buffer big enough
             // for every region
+            self.unfenced = true;
             unsafe { self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, readback, &regions) };
             offsets.push(offset);
             offset += size_of(s);
