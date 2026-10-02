@@ -1,4 +1,5 @@
-//! the vertex shader run over several vertices at once, one lane each, so
+//! the vertex and geometry shaders run over several vertices or primitives
+//! at once, one lane each, so
 //! that every instruction works through all of them together with vector
 //! instructions. a lane computes exactly what the interpreter computes for
 //! its vertex, operation for operation, and the rare operations run lane by
@@ -39,6 +40,29 @@ const ALL: u8 = u8::MAX;
 /// the output registers of lanes that went their own way at a branch.
 type Fork = (u8, [Wide; OUTPUT_REGISTERS]);
 
+/// one emitted triangle, as each vertex's output registers.
+pub(super) type Triangle = [[Vec4; OUTPUT_REGISTERS]; 3];
+
+/// what the lanes of a geometry shader emit, each its own vertices and
+/// triangles, the way the interpreter's emitter keeps them for one.
+pub(super) struct Emitters {
+    slot: [usize; LANES],
+    completes: [bool; LANES],
+    slots: [Triangle; LANES],
+    pub(super) triangles: [Vec<Triangle>; LANES],
+}
+
+impl Emitters {
+    pub(super) fn new() -> Emitters {
+        Emitters {
+            slot: [0; LANES],
+            completes: [false; LANES],
+            slots: [[[[0.0; 4]; OUTPUT_REGISTERS]; 3]; LANES],
+            triangles: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+}
+
 /// shades up to LANES vertices, writing their output registers.
 pub(super) fn run(
     unit: &ShaderUnit,
@@ -49,6 +73,47 @@ pub(super) fn run(
     forks: &mut Vec<Fork>,
 ) {
     debug_assert!(!inputs.is_empty() && inputs.len() <= LANES);
+    let mut batch = start(program, inputs);
+    blocks.clear();
+    forks.clear();
+    let finished = execute(unit, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, None);
+    forks.push((finished, batch.output));
+    // each lane's outputs from the copy it finished in. the registers
+    // nothing writes stay zero, as they come
+    for (lanes, registers) in forks.iter() {
+        for register in (0..OUTPUT_REGISTERS).filter(|register| program.outputs & (1 << register) != 0) {
+            for component in 0..4 {
+                let values = registers[register][component].to_array();
+                for (lane, output) in outputs.iter_mut().enumerate() {
+                    if lanes & (1 << lane) != 0 {
+                        output[register][component] = values[lane];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// runs the geometry shader over up to LANES primitives' inputs, each
+/// lane's triangles going in its emitter. lanes past the last primitive
+/// repeat it and what they emit is theirs to drop.
+pub(super) fn run_geometry(
+    unit: &ShaderUnit,
+    program: &Program,
+    inputs: &[[Vec4; INPUT_REGISTERS]],
+    emitters: &mut Emitters,
+    blocks: &mut Vec<Block>,
+    forks: &mut Vec<Fork>,
+) {
+    debug_assert!(!inputs.is_empty() && inputs.len() <= LANES);
+    let mut batch = start(program, inputs);
+    blocks.clear();
+    forks.clear();
+    execute(unit, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, Some(emitters));
+}
+
+/// a batch with the inputs in its lanes and everything else zero.
+fn start(program: &Program, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Batch {
     let mut batch = Batch {
         input: [ZERO; INPUT_REGISTERS],
         output: [ZERO; OUTPUT_REGISTERS],
@@ -66,22 +131,25 @@ pub(super) fn run(
             *row = f32x8::from(lanes);
         }
     }
-    blocks.clear();
-    forks.clear();
-    let finished = execute(unit, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL);
-    forks.push((finished, batch.output));
-    // each lane's outputs from the copy it finished in. the registers
-    // nothing writes stay zero, as they come
-    for (lanes, registers) in forks.iter() {
-        for register in (0..OUTPUT_REGISTERS).filter(|register| program.outputs & (1 << register) != 0) {
-            for component in 0..4 {
-                let values = registers[register][component].to_array();
-                for (lane, output) in outputs.iter_mut().enumerate() {
-                    if lanes & (1 << lane) != 0 {
-                        output[register][component] = values[lane];
-                    }
-                }
+    batch
+}
+
+/// each active lane's output registers into its emitter's slot, a
+/// triangle out when the slot completes one.
+fn emit(batch: &Batch, program: &Program, active: u8, emitters: &mut Emitters) {
+    for register in (0..OUTPUT_REGISTERS).filter(|register| program.outputs & (1 << register) != 0) {
+        for component in 0..4 {
+            let values = batch.output[register][component].to_array();
+            for lane in (0..LANES).filter(|lane| active & (1 << lane) != 0) {
+                let slot = emitters.slot[lane];
+                emitters.slots[lane][slot][register][component] = values[lane];
             }
+        }
+    }
+    for lane in (0..LANES).filter(|lane| active & (1 << lane) != 0) {
+        if emitters.completes[lane] {
+            let triangle = emitters.slots[lane];
+            emitters.triangles[lane].push(triangle);
         }
     }
 }
@@ -100,6 +168,7 @@ fn execute(
     mut pc: u32,
     mut budget: u32,
     mut active: u8,
+    mut emitters: Option<&mut Emitters>,
 ) -> u8 {
     // where uniforms go to be read like registers
     let mut scratch = [ZERO; 3];
@@ -128,8 +197,24 @@ fn execute(
         let op = &program.ops[pc as usize];
         match op.opcode {
             OpCode::End => break,
-            // a vertex shader has nothing to emit to
-            OpCode::Nop | OpCode::SetEmit | OpCode::Emit => pc += 1,
+            OpCode::Nop => pc += 1,
+            // what a vertex shader runs has nothing to emit to
+            OpCode::SetEmit => {
+                if let Some(emitters) = emitters.as_deref_mut() {
+                    let (slot, completes) = (op.instruction.emit_vertex().min(2), op.instruction.emit_primitive());
+                    for lane in (0..LANES).filter(|lane| active & (1 << lane) != 0) {
+                        emitters.slot[lane] = slot;
+                        emitters.completes[lane] = completes;
+                    }
+                }
+                pc += 1;
+            }
+            OpCode::Emit => {
+                if let Some(emitters) = emitters.as_deref_mut() {
+                    emit(batch, program, active, emitters);
+                }
+                pc += 1;
+            }
             OpCode::Mad | OpCode::MadI => {
                 let [sa, sb, sc] = &mut scratch;
                 let a = operand(unit, batch, &op.sources[0], sa);
@@ -170,7 +255,8 @@ fn execute(
                     let mut copy = batch.clone();
                     let mut copy_blocks = blocks.clone();
                     let next = branch(op, pc, false, &mut copy_blocks);
-                    let finished = execute(unit, program, &mut copy, &mut copy_blocks, forks, next, budget, others);
+                    let finished =
+                        execute(unit, program, &mut copy, &mut copy_blocks, forks, next, budget, others, emitters.as_deref_mut());
                     forks.push((finished, copy.output));
                     active = taken;
                 }

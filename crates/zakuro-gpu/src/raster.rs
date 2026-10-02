@@ -12,7 +12,7 @@ use crate::lighting::{Lighting, Tables};
 #[cfg(feature = "vulkan")]
 pub(crate) mod hardware;
 use crate::texture::TextureFormat;
-use crate::shader::{self, ShaderState, ShaderUnit, Vec4};
+use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
 
 /// reads a float24-encoded viewport register.
@@ -477,20 +477,22 @@ fn geometry_stage(
     let per_invocation = ((registers[REG_GS_BLOCK + SHADER_INPUT_CONFIG] & 0xF) + 1) as usize;
     let output_mask = registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK];
 
+    // every invocation's inputs, then all of them through the shader in
+    // batches
     let mut pending: Vec<Vec4> = Vec::with_capacity(16);
-    let mut vertices = Vec::new();
+    let mut invocations = Vec::new();
     for outputs in vertex_outputs {
         pending.extend_from_slice(&outputs[..per_vertex]);
         if pending.len() < per_invocation {
             continue;
         }
-        let mut state = ShaderState::new();
-        state.input = map_inputs(registers, REG_GS_BLOCK, &pending[..per_invocation]);
+        invocations.push(map_inputs(registers, REG_GS_BLOCK, &pending[..per_invocation]));
         pending.clear();
+    }
+    let emitted = shader::run_geometry_many(unit, &invocations);
 
-        let mut emitter = shader::Emitter::default();
-        let input = state.input;
-        shader::run_geometry(unit, &mut state, &mut emitter);
+    let mut vertices = Vec::new();
+    for (input, triangles) in invocations.iter().zip(&emitted) {
         if vertices.is_empty() && log::log_enabled!(log::Level::Trace) {
             let used_uniforms = unit.float_uniforms.iter().filter(|u| **u != shader::ZERO).count();
             log::trace!(
@@ -505,11 +507,11 @@ fn geometry_stage(
                 unit.bool_uniforms,
                 unit.int_uniforms,
                 &input[..per_invocation.min(4)],
-                emitter.triangles.first().map(|t| &t[0][..4]),
-                emitter.triangles.len(),
+                triangles.first().map(|t| &t[0][..4]),
+                triangles.len(),
             );
         }
-        for triangle in &emitter.triangles {
+        for triangle in triangles {
             for outputs in triangle {
                 vertices.push(to_vertex(map, &pack_outputs(outputs, output_mask)));
             }

@@ -412,6 +412,39 @@ pub fn run(unit: &ShaderUnit, state: &mut ShaderState) {
     }
 }
 
+/// runs a geometry shader over many primitives' inputs, a batch of them
+/// at a time, giving each one's triangles in order, what running it on
+/// each would give.
+pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<Vec<batch::Triangle>> {
+    let decoded;
+    let program = match &unit.decoded {
+        Some(program) => program.as_ref(),
+        None => {
+            decoded = Program::decode(unit);
+            &decoded
+        }
+    };
+    let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
+    let mut triangles = Vec::with_capacity(inputs.len());
+    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    for inputs in inputs.chunks(batch::LANES) {
+        if trace_nan {
+            for input in inputs {
+                let mut state = ShaderState::new();
+                state.input = *input;
+                let mut emitter = Emitter::default();
+                execute(unit, program, &mut state, Some(&mut emitter));
+                triangles.push(emitter.triangles);
+            }
+            continue;
+        }
+        let mut emitters = batch::Emitters::new();
+        batch::run_geometry(unit, program, inputs, &mut emitters, &mut blocks, &mut forks);
+        triangles.extend(emitters.triangles.into_iter().take(inputs.len()));
+    }
+    triangles
+}
+
 /// runs a geometry shader over one primitive's worth of input, collecting
 /// what it emits.
 pub fn run_geometry(unit: &ShaderUnit, state: &mut ShaderState, emitter: &mut Emitter) {
