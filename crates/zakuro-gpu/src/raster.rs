@@ -489,7 +489,12 @@ fn geometry_stage(
         invocations.push(map_inputs(registers, REG_GS_BLOCK, &pending[..per_invocation]));
         pending.clear();
     }
-    let emitted = shader::run_geometry_many(unit, &invocations);
+    // many primitives go over threads, like many vertices do
+    let emitted: Vec<Vec<_>> = if invocations.len() < PARALLEL_VERTICES / 4 {
+        shader::run_geometry_many(unit, &invocations)
+    } else {
+        invocations.par_chunks(PARALLEL_CHUNK / 4).flat_map_iter(|chunk| shader::run_geometry_many(unit, chunk)).collect()
+    };
 
     let mut vertices = Vec::new();
     for (input, triangles) in invocations.iter().zip(&emitted) {
