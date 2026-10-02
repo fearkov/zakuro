@@ -539,7 +539,8 @@ impl Gpu {
     pub fn enable_hardware_renderer(&mut self, scale: u32) -> Result<String, String> {
         let mut hardware = raster::hardware::Hardware::new()?;
         let scale = hardware.set_scale(scale);
-        let name = format!("{} at {scale}x", hardware.name());
+        let shaded = if hardware.shades() { "" } else { ", vertices shaded on the CPU," };
+        let name = format!("{} at {scale}x{shaded}", hardware.name());
         self.resources.hardware = Some(hardware);
         Ok(name)
     }
