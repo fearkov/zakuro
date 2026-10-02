@@ -353,10 +353,11 @@ void main() {
     run();
 
     vec4 position = vec4(semantic(0u, 0.0), semantic(1u, 0.0), semantic(2u, 0.0), semantic(3u, 0.0));
-    // the PICA places vertices on a sixteenth of a pixel
+    // the PICA places vertices on a sixteenth of a pixel, halves to even
+    // the way translated programs place them too
     if (position.w > 1e-5) {
         vec2 window = viewport.xy + (position.xy / position.w * 0.5 + 0.5) * viewport.zw;
-        window = round(window * 16.0) / 16.0;
+        window = roundEven(window * 16.0) / 16.0;
         position.xy = ((window - viewport.xy) / viewport.zw * 2.0 - 1.0) * position.w;
     }
     gl_Position = vec4(position.xy, -position.z, position.w);
