@@ -301,6 +301,40 @@ struct Capture {
 
 /// a batch's command buffer, the fence the GPU signals once done with it and
 /// the ring it stages in.
+/// kinds of work the GPU does, to tell where its time goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Work {
+    Other,
+    Draw,
+    Upload,
+    Clear,
+    Transfer,
+    Capture,
+    Copy,
+    Download,
+}
+
+const WORK_NAMES: [&str; 8] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download"];
+/// timestamps a batch can take.
+const TIMESTAMPS: u32 = 4096;
+/// batches the times are added up over before they are logged.
+const TIMED_BATCHES: u32 = 600;
+
+/// the GPU's time per kind of work, from timestamps written whenever the
+/// work changes kind, ZAKURO_GPU_TIMES=1 turns it on.
+struct Timing {
+    /// nanoseconds a tick of the GPU's clock lasts.
+    period: f64,
+    /// each command buffer's timestamps, and the work between them.
+    pools: HashMap<vk::CommandBuffer, (vk::QueryPool, Vec<Work>)>,
+    current: Work,
+    /// milliseconds per kind of work.
+    totals: [f64; 8],
+    batches: u32,
+    barriers: u64,
+    renderings: u64,
+}
+
 struct Frame {
     commands: vk::CommandBuffer,
     fence: vk::Fence,
@@ -433,6 +467,9 @@ pub struct Hardware {
     scale: u32,
     /// whether the GPU can blit both surface formats, which scaling needs.
     blits: bool,
+    timing: Option<Timing>,
+    barriers: std::cell::Cell<u64>,
+    renderings: u64,
 }
 
 impl Hardware {
@@ -551,6 +588,7 @@ impl Hardware {
                 let features = instance.get_physical_device_format_properties(physical, format).optimal_tiling_features;
                 features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
             });
+            let timestamps = instance.get_physical_device_queue_family_properties(physical)[family as usize].timestamp_valid_bits > 0;
             let mut hardware = Hardware {
                 ring: unmade(),
                 in_flight: VecDeque::with_capacity(IN_FLIGHT),
@@ -595,6 +633,18 @@ impl Hardware {
                 name,
                 scale: 1,
                 blits,
+                // the queue has to count time for timestamps to mean anything
+                timing: (std::env::var_os("ZAKURO_GPU_TIMES").is_some() && timestamps).then(|| Timing {
+                        period: properties.limits.timestamp_period as f64,
+                        pools: HashMap::new(),
+                        current: Work::Other,
+                        totals: [0.0; 8],
+                        batches: 0,
+                        barriers: 0,
+                        renderings: 0,
+                    }),
+                barriers: std::cell::Cell::new(0),
+                renderings: 0,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -767,8 +817,98 @@ impl Hardware {
                     .map_err(vk_error("begin a command buffer"))?;
             }
             self.recording = true;
+            self.start_timing()?;
             // the batch before may still be running
             self.barrier();
+        }
+        Ok(())
+    }
+
+    /// stamps the start of a batch, when its time is being measured.
+    fn start_timing(&mut self) -> Result<(), String> {
+        let commands = self.commands;
+        let Some(timing) = &mut self.timing else { return Ok(()) };
+        let pool = match timing.pools.get_mut(&commands) {
+            Some((pool, marks)) => {
+                marks.clear();
+                *pool
+            }
+            None => {
+                let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(TIMESTAMPS);
+                // SAFETY: a pool of ours, made once per command buffer
+                let pool = unsafe { self.device.create_query_pool(&info, None) }.map_err(vk_error("create a query pool"))?;
+                timing.pools.insert(commands, (pool, Vec::new()));
+                pool
+            }
+        };
+        timing.current = Work::Other;
+        // SAFETY: recording, outside rendering
+        unsafe {
+            self.device.cmd_reset_query_pool(commands, pool, 0, TIMESTAMPS);
+            self.device.cmd_write_timestamp2(commands, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 0);
+        }
+        Ok(())
+    }
+
+    /// the GPU starts on another kind of work, the time since the last
+    /// stamp goes to the kind before. ended stamps the end of the batch.
+    fn mark(&mut self, work: Work, ended: bool) {
+        let commands = self.commands;
+        let Some(timing) = &mut self.timing else { return };
+        if !self.recording || (timing.current == work && !ended) {
+            return;
+        }
+        if let Some((pool, marks)) = timing.pools.get_mut(&commands) {
+            if (marks.len() as u32) + 1 < TIMESTAMPS {
+                // SAFETY: recording, the query was reset when the batch began
+                unsafe { self.device.cmd_write_timestamp2(commands, vk::PipelineStageFlags2::ALL_COMMANDS, *pool, marks.len() as u32 + 1) };
+                marks.push(timing.current);
+            }
+        }
+        timing.current = work;
+    }
+
+    /// adds up a finished batch's times, and logs them every so many.
+    fn add_times(&mut self, commands: vk::CommandBuffer) -> Result<(), String> {
+        let barriers = self.barriers.take();
+        let renderings = std::mem::take(&mut self.renderings);
+        let Some(timing) = &mut self.timing else { return Ok(()) };
+        let Some((pool, marks)) = timing.pools.get_mut(&commands) else { return Ok(()) };
+        if !marks.is_empty() {
+            let mut stamps = vec![0u64; marks.len() + 1];
+            // SAFETY: the batch finished, its fence was waited for
+            unsafe {
+                self.device
+                    .get_query_pool_results(*pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
+                    .map_err(vk_error("read timestamps"))?;
+            }
+            for (i, &work) in marks.iter().enumerate() {
+                timing.totals[work as usize] += stamps[i + 1].wrapping_sub(stamps[i]) as f64 * timing.period / 1e6;
+            }
+            marks.clear();
+        }
+        timing.barriers += barriers;
+        timing.renderings += renderings;
+        timing.batches += 1;
+        if timing.batches == TIMED_BATCHES {
+            let total: f64 = timing.totals.iter().sum();
+            let parts: Vec<String> = WORK_NAMES
+                .iter()
+                .zip(timing.totals)
+                .filter(|&(_, ms)| ms > 0.0)
+                .map(|(name, ms)| format!("{name} {ms:.1}"))
+                .collect();
+            log::info!(
+                target: "zakuro_gpu::times",
+                "GPU over {TIMED_BATCHES} batches: {total:.1} ms, {}, {} barriers, {} render passes",
+                parts.join(", "),
+                timing.barriers,
+                timing.renderings
+            );
+            timing.totals = [0.0; 8];
+            timing.batches = 0;
+            timing.barriers = 0;
+            timing.renderings = 0;
         }
         Ok(())
     }
@@ -780,6 +920,7 @@ impl Hardware {
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
+        self.barriers.set(self.barriers.get() + 1);
         // SAFETY: recording is on whenever this is called
         unsafe { self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
     }
@@ -828,6 +969,8 @@ impl Hardware {
         let (width, height, kind, view) = (surface.width, surface.height, surface.kind, surface.image.view);
         let scale = self.scale;
         self.begin()?;
+        self.mark(Work::Clear, false);
+        self.renderings += 1;
         self.end_rendering();
         self.barrier();
         let attachment = [vk::RenderingAttachmentInfo::default()
@@ -972,6 +1115,7 @@ impl Hardware {
     /// copies a guest buffer's bytes into its surface.
     fn upload(&mut self, index: usize, bytes: &[u8]) -> Result<(), String> {
         self.end_rendering();
+        self.mark(Work::Upload, false);
         let (width, height, kind, tiled) = {
             let s = &self.surfaces[index];
             (s.width, s.height, s.kind, s.tiled)
@@ -1090,6 +1234,7 @@ impl Hardware {
             texture.used = self.batch;
             return Ok(texture.image.view);
         }
+        self.mark(Work::Upload, false);
         self.end_rendering();
         let image = self.image(
             bound.width,
@@ -1340,6 +1485,7 @@ impl Hardware {
             let filled = filled.to_vec();
             let (image, kind) = (surface.image.image, surface.kind);
             self.begin()?;
+            self.mark(Work::Clear, false);
             self.end_rendering();
             // SAFETY: recording, outside rendering, on an image in the
             // general layout that allows transfers into it
@@ -1654,6 +1800,7 @@ impl Hardware {
         let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some() };
         let pipeline = self.pipeline(key)?;
 
+        self.mark(Work::Draw, false);
         if self.uploads {
             self.end_rendering();
             self.barrier();
@@ -1796,6 +1943,7 @@ impl Hardware {
     }
 
     fn begin_rendering(&mut self, color: usize, depth: Option<usize>) {
+        self.renderings += 1;
         let surface = &self.surfaces[color];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -1917,6 +2065,7 @@ impl Hardware {
     /// records the transfer shader going over size pixels, from one image
     /// to another, as the constants say.
     fn dispatch_transfer(&mut self, (source, target): (vk::ImageView, vk::ImageView), constants: [i32; 11], size: (u32, u32)) -> Result<(), String> {
+        self.mark(Work::Transfer, false);
         let (layout, pipeline) = self.transfer_pipeline()?;
         self.end_rendering();
         self.barrier();
@@ -1977,6 +2126,7 @@ impl Hardware {
     /// the image of a texture copied from the surface it is part of, copied
     /// again whenever the surface changed.
     fn copy_texture(&mut self, texture: &DrawnTexture) -> Result<vk::ImageView, String> {
+        self.mark(Work::Copy, false);
         let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
         let generation = self.surfaces[source].generation;
         let batch = self.batch;
@@ -2070,6 +2220,7 @@ impl Hardware {
 
     /// records a copy of a surface for the host to read later.
     fn capture(&mut self, index: usize) -> Result<(), String> {
+        self.mark(Work::Capture, false);
         let (width, height) = (self.surfaces[index].width, self.surfaces[index].height);
         let size = (width * height * 4) as u64;
         if self.surfaces[index].capture.is_none() {
@@ -2107,6 +2258,7 @@ impl Hardware {
 
     /// records a copy of a scaled surface turned upright, for showing it.
     fn capture_screen(&mut self, index: usize) -> Result<(), String> {
+        self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
         let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
         let size = (width * height * 4) as u64;
@@ -2359,6 +2511,7 @@ impl Hardware {
             return Ok(());
         }
         self.end_rendering();
+        self.mark(Work::Other, true);
         self.retire_finished()?;
         if self.free.is_empty() {
             self.retire_oldest()?;
@@ -2451,6 +2604,7 @@ impl Hardware {
                 .map_err(vk_error("reset a command buffer"))?;
         }
         let batch = frame.pending.take();
+        self.add_times(frame.commands)?;
         self.free.push(frame);
         // pictures for screens are read out before a later batch can draw
         // over them
@@ -2467,6 +2621,7 @@ impl Hardware {
     /// when those still hold them, else running the batch and reading them
     /// back.
     fn write_back<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
+        self.mark(Work::Download, false);
         let (captured, others): (Vec<usize>, Vec<usize>) =
             dirty.into_iter().partition(|&i| self.surfaces[i].captured().is_some());
         if !others.is_empty() {
