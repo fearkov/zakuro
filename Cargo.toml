@@ -44,6 +44,9 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.zakuro-core]
 opt-level = 2
+# translated vertex shaders compile through it as games run
+[profile.dev.package.naga]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

@@ -2527,6 +2527,236 @@ mod tests {
         assert!(deepest < 1 << 8, "depth differs by {deepest}");
     }
 
+    /// a random number generator for the translation tests, the same
+    /// numbers every run.
+    #[cfg(feature = "vulkan")]
+    struct Random(u64);
+
+    #[cfg(feature = "vulkan")]
+    impl Random {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        /// an arithmetic instruction of any kind, writing a temporary or
+        /// the color, o2.
+        fn arithmetic(&mut self) -> u32 {
+            let (wide, narrow, index, descriptor) = (self.next() % 0x80, self.next() % 0x20, self.next() % 4, 1 + self.next() % 127);
+            let destination = if self.next().is_multiple_of(4) { 2 } else { 0x10 + self.next() % 16 };
+            let ops = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x12, 0x13];
+            match self.next() % 12 {
+                0..=7 => ops[(self.next() % ops.len() as u32) as usize] << 26 | destination << 21 | index << 19 | wide << 12 | narrow << 7 | descriptor,
+                8 => [0x18, 0x19, 0x1A, 0x1B][(self.next() % 4) as usize] << 26 | destination << 21 | index << 19 | narrow << 14 | wide << 7 | descriptor,
+                9 => 0x2E << 26 | (self.next() % 8) << 24 | (self.next() % 8) << 21 | index << 19 | wide << 12 | narrow << 7 | descriptor,
+                10 => 0b111 << 29 | destination << 24 | index << 22 | (self.next() % 0x20) << 17 | wide << 10 | narrow << 5 | descriptor & 0x1F,
+                _ => 0b110 << 29 | destination << 24 | index << 22 | (self.next() % 0x20) << 17 | narrow << 12 | wide << 5 | descriptor & 0x1F,
+            }
+        }
+
+        /// a condition of any kind for a flow instruction, in its bits.
+        fn condition(&mut self) -> u32 {
+            (self.next() % 16) << 22
+        }
+    }
+
+    /// draws programs made by program with the GPU interpreting them and
+    /// with them translated, and checks color and depth come out the same
+    /// to the bit, at least so many programs translated, and any other one
+    /// only because it can run on past its end.
+    #[cfg(feature = "vulkan")]
+    fn draws_like_the_interpreter(cases: u32, least: u32, seed: u64, program: impl Fn(&mut Random) -> Vec<u32>) {
+        let (Ok(mut translating), Ok(mut interpreting)) = (hardware::Hardware::new(), hardware::Hardware::new()) else {
+            return;
+        };
+        translating.set_translates(true);
+        interpreting.set_translates(false);
+        const SIZE: u32 = 32;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut random = Random(seed);
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
+        registers[REG_VIEWPORT_WIDTH] = float24(12.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
+        registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        registers[REG_DEPTHMAP_ENABLE] = 1;
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        // the position from o0, the color from o2
+        registers[REG_VS_OUTPUT_MASK] = 0b101;
+        registers[REG_PRIMITIVE_CONFIG] = 0;
+        let mut translators = Resources { hardware: Some(translating), ..Default::default() };
+        let mut interpreters = Resources { hardware: Some(interpreting), ..Default::default() };
+        let mut drawn = 0;
+        for case in 0..cases {
+            let mut unit = ShaderUnit::new();
+            unit.descriptors[0] = 0xF | IDENTITY;
+            for descriptor in &mut unit.descriptors[1..] {
+                *descriptor = random.next() & 0x7FFF_FFFF;
+            }
+            for uniform in unit.float_uniforms.iter_mut() {
+                *uniform = std::array::from_fn(|_| match random.next() % 30 {
+                    0 => f32::INFINITY,
+                    1 => -0.0,
+                    _ => (random.next() % 2000) as f32 / 1000.0 - 1.0,
+                });
+            }
+            for integer in &mut unit.int_uniforms {
+                *integer = [(random.next() % 3) as u8, (random.next() % 8) as u8, (random.next() % 3) as u8, 0];
+            }
+            unit.bool_uniforms = random.next() as u16;
+            // the program some words in, past instructions never run, its
+            // flow moved along with it, so the entry point matters
+            let skip = random.next() % 8;
+            let mut words: Vec<u32> = (0..skip).map(|_| random.arithmetic()).collect();
+            words.extend(program(&mut random).into_iter().map(|word| match word >> 26 {
+                0x24..=0x29 | 0x2C | 0x2D => word + (skip << 10),
+                _ => word,
+            }));
+            let program = words;
+            unit.program[..program.len()].copy_from_slice(&program);
+            unit.entry_point = skip;
+            unit.prepare();
+            // the only program left to the interpreter is one that can run
+            // on into the words after it
+            if let Err(error) = unit.translate(&output_semantics(&registers)) {
+                assert!(error.contains("reachable instructions"), "case {case} not translated, {error}, program {program:08X?}");
+            }
+
+            let mut inputs = vec![[shader::ZERO; shader::INPUT_REGISTERS]; 24];
+            for input in &mut inputs {
+                let mut float = || (random.next() % 2000) as f32 / 1000.0 - 1.0;
+                input[0] = [float() * 1.3, float() * 1.3, float() * 0.6 - 0.1, 1.0];
+                for register in &mut input[1..] {
+                    *register = [float(), float(), float(), float()];
+                }
+            }
+            let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &unit, inputs: &inputs, order: None };
+            let (mut translated, mut interpreted) = (ConsoleMemory::default(), ConsoleMemory::default());
+            for memory in [&mut translated, &mut interpreted] {
+                memory.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                memory.write(DEPTH, &vec![0xFFu8; (SIZE * SIZE * 4) as usize]);
+            }
+            rasterize(&registers, &mut translated, &mut translators, vertices);
+            rasterize(&registers, &mut interpreted, &mut interpreters, vertices);
+            translators.hardware.as_mut().unwrap().flush(&mut translated).unwrap();
+            interpreters.hardware.as_mut().unwrap().flush(&mut interpreted).unwrap();
+            let bytes = (SIZE * SIZE * 4) as usize;
+            let (mut a, mut b) = (vec![0u8; bytes * 2], vec![0u8; bytes * 2]);
+            translated.read(COLOR, &mut a[..bytes]);
+            translated.read(DEPTH, &mut a[bytes..]);
+            interpreted.read(COLOR, &mut b[..bytes]);
+            interpreted.read(DEPTH, &mut b[bytes..]);
+            assert!(a == b, "case {case} draws differently translated, program {program:08X?}");
+            drawn += a[..bytes].chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+        }
+        let translations = translators.hardware.as_ref().unwrap().translations();
+        eprintln!("{cases} programs, {translations} translated, {drawn} pixels drawn");
+        assert!(drawn as u32 > cases * 40, "only {drawn} pixels drawn");
+        assert!(translations as u32 >= least, "only {translations} of {cases} programs translated");
+        assert_eq!(interpreters.hardware.as_ref().unwrap().translations(), 0);
+    }
+
+    /// programs of every instruction, with flow of every kind going
+    /// forward, draw the same translated as interpreted, to the bit.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn translated_shaders_draw_like_the_interpreter() {
+        draws_like_the_interpreter(200, 200, 21, |random| {
+            // the position as it comes, then instructions of every kind,
+            // flow only going forward so every program ends, and blocks
+            // ending within the program, past it are words of zero that
+            // run to the end of the program memory
+            let length = 4 + random.next() % 28;
+            let mut program = vec![0x13 << 26];
+            for at in 1..length {
+                let forward = at + 1 + random.next() % (length - at);
+                let (count, condition) = ((random.next() % 4).min(length - forward), random.condition());
+                program.push(match random.next() % 16 {
+                    0..=11 => random.arithmetic(),
+                    12 => [0x24, 0x25, 0x26, 0x27, 0x28][(random.next() % 5) as usize] << 26 | condition | forward << 10 | count,
+                    13 => [0x2C, 0x2D][(random.next() % 2) as usize] << 26 | condition | forward << 10 | count,
+                    14 => 0x29 << 26 | (random.next() % 4) << 22 | (at + 1 + random.next() % 3).min(length - 1) << 10,
+                    _ => [0x20 << 26, 0x23 << 26 | condition][(random.next() % 2) as usize],
+                });
+            }
+            program.push(0x22 << 26);
+            program
+        });
+    }
+
+    /// programs laid out the way the SDK's compiler lays them out, a main
+    /// part calling subroutines after its end, each running into the next
+    /// one where its call ends it, with ifs, loops, breaks and calls of
+    /// their own, draw the same translated as interpreted, to the bit. a
+    /// jump out of a loop leaves the loop's block over the call's, which
+    /// then never ends, and execution runs on to the end of the program
+    /// memory, so some of them stay interpreted, as they should.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn subroutines_draw_like_the_interpreter() {
+        draws_like_the_interpreter(150, 100, 22, |random| {
+            let routines = 1 + random.next() % 5;
+            let main = 3 + random.next() % 8;
+            let lengths: Vec<u32> = (0..routines).map(|_| 2 + random.next() % 10).collect();
+            let starts: Vec<u32> = lengths
+                .iter()
+                .scan(main + 1, |at, &length| {
+                    let start = *at;
+                    *at += length;
+                    Some(start)
+                })
+                .collect();
+            let call = |random: &mut Random, after: u32| -> Option<u32> {
+                // only routines further on, so nothing calls itself
+                let first = starts.iter().position(|&start| start > after)?;
+                let routine = first + (random.next() as usize % (starts.len() - first));
+                let opcode = [0x24, 0x25, 0x26][(random.next() % 3) as usize];
+                Some(opcode << 26 | random.condition() | starts[routine] << 10 | lengths[routine])
+            };
+            // the position as it comes, then the main part
+            let mut program = vec![0x13 << 26];
+            for at in 1..main {
+                program.push(match random.next() % 4 {
+                    0 => call(random, at).unwrap_or_else(|| random.arithmetic()),
+                    _ => random.arithmetic(),
+                });
+            }
+            program.push(0x22 << 26);
+            // the subroutines, ifs and jumps forward within themselves, and
+            // breaks within their loops, a break with no loop open would
+            // close the call too and run on into the next subroutine
+            for (&start, &length) in starts.iter().zip(&lengths) {
+                let end = start + length;
+                let mut looped = 0;
+                for at in start..end {
+                    let forward = at + 1 + random.next() % (end - at);
+                    let count = (random.next() % 3).min(end - forward);
+                    let word = match random.next() % 10 {
+                        0 if at + 1 < end => {
+                            let opcode = [0x27, 0x28][(random.next() % 2) as usize];
+                            opcode << 26 | random.condition() | forward << 10 | count
+                        }
+                        1 if at + 1 < end => [0x2C, 0x2D][(random.next() % 2) as usize] << 26 | random.condition() | forward << 10,
+                        2 => call(random, end - 1).unwrap_or_else(|| random.arithmetic()),
+                        3 if at + 2 < end && at >= looped => {
+                            let last = (at + 1 + random.next() % (end - at - 1)).min(end - 1);
+                            looped = last + 1;
+                            0x29 << 26 | (random.next() % 4) << 22 | last << 10
+                        }
+                        4 if at < looped => 0x23 << 26 | random.condition(),
+                        _ => random.arithmetic(),
+                    };
+                    program.push(word);
+                }
+            }
+            program
+        });
+    }
+
     /// a texture that is rows of a buffer the GPU just drew samples the
     /// same from a copy the GPU makes as from memory once it has the buffer,
     /// whether the buffer holds colors or depth and stencil.

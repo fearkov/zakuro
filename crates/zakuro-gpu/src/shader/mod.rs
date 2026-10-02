@@ -2,6 +2,8 @@
 
 pub mod isa;
 mod batch;
+#[cfg(feature = "vulkan")]
+pub(crate) mod glsl;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -27,6 +27,7 @@ use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
+use crate::shader::glsl::{self, SEMANTICS};
 use crate::shader::{ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
 
@@ -416,8 +417,7 @@ struct PipelineKey {
     /// red, green, blue and alpha writes, one bit each.
     mask: u32,
     depth: bool,
-    /// the vertex shader runs on the GPU.
-    shaded: bool,
+    vertex: VertexStage,
     /// the fragment shader's specialization constants, what decides its
     /// shape, the combiners, the units, lighting, the alpha test, depth.
     fragment: [u32; FRAGMENT_CONSTANTS],
@@ -426,6 +426,21 @@ struct PipelineKey {
 /// the fragment shader's specialization constants, as raster.frag numbers
 /// them.
 const FRAGMENT_CONSTANTS: usize = 29;
+
+/// what a draw's vertices go through on the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum VertexStage {
+    /// triangles the CPU shaded and placed, raster.vert passing them on.
+    Placed,
+    /// the title's program interpreted, shade.vert.
+    Interpreted,
+    /// the title's program translated into a module of its own.
+    Translated(vk::ShaderModule),
+}
+
+/// a program translated, by its fingerprint, its entry point and where
+/// its outputs go, what the translation is made from.
+type ProgramKey = (u64, u32, [u32; SEMANTICS]);
 
 pub struct Hardware {
     _entry: ash::Entry,
@@ -451,6 +466,13 @@ pub struct Hardware {
     shade_shader: vk::ShaderModule,
     /// whether draws go to shade_shader.
     shades: bool,
+    /// whether programs are translated rather than interpreted.
+    translates: bool,
+    /// the programs translated, none for one left to shade_shader.
+    translated: HashMap<ProgramKey, Option<vk::ShaderModule>>,
+    /// the modules made, by their source, which programs differing only in
+    /// words they never run share, and so their pipelines.
+    modules: HashMap<String, vk::ShaderModule>,
     /// whether the device does logic ops.
     logic_ops: bool,
     /// where the batch copied programs, by their fingerprints.
@@ -642,6 +664,10 @@ impl Hardware {
                 shade_shader,
                 // shading on the CPU instead, to tell the two apart
                 shades: std::env::var_os("ZAKURO_CPU_SHADERS").is_none(),
+                // interpreting them all instead, to tell the two apart
+                translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
+                translated: HashMap::new(),
+                modules: HashMap::new(),
                 logic_ops,
                 programs: HashMap::new(),
                 pipelines: HashMap::new(),
@@ -1357,7 +1383,11 @@ impl Hardware {
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(if key.shaded { self.shade_shader } else { self.vertex_shader })
+                .module(match key.vertex {
+                    VertexStage::Placed => self.vertex_shader,
+                    VertexStage::Interpreted => self.shade_shader,
+                    VertexStage::Translated(module) => module,
+                })
                 .name(c"main"),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -1378,12 +1408,12 @@ impl Hardware {
                     .offset(location * 16)
             })
             .collect();
-        // the shaded pipeline reads its vertices out of a storage buffer
-        let vertex_input = match key.shaded {
-            true => vk::PipelineVertexInputStateCreateInfo::default(),
-            false => vk::PipelineVertexInputStateCreateInfo::default()
+        // the shaded pipelines read their vertices out of a storage buffer
+        let vertex_input = match key.vertex {
+            VertexStage::Placed => vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(&bindings)
                 .vertex_attribute_descriptions(&attributes),
+            _ => vk::PipelineVertexInputStateCreateInfo::default(),
         };
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
@@ -1392,7 +1422,7 @@ impl Hardware {
         // the images run bottom up, so a triangle wound counter-clockwise
         // with y up is wound clockwise to Vulkan, which culls per draw
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-            .depth_clamp_enable(!key.shaded)
+            .depth_clamp_enable(key.vertex == VertexStage::Placed)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::CLOCKWISE)
@@ -1467,8 +1497,15 @@ impl Hardware {
             .push_next(&mut rendering);
         // SAFETY: every state the create info points at lives until it
         // returns
+        let started = std::time::Instant::now();
         let pipeline = unsafe { self.device.create_graphics_pipelines(self.pipeline_cache, &[info], None) }
             .map_err(|(_, error)| format!("could not create a pipeline, {error}"))?[0];
+        log::debug!(
+            target: "zakuro_gpu::pipelines",
+            "compiled pipeline {} in {:.1} ms",
+            self.pipelines.len() + 1,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         self.pipelines.insert(key, pipeline);
         Ok(pipeline)
     }
@@ -1643,6 +1680,63 @@ impl Hardware {
         Ok(vertex_offset)
     }
 
+    /// whether programs get translated, for comparing the two.
+    #[cfg(test)]
+    pub(super) fn set_translates(&mut self, translates: bool) {
+        self.translates = translates;
+    }
+
+    /// the programs that run translated so far.
+    #[cfg(test)]
+    pub(super) fn translations(&self) -> usize {
+        self.translated.values().filter(|module| module.is_some()).count()
+    }
+
+    /// the stage a draw's program runs in, translated the first time it is
+    /// seen, or interpreted when it cannot be.
+    fn vertex_stage(&mut self, shading: &Shading) -> VertexStage {
+        if !self.translates {
+            return VertexStage::Interpreted;
+        }
+        let unit = shading.unit;
+        let key = (unit.fingerprint(), unit.entry_point, shading.semantics);
+        if let Some(&module) = self.translated.get(&key) {
+            return module.map_or(VertexStage::Interpreted, VertexStage::Translated);
+        }
+        let started = std::time::Instant::now();
+        let module = unit.translate(&shading.semantics).and_then(|source| match self.modules.get(&source) {
+            Some(&module) => Ok(module),
+            None => {
+                let words = glsl::compile(&source)?;
+                let info = vk::ShaderModuleCreateInfo::default().code(&words);
+                // SAFETY: the words are SPIR-V naga made and validated
+                let module = unsafe { self.device.create_shader_module(&info, None) }
+                    .map_err(vk_error("create a shader module"))?;
+                self.modules.insert(source, module);
+                Ok(module)
+            }
+        });
+        match &module {
+            Ok(_) => log::debug!(
+                target: "zakuro_gpu::programs",
+                "translated program {:016X} from {} in {:.1} ms, {} modules",
+                key.0,
+                key.1,
+                started.elapsed().as_secs_f64() * 1000.0,
+                self.modules.len()
+            ),
+            Err(error) => log::debug!(
+                target: "zakuro_gpu::programs",
+                "program {:016X} from {} stays interpreted, {error}",
+                key.0,
+                key.1
+            ),
+        }
+        let module = module.ok();
+        self.translated.insert(key, module);
+        module.map_or(VertexStage::Interpreted, VertexStage::Translated)
+    }
+
     /// copies what the vertex shader reads into the batch, and says where
     /// the program, the rest of what it reads, the inputs and the indices
     /// went.
@@ -1774,12 +1868,15 @@ impl Hardware {
 
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
-        let (vertex_count, vertex_offset, shaded) = match draw.geometry {
+        let (vertex_count, vertex_offset, shaded, vertex) = match draw.geometry {
             Geometry::Triangles(triangles) => {
                 let count = triangles.len() * 3;
-                (count, self.triangles(triangles, (width, height), depth_map)?, None)
+                (count, self.triangles(triangles, (width, height), depth_map)?, None, VertexStage::Placed)
             }
-            Geometry::Shaded(shading) => (shading.indices.len(), 0, Some(self.stage_shading(shading, depth_map)?)),
+            Geometry::Shaded(shading) => {
+                let staged = self.stage_shading(shading, depth_map)?;
+                (shading.indices.len(), 0, Some(staged), self.vertex_stage(shading))
+            }
         };
 
 
@@ -1848,8 +1945,24 @@ impl Hardware {
         fragment[26] = draw.lighting.is_some() as u32;
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
         fragment[28] = depth_flags;
-        let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some(), fragment };
-        let pipeline = self.pipeline(key)?;
+        let mut key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), vertex, fragment };
+        let pipeline = match (self.pipeline(key), vertex) {
+            (Ok(pipeline), _) => pipeline,
+            // a translated program the driver turns down goes back to the
+            // interpreter, which has its program staged and bound all the
+            // same
+            (Err(error), VertexStage::Translated(failed)) => {
+                log::warn!("a translated vertex shader could not be used, {error}, interpreting it");
+                for module in self.translated.values_mut() {
+                    if *module == Some(failed) {
+                        *module = None;
+                    }
+                }
+                key.vertex = VertexStage::Interpreted;
+                self.pipeline(key)?
+            }
+            (Err(error), _) => return Err(error),
+        };
 
         self.mark(Work::Draw, false);
         if self.uploads {
@@ -2901,6 +3014,9 @@ impl Drop for Hardware {
             self.device.destroy_shader_module(self.vertex_shader, None);
             self.device.destroy_shader_module(self.fragment_shader, None);
             self.device.destroy_shader_module(self.shade_shader, None);
+            for &module in self.modules.values() {
+                self.device.destroy_shader_module(module, None);
+            }
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_fence(self.fence, None);

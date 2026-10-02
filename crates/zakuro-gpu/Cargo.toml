@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = []
 opengl = ["dep:glow"]
-vulkan = ["dep:ash", "dep:ash-window"]
+vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
 
 [dependencies]
 zakuro-common.workspace = true
@@ -21,3 +21,6 @@ raw-window-handle = "0.6"
 glow = { version = "0.16", optional = true }
 ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
 ash-window = { version = "0.13", optional = true }
+# turns translated vertex shaders into SPIR-V. wgsl-in only so 30.0.1 builds,
+# its glsl-in needs code it gates on wgsl-in
+naga = { version = "30.0.1", optional = true, features = ["glsl-in", "wgsl-in", "spv-out"] }
