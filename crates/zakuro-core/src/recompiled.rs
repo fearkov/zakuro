@@ -25,7 +25,17 @@ pub struct Library {
     code: recomp_abi::Library,
     /// instructions the code handed to the interpreter one at a time.
     fallbacks: Cell<u64>,
+    /// the code found for addresses lately, each in a slot its address
+    /// picks. a jump through a register looks its target up, which is a
+    /// search through every function otherwise.
+    found: Box<[Found]>,
 }
+
+/// a slot of Library::found, an address and the code found for it.
+type Found = Cell<(u32, Option<Code>)>;
+
+/// slots of Library::found, a power of two.
+const FOUND: usize = 4096;
 
 /// why a run of recompiled code ended.
 pub enum Stop {
@@ -141,7 +151,12 @@ impl Library {
     }
 
     fn new(code: recomp_abi::Library) -> Library {
-        Library { code, fallbacks: Cell::new(0) }
+        Library { code, fallbacks: Cell::new(0), found: Library::nothing_found() }
+    }
+
+    /// every slot of found empty, an address no code starts at in each.
+    fn nothing_found() -> Box<[Found]> {
+        (0..FOUND).map(|_| Cell::new((u32::MAX, None))).collect()
     }
 
     /// how many instructions the code has handed to the interpreter.
@@ -157,7 +172,17 @@ impl Library {
     /// the code that can run from address, bit 0 set for Thumb, in the
     /// executable or in a module that is loaded.
     fn lookup(&self, address: u32) -> Option<Code> {
-        self.code.lookup(address)
+        // instructions are two bytes apart at least, the low bit is the
+        // instruction set
+        let slot = &self.found[(address as usize >> 1) & (FOUND - 1)];
+        match slot.get() {
+            (seen, code) if seen == address => code,
+            _ => {
+                let code = self.code.lookup(address);
+                slot.set((address, code));
+                code
+            }
+        }
     }
 
     pub fn has_code(&self, address: u32) -> bool {
@@ -169,6 +194,8 @@ impl Library {
     pub fn place(&mut self, name: &str, base: u32) {
         let Some(index) = self.code.module_index(name) else { return };
         self.code.place(index, base);
+        // what was found before may have moved or gone
+        self.found = Library::nothing_found();
         if base != 0 {
             log::info!("recompiled code for {name} runs at 0x{base:08X}");
         }
