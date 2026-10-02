@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
+use std::sync::Arc;
 
 use super::isa::OpCode;
 use super::{Op, Operand, Program, ShaderUnit, PROGRAM_SIZE};
@@ -42,19 +43,30 @@ const BLOCK_LIMIT: usize = 16;
 const STATES: usize = 1 << 16;
 
 impl ShaderUnit {
-    /// the program from its entry point as a GLSL vertex shader with
-    /// shade.vert's interface, its outputs going where semantics says, the
-    /// output register times four plus the component for each, or MISSING
-    /// or ZERO as hardware.rs has them.
+    /// the program from its entry point translated, as translate does.
+    #[cfg(test)]
     pub(crate) fn translate(&self, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
-        let program = self.decoded.as_deref().ok_or("the program was not prepared")?;
-        let translator = Translator::new(program, self.entry_point)?;
-        let length: usize = translator.runs.values().map(|run| run.length() as usize).sum();
-        if length > LONGEST {
-            return Err(format!("{length} reachable instructions, more than {LONGEST}"));
-        }
-        Ok(translator.shader(semantics))
+        let program = self.prepared().ok_or("the program was not prepared")?;
+        translate(&program, self.entry_point, semantics)
     }
+
+    /// the program as prepare decoded it, to translate it elsewhere.
+    pub(crate) fn prepared(&self) -> Option<Arc<Program>> {
+        self.decoded.clone()
+    }
+}
+
+/// a program from an entry point as a GLSL vertex shader with shade.vert's
+/// interface, its outputs going where semantics says, the output register
+/// times four plus the component for each, or MISSING or ZERO as
+/// hardware.rs has them.
+pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
+    let translator = Translator::new(program, entry_point)?;
+    let length: usize = translator.runs.values().map(|run| run.length() as usize).sum();
+    if length > LONGEST {
+        return Err(format!("{length} reachable instructions, more than {LONGEST}"));
+    }
+    Ok(translator.shader(semantics))
 }
 
 /// a vertex shader in GLSL to SPIR-V for vkCreateShaderModule, or why not.

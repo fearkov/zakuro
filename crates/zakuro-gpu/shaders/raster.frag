@@ -48,6 +48,11 @@ layout(constant_id = 25) const uint TEXTURE_CONFIG = 0u;
 layout(constant_id = 26) const uint LIGHTING = 0u;
 layout(constant_id = 27) const uint ALPHA_TEST = 0u;
 layout(constant_id = 28) const uint DEPTH_MODE = 0u;
+// set, a generic pipeline that reads all of the above from the draw's
+// registers instead, to draw with while the one for its combination
+// compiles. it masks them as hardware.rs masks the constants, so the two
+// draw the same
+layout(constant_id = 29) const uint DYNAMIC = 0u;
 
 layout(set = 0, binding = 0) uniform sampler2D texture0;
 layout(set = 0, binding = 1) uniform sampler2D texture1;
@@ -95,6 +100,16 @@ layout(std140, set = 0, binding = 3) uniform Draw {
     uvec4 proctex[2];
 };
 
+// a combiner stage's source, operand, combiner and scale registers, the
+// pipeline's constants or, generic, the draw's
+uvec4 stage_registers(uint stage, uvec4 constants) {
+    if (DYNAMIC == 0u) {
+        return constants;
+    }
+    uvec4 registers = tev[stage * 2u];
+    return uvec4(registers.x & 0x0FFF0FFFu, registers.y & 0x00777FFFu, registers.z & 0x000F000Fu, tev[stage * 2u + 1u].x & 0x00030003u);
+}
+
 layout(std430, set = 0, binding = 4) readonly buffer Tables {
     // 24 tables of 256 entries, a value and the step to the next, then the
     // procedural texture's noise, color map and alpha map, 128 entries
@@ -125,7 +140,9 @@ vec4 sample_unit(uint unit, vec2 uv) {
     uint config = units[unit].x;
     uint wrap_t = (config >> 8) & 7u;
     uint wrap_s = (config >> 12) & 7u;
-    vec2 st = vec2(uv.x, 1.0 - uv.y);
+    // precise as the combiners are. the coordinate itself the driver may
+    // still interpolate a hair apart from one shader to another
+    precise vec2 st = vec2(uv.x, 1.0 - uv.y);
     bool border_s = (wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0);
     bool border_t = (wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0);
     if (border_s || border_t) {
@@ -139,13 +156,13 @@ vec4 sample_unit(uint unit, vec2 uv) {
     return texture(texture2, st);
 }
 
-float lookup(uint table, uint entry, float delta) {
+precise float lookup(uint table, uint entry, float delta) {
     vec2 value = tables[table * 256u + entry];
     return value.x + value.y * delta;
 }
 
 // a procedural texture map read at a coordinate from 0 to 1
-float proctex_lookup(uint map, float coordinate) {
+precise float proctex_lookup(uint map, float coordinate) {
     float at = coordinate * 128.0;
     uint entry = min(uint(max(at, 0.0)), 127u);
     vec2 value = tables[PROCTEX_MAPS + map * 128u + entry];
@@ -183,7 +200,7 @@ float proctex_shift(float other, uint mode, uint clamping) {
     return 0.0;
 }
 
-float proctex_clamp(float c, uint mode) {
+precise float proctex_clamp(float c, uint mode) {
     switch (mode) {
         case 0u: return c > 1.0 ? 0.0 : c;
         case 1u: return min(c, 1.0);
@@ -198,7 +215,7 @@ float proctex_clamp(float c, uint mode) {
     }
 }
 
-float proctex_combine(float u, float v, uint function) {
+precise float proctex_combine(float u, float v, uint function) {
     float len = sqrt(u * u + v * v);
     switch (function) {
         case 0u: return u;
@@ -215,8 +232,9 @@ float proctex_combine(float u, float v, uint function) {
     }
 }
 
-// texture 3, made up from its coordinates, as the software rasterizer has it
-vec4 procedural(vec2 uv) {
+// texture 3, made up from its coordinates, as the software rasterizer has
+// it. precise as the combiners are, as is lighting
+precise vec4 procedural(vec2 uv) {
     uint config = proctex[0].x;
     uvec2 clamps = uvec2(config & 7u, (config >> 3) & 7u);
     float u = abs(uv.x);
@@ -265,12 +283,12 @@ vec4 procedural(vec2 uv) {
     return color;
 }
 
-vec3 rotate(vec4 q, vec3 v) {
+precise vec3 rotate(vec4 q, vec3 v) {
     vec3 inner = cross(q.xyz, v);
     return v + 2.0 * cross(q.xyz, inner + v * q.w);
 }
 
-float quantize(float c) {
+precise float quantize(float c) {
     return floor(clamp(c, 0.0, 1.0) * 255.0) / 255.0;
 }
 
@@ -308,8 +326,8 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     vec3 view = in_view;
     vec3 norm_view = needs_view ? normalize(view) : vec3(0.0);
 
-    vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
-    vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    precise vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    precise vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
     uint count = light_config.y;
     for (uint slot = 0u; slot < count; slot++) {
         Light light = lights[slot];
@@ -429,7 +447,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     specular_out = vec4(quantize(specular_sum.r), quantize(specular_sum.g), quantize(specular_sum.b), quantize(specular_sum.a));
 }
 
-vec3 color_operand(vec4 s, uint operand) {
+precise vec3 color_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x1u: return vec3(1.0) - s.rgb;
         case 0x2u: return vec3(s.a);
@@ -444,7 +462,7 @@ vec3 color_operand(vec4 s, uint operand) {
     }
 }
 
-float alpha_operand(vec4 s, uint operand) {
+precise float alpha_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x0u: return s.a;
         case 0x1u: return 1.0 - s.a;
@@ -457,38 +475,46 @@ float alpha_operand(vec4 s, uint operand) {
     }
 }
 
+// the operations' results are precise, so the driver fuses no multiply
+// into an add, which it would do one way where it knows the operation and
+// another where the generic shader does not, rounding differently
 vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
+    precise vec3 result;
     switch (op) {
-        case 0u: return a;
-        case 1u: return a * b;
-        case 2u: return min(a + b, vec3(1.0));
-        case 3u: return clamp(a + b - 0.5, 0.0, 1.0);
-        case 4u: return a * c + b * (vec3(1.0) - c);
-        case 5u: return max(a - b, vec3(0.0));
+        case 0u: result = a; break;
+        case 1u: result = a * b; break;
+        case 2u: result = min(a + b, vec3(1.0)); break;
+        case 3u: result = clamp(a + b - 0.5, 0.0, 1.0); break;
+        case 4u: result = a * c + b * (vec3(1.0) - c); break;
+        case 5u: result = max(a - b, vec3(0.0)); break;
         case 6u:
         case 7u: {
             // both inputs are signed values packed into 0..1
             float d = clamp(dot(a * 2.0 - 1.0, b * 2.0 - 1.0), 0.0, 1.0);
-            return vec3(d);
+            result = vec3(d);
+            break;
         }
-        case 8u: return min(a * b + c, vec3(1.0));
-        default: return min(a + b, vec3(1.0)) * c;
+        case 8u: result = min(a * b + c, vec3(1.0)); break;
+        default: result = min(a + b, vec3(1.0)) * c; break;
     }
+    return result;
 }
 
 float combine_alpha(uint op, float a, float b, float c) {
+    precise float result;
     switch (op) {
-        case 0u: return a;
-        case 1u: return a * b;
-        case 2u: return min(a + b, 1.0);
-        case 3u: return clamp(a + b - 0.5, 0.0, 1.0);
-        case 4u: return a * c + b * (1.0 - c);
-        case 5u: return max(a - b, 0.0);
+        case 0u: result = a; break;
+        case 1u: result = a * b; break;
+        case 2u: result = min(a + b, 1.0); break;
+        case 3u: result = clamp(a + b - 0.5, 0.0, 1.0); break;
+        case 4u: result = a * c + b * (1.0 - c); break;
+        case 5u: result = max(a - b, 0.0); break;
         case 6u:
-        case 7u: return a;
-        case 8u: return min(a * b + c, 1.0);
-        default: return min(a + b, 1.0) * c;
+        case 7u: result = a; break;
+        case 8u: result = min(a * b + c, 1.0); break;
+        default: result = min(a + b, 1.0) * c; break;
     }
+    return result;
 }
 
 uint operation(uint raw) {
@@ -530,12 +556,17 @@ vec4 source_value(uint s, vec4 primary, vec4 fragment_primary, vec4 fragment_sec
     }
 }
 
-// one combiner stage, the registers constant in each pipeline
+// one combiner stage, its registers and the buffer update register
+// constant in each pipeline but the generic one
 void combine_stage(
-    uint stage, uint source, uint operand, uint combiner, uint scale,
+    uint stage, uvec4 registers, uint update,
     vec4 primary, vec4 fragment_primary, vec4 fragment_secondary, vec4 textures[4],
     inout vec4 previous, inout vec4 held, inout vec4 next_buffer
 ) {
+    uint source = registers.x;
+    uint operand = registers.y;
+    uint combiner = registers.z;
+    uint scale = registers.w;
     vec4 constant = unpack_color(tev[stage * 2u].w);
     vec4 rgb_in[3];
     vec4 alpha_in[3];
@@ -559,14 +590,15 @@ void combine_stage(
             alpha_operand(alpha_in[1], (operand >> 16) & 0x7u),
             alpha_operand(alpha_in[2], (operand >> 20) & 0x7u)
         );
-    previous = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
+    precise vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
+    previous = scaled;
 
     held = next_buffer;
     if (stage < 4u) {
-        if ((UPDATE & (0x100u << stage)) != 0u) {
+        if ((update & (0x100u << stage)) != 0u) {
             next_buffer.rgb = previous.rgb;
         }
-        if ((UPDATE & (0x1000u << stage)) != 0u) {
+        if ((update & (0x1000u << stage)) != 0u) {
             next_buffer.a = previous.a;
         }
     }
@@ -577,7 +609,7 @@ void main() {
 
     // the units the configuration turns on, unit 2 can read coordinate
     // set 1 instead of its own
-    const uint texture_config = TEXTURE_CONFIG;
+    uint texture_config = DYNAMIC != 0u ? misc.w & 0x2707u : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
         textures[0] = sample_unit(0u, in_texcoords01.xy);
@@ -597,7 +629,7 @@ void main() {
     // color and there is no specular term
     vec4 fragment_primary = primary;
     vec4 fragment_secondary = vec4(0.0, 0.0, 0.0, 1.0);
-    if (LIGHTING != 0u) {
+    if ((DYNAMIC != 0u ? flags.y : LIGHTING) != 0u) {
         shade(textures, fragment_primary, fragment_secondary);
     }
 
@@ -606,26 +638,34 @@ void main() {
     // the configured buffer color
     vec4 held = vec4(0.0);
     vec4 next_buffer = unpack_color(misc.y);
-    combine_stage(0u, SOURCE0, OPERAND0, COMBINER0, SCALE0, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
-    combine_stage(1u, SOURCE1, OPERAND1, COMBINER1, SCALE1, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
-    combine_stage(2u, SOURCE2, OPERAND2, COMBINER2, SCALE2, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
-    combine_stage(3u, SOURCE3, OPERAND3, COMBINER3, SCALE3, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
-    combine_stage(4u, SOURCE4, OPERAND4, COMBINER4, SCALE4, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
-    combine_stage(5u, SOURCE5, OPERAND5, COMBINER5, SCALE5, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    uint update = DYNAMIC != 0u ? misc.x & 0xFF00u : UPDATE;
+    combine_stage(0u, stage_registers(0u, uvec4(SOURCE0, OPERAND0, COMBINER0, SCALE0)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(1u, stage_registers(1u, uvec4(SOURCE1, OPERAND1, COMBINER1, SCALE1)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(2u, stage_registers(2u, uvec4(SOURCE2, OPERAND2, COMBINER2, SCALE2)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(3u, stage_registers(3u, uvec4(SOURCE3, OPERAND3, COMBINER3, SCALE3)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(4u, stage_registers(4u, uvec4(SOURCE4, OPERAND4, COMBINER4, SCALE4)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(5u, stage_registers(5u, uvec4(SOURCE5, OPERAND5, COMBINER5, SCALE5)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
 
-    // the color leaves as whole bytes, the way the software path truncates
-    vec4 color = floor(previous * 255.0);
-    if ((ALPHA_TEST & 1u) != 0u && !compare((ALPHA_TEST >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
+    // the color leaves as whole bytes, the way the software path truncates.
+    // precise, as everything from the operands on is, or where the driver
+    // knows the operands it works 1 - a times 255 out as 255 - 255a, which
+    // rounds to the other side of a byte
+    precise vec4 color = floor(previous * 255.0);
+    uint alpha_test = DYNAMIC != 0u ? misc.z & 0x71u : ALPHA_TEST;
+    if ((alpha_test & 1u) != 0u && !compare((alpha_test >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
         discard;
     }
-    out_color = color / 255.0;
+    precise vec4 written = color / 255.0;
+    out_color = written;
 
-    // what the GPU shaded maps z/w itself, which the clipper got exactly
-    float depth = in_depth;
-    if ((DEPTH_MODE & 2u) != 0u) {
+    // what the GPU shaded maps z/w itself, which the clipper got exactly.
+    // precise as the combiners are
+    precise float depth = in_depth;
+    uint depth_mode = DYNAMIC != 0u ? flags.x : DEPTH_MODE;
+    if ((depth_mode & 2u) != 0u) {
         depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
     }
-    if ((DEPTH_MODE & 1u) != 0u) {
+    if ((depth_mode & 1u) != 0u) {
         depth /= gl_FragCoord.w;
     }
     gl_FragDepth = clamp(depth, 0.0, 1.0);

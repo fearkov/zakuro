@@ -14,9 +14,11 @@
 //! output for the host to read later. recording goes on in a second command
 //! buffer meanwhile, so the CPU rarely waits for the GPU.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
+use std::thread;
 
 use ash::vk;
 
@@ -28,7 +30,7 @@ use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
 use crate::shader::glsl::{self, SEMANTICS};
-use crate::shader::{ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
+use crate::shader::{Program, ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
 
 const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
@@ -258,8 +260,11 @@ impl Surface {
 }
 
 /// where the pipelines compiled before are kept, the system's place for
-/// caches.
+/// caches. the tests keep none, theirs are no use to anyone playing.
 fn pipeline_cache_path() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from);
     let dir = if cfg!(windows) {
         var("LOCALAPPDATA")
@@ -270,6 +275,41 @@ fn pipeline_cache_path() -> Option<std::path::PathBuf> {
     };
     dir.map(|dir| dir.join("zakuro").join("pipelines.bin"))
 }
+
+/// keeps the pipelines compiled so far for the next run, by way of a file
+/// of its own, so a run killed halfway leaves the last one whole.
+fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache) {
+    let Some(path) = pipeline_cache_path() else {
+        return;
+    };
+    // SAFETY: the cache is the device's, and taking its data needs no one
+    // else to keep off it
+    let data = match unsafe { device.get_pipeline_cache_data(cache) } {
+        Ok(data) => data,
+        Err(error) => {
+            log::warn!("could not read the pipeline cache, {error}");
+            return;
+        }
+    };
+    let partial = path.with_extension(format!("{}.partial", std::process::id()));
+    let size = data.len();
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&partial, data))
+        .and_then(|()| std::fs::rename(&partial, &path));
+    match written {
+        Ok(()) => log::debug!(target: "zakuro_gpu::pipelines", "kept {} KB of pipelines in {}", size / 1024, path.display()),
+        Err(error) => {
+            log::warn!("could not save the pipeline cache to {}, {error}", path.display());
+            let _ = std::fs::remove_file(&partial);
+        }
+    }
+}
+
+/// how long the compiler thread waits between keeping what it compiled, a
+/// run that does not end well losing no more than that.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// how much a surface holds the latest of its memory, of those over the
 /// same rows, what the GPU drew and guest memory lacks first, then the
@@ -424,8 +464,16 @@ struct PipelineKey {
 }
 
 /// the fragment shader's specialization constants, as raster.frag numbers
-/// them.
-const FRAGMENT_CONSTANTS: usize = 29;
+/// them, the last one making it the generic shader.
+const FRAGMENT_CONSTANTS: usize = 30;
+
+/// the generic fragment shader's specialization, which reads what the
+/// others have as constants from the draw's registers.
+const GENERIC: [u32; FRAGMENT_CONSTANTS] = {
+    let mut constants = [0; FRAGMENT_CONSTANTS];
+    constants[FRAGMENT_CONSTANTS - 1] = 1;
+    constants
+};
 
 /// what a draw's vertices go through on the GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -441,6 +489,307 @@ enum VertexStage {
 /// a program translated, by its fingerprint, its entry point and where
 /// its outputs go, what the translation is made from.
 type ProgramKey = (u64, u32, [u32; SEMANTICS]);
+
+/// how far a program's translation got.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Translation {
+    /// the compiler is on it.
+    Pending,
+    /// it stays interpreted.
+    Failed,
+    Done(vk::ShaderModule),
+}
+
+/// work for the compiler thread.
+enum Job {
+    /// a program to translate.
+    Translate(ProgramKey, Arc<Program>),
+    /// a pipeline to compile, with its vertex shader's module.
+    Compile(PipelineKey, vk::ShaderModule),
+}
+
+/// what the compiler thread made of a job.
+enum Made {
+    /// the SPIR-V and the source it came from, which programs that run
+    /// the same share a module by.
+    Translated(ProgramKey, Result<(Vec<u32>, String), String>),
+    Compiled(PipelineKey, Result<vk::Pipeline, String>),
+}
+
+/// the jobs waiting for the compiler thread, translations first, as they
+/// are quick and pipelines wait for them, and whether it should stop.
+#[derive(Default)]
+struct Queue {
+    translations: VecDeque<Job>,
+    compiles: VecDeque<Job>,
+    stopped: bool,
+}
+
+/// a thread translating programs and compiling pipelines, which takes the
+/// driver up to seconds for one. draws go on meanwhile through pipelines
+/// that draw the same, rather than stall.
+struct Compiler {
+    queue: Arc<(Mutex<Queue>, Condvar)>,
+    made: mpsc::Receiver<Made>,
+    /// the jobs queued and not made yet.
+    outstanding: usize,
+    /// the pipelines asked for, each only once.
+    asked: HashSet<PipelineKey>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Compiler {
+    /// the thread, compiling with a cache, a layout and a fragment shader
+    /// that outlive it.
+    fn start(device: ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragment: vk::ShaderModule) -> Compiler {
+        let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        let (sent, made) = mpsc::channel();
+        let jobs = queue.clone();
+        let thread = thread::Builder::new()
+            .name("shader compiler".into())
+            .spawn(move || {
+                let (queue, ready) = &*jobs;
+                // pipelines compiled since the cache was last kept on disk,
+                // done when there is nothing else to do
+                let (mut compiled, mut saved) = (0, std::time::Instant::now());
+                loop {
+                    let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
+                    let job = loop {
+                        if waiting.stopped {
+                            return;
+                        }
+                        if let Some(job) = waiting.translations.pop_front().or_else(|| waiting.compiles.pop_front()) {
+                            break job;
+                        }
+                        if compiled == 0 {
+                            waiting = ready.wait(waiting).unwrap_or_else(PoisonError::into_inner);
+                        } else if let Some(left) = SAVE_EVERY.checked_sub(saved.elapsed()).filter(|left| !left.is_zero()) {
+                            waiting = ready.wait_timeout(waiting, left).unwrap_or_else(PoisonError::into_inner).0;
+                        } else {
+                            drop(waiting);
+                            save_pipeline_cache(&device, cache);
+                            (compiled, saved) = (0, std::time::Instant::now());
+                            waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
+                        }
+                    };
+                    drop(waiting);
+                    compiled += matches!(job, Job::Compile(..)) as usize;
+                    if sent.send(work(job, &device, cache, layout, fragment)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .ok();
+        Compiler { queue, made, outstanding: 0, asked: HashSet::new(), thread }
+    }
+
+    /// queues a job for the thread, or gives it back when there is none.
+    fn send(&mut self, job: Job) -> Option<Job> {
+        if self.thread.is_none() {
+            return Some(job);
+        }
+        let (queue, ready) = &*self.queue;
+        let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        match job {
+            Job::Translate(..) => waiting.translations.push_back(job),
+            Job::Compile(..) => waiting.compiles.push_back(job),
+        }
+        ready.notify_one();
+        self.outstanding += 1;
+        None
+    }
+
+    /// waits for the job the thread is on and drops the rest, giving back
+    /// the pipelines it made that no one took.
+    fn finish(&mut self) -> Vec<vk::Pipeline> {
+        let (queue, ready) = &*self.queue;
+        let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        *waiting = Queue { stopped: true, ..Queue::default() };
+        ready.notify_all();
+        drop(waiting);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let made = self.made.try_iter().filter_map(|made| match made {
+            Made::Compiled(_, Ok(pipeline)) => Some(pipeline),
+            _ => None,
+        });
+        made.collect()
+    }
+}
+
+/// a job done, on the compiler thread or, when waiting for it, on the
+/// caller's.
+fn work(job: Job, device: &ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragment: vk::ShaderModule) -> Made {
+    let started = std::time::Instant::now();
+    match job {
+        Job::Translate(key, program) => {
+            // a panic is a bug in the translation, which the interpreter
+            // can cover for
+            let source = std::panic::catch_unwind(|| glsl::translate(&program, key.1, &key.2))
+                .unwrap_or_else(|_| Err("the translation panicked".to_owned()));
+            let made = source.and_then(|source| Ok((glsl::compile(&source)?, source)));
+            match &made {
+                Ok(_) => log::debug!(
+                    target: "zakuro_gpu::programs",
+                    "translated program {:016X} from {} in {:.1} ms",
+                    key.0,
+                    key.1,
+                    started.elapsed().as_secs_f64() * 1000.0
+                ),
+                Err(error) => log::debug!(
+                    target: "zakuro_gpu::programs",
+                    "program {:016X} from {} stays interpreted, {error}",
+                    key.0,
+                    key.1
+                ),
+            }
+            Made::Translated(key, made)
+        }
+        Job::Compile(key, module) => {
+            let made = compile_pipeline(device, cache, layout, [module, fragment], &key, vk::PipelineCreateFlags::empty());
+            log::debug!(
+                target: "zakuro_gpu::pipelines",
+                "compiled a pipeline while drawing went on, in {:.1} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            Made::Compiled(key, made)
+        }
+    }
+}
+
+/// a draw pipeline for a key, with its vertex and fragment shader modules.
+fn compile_pipeline(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    [vertex, fragment]: [vk::ShaderModule; 2],
+    key: &PipelineKey,
+    flags: vk::PipelineCreateFlags,
+) -> Result<vk::Pipeline, String> {
+    let entries: Vec<vk::SpecializationMapEntry> = (0..FRAGMENT_CONSTANTS as u32)
+        .map(|id| vk::SpecializationMapEntry::default().constant_id(id).offset(id * 4).size(4))
+        .collect();
+    let constants: Vec<u8> = key.fragment.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(&constants);
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment)
+            .name(c"main")
+            .specialization_info(&specialization),
+    ];
+    let bindings = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(VERTEX_SIZE as u32)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let attributes: Vec<_> = (0..6)
+        .map(|location| {
+            vk::VertexInputAttributeDescription::default()
+                .location(location)
+                .binding(0)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(location * 16)
+        })
+        .collect();
+    // the shaded pipelines read their vertices out of a storage buffer
+    let vertex_input = match key.vertex {
+        VertexStage::Placed => vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes),
+        _ => vk::PipelineVertexInputStateCreateInfo::default(),
+    };
+    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+    // depth comes from the fragment shader, what the CPU sends it has
+    // been clipped already, what the GPU shades has z clipped to 0..w.
+    // the images run bottom up, so a triangle wound counter-clockwise
+    // with y up is wound clockwise to Vulkan, which culls per draw
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_clamp_enable(key.vertex == VertexStage::Placed)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .line_width(1.0);
+    let multisample =
+        vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+    let factor = |raw: u32| {
+        if raw & 0xF == 15 {
+            vk::BlendFactor::ONE
+        } else {
+            // the PICA numbers its factors the way Vulkan does
+            vk::BlendFactor::from_raw((raw & 0xF) as i32)
+        }
+    };
+    let equation = |raw: u32| {
+        if raw & 7 > 4 {
+            vk::BlendOp::ADD
+        } else {
+            vk::BlendOp::from_raw((raw & 7) as i32)
+        }
+    };
+    let mut attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::from_raw(key.mask));
+    if let Some(config) = key.blend {
+        attachment = attachment
+            .blend_enable(true)
+            .color_blend_op(equation(config))
+            .alpha_blend_op(equation(config >> 8))
+            .src_color_blend_factor(factor(config >> 16))
+            .dst_color_blend_factor(factor(config >> 20))
+            .src_alpha_blend_factor(factor(config >> 24))
+            .dst_alpha_blend_factor(factor(config >> 28));
+    }
+    let attachments = [attachment];
+    let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+    if let Some(op) = key.logic_op {
+        blend = blend.logic_op_enable(true).logic_op(logic_op(op));
+    }
+    let dynamic_states = [
+        vk::DynamicState::VIEWPORT,
+        vk::DynamicState::SCISSOR,
+        vk::DynamicState::DEPTH_TEST_ENABLE,
+        vk::DynamicState::DEPTH_WRITE_ENABLE,
+        vk::DynamicState::DEPTH_COMPARE_OP,
+        vk::DynamicState::STENCIL_TEST_ENABLE,
+        vk::DynamicState::STENCIL_OP,
+        vk::DynamicState::STENCIL_COMPARE_MASK,
+        vk::DynamicState::STENCIL_WRITE_MASK,
+        vk::DynamicState::STENCIL_REFERENCE,
+        vk::DynamicState::BLEND_CONSTANTS,
+        vk::DynamicState::CULL_MODE,
+    ];
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let color_formats = [COLOR_FORMAT];
+    let depth_format = if key.depth { DEPTH_FORMAT } else { vk::Format::UNDEFINED };
+    let mut rendering = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&color_formats)
+        .depth_attachment_format(depth_format)
+        .stencil_attachment_format(depth_format);
+    let info = vk::GraphicsPipelineCreateInfo::default()
+        .flags(flags)
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&assembly)
+        .viewport_state(&viewport)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&blend)
+        .dynamic_state(&dynamic)
+        .layout(layout)
+        .push_next(&mut rendering);
+    // SAFETY: every state the create info points at lives until it
+    // returns
+    unsafe { device.create_graphics_pipelines(cache, &[info], None) }
+        .map(|pipelines| pipelines[0])
+        .map_err(|(_, error)| format!("could not create a pipeline, {error}"))
+}
 
 pub struct Hardware {
     _entry: ash::Entry,
@@ -468,11 +817,18 @@ pub struct Hardware {
     shades: bool,
     /// whether programs are translated rather than interpreted.
     translates: bool,
-    /// the programs translated, none for one left to shade_shader.
-    translated: HashMap<ProgramKey, Option<vk::ShaderModule>>,
+    /// the programs seen and how far their translation got.
+    translated: HashMap<ProgramKey, Translation>,
     /// the modules made, by their source, which programs differing only in
     /// words they never run share, and so their pipelines.
     modules: HashMap<String, vk::ShaderModule>,
+    /// whether draws wait for their translations and pipelines rather than
+    /// draw the same through others meanwhile.
+    waits: bool,
+    /// whether draws always go through the generic fragment shader, to
+    /// compare the two.
+    generic: bool,
+    compiler: Compiler,
     /// whether the device does logic ops.
     logic_ops: bool,
     /// where the batch copied programs, by their fingerprints.
@@ -548,7 +904,12 @@ impl Hardware {
         // SAFETY: as above
         let logic_ops = unsafe { instance.get_physical_device_features(physical) }.logic_op == vk::TRUE;
         let features = vk::PhysicalDeviceFeatures::default().depth_clamp(true).logic_op(logic_ops);
-        let mut features13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
+        // the cache control, to make a pipeline only when the cache on disk
+        // has it, every Vulkan 1.3 device does
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .synchronization2(true)
+            .pipeline_creation_cache_control(true);
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extensions)
@@ -641,6 +1002,7 @@ impl Hardware {
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
+            let compiler = Compiler::start(device.clone(), pipeline_cache, layout, fragment_shader);
             let mut hardware = Hardware {
                 ring: unmade(),
                 in_flight: VecDeque::with_capacity(IN_FLIGHT),
@@ -668,6 +1030,11 @@ impl Hardware {
                 translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
                 translated: HashMap::new(),
                 modules: HashMap::new(),
+                // to draw through the pipeline made for each draw from the
+                // first on, as the tests do
+                waits: cfg!(test) || std::env::var_os("ZAKURO_WAIT_FOR_SHADERS").is_some(),
+                generic: std::env::var_os("ZAKURO_GENERIC_SHADERS").is_some(),
+                compiler,
                 logic_ops,
                 programs: HashMap::new(),
                 pipelines: HashMap::new(),
@@ -1375,139 +1742,83 @@ impl Hardware {
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
         }
-        let entries: Vec<vk::SpecializationMapEntry> = (0..FRAGMENT_CONSTANTS as u32)
-            .map(|id| vk::SpecializationMapEntry::default().constant_id(id).offset(id * 4).size(4))
-            .collect();
-        let constants: Vec<u8> = key.fragment.iter().flat_map(|value| value.to_le_bytes()).collect();
-        let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(&constants);
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(match key.vertex {
-                    VertexStage::Placed => self.vertex_shader,
-                    VertexStage::Interpreted => self.shade_shader,
-                    VertexStage::Translated(module) => module,
-                })
-                .name(c"main"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.fragment_shader)
-                .name(c"main")
-                .specialization_info(&specialization),
-        ];
-        let bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(VERTEX_SIZE as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
-        let attributes: Vec<_> = (0..6)
-            .map(|location| {
-                vk::VertexInputAttributeDescription::default()
-                    .location(location)
-                    .binding(0)
-                    .format(vk::Format::R32G32B32A32_SFLOAT)
-                    .offset(location * 16)
-            })
-            .collect();
-        // the shaded pipelines read their vertices out of a storage buffer
-        let vertex_input = match key.vertex {
-            VertexStage::Placed => vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&bindings)
-                .vertex_attribute_descriptions(&attributes),
-            _ => vk::PipelineVertexInputStateCreateInfo::default(),
-        };
-        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-        let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
-        // depth comes from the fragment shader, what the CPU sends it has
-        // been clipped already, what the GPU shades has z clipped to 0..w.
-        // the images run bottom up, so a triangle wound counter-clockwise
-        // with y up is wound clockwise to Vulkan, which culls per draw
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-            .depth_clamp_enable(key.vertex == VertexStage::Placed)
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0);
-        let multisample =
-            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
-        let factor = |raw: u32| {
-            if raw & 0xF == 15 {
-                vk::BlendFactor::ONE
-            } else {
-                // the PICA numbers its factors the way Vulkan does
-                vk::BlendFactor::from_raw((raw & 0xF) as i32)
-            }
-        };
-        let equation = |raw: u32| {
-            if raw & 7 > 4 {
-                vk::BlendOp::ADD
-            } else {
-                vk::BlendOp::from_raw((raw & 7) as i32)
-            }
-        };
-        let mut attachment = vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::from_raw(key.mask));
-        if let Some(config) = key.blend {
-            attachment = attachment
-                .blend_enable(true)
-                .color_blend_op(equation(config))
-                .alpha_blend_op(equation(config >> 8))
-                .src_color_blend_factor(factor(config >> 16))
-                .dst_color_blend_factor(factor(config >> 20))
-                .src_alpha_blend_factor(factor(config >> 24))
-                .dst_alpha_blend_factor(factor(config >> 28));
-        }
-        let attachments = [attachment];
-        let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
-        if let Some(op) = key.logic_op {
-            blend = blend.logic_op_enable(true).logic_op(logic_op(op));
-        }
-        let dynamic_states = [
-            vk::DynamicState::VIEWPORT,
-            vk::DynamicState::SCISSOR,
-            vk::DynamicState::DEPTH_TEST_ENABLE,
-            vk::DynamicState::DEPTH_WRITE_ENABLE,
-            vk::DynamicState::DEPTH_COMPARE_OP,
-            vk::DynamicState::STENCIL_TEST_ENABLE,
-            vk::DynamicState::STENCIL_OP,
-            vk::DynamicState::STENCIL_COMPARE_MASK,
-            vk::DynamicState::STENCIL_WRITE_MASK,
-            vk::DynamicState::STENCIL_REFERENCE,
-            vk::DynamicState::BLEND_CONSTANTS,
-            vk::DynamicState::CULL_MODE,
-        ];
-        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let color_formats = [COLOR_FORMAT];
-        let depth_format = if key.depth { DEPTH_FORMAT } else { vk::Format::UNDEFINED };
-        let mut rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_formats)
-            .depth_attachment_format(depth_format)
-            .stencil_attachment_format(depth_format);
-        let info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&assembly)
-            .viewport_state(&viewport)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&blend)
-            .dynamic_state(&dynamic)
-            .layout(self.layout)
-            .push_next(&mut rendering);
-        // SAFETY: every state the create info points at lives until it
-        // returns
+        let modules = [self.vertex_module(key.vertex), self.fragment_shader];
         let started = std::time::Instant::now();
-        let pipeline = unsafe { self.device.create_graphics_pipelines(self.pipeline_cache, &[info], None) }
-            .map_err(|(_, error)| format!("could not create a pipeline, {error}"))?[0];
+        let pipeline =
+            compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, vk::PipelineCreateFlags::empty())?;
         log::debug!(
             target: "zakuro_gpu::pipelines",
-            "compiled pipeline {} in {:.1} ms",
+            "compiled pipeline {} on the draw in {:.1} ms",
             self.pipelines.len() + 1,
             started.elapsed().as_secs_f64() * 1000.0
         );
         self.pipelines.insert(key, pipeline);
         Ok(pipeline)
+    }
+
+    /// the pipeline for a key when the cache on disk has it, made without
+    /// compiling anything.
+    fn cached(&mut self, key: PipelineKey) -> Option<vk::Pipeline> {
+        let modules = [self.vertex_module(key.vertex), self.fragment_shader];
+        let started = std::time::Instant::now();
+        let flags = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
+        let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags).ok()?;
+        log::debug!(
+            target: "zakuro_gpu::pipelines",
+            "took pipeline {} from the cache in {:.1} ms",
+            self.pipelines.len() + 1,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        self.pipelines.insert(key, pipeline);
+        Some(pipeline)
+    }
+
+    /// the pipeline a draw goes through. until the one made for its key is
+    /// ready the compiler makes it, and the draw goes through one that
+    /// draws the same, the interpreter's with the same fragment stages when
+    /// there is one, or else the generic fragment shader's, made right away
+    /// once per blend function and the like. a program still being
+    /// translated does not have its interpreted pipeline asked for, it
+    /// would not be used for long.
+    fn pipeline_for(&mut self, key: PipelineKey, translating: bool) -> Result<vk::Pipeline, String> {
+        let vertex = match key.vertex {
+            VertexStage::Placed => VertexStage::Placed,
+            _ => VertexStage::Interpreted,
+        };
+        let generic = PipelineKey { vertex, fragment: GENERIC, ..key };
+        if self.generic {
+            return self.pipeline(generic);
+        }
+        if let Some(&pipeline) = self.pipelines.get(&key) {
+            return Ok(pipeline);
+        }
+        if !translating && self.compiler.asked.insert(key) {
+            if let Some(pipeline) = self.cached(key) {
+                return Ok(pipeline);
+            }
+            // made right here when waiting for it
+            self.hand(Job::Compile(key, self.vertex_module(key.vertex)));
+            if let Some(&pipeline) = self.pipelines.get(&key) {
+                return Ok(pipeline);
+            }
+        }
+        // meanwhile, or for good when the driver turned it down
+        if let VertexStage::Translated(_) = key.vertex {
+            let interpreted = PipelineKey { vertex: VertexStage::Interpreted, ..key };
+            if self.waits || self.pipelines.contains_key(&interpreted) {
+                return self.pipeline(interpreted);
+            }
+        }
+        self.pipeline(generic)
+    }
+
+    /// the module a vertex stage runs.
+    fn vertex_module(&self, vertex: VertexStage) -> vk::ShaderModule {
+        match vertex {
+            VertexStage::Placed => self.vertex_shader,
+            VertexStage::Interpreted => self.shade_shader,
+            VertexStage::Translated(module) => module,
+        }
     }
 
     /// a memory fill wrote bytes at addr. a surface it covered with one
@@ -1680,61 +1991,136 @@ impl Hardware {
         Ok(vertex_offset)
     }
 
-    /// whether programs get translated, for comparing the two.
+    /// whether programs get translated, for comparing the two, and whether
+    /// draws wait for that.
     #[cfg(test)]
-    pub(super) fn set_translates(&mut self, translates: bool) {
+    pub(super) fn set_translates(&mut self, translates: bool, waits: bool) {
         self.translates = translates;
+        self.waits = waits;
+    }
+
+    /// whether draws always go through the generic fragment shader.
+    #[cfg(test)]
+    pub(super) fn set_generic(&mut self, generic: bool) {
+        self.generic = generic;
     }
 
     /// the programs that run translated so far.
     #[cfg(test)]
     pub(super) fn translations(&self) -> usize {
-        self.translated.values().filter(|module| module.is_some()).count()
+        self.translated.values().filter(|translation| matches!(translation, Translation::Done(_))).count()
     }
 
-    /// the stage a draw's program runs in, translated the first time it is
-    /// seen, or interpreted when it cannot be.
-    fn vertex_stage(&mut self, shading: &Shading) -> VertexStage {
+    /// the pipelines made for translated programs so far.
+    #[cfg(test)]
+    pub(super) fn translated_pipelines(&self) -> usize {
+        self.pipelines.keys().filter(|key| matches!(key.vertex, VertexStage::Translated(_))).count()
+    }
+
+    /// the stage a draw's program runs in, and whether it is still being
+    /// translated. the first time it is seen the compiler starts translating
+    /// it, and it is interpreted until that is done, and for good if it
+    /// cannot be.
+    fn vertex_stage(&mut self, shading: &Shading) -> (VertexStage, bool) {
         if !self.translates {
-            return VertexStage::Interpreted;
+            return (VertexStage::Interpreted, false);
         }
         let unit = shading.unit;
         let key = (unit.fingerprint(), unit.entry_point, shading.semantics);
-        if let Some(&module) = self.translated.get(&key) {
-            return module.map_or(VertexStage::Interpreted, VertexStage::Translated);
-        }
-        let started = std::time::Instant::now();
-        let module = unit.translate(&shading.semantics).and_then(|source| match self.modules.get(&source) {
-            Some(&module) => Ok(module),
-            None => {
-                let words = glsl::compile(&source)?;
-                let info = vk::ShaderModuleCreateInfo::default().code(&words);
-                // SAFETY: the words are SPIR-V naga made and validated
-                let module = unsafe { self.device.create_shader_module(&info, None) }
-                    .map_err(vk_error("create a shader module"))?;
-                self.modules.insert(source, module);
-                Ok(module)
+        if let Entry::Vacant(entry) = self.translated.entry(key) {
+            match unit.prepared() {
+                Some(program) => {
+                    entry.insert(Translation::Pending);
+                    self.hand(Job::Translate(key, program));
+                }
+                None => {
+                    entry.insert(Translation::Failed);
+                    log::debug!(
+                        target: "zakuro_gpu::programs",
+                        "program {:016X} from {} stays interpreted, it was not prepared",
+                        key.0,
+                        key.1
+                    );
+                }
             }
-        });
-        match &module {
-            Ok(_) => log::debug!(
-                target: "zakuro_gpu::programs",
-                "translated program {:016X} from {} in {:.1} ms, {} modules",
-                key.0,
-                key.1,
-                started.elapsed().as_secs_f64() * 1000.0,
-                self.modules.len()
-            ),
-            Err(error) => log::debug!(
-                target: "zakuro_gpu::programs",
-                "program {:016X} from {} stays interpreted, {error}",
-                key.0,
-                key.1
-            ),
         }
-        let module = module.ok();
-        self.translated.insert(key, module);
-        module.map_or(VertexStage::Interpreted, VertexStage::Translated)
+        match self.translated[&key] {
+            Translation::Pending => (VertexStage::Interpreted, true),
+            Translation::Failed => (VertexStage::Interpreted, false),
+            Translation::Done(module) => (VertexStage::Translated(module), false),
+        }
+    }
+
+    /// has the compiler do a job, or does it here, when waiting for it or
+    /// when there is no compiler.
+    fn hand(&mut self, job: Job) {
+        let job = match self.waits {
+            true => job,
+            false => match self.compiler.send(job) {
+                Some(job) => job,
+                None => return,
+            },
+        };
+        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_shader);
+        self.take(made);
+    }
+
+    /// takes in what the compiler made since last time.
+    fn collect(&mut self) {
+        while self.compiler.outstanding > 0 {
+            let Ok(made) = self.compiler.made.try_recv() else {
+                break;
+            };
+            self.compiler.outstanding -= 1;
+            self.take(made);
+        }
+    }
+
+    fn take(&mut self, made: Made) {
+        match made {
+            Made::Translated(key, Ok((words, source))) => {
+                let module = match self.modules.get(&source) {
+                    Some(&module) => module,
+                    None => {
+                        let info = vk::ShaderModuleCreateInfo::default().code(&words);
+                        // SAFETY: the words are SPIR-V naga made and validated
+                        match unsafe { self.device.create_shader_module(&info, None) } {
+                            Ok(module) => {
+                                self.modules.insert(source, module);
+                                module
+                            }
+                            Err(error) => {
+                                log::warn!("could not create a translated program's module, {error}, interpreting it");
+                                self.translated.insert(key, Translation::Failed);
+                                return;
+                            }
+                        }
+                    }
+                };
+                self.translated.insert(key, Translation::Done(module));
+            }
+            // the compiler said why
+            Made::Translated(key, Err(_)) => {
+                self.translated.insert(key, Translation::Failed);
+            }
+            Made::Compiled(key, Ok(pipeline)) => {
+                self.pipelines.insert(key, pipeline);
+            }
+            Made::Compiled(key, Err(error)) => match key.vertex {
+                // a translated program the driver turns down goes back to
+                // the interpreter
+                VertexStage::Translated(failed) => {
+                    log::warn!("a translated vertex shader could not be used, {error}, interpreting it");
+                    for translation in self.translated.values_mut() {
+                        if *translation == Translation::Done(failed) {
+                            *translation = Translation::Failed;
+                        }
+                    }
+                }
+                // the generic fragment shader goes on drawing it
+                _ => log::warn!("could not compile a pipeline, {error}, drawing through the generic one"),
+            },
+        }
     }
 
     /// copies what the vertex shader reads into the batch, and says where
@@ -1868,10 +2254,11 @@ impl Hardware {
 
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
-        let (vertex_count, vertex_offset, shaded, vertex) = match draw.geometry {
+        self.collect();
+        let (vertex_count, vertex_offset, shaded, (vertex, translating)) = match draw.geometry {
             Geometry::Triangles(triangles) => {
                 let count = triangles.len() * 3;
-                (count, self.triangles(triangles, (width, height), depth_map)?, None, VertexStage::Placed)
+                (count, self.triangles(triangles, (width, height), depth_map)?, None, (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
                 let staged = self.stage_shading(shading, depth_map)?;
@@ -1920,7 +2307,9 @@ impl Hardware {
         let depth_test = mask & 1 != 0;
         let depth_write = writable && mask & (1 << 12) != 0;
         let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
-        let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC]);
+        // only the bits compile_pipeline reads, so draws that differ
+        // elsewhere share a pipeline
+        let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC] & 0xFFFF_0707);
         let mut logic_op = LogicOp::read(r);
         let mut color_mask = color_mask;
         if !self.logic_ops {
@@ -1945,24 +2334,10 @@ impl Hardware {
         fragment[26] = draw.lighting.is_some() as u32;
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
         fragment[28] = depth_flags;
-        let mut key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), vertex, fragment };
-        let pipeline = match (self.pipeline(key), vertex) {
-            (Ok(pipeline), _) => pipeline,
-            // a translated program the driver turns down goes back to the
-            // interpreter, which has its program staged and bound all the
-            // same
-            (Err(error), VertexStage::Translated(failed)) => {
-                log::warn!("a translated vertex shader could not be used, {error}, interpreting it");
-                for module in self.translated.values_mut() {
-                    if *module == Some(failed) {
-                        *module = None;
-                    }
-                }
-                key.vertex = VertexStage::Interpreted;
-                self.pipeline(key)?
-            }
-            (Err(error), _) => return Err(error),
-        };
+        // what stands in for a translated program's pipeline, the
+        // interpreter, has the program staged and bound all the same
+        let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), vertex, fragment };
+        let pipeline = self.pipeline_for(key, translating)?;
 
         self.mark(Work::Draw, false);
         if self.uploads {
@@ -2965,15 +3340,12 @@ pub(crate) fn format_index(format: ColorFormat) -> i32 {
 
 impl Drop for Hardware {
     fn drop(&mut self) {
+        // the compiler first, it uses the cache, the layout and the modules
+        let unclaimed = self.compiler.finish();
         // SAFETY: waits for the GPU before anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let (Some(path), Ok(data)) = (pipeline_cache_path(), self.device.get_pipeline_cache_data(self.pipeline_cache)) {
-                let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, data));
-                if let Err(error) = written {
-                    log::warn!("could not save the pipeline cache to {}, {error}", path.display());
-                }
-            }
+            save_pipeline_cache(&self.device, self.pipeline_cache);
             self.device.destroy_pipeline_cache(self.pipeline_cache, None);
             for texture in self.textures.values() {
                 self.destroy_image(&texture.image);
@@ -3005,7 +3377,7 @@ impl Drop for Hardware {
                 self.device.destroy_buffer(samples.buffer, None);
                 self.device.free_memory(samples.memory, None);
             }
-            for &pipeline in self.pipelines.values() {
+            for &pipeline in self.pipelines.values().chain(&unclaimed) {
                 self.device.destroy_pipeline(pipeline, None);
             }
             for &sampler in self.samplers.values() {

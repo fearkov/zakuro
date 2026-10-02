@@ -2560,6 +2560,95 @@ mod tests {
         }
     }
 
+    /// the side of the square the translation tests draw into.
+    #[cfg(feature = "vulkan")]
+    const TRANSLATION_SIZE: u32 = 32;
+
+    /// what the translation tests draw with, the position from o0 and the
+    /// color from o2.
+    #[cfg(feature = "vulkan")]
+    fn translation_registers() -> Vec<u32> {
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
+        registers[REG_VIEWPORT_WIDTH] = float24(12.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = TRANSLATION_SIZE | ((TRANSLATION_SIZE - 1) << 12);
+        registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
+        registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        registers[REG_DEPTHMAP_ENABLE] = 1;
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        registers[REG_VS_OUTPUT_MASK] = 0b101;
+        registers[REG_PRIMITIVE_CONFIG] = 0;
+        registers
+    }
+
+    /// a unit running the program made some random words in, its flow moved
+    /// along with it so the entry point matters, with random descriptors and
+    /// uniforms, prepared, and all its words.
+    #[cfg(feature = "vulkan")]
+    fn random_unit(random: &mut Random, program: impl FnOnce(&mut Random) -> Vec<u32>) -> (ShaderUnit, Vec<u32>) {
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut unit = ShaderUnit::new();
+        unit.descriptors[0] = 0xF | IDENTITY;
+        for descriptor in &mut unit.descriptors[1..] {
+            *descriptor = random.next() & 0x7FFF_FFFF;
+        }
+        for uniform in unit.float_uniforms.iter_mut() {
+            *uniform = std::array::from_fn(|_| match random.next() % 30 {
+                0 => f32::INFINITY,
+                1 => -0.0,
+                _ => (random.next() % 2000) as f32 / 1000.0 - 1.0,
+            });
+        }
+        for integer in &mut unit.int_uniforms {
+            *integer = [(random.next() % 3) as u8, (random.next() % 8) as u8, (random.next() % 3) as u8, 0];
+        }
+        unit.bool_uniforms = random.next() as u16;
+        // past instructions never run
+        let skip = random.next() % 8;
+        let mut words: Vec<u32> = (0..skip).map(|_| random.arithmetic()).collect();
+        words.extend(program(random).into_iter().map(|word| match word >> 26 {
+            0x24..=0x29 | 0x2C | 0x2D => word + (skip << 10),
+            _ => word,
+        }));
+        unit.program[..words.len()].copy_from_slice(&words);
+        unit.entry_point = skip;
+        unit.prepare();
+        (unit, words)
+    }
+
+    /// random inputs for a translation test's draw.
+    #[cfg(feature = "vulkan")]
+    fn random_inputs(random: &mut Random) -> Vec<[shader::Vec4; shader::INPUT_REGISTERS]> {
+        let mut inputs = vec![[shader::ZERO; shader::INPUT_REGISTERS]; 24];
+        for input in &mut inputs {
+            let mut float = || (random.next() % 2000) as f32 / 1000.0 - 1.0;
+            input[0] = [float() * 1.3, float() * 1.3, float() * 0.6 - 0.1, 1.0];
+            for register in &mut input[1..] {
+                *register = [float(), float(), float(), float()];
+            }
+        }
+        inputs
+    }
+
+    /// the color and then the depth a draw leaves on the GPU.
+    #[cfg(feature = "vulkan")]
+    fn draw_on_gpu(registers: &[u32], resources: &mut Resources, unit: &ShaderUnit, inputs: &[[shader::Vec4; shader::INPUT_REGISTERS]]) -> Vec<u8> {
+        let bytes = (TRANSLATION_SIZE * TRANSLATION_SIZE * 4) as usize;
+        let mut memory = ConsoleMemory::default();
+        memory.write(COLOR, &vec![0u8; bytes]);
+        memory.write(DEPTH, &vec![0xFFu8; bytes]);
+        let vertices = Vertices::Unshaded { vertex_shader: unit, geometry_shader: unit, inputs, order: None };
+        rasterize(registers, &mut memory, resources, vertices);
+        resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+        let mut out = vec![0u8; bytes * 2];
+        memory.read(COLOR, &mut out[..bytes]);
+        memory.read(DEPTH, &mut out[bytes..]);
+        out
+    }
+
     /// draws programs made by program with the GPU interpreting them and
     /// with them translated, and checks color and depth come out the same
     /// to the bit, at least so many programs translated, and any other one
@@ -2569,95 +2658,220 @@ mod tests {
         let (Ok(mut translating), Ok(mut interpreting)) = (hardware::Hardware::new(), hardware::Hardware::new()) else {
             return;
         };
-        translating.set_translates(true);
-        interpreting.set_translates(false);
-        const SIZE: u32 = 32;
-        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        translating.set_translates(true, true);
+        interpreting.set_translates(false, true);
         let mut random = Random(seed);
-        let mut registers = target_registers();
-        registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
-        registers[REG_VIEWPORT_WIDTH] = float24(12.0);
-        registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
-        registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
-        registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
-        registers[REG_DEPTHMAP_ENABLE] = 1;
-        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
-        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
-        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
-        // the position from o0, the color from o2
-        registers[REG_VS_OUTPUT_MASK] = 0b101;
-        registers[REG_PRIMITIVE_CONFIG] = 0;
+        let registers = translation_registers();
         let mut translators = Resources { hardware: Some(translating), ..Default::default() };
         let mut interpreters = Resources { hardware: Some(interpreting), ..Default::default() };
         let mut drawn = 0;
         for case in 0..cases {
-            let mut unit = ShaderUnit::new();
-            unit.descriptors[0] = 0xF | IDENTITY;
-            for descriptor in &mut unit.descriptors[1..] {
-                *descriptor = random.next() & 0x7FFF_FFFF;
-            }
-            for uniform in unit.float_uniforms.iter_mut() {
-                *uniform = std::array::from_fn(|_| match random.next() % 30 {
-                    0 => f32::INFINITY,
-                    1 => -0.0,
-                    _ => (random.next() % 2000) as f32 / 1000.0 - 1.0,
-                });
-            }
-            for integer in &mut unit.int_uniforms {
-                *integer = [(random.next() % 3) as u8, (random.next() % 8) as u8, (random.next() % 3) as u8, 0];
-            }
-            unit.bool_uniforms = random.next() as u16;
-            // the program some words in, past instructions never run, its
-            // flow moved along with it, so the entry point matters
-            let skip = random.next() % 8;
-            let mut words: Vec<u32> = (0..skip).map(|_| random.arithmetic()).collect();
-            words.extend(program(&mut random).into_iter().map(|word| match word >> 26 {
-                0x24..=0x29 | 0x2C | 0x2D => word + (skip << 10),
-                _ => word,
-            }));
-            let program = words;
-            unit.program[..program.len()].copy_from_slice(&program);
-            unit.entry_point = skip;
-            unit.prepare();
+            let (unit, program) = random_unit(&mut random, &program);
             // the only program left to the interpreter is one that can run
             // on into the words after it
             if let Err(error) = unit.translate(&output_semantics(&registers)) {
                 assert!(error.contains("reachable instructions"), "case {case} not translated, {error}, program {program:08X?}");
             }
-
-            let mut inputs = vec![[shader::ZERO; shader::INPUT_REGISTERS]; 24];
-            for input in &mut inputs {
-                let mut float = || (random.next() % 2000) as f32 / 1000.0 - 1.0;
-                input[0] = [float() * 1.3, float() * 1.3, float() * 0.6 - 0.1, 1.0];
-                for register in &mut input[1..] {
-                    *register = [float(), float(), float(), float()];
-                }
-            }
-            let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &unit, inputs: &inputs, order: None };
-            let (mut translated, mut interpreted) = (ConsoleMemory::default(), ConsoleMemory::default());
-            for memory in [&mut translated, &mut interpreted] {
-                memory.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
-                memory.write(DEPTH, &vec![0xFFu8; (SIZE * SIZE * 4) as usize]);
-            }
-            rasterize(&registers, &mut translated, &mut translators, vertices);
-            rasterize(&registers, &mut interpreted, &mut interpreters, vertices);
-            translators.hardware.as_mut().unwrap().flush(&mut translated).unwrap();
-            interpreters.hardware.as_mut().unwrap().flush(&mut interpreted).unwrap();
-            let bytes = (SIZE * SIZE * 4) as usize;
-            let (mut a, mut b) = (vec![0u8; bytes * 2], vec![0u8; bytes * 2]);
-            translated.read(COLOR, &mut a[..bytes]);
-            translated.read(DEPTH, &mut a[bytes..]);
-            interpreted.read(COLOR, &mut b[..bytes]);
-            interpreted.read(DEPTH, &mut b[bytes..]);
-            assert!(a == b, "case {case} draws differently translated, program {program:08X?}");
-            drawn += a[..bytes].chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+            let inputs = random_inputs(&mut random);
+            let translated = draw_on_gpu(&registers, &mut translators, &unit, &inputs);
+            let interpreted = draw_on_gpu(&registers, &mut interpreters, &unit, &inputs);
+            assert!(translated == interpreted, "case {case} draws differently translated, program {program:08X?}");
+            let bytes = (TRANSLATION_SIZE * TRANSLATION_SIZE * 4) as usize;
+            drawn += translated[..bytes].chunks(4).filter(|pixel| *pixel != [0; 4]).count();
         }
         let translations = translators.hardware.as_ref().unwrap().translations();
         eprintln!("{cases} programs, {translations} translated, {drawn} pixels drawn");
         assert!(drawn as u32 > cases * 40, "only {drawn} pixels drawn");
         assert!(translations as u32 >= least, "only {translations} of {cases} programs translated");
         assert_eq!(interpreters.hardware.as_ref().unwrap().translations(), 0);
+    }
+
+    /// a program is interpreted while the compiler thread translates it and
+    /// compiles its pipeline, then runs translated, drawing the same to the
+    /// bit throughout, and the compiler stops with the GPU while it works.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn programs_translate_while_drawing_goes_on() {
+        let (Ok(mut translating), Ok(mut interpreting)) = (hardware::Hardware::new(), hardware::Hardware::new()) else {
+            return;
+        };
+        translating.set_translates(true, false);
+        interpreting.set_translates(false, true);
+        let mut random = Random(24);
+        let registers = translation_registers();
+        let mut translators = Resources { hardware: Some(translating), ..Default::default() };
+        let mut interpreters = Resources { hardware: Some(interpreting), ..Default::default() };
+        // a loop around a call to after the end, then an if
+        let (unit, _) = random_unit(&mut random, |random| {
+            let mut arithmetic = || random.arithmetic();
+            vec![
+                0x13 << 26,
+                0x29 << 26 | 4 << 10,
+                0x24 << 26 | 8 << 10 | 2,
+                arithmetic(),
+                arithmetic(),
+                0x27 << 26 | 1 << 22 | 7 << 10,
+                arithmetic(),
+                0x22 << 26,
+                arithmetic(),
+                arithmetic(),
+            ]
+        });
+        let inputs = random_inputs(&mut random);
+        let started = std::time::Instant::now();
+        let mut draws = 0;
+        loop {
+            // a pipeline made before the draw is the one it uses
+            let translated = translators.hardware.as_ref().unwrap().translated_pipelines() > 0;
+            assert!(draws > 0 || !translated, "the first draw waited for its program to be translated");
+            let a = draw_on_gpu(&registers, &mut translators, &unit, &inputs);
+            let b = draw_on_gpu(&registers, &mut interpreters, &unit, &inputs);
+            assert!(a == b, "draw {draws} differs, translated {translated}");
+            draws += 1;
+            if translated {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 60, "the program was never translated");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        eprintln!("translated after {draws} draws, {:?}", started.elapsed());
+        // and one more the compiler is still busy with when everything goes
+        let (unit, _) = random_unit(&mut random, |random| {
+            std::iter::once(0x13 << 26).chain((0..60).map(|_| random.arithmetic())).chain([0x22 << 26]).collect()
+        });
+        draw_on_gpu(&registers, &mut translators, &unit, &inputs);
+    }
+
+    /// random fragment stages, every combiner source, operand, operation
+    /// and scale, buffer updates, the three texture units over the texels at
+    /// textures, procedural textures, lighting, the alpha test and both depth
+    /// modes.
+    #[cfg(feature = "vulkan")]
+    fn random_fragment_stages(random: &mut Random, registers: &mut [u32], textures: u32) {
+        for base in [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            registers[base] = random.next() & 0x0FFF_0FFF;
+            registers[base + 1] = random.next() & 0x0077_7FFF;
+            registers[base + 2] = (random.next() % 10) | ((random.next() % 10) << 16);
+            registers[base + 3] = random.next();
+            registers[base + 4] = random.next() & 0x0003_0003;
+        }
+        // the buffer updates and the buffer's first color
+        registers[0x0E0] = random.next() & 0xFF00;
+        registers[0x0FD] = random.next();
+        // any of the units, unit 2 reading either coordinates, now and then a
+        // procedural texture
+        registers[REG_TEXTURE_CONFIG] = random.next() & 0x2307 | (random.next().is_multiple_of(4) as u32) << 10;
+        for (unit, base) in TEXTURE_UNIT_BASES.into_iter().enumerate() {
+            registers[base] = random.next();
+            registers[base + 1] = 8 | 8 << 16;
+            // the filters and the wrap modes
+            registers[base + 2] = (random.next() % 4) << 1 | (random.next() % 4) << 8 | (random.next() % 4) << 12;
+            registers[base + 4] = (textures + unit as u32 * 0x100) >> 3;
+            registers[if unit == 0 { base + 13 } else { base + 5 }] = 0;
+        }
+        registers[crate::lighting::REG_ENABLE] = random.next().is_multiple_of(3) as u32;
+        // on or off, a function and a reference
+        registers[REG_ALPHA_TEST] = random.next() & 0xFF71;
+        registers[REG_DEPTHMAP_ENABLE] = random.next() & 1;
+    }
+
+    /// the generic fragment shader, which draws while the one made for a
+    /// combination compiles, draws what that one draws, to the bit, over
+    /// random fragment stages, with the triangles placed by the CPU and with
+    /// the vertices shaded on the GPU.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_generic_fragment_shader_draws_like_the_specialized_ones() {
+        let (Ok(mut generic), Ok(specialized)) = (hardware::Hardware::new(), hardware::Hardware::new()) else {
+            return;
+        };
+        generic.set_generic(true);
+        const TEXTURES: u32 = 0x8_0000;
+        let mut random = Random(25);
+        let mut generics = Resources { hardware: Some(generic), ..Default::default() };
+        let mut specializeds = Resources { hardware: Some(specialized), ..Default::default() };
+        let bytes = (TRANSLATION_SIZE * TRANSLATION_SIZE * 4) as usize;
+        let (mut drawn, mut differing) = (0, 0);
+        for case in 0..180 {
+            let mut registers = translation_registers();
+            random_fragment_stages(&mut random, &mut registers, TEXTURES);
+            let texels: Vec<u8> = (0..0x300).map(|_| random.next() as u8).collect();
+            let mut results = Vec::new();
+            if case < 120 {
+                let triangles: Vec<Vec<Vertex>> = (0..4)
+                    .map(|_| {
+                        (0..3)
+                            .map(|_| {
+                                let mut float = || (random.next() % 2000) as f32 / 1000.0 - 1.0;
+                                let w = 1.5 + float();
+                                Vertex {
+                                    clip: [float() * w, float() * w, (float() * 0.5 - 0.5) * w, w],
+                                    color: [float().abs(), float().abs(), float().abs(), float().abs()],
+                                    texcoords: [[float() * 2.0, float() * 2.0], [float() * 2.0, float() * 2.0], [float() * 2.0, float() * 2.0]],
+                                    quaternion: [float(), float(), float(), float()],
+                                    view: [float(), float(), float()],
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                for resources in [&mut generics, &mut specializeds] {
+                    let mut memory = ConsoleMemory::default();
+                    memory.write(COLOR, &vec![0u8; bytes]);
+                    memory.write(DEPTH, &vec![0xFFu8; bytes]);
+                    memory.write(TEXTURES, &texels);
+                    for triangle in &triangles {
+                        rasterize_shaded(&registers, &mut memory, resources, triangle);
+                    }
+                    resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+                    let mut out = vec![0u8; bytes * 2];
+                    memory.read(COLOR, &mut out[..bytes]);
+                    memory.read(DEPTH, &mut out[bytes..]);
+                    results.push(out);
+                }
+            } else {
+                // all that lighting and the units read, each output register
+                // moved from the input register of its number, the position,
+                // the quaternion, the color, the view and the coordinates
+                registers[REG_SHADER_OUTPUT_TOTAL] = 6;
+                let map = [0x0302_0100, 0x0706_0504, 0x0B0A_0908, 0x1F14_1312, 0x0F0E_0D0C, 0x1F1F_1716];
+                registers[REG_SHADER_OUTPUT_MAP..REG_SHADER_OUTPUT_MAP + 6].copy_from_slice(&map);
+                registers[REG_VS_OUTPUT_MASK] = 0b11_1111;
+                let moves = (0..6).map(|register| 0x13 << 26 | register << 21 | register << 12);
+                let (unit, _) = random_unit(&mut random, |_| moves.chain([0x22 << 26]).collect());
+                let inputs = random_inputs(&mut random);
+                for resources in [&mut generics, &mut specializeds] {
+                    let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &unit, inputs: &inputs, order: None };
+                    let mut memory = ConsoleMemory::default();
+                    memory.write(COLOR, &vec![0u8; bytes]);
+                    memory.write(DEPTH, &vec![0xFFu8; bytes]);
+                    memory.write(TEXTURES, &texels);
+                    rasterize(&registers, &mut memory, resources, vertices);
+                    resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+                    let mut out = vec![0u8; bytes * 2];
+                    memory.read(COLOR, &mut out[..bytes]);
+                    memory.read(DEPTH, &mut out[bytes..]);
+                    results.push(out);
+                }
+            }
+            // the coordinates the units and the procedural texture read are
+            // interpolated as the driver sees fit for each shader, which now
+            // and then puts a texel's weight a hair apart and a channel a
+            // step off. everything else comes out the same to the bit, the
+            // combiners, lighting, the tests and depth
+            let coordinates = registers[REG_TEXTURE_CONFIG] & 0x407 != 0;
+            let stages: Vec<u32> = [0x0C0, 0x0C1, 0x0C2, 0x0C4, 0x0E0, REG_TEXTURE_CONFIG, REG_ALPHA_TEST].map(|r| registers[r]).to_vec();
+            for (i, (a, b)) in results[0].chunks(4).zip(results[1].chunks(4)).enumerate() {
+                let apart = a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                let allowed = if coordinates && i < bytes / 4 { 1 } else { 0 };
+                assert!(apart <= allowed, "case {case}, pixel {i} is {a:?} through the generic shader, {b:?} through its own, {stages:08X?}");
+                differing += (apart > 0) as usize;
+            }
+            drawn += results[0][..bytes].chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+        }
+        eprintln!("{drawn} pixels drawn, {differing} a step off");
+        assert!(drawn > 180 * 40, "only {drawn} pixels drawn");
+        assert!(differing * 100 < drawn, "{differing} of {drawn} pixels a step off");
     }
 
     /// programs of every instruction, with flow of every kind going
