@@ -36,6 +36,9 @@ use crate::GpuMemory;
 const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
+/// raster.frag built with WRITES_DEPTH, for the draws whose depth the
+/// rasterizer can't work out.
+const FRAGMENT_DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/raster_depth.frag.spv");
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
 const DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/depth.comp.spv");
 const UPRIGHT_SPIRV: &[u8] = include_bytes!("../../shaders/upright.comp.spv");
@@ -492,12 +495,28 @@ const GENERIC: [u32; FRAGMENT_CONSTANTS] = {
 
 /// the generic fragment shader for a draw's constants. it keeps whether
 /// lighting and the procedural texture are on as constants, a lot of code
-/// it goes without when they are off, which costs a lot on a small GPU.
+/// it goes without when they are off, which costs a lot on a small GPU, and
+/// which build of the shader it is.
 fn generic(fragment: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
     let mut generic = GENERIC;
     generic[25] = fragment[25] & 0x400;
     generic[26] = fragment[26];
+    generic[28] = fragment[28] & WRITES_DEPTH;
     generic
+}
+
+/// the bit of the depth mode constant for the build of raster.frag that
+/// works depth out itself.
+const WRITES_DEPTH: u32 = 4;
+
+/// the build of raster.frag a pipeline runs, of the one leaving depth to
+/// the rasterizer and the one working it out.
+fn fragment_module([plain, writing]: [vk::ShaderModule; 2], key: &PipelineKey) -> vk::ShaderModule {
+    if key.fragment[28] & WRITES_DEPTH != 0 {
+        writing
+    } else {
+        plain
+    }
 }
 
 /// what a draw's vertices go through on the GPU.
@@ -573,7 +592,7 @@ impl Compiler {
     /// pipelines, which are drawn through the slower generic shader until
     /// then, so there is one for each core the emulation and the driver
     /// leave, up to three.
-    fn start(device: ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragment: vk::ShaderModule) -> Compiler {
+    fn start(device: ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragments: [vk::ShaderModule; 2]) -> Compiler {
         let waiting = Queue {
             translations: VecDeque::new(),
             compiles: Vec::new(),
@@ -589,7 +608,7 @@ impl Compiler {
                 let (jobs, sent, device) = (queue.clone(), sent.clone(), device.clone());
                 thread::Builder::new()
                     .name("shader compiler".into())
-                    .spawn(move || compile(&jobs, &sent, &device, cache, layout, fragment))
+                    .spawn(move || compile(&jobs, &sent, &device, cache, layout, fragments))
                     .ok()
             })
             .collect();
@@ -641,7 +660,7 @@ fn compile(
     device: &ash::Device,
     cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
-    fragment: vk::ShaderModule,
+    fragments: [vk::ShaderModule; 2],
 ) {
     let (queue, ready) = jobs;
     let lock = || queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -668,7 +687,7 @@ fn compile(
         };
         drop(waiting);
         let compiles = matches!(job, Job::Compile(..));
-        let made = work(job, device, cache, layout, fragment);
+        let made = work(job, device, cache, layout, fragments);
         lock().compiled += compiles as usize;
         if sent.send(made).is_err() {
             return;
@@ -678,7 +697,7 @@ fn compile(
 
 /// a job done, on the compiler thread or, when waiting for it, on the
 /// caller's.
-fn work(job: Job, device: &ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragment: vk::ShaderModule) -> Made {
+fn work(job: Job, device: &ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragments: [vk::ShaderModule; 2]) -> Made {
     let started = std::time::Instant::now();
     match job {
         Job::Translate(key, program) => {
@@ -705,7 +724,8 @@ fn work(job: Job, device: &ash::Device, cache: vk::PipelineCache, layout: vk::Pi
             Made::Translated(key, made)
         }
         Job::Compile(key, module) => {
-            let made = compile_pipeline(device, cache, layout, [module, fragment], &key, vk::PipelineCreateFlags::empty());
+            let modules = [module, fragment_module(fragments, &key)];
+            let made = compile_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty());
             log::debug!(
                 target: "zakuro_gpu::pipelines",
                 "compiled a pipeline while drawing went on, in {:.1} ms",
@@ -870,6 +890,7 @@ pub struct Hardware {
     layout: vk::PipelineLayout,
     vertex_shader: vk::ShaderModule,
     fragment_shader: vk::ShaderModule,
+    depth_fragment_shader: vk::ShaderModule,
     shade_shader: vk::ShaderModule,
     /// whether draws go to shade_shader.
     shades: bool,
@@ -1050,6 +1071,7 @@ impl Hardware {
             };
             let vertex_shader = module(VERTEX_SPIRV)?;
             let fragment_shader = module(FRAGMENT_SPIRV)?;
+            let depth_fragment_shader = module(FRAGMENT_DEPTH_SPIRV)?;
             let shade_shader = module(SHADE_SPIRV)?;
 
             let unmade = || Buffer {
@@ -1070,7 +1092,7 @@ impl Hardware {
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
-            let compiler = Compiler::start(device.clone(), pipeline_cache, layout, fragment_shader);
+            let compiler = Compiler::start(device.clone(), pipeline_cache, layout, [fragment_shader, depth_fragment_shader]);
             let mut hardware = Hardware {
                 ring: unmade(),
                 in_flight: VecDeque::with_capacity(IN_FLIGHT),
@@ -1091,6 +1113,7 @@ impl Hardware {
                 layout,
                 vertex_shader,
                 fragment_shader,
+                depth_fragment_shader,
                 shade_shader,
                 // shading on the CPU instead, to tell the two apart
                 shades: std::env::var_os("ZAKURO_CPU_SHADERS").is_none(),
@@ -1883,7 +1906,7 @@ impl Hardware {
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
         }
-        let modules = [self.vertex_module(key.vertex), self.fragment_shader];
+        let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
         let pipeline =
             compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, vk::PipelineCreateFlags::empty())?;
@@ -1900,7 +1923,7 @@ impl Hardware {
     /// the pipeline for a key when the cache on disk has it, made without
     /// compiling anything.
     fn cached(&mut self, key: PipelineKey) -> Option<vk::Pipeline> {
-        let modules = [self.vertex_module(key.vertex), self.fragment_shader];
+        let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
         let flags = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
         let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags).ok()?;
@@ -1951,6 +1974,11 @@ impl Hardware {
             }
         }
         self.pipeline(generic)
+    }
+
+    /// raster.frag leaving depth to the rasterizer, and working it out.
+    fn fragment_modules(&self) -> [vk::ShaderModule; 2] {
+        [self.fragment_shader, self.depth_fragment_shader]
     }
 
     /// the module a vertex stage runs.
@@ -2204,7 +2232,7 @@ impl Hardware {
                 None => return,
             },
         };
-        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_shader);
+        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules());
         self.take(made);
     }
 
@@ -2421,6 +2449,18 @@ impl Hardware {
             words.extend([r[base + 2], r[base], 0, 0]);
         }
         let depth_flags = depth_map.w_buffer as u32 | (shaded.is_some() as u32) << 1;
+        // the depth map goes through the viewport where it fits, and what
+        // the CPU placed carries its depth in its position, so the fragment
+        // shader leaves depth alone and the GPU skips what is hidden before
+        // shading it. a w-buffer is not linear on the screen, the fragment
+        // shader works that out as before
+        let mapped = (depth_map.offset, depth_map.offset - depth_map.scale);
+        let (writes_depth, depth_range) = match draw.geometry {
+            _ if depth_map.w_buffer => (true, (0.0, 1.0)),
+            Geometry::Triangles(_) => (false, (0.0, 1.0)),
+            Geometry::Shaded(_) if [mapped.0, mapped.1].iter().all(|d| (0.0..=1.0).contains(d)) => (false, mapped),
+            Geometry::Shaded(_) => (true, (0.0, 1.0)),
+        };
         words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
         match draw.lighting {
             Some(lighting) => lighting.pack(&mut words),
@@ -2476,7 +2516,7 @@ impl Hardware {
         fragment[25] = texture_config & 0x2707;
         fragment[26] = draw.lighting.is_some() as u32;
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
-        fragment[28] = depth_flags;
+        fragment[28] = depth_flags | ((writes_depth as u32) * WRITES_DEPTH);
         // what stands in for a translated program's pipeline, the
         // interpreter, has the program staged and bound all the same
         let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), vertex, fragment };
@@ -2565,8 +2605,8 @@ impl Hardware {
             y: y * scale as f32,
             width: viewport_width * scale as f32,
             height: viewport_height * scale as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
+            min_depth: depth_range.0,
+            max_depth: depth_range.1,
         };
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
         let test = r[REG_STENCIL_TEST];
@@ -3540,6 +3580,7 @@ impl Drop for Hardware {
             }
             self.device.destroy_shader_module(self.vertex_shader, None);
             self.device.destroy_shader_module(self.fragment_shader, None);
+            self.device.destroy_shader_module(self.depth_fragment_shader, None);
             self.device.destroy_shader_module(self.shade_shader, None);
             for &module in self.modules.values() {
                 self.device.destroy_shader_module(module, None);

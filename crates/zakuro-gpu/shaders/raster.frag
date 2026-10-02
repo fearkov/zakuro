@@ -667,8 +667,11 @@ void main() {
     precise vec4 written = color / 255.0;
     out_color = written;
 
+#ifdef WRITES_DEPTH
     // what the GPU shaded maps z/w itself, which the clipper got exactly.
-    // precise as the combiners are
+    // precise as the combiners are. built so only for a w-buffer and for a
+    // depth map the viewport can't hold, the rest leave depth to the
+    // rasterizer, which lets the GPU skip what is hidden before shading it
     precise float depth = in_depth;
     uint depth_mode = DYNAMIC != 0u ? flags.x : DEPTH_MODE;
     if ((depth_mode & 2u) != 0u) {
@@ -678,4 +681,5 @@ void main() {
         depth /= gl_FragCoord.w;
     }
     gl_FragDepth = clamp(depth, 0.0, 1.0);
+#endif
 }
