@@ -1723,16 +1723,21 @@ impl Hardware {
         let offset = self.stage(TABLES_SIZE, self.storage_alignment)?;
         let staging = self.ring(offset, TABLES_SIZE);
         let (colors, steps) = procedural.colors();
-        let values = tables
-            .entries()
-            .iter()
-            .flatten()
-            .flatten()
-            .chain(procedural.maps().iter().flatten().flatten())
-            .chain(colors.iter().flatten())
-            .chain(steps.iter().flatten());
-        for (out, value) in staging.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-            *out = value.to_le_bytes();
+        // a plain loop over each, which goes as fast as copying, a chain of
+        // flattened iterators took a quarter of a frame
+        let parts = [
+            tables.entries().as_flattened().as_flattened(),
+            procedural.maps().as_flattened().as_flattened(),
+            colors.as_flattened(),
+            steps.as_flattened(),
+        ];
+        let mut out = staging.as_chunks_mut::<4>().0;
+        for part in parts {
+            let (here, rest) = out.split_at_mut(part.len());
+            for (bytes, value) in here.iter_mut().zip(part) {
+                *bytes = value.to_le_bytes();
+            }
+            out = rest;
         }
         self.tables = Some((generation, offset));
         Ok(offset)

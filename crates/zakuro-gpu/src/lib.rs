@@ -668,6 +668,16 @@ impl Gpu {
         self.command_lists += 1;
     }
 
+    /// decodes the programs a draw runs. the geometry unit gets the vertex
+    /// shader's uploads too, and decoding hashes a whole program, so it is
+    /// left alone while the geometry stage is off.
+    fn prepare_shaders(&mut self) {
+        self.vertex_shader.prepare();
+        if self.internal[REG_GEOSTAGE_CONFIG] & 0x3 == 2 {
+            self.geometry_shader.prepare();
+        }
+    }
+
     /// draws any immediate-mode vertices still waiting.
     fn flush_immediate<M: GpuMemory>(&mut self, memory: &mut M) {
         if self.immediate.vertices.is_empty() {
@@ -676,8 +686,7 @@ impl Gpu {
         let vertices = std::mem::take(&mut self.immediate.vertices);
         self.draw_calls += 1;
         self.vertices_drawn += vertices.len() as u64;
-        self.vertex_shader.prepare();
-        self.geometry_shader.prepare();
+        self.prepare_shaders();
         raster::draw_immediate(
             &self.internal,
             &self.vertex_shader,
@@ -726,8 +735,7 @@ impl Gpu {
                     indexed,
                     registers: &self.internal,
                 });
-                self.vertex_shader.prepare();
-                self.geometry_shader.prepare();
+                self.prepare_shaders();
                 let vertices =
                     raster::draw(
                     &self.internal,

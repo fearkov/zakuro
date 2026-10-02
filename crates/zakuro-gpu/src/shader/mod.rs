@@ -12,6 +12,9 @@ use isa::{Instruction, OpCode, OperandDescriptor};
 
 pub const PROGRAM_SIZE: usize = 4096;
 pub const DESCRIPTOR_SIZE: usize = 128;
+
+// fingerprint hashes both four words at a time
+const _: () = assert!(PROGRAM_SIZE.is_multiple_of(4) && DESCRIPTOR_SIZE.is_multiple_of(4));
 pub const FLOAT_UNIFORMS: usize = 96;
 pub const INPUT_REGISTERS: usize = 16;
 pub const OUTPUT_REGISTERS: usize = 16;
@@ -128,8 +131,17 @@ impl ShaderUnit {
         if let Some(program) = &self.decoded {
             return program.fingerprint;
         }
-        let words = self.program.iter().chain(self.descriptors.iter());
-        words.fold(0, |hash: u64, &word| (hash.rotate_left(5) ^ word as u64).wrapping_mul(0x517C_C1B7_2722_0A95))
+        // four lanes the CPU works on side by side, titles switch programs
+        // often enough for one chain through every word to show
+        let mix = |hash: u64, word: u64| (hash.rotate_left(5) ^ word).wrapping_mul(0x517C_C1B7_2722_0A95);
+        let mut lanes = [0u64; 4];
+        let words = self.program.as_chunks::<4>().0.iter().chain(self.descriptors.as_chunks::<4>().0);
+        for chunk in words {
+            for (lane, &word) in lanes.iter_mut().zip(chunk) {
+                *lane = mix(*lane, word as u64);
+            }
+        }
+        lanes.into_iter().fold(0, mix)
     }
 
     /// starts a float uniform upload at the register the raw value names.

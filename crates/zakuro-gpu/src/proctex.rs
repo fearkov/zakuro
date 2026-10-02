@@ -32,7 +32,8 @@ pub struct Tables {
     /// the colors, 0 to 255 a channel, and the steps to the next ones.
     colors: Box<[[f32; 4]; COLOR_ENTRIES]>,
     steps: Box<[[f32; 4]; COLOR_ENTRIES]>,
-    /// goes up with every write, so a copy elsewhere knows it is stale.
+    /// goes up with every write that changes an entry, so a copy elsewhere
+    /// knows it is stale. titles send the same tables over and over.
     generation: u64,
 }
 
@@ -47,14 +48,20 @@ impl Default for Tables {
     }
 }
 
+/// an entry set to a new value, and whether that changed it, to the bit.
+fn replace<const N: usize>(entry: &mut [f32; N], value: [f32; N]) -> bool {
+    let changed = entry.map(f32::to_bits) != value.map(f32::to_bits);
+    *entry = value;
+    changed
+}
+
 impl Tables {
     /// takes a write to the table data registers, into the table and entry
     /// the index register names, which then moves on to the next entry.
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
         let index = registers[REG_TABLE_INDEX];
         let entry = (index & 0xFF) as usize;
-        self.generation += 1;
-        match ((index >> 8) & 0xF) as usize {
+        let changed = match ((index >> 8) & 0xF) as usize {
             table @ (NOISE | COLOR_MAP | ALPHA_MAP) if entry < MAP_ENTRIES => {
                 // a 0.12 value and the step to the next one, 12 bits with
                 // the sign on top
@@ -64,13 +71,14 @@ impl Tables {
                     COLOR_MAP => 1,
                     _ => 2,
                 };
-                self.maps[map][entry] = [(value & 0xFFF) as f32 / 4095.0, step as f32 / 4095.0];
+                replace(&mut self.maps[map][entry], [(value & 0xFFF) as f32 / 4095.0, step as f32 / 4095.0])
             }
-            COLOR => self.colors[entry] = value.to_le_bytes().map(|c| c as f32),
+            COLOR => replace(&mut self.colors[entry], value.to_le_bytes().map(|c| c as f32)),
             // the steps come halved, signed bytes
-            COLOR_DIFF => self.steps[entry] = value.to_le_bytes().map(|c| c as i8 as f32 * 2.0),
-            _ => {}
-        }
+            COLOR_DIFF => replace(&mut self.steps[entry], value.to_le_bytes().map(|c| c as i8 as f32 * 2.0)),
+            _ => false,
+        };
+        self.generation += changed as u64;
         registers[REG_TABLE_INDEX] = (index & !0xFF) | ((entry as u32 + 1) & 0xFF);
     }
 
@@ -283,6 +291,26 @@ fn half_to_f32(half: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the same tables sent again leave what the GPU has of them as it is,
+    /// a changed entry of any of them makes it stale.
+    #[test]
+    fn only_a_changed_entry_makes_the_tables_stale() {
+        let mut registers = vec![0u32; 0x300];
+        let mut tables = Tables::default();
+        let send = |tables: &mut Tables, registers: &mut Vec<u32>, color: u32| {
+            for (table, value) in [(NOISE, 100 | (5 << 12)), (COLOR, color), (COLOR_DIFF, 0x01FF_0102)] {
+                registers[REG_TABLE_INDEX] = (table as u32) << 8;
+                tables.write(registers, value);
+            }
+        };
+        send(&mut tables, &mut registers, 0xFF80_8080);
+        let sent = tables.generation();
+        send(&mut tables, &mut registers, 0xFF80_8080);
+        assert_eq!(tables.generation(), sent);
+        send(&mut tables, &mut registers, 0xFF80_8081);
+        assert_ne!(tables.generation(), sent);
+    }
 
     /// a flat grey table and a map straight through, the texture comes out
     /// the grey wherever it is read.

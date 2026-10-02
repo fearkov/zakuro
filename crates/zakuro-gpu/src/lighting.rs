@@ -35,7 +35,8 @@ const TABLES: usize = 24;
 /// the step to the next entry, which interpolates between them.
 pub struct Tables {
     entries: Box<[[[f32; 2]; 256]; TABLES]>,
-    /// goes up with every write, so a copy elsewhere knows it is stale.
+    /// goes up with every write that changes an entry, so a copy elsewhere
+    /// knows it is stale. titles send the same tables over and over.
     generation: u64,
 }
 
@@ -51,13 +52,16 @@ impl Tables {
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
         let index = registers[REG_TABLE_INDEX];
         let entry = (index & 0xFF) as usize;
-        self.generation += 1;
         if let Some(table) = self.entries.get_mut(((index >> 8) & 0x1F) as usize) {
             // a 0.12 value and the step to the next one, an 11-bit magnitude
             // with the sign above it
             let step = ((value >> 12) & 0x7FF) as f32 / 2047.0;
             let step = if value & (1 << 23) != 0 { -step } else { step };
-            table[entry] = [(value & 0xFFF) as f32 / 4095.0, step];
+            let decoded = [(value & 0xFFF) as f32 / 4095.0, step];
+            if table[entry].map(f32::to_bits) != decoded.map(f32::to_bits) {
+                table[entry] = decoded;
+                self.generation += 1;
+            }
         }
         registers[REG_TABLE_INDEX] = (index & !0xFF) | ((entry as u32 + 1) & 0xFF);
     }
@@ -535,6 +539,24 @@ mod tests {
         assert_eq!(tables.entries[3][0], [1.0, 0.0]);
         assert_eq!(tables.entries[3][1][1], -1024.0 / 2047.0);
         assert_eq!(registers[REG_TABLE_INDEX], (3 << 8) | 2);
+    }
+
+    /// titles send the same tables again and again, which leaves what the
+    /// GPU has of them as it is, and only a changed entry makes it stale.
+    #[test]
+    fn only_a_changed_entry_makes_the_tables_stale() {
+        let mut registers = vec![0u32; 0x200];
+        let mut tables = Tables::default();
+        let values = [4095, 2048 | ((0x800 | 0x400) << 12), 0];
+        registers[REG_TABLE_INDEX] = 5 << 8;
+        values.iter().for_each(|&value| tables.write(&mut registers, value));
+        let sent = tables.generation();
+        registers[REG_TABLE_INDEX] = 5 << 8;
+        values.iter().for_each(|&value| tables.write(&mut registers, value));
+        assert_eq!(tables.generation(), sent);
+        registers[REG_TABLE_INDEX] = (5 << 8) | 1;
+        tables.write(&mut registers, 2048);
+        assert_ne!(tables.generation(), sent);
     }
 
     #[test]
