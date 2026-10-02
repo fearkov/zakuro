@@ -256,6 +256,20 @@ impl Surface {
     }
 }
 
+/// where the pipelines compiled before are kept, the system's place for
+/// caches.
+fn pipeline_cache_path() -> Option<std::path::PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from);
+    let dir = if cfg!(windows) {
+        var("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|home| home.join("Library/Caches"))
+    } else {
+        var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|home| home.join(".cache")))
+    };
+    dir.map(|dir| dir.join("zakuro").join("pipelines.bin"))
+}
+
 /// how much a surface holds the latest of its memory, of those over the
 /// same rows, what the GPU drew and guest memory lacks first, then the
 /// taller, which titles draw a shorter buffer into the start of.
@@ -404,7 +418,14 @@ struct PipelineKey {
     depth: bool,
     /// the vertex shader runs on the GPU.
     shaded: bool,
+    /// the fragment shader's specialization constants, what decides its
+    /// shape, the combiners, the units, lighting, the alpha test, depth.
+    fragment: [u32; FRAGMENT_CONSTANTS],
 }
+
+/// the fragment shader's specialization constants, as raster.frag numbers
+/// them.
+const FRAGMENT_CONSTANTS: usize = 29;
 
 pub struct Hardware {
     _entry: ash::Entry,
@@ -470,6 +491,9 @@ pub struct Hardware {
     timing: Option<Timing>,
     barriers: std::cell::Cell<u64>,
     renderings: u64,
+    /// the pipelines compiled before, kept on disk between runs, so a
+    /// combination of fragment stages seen once does not stall again.
+    pipeline_cache: vk::PipelineCache,
 }
 
 impl Hardware {
@@ -589,6 +613,12 @@ impl Hardware {
                 features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
             });
             let timestamps = instance.get_physical_device_queue_family_properties(physical)[family as usize].timestamp_valid_bits > 0;
+            // the driver checks the data is for this GPU and ignores it if not
+            let saved = pipeline_cache_path().and_then(|path| std::fs::read(path).ok()).unwrap_or_default();
+            let pipeline_cache = device
+                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
+                .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
+                .map_err(vk_error("create a pipeline cache"))?;
             let mut hardware = Hardware {
                 ring: unmade(),
                 in_flight: VecDeque::with_capacity(IN_FLIGHT),
@@ -645,6 +675,7 @@ impl Hardware {
                     }),
                 barriers: std::cell::Cell::new(0),
                 renderings: 0,
+                pipeline_cache,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -1318,6 +1349,11 @@ impl Hardware {
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
         }
+        let entries: Vec<vk::SpecializationMapEntry> = (0..FRAGMENT_CONSTANTS as u32)
+            .map(|id| vk::SpecializationMapEntry::default().constant_id(id).offset(id * 4).size(4))
+            .collect();
+        let constants: Vec<u8> = key.fragment.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(&constants);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1326,7 +1362,8 @@ impl Hardware {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.fragment_shader)
-                .name(c"main"),
+                .name(c"main")
+                .specialization_info(&specialization),
         ];
         let bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -1430,7 +1467,7 @@ impl Hardware {
             .push_next(&mut rendering);
         // SAFETY: every state the create info points at lives until it
         // returns
-        let pipeline = unsafe { self.device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
+        let pipeline = unsafe { self.device.create_graphics_pipelines(self.pipeline_cache, &[info], None) }
             .map_err(|(_, error)| format!("could not create a pipeline, {error}"))?[0];
         self.pipelines.insert(key, pipeline);
         Ok(pipeline)
@@ -1797,7 +1834,21 @@ impl Hardware {
             }
             logic_op = None;
         }
-        let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some() };
+        // only the bits the shader reads, so draws that differ elsewhere
+        // share a pipeline
+        let mut fragment = [0u32; FRAGMENT_CONSTANTS];
+        for (i, base) in STAGE_REGISTERS.into_iter().enumerate() {
+            fragment[i] = r[base] & 0x0FFF_0FFF;
+            fragment[6 + i] = r[base + 1] & 0x0077_7FFF;
+            fragment[12 + i] = r[base + 2] & 0x000F_000F;
+            fragment[18 + i] = r[base + 4] & 0x0003_0003;
+        }
+        fragment[24] = r[REG_UPDATE_BUFFER] & 0xFF00;
+        fragment[25] = texture_config & 0x2707;
+        fragment[26] = draw.lighting.is_some() as u32;
+        fragment[27] = r[REG_ALPHA_TEST] & 0x71;
+        fragment[28] = depth_flags;
+        let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), shaded: shaded.is_some(), fragment };
         let pipeline = self.pipeline(key)?;
 
         self.mark(Work::Draw, false);
@@ -2464,7 +2515,7 @@ impl Hardware {
             let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
             let pipeline = self
                 .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(self.pipeline_cache, &[info], None)
                 .map_err(|(_, error)| format!("could not create a pipeline, {error}"))?[0];
             Ok(Compute { shader, set_layout, layout, pipeline })
         }
@@ -2804,6 +2855,13 @@ impl Drop for Hardware {
         // SAFETY: waits for the GPU before anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let (Some(path), Ok(data)) = (pipeline_cache_path(), self.device.get_pipeline_cache_data(self.pipeline_cache)) {
+                let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, data));
+                if let Err(error) = written {
+                    log::warn!("could not save the pipeline cache to {}, {error}", path.display());
+                }
+            }
+            self.device.destroy_pipeline_cache(self.pipeline_cache, None);
             for texture in self.textures.values() {
                 self.destroy_image(&texture.image);
             }

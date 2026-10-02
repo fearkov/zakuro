@@ -13,6 +13,42 @@ layout(location = 5) in vec3 in_view;
 
 layout(location = 0) out vec4 out_color;
 
+// what decides the shape of the fragment stages comes in as specialization
+// constants, a pipeline for each combination, so the driver compiles away
+// the combiners' switches and the stages a draw does not use. per combiner
+// stage the source, operand, combiner and scale registers, then the buffer
+// update, the texture units' configuration, whether lighting is on, the
+// alpha test's switch and function, and the depth mode
+layout(constant_id = 0) const uint SOURCE0 = 0u;
+layout(constant_id = 1) const uint SOURCE1 = 0u;
+layout(constant_id = 2) const uint SOURCE2 = 0u;
+layout(constant_id = 3) const uint SOURCE3 = 0u;
+layout(constant_id = 4) const uint SOURCE4 = 0u;
+layout(constant_id = 5) const uint SOURCE5 = 0u;
+layout(constant_id = 6) const uint OPERAND0 = 0u;
+layout(constant_id = 7) const uint OPERAND1 = 0u;
+layout(constant_id = 8) const uint OPERAND2 = 0u;
+layout(constant_id = 9) const uint OPERAND3 = 0u;
+layout(constant_id = 10) const uint OPERAND4 = 0u;
+layout(constant_id = 11) const uint OPERAND5 = 0u;
+layout(constant_id = 12) const uint COMBINER0 = 0u;
+layout(constant_id = 13) const uint COMBINER1 = 0u;
+layout(constant_id = 14) const uint COMBINER2 = 0u;
+layout(constant_id = 15) const uint COMBINER3 = 0u;
+layout(constant_id = 16) const uint COMBINER4 = 0u;
+layout(constant_id = 17) const uint COMBINER5 = 0u;
+layout(constant_id = 18) const uint SCALE0 = 0u;
+layout(constant_id = 19) const uint SCALE1 = 0u;
+layout(constant_id = 20) const uint SCALE2 = 0u;
+layout(constant_id = 21) const uint SCALE3 = 0u;
+layout(constant_id = 22) const uint SCALE4 = 0u;
+layout(constant_id = 23) const uint SCALE5 = 0u;
+layout(constant_id = 24) const uint UPDATE = 0u;
+layout(constant_id = 25) const uint TEXTURE_CONFIG = 0u;
+layout(constant_id = 26) const uint LIGHTING = 0u;
+layout(constant_id = 27) const uint ALPHA_TEST = 0u;
+layout(constant_id = 28) const uint DEPTH_MODE = 0u;
+
 layout(set = 0, binding = 0) uniform sampler2D texture0;
 layout(set = 0, binding = 1) uniform sampler2D texture1;
 layout(set = 0, binding = 2) uniform sampler2D texture2;
@@ -478,12 +514,70 @@ bool compare(uint function, float value, float reference) {
     }
 }
 
+// a source's value for a combiner stage
+vec4 source_value(uint s, vec4 primary, vec4 fragment_primary, vec4 fragment_secondary, vec4 textures[4], vec4 previous, vec4 held, vec4 constant) {
+    switch (s) {
+        case 0x0u: return primary;
+        case 0x1u: return fragment_primary;
+        case 0x2u: return fragment_secondary;
+        case 0x3u: return textures[0];
+        case 0x4u: return textures[1];
+        case 0x5u: return textures[2];
+        case 0x6u: return textures[3];
+        case 0xDu: return held;
+        case 0xEu: return constant;
+        default: return previous;
+    }
+}
+
+// one combiner stage, the registers constant in each pipeline
+void combine_stage(
+    uint stage, uint source, uint operand, uint combiner, uint scale,
+    vec4 primary, vec4 fragment_primary, vec4 fragment_secondary, vec4 textures[4],
+    inout vec4 previous, inout vec4 held, inout vec4 next_buffer
+) {
+    vec4 constant = unpack_color(tev[stage * 2u].w);
+    vec4 rgb_in[3];
+    vec4 alpha_in[3];
+    for (uint i = 0u; i < 3u; i++) {
+        rgb_in[i] = source_value((source >> (i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
+        alpha_in[i] = source_value((source >> (16u + i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
+    }
+    uint color_op = operation(combiner);
+    uint alpha_op = operation(combiner >> 16);
+    vec3 rgb = combine_rgb(
+        color_op,
+        color_operand(rgb_in[0], operand & 0xFu),
+        color_operand(rgb_in[1], (operand >> 4) & 0xFu),
+        color_operand(rgb_in[2], (operand >> 8) & 0xFu)
+    );
+    float alpha = color_op == 7u
+        ? rgb.r
+        : combine_alpha(
+            alpha_op,
+            alpha_operand(alpha_in[0], (operand >> 12) & 0x7u),
+            alpha_operand(alpha_in[1], (operand >> 16) & 0x7u),
+            alpha_operand(alpha_in[2], (operand >> 20) & 0x7u)
+        );
+    previous = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
+
+    held = next_buffer;
+    if (stage < 4u) {
+        if ((UPDATE & (0x100u << stage)) != 0u) {
+            next_buffer.rgb = previous.rgb;
+        }
+        if ((UPDATE & (0x1000u << stage)) != 0u) {
+            next_buffer.a = previous.a;
+        }
+    }
+}
+
 void main() {
     vec4 primary = clamp(in_color, 0.0, 1.0);
 
     // the units the configuration turns on, unit 2 can read coordinate
     // set 1 instead of its own
-    uint texture_config = misc.w;
+    const uint texture_config = TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
         textures[0] = sample_unit(0u, in_texcoords01.xy);
@@ -503,7 +597,7 @@ void main() {
     // color and there is no specular term
     vec4 fragment_primary = primary;
     vec4 fragment_secondary = vec4(0.0, 0.0, 0.0, 1.0);
-    if (flags.y != 0u) {
+    if (LIGHTING != 0u) {
         shade(textures, fragment_primary, fragment_secondary);
     }
 
@@ -512,85 +606,26 @@ void main() {
     // the configured buffer color
     vec4 held = vec4(0.0);
     vec4 next_buffer = unpack_color(misc.y);
-    uint update = misc.x;
-    for (uint stage = 0u; stage < 6u; stage++) {
-        uvec4 words = tev[stage * 2u];
-        uint source = words.x;
-        uint operand = words.y;
-        uint combiner = words.z;
-        vec4 constant = unpack_color(words.w);
-        uint scale = tev[stage * 2u + 1u].x;
-
-        vec4 inputs_rgb[3];
-        vec4 inputs_alpha[3];
-        for (uint i = 0u; i < 3u; i++) {
-            uint sources[2] = uint[2]((source >> (i * 4u)) & 0xFu, (source >> (16u + i * 4u)) & 0xFu);
-            for (uint which = 0u; which < 2u; which++) {
-                uint s = sources[which];
-                vec4 value;
-                switch (s) {
-                    case 0x0u: value = primary; break;
-                    case 0x1u: value = fragment_primary; break;
-                    case 0x2u: value = fragment_secondary; break;
-                    case 0x3u: value = textures[0]; break;
-                    case 0x4u: value = textures[1]; break;
-                    case 0x5u: value = textures[2]; break;
-                    case 0x6u: value = textures[3]; break;
-                    case 0xDu: value = held; break;
-                    case 0xEu: value = constant; break;
-                    default: value = previous; break;
-                }
-                if (which == 0u) {
-                    inputs_rgb[i] = value;
-                } else {
-                    inputs_alpha[i] = value;
-                }
-            }
-        }
-
-        uint color_op = operation(combiner);
-        uint alpha_op = operation(combiner >> 16);
-        vec3 rgb = combine_rgb(
-            color_op,
-            color_operand(inputs_rgb[0], operand & 0xFu),
-            color_operand(inputs_rgb[1], (operand >> 4) & 0xFu),
-            color_operand(inputs_rgb[2], (operand >> 8) & 0xFu)
-        );
-        float alpha = color_op == 7u
-            ? rgb.r
-            : combine_alpha(
-                alpha_op,
-                alpha_operand(inputs_alpha[0], (operand >> 12) & 0x7u),
-                alpha_operand(inputs_alpha[1], (operand >> 16) & 0x7u),
-                alpha_operand(inputs_alpha[2], (operand >> 20) & 0x7u)
-            );
-        previous = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
-
-        held = next_buffer;
-        if (stage < 4u) {
-            if ((update & (0x100u << stage)) != 0u) {
-                next_buffer.rgb = previous.rgb;
-            }
-            if ((update & (0x1000u << stage)) != 0u) {
-                next_buffer.a = previous.a;
-            }
-        }
-    }
+    combine_stage(0u, SOURCE0, OPERAND0, COMBINER0, SCALE0, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(1u, SOURCE1, OPERAND1, COMBINER1, SCALE1, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(2u, SOURCE2, OPERAND2, COMBINER2, SCALE2, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(3u, SOURCE3, OPERAND3, COMBINER3, SCALE3, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(4u, SOURCE4, OPERAND4, COMBINER4, SCALE4, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
+    combine_stage(5u, SOURCE5, OPERAND5, COMBINER5, SCALE5, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
 
     // the color leaves as whole bytes, the way the software path truncates
     vec4 color = floor(previous * 255.0);
-    uint alpha_test = misc.z;
-    if ((alpha_test & 1u) != 0u && !compare((alpha_test >> 4) & 7u, color.a, float((alpha_test >> 8) & 0xFFu))) {
+    if ((ALPHA_TEST & 1u) != 0u && !compare((ALPHA_TEST >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
         discard;
     }
     out_color = color / 255.0;
 
     // what the GPU shaded maps z/w itself, which the clipper got exactly
     float depth = in_depth;
-    if ((flags.x & 2u) != 0u) {
+    if ((DEPTH_MODE & 2u) != 0u) {
         depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
     }
-    if ((flags.x & 1u) != 0u) {
+    if ((DEPTH_MODE & 1u) != 0u) {
         depth /= gl_FragCoord.w;
     }
     gl_FragDepth = clamp(depth, 0.0, 1.0);
