@@ -475,6 +475,16 @@ const GENERIC: [u32; FRAGMENT_CONSTANTS] = {
     constants
 };
 
+/// the generic fragment shader for a draw's constants. it keeps whether
+/// lighting and the procedural texture are on as constants, a lot of code
+/// it goes without when they are off, which costs a lot on a small GPU.
+fn generic(fragment: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
+    let mut generic = GENERIC;
+    generic[25] = fragment[25] & 0x400;
+    generic[26] = fragment[26];
+    generic
+}
+
 /// what a draw's vertices go through on the GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum VertexStage {
@@ -516,16 +526,20 @@ enum Made {
     Compiled(PipelineKey, Result<vk::Pipeline, String>),
 }
 
-/// the jobs waiting for the compiler thread, translations first, as they
-/// are quick and pipelines wait for them, and whether it should stop.
-#[derive(Default)]
+/// the jobs waiting for the compiler threads, translations first, as they
+/// are quick and pipelines wait for them, then the pipelines asked for last,
+/// as those are what is being drawn now, and whether the threads should stop.
 struct Queue {
     translations: VecDeque<Job>,
-    compiles: VecDeque<Job>,
+    compiles: Vec<Job>,
     stopped: bool,
+    /// pipelines compiled since the cache was last kept on disk, and when
+    /// that was, which a thread with nothing else to do sees to.
+    compiled: usize,
+    saved: std::time::Instant,
 }
 
-/// a thread translating programs and compiling pipelines, which takes the
+/// threads translating programs and compiling pipelines, which takes the
 /// driver up to seconds for one. draws go on meanwhile through pipelines
 /// that draw the same, rather than stall.
 struct Compiler {
@@ -535,79 +549,65 @@ struct Compiler {
     outstanding: usize,
     /// the pipelines asked for, each only once.
     asked: HashSet<PipelineKey>,
-    thread: Option<thread::JoinHandle<()>>,
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl Compiler {
-    /// the thread, compiling with a cache, a layout and a fragment shader
-    /// that outlive it.
+    /// the threads, compiling with a cache, a layout and a fragment shader
+    /// that outlive them. a slow driver takes a long while over a scene's
+    /// pipelines, which are drawn through the slower generic shader until
+    /// then, so there is one for each core the emulation and the driver
+    /// leave, up to three.
     fn start(device: ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragment: vk::ShaderModule) -> Compiler {
-        let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        let waiting = Queue {
+            translations: VecDeque::new(),
+            compiles: Vec::new(),
+            stopped: false,
+            compiled: 0,
+            saved: std::time::Instant::now(),
+        };
+        let queue = Arc::new((Mutex::new(waiting), Condvar::new()));
         let (sent, made) = mpsc::channel();
-        let jobs = queue.clone();
-        let thread = thread::Builder::new()
-            .name("shader compiler".into())
-            .spawn(move || {
-                let (queue, ready) = &*jobs;
-                // pipelines compiled since the cache was last kept on disk,
-                // done when there is nothing else to do
-                let (mut compiled, mut saved) = (0, std::time::Instant::now());
-                loop {
-                    let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
-                    let job = loop {
-                        if waiting.stopped {
-                            return;
-                        }
-                        if let Some(job) = waiting.translations.pop_front().or_else(|| waiting.compiles.pop_front()) {
-                            break job;
-                        }
-                        if compiled == 0 {
-                            waiting = ready.wait(waiting).unwrap_or_else(PoisonError::into_inner);
-                        } else if let Some(left) = SAVE_EVERY.checked_sub(saved.elapsed()).filter(|left| !left.is_zero()) {
-                            waiting = ready.wait_timeout(waiting, left).unwrap_or_else(PoisonError::into_inner).0;
-                        } else {
-                            drop(waiting);
-                            save_pipeline_cache(&device, cache);
-                            (compiled, saved) = (0, std::time::Instant::now());
-                            waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
-                        }
-                    };
-                    drop(waiting);
-                    compiled += matches!(job, Job::Compile(..)) as usize;
-                    if sent.send(work(job, &device, cache, layout, fragment)).is_err() {
-                        return;
-                    }
-                }
+        let count = thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3));
+        let threads = (0..count)
+            .map_while(|_| {
+                let (jobs, sent, device) = (queue.clone(), sent.clone(), device.clone());
+                thread::Builder::new()
+                    .name("shader compiler".into())
+                    .spawn(move || compile(&jobs, &sent, &device, cache, layout, fragment))
+                    .ok()
             })
-            .ok();
-        Compiler { queue, made, outstanding: 0, asked: HashSet::new(), thread }
+            .collect();
+        Compiler { queue, made, outstanding: 0, asked: HashSet::new(), threads }
     }
 
-    /// queues a job for the thread, or gives it back when there is none.
+    /// queues a job for the threads, or gives it back when there are none.
     fn send(&mut self, job: Job) -> Option<Job> {
-        if self.thread.is_none() {
+        if self.threads.is_empty() {
             return Some(job);
         }
         let (queue, ready) = &*self.queue;
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
         match job {
             Job::Translate(..) => waiting.translations.push_back(job),
-            Job::Compile(..) => waiting.compiles.push_back(job),
+            Job::Compile(..) => waiting.compiles.push(job),
         }
         ready.notify_one();
         self.outstanding += 1;
         None
     }
 
-    /// waits for the job the thread is on and drops the rest, giving back
-    /// the pipelines it made that no one took.
+    /// waits for the jobs the threads are on and drops the rest, giving
+    /// back the pipelines they made that no one took.
     fn finish(&mut self) -> Vec<vk::Pipeline> {
         let (queue, ready) = &*self.queue;
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
-        *waiting = Queue { stopped: true, ..Queue::default() };
+        waiting.stopped = true;
+        waiting.translations.clear();
+        waiting.compiles.clear();
         ready.notify_all();
         drop(waiting);
-        if let Some(thread) = self.thread.take() {
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
         let made = self.made.try_iter().filter_map(|made| match made {
@@ -615,6 +615,49 @@ impl Compiler {
             _ => None,
         });
         made.collect()
+    }
+}
+
+/// what a compiler thread does until it is told to stop, jobs as they come,
+/// and keeping the cache on disk now and then when there are none.
+fn compile(
+    jobs: &(Mutex<Queue>, Condvar),
+    sent: &mpsc::Sender<Made>,
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    fragment: vk::ShaderModule,
+) {
+    let (queue, ready) = jobs;
+    let lock = || queue.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        let mut waiting = lock();
+        let job = loop {
+            if waiting.stopped {
+                return;
+            }
+            if let Some(job) = waiting.translations.pop_front().or_else(|| waiting.compiles.pop()) {
+                break job;
+            }
+            if waiting.compiled == 0 {
+                waiting = ready.wait(waiting).unwrap_or_else(PoisonError::into_inner);
+            } else if let Some(left) = SAVE_EVERY.checked_sub(waiting.saved.elapsed()).filter(|left| !left.is_zero()) {
+                waiting = ready.wait_timeout(waiting, left).unwrap_or_else(PoisonError::into_inner).0;
+            } else {
+                // the others find nothing to keep meanwhile
+                (waiting.compiled, waiting.saved) = (0, std::time::Instant::now());
+                drop(waiting);
+                save_pipeline_cache(device, cache);
+                waiting = lock();
+            }
+        };
+        drop(waiting);
+        let compiles = matches!(job, Job::Compile(..));
+        let made = work(job, device, cache, layout, fragment);
+        lock().compiled += compiles as usize;
+        if sent.send(made).is_err() {
+            return;
+        }
     }
 }
 
@@ -1790,7 +1833,7 @@ impl Hardware {
             VertexStage::Placed => VertexStage::Placed,
             _ => VertexStage::Interpreted,
         };
-        let generic = PipelineKey { vertex, fragment: GENERIC, ..key };
+        let generic = PipelineKey { vertex, fragment: generic(&key.fragment), ..key };
         if self.generic {
             return self.pipeline(generic);
         }

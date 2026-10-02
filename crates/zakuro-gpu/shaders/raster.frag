@@ -48,10 +48,11 @@ layout(constant_id = 25) const uint TEXTURE_CONFIG = 0u;
 layout(constant_id = 26) const uint LIGHTING = 0u;
 layout(constant_id = 27) const uint ALPHA_TEST = 0u;
 layout(constant_id = 28) const uint DEPTH_MODE = 0u;
-// set, a generic pipeline that reads all of the above from the draw's
-// registers instead, to draw with while the one for its combination
-// compiles. it masks them as hardware.rs masks the constants, so the two
-// draw the same
+// set, a generic pipeline that reads the above from the draw's registers
+// instead, to draw with while the one for its combination compiles. it
+// keeps lighting and the procedural texture's switch, a lot of code it goes
+// without when they are off. it masks the rest as hardware.rs masks the
+// constants, so the two draw the same
 layout(constant_id = 29) const uint DYNAMIC = 0u;
 
 layout(set = 0, binding = 0) uniform sampler2D texture0;
@@ -567,31 +568,39 @@ void combine_stage(
     uint operand = registers.y;
     uint combiner = registers.z;
     uint scale = registers.w;
-    vec4 constant = unpack_color(tev[stage * 2u].w);
-    vec4 rgb_in[3];
-    vec4 alpha_in[3];
-    for (uint i = 0u; i < 3u; i++) {
-        rgb_in[i] = source_value((source >> (i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
-        alpha_in[i] = source_value((source >> (16u + i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
-    }
-    uint color_op = operation(combiner);
-    uint alpha_op = operation(combiner >> 16);
-    vec3 rgb = combine_rgb(
-        color_op,
-        color_operand(rgb_in[0], operand & 0xFu),
-        color_operand(rgb_in[1], (operand >> 4) & 0xFu),
-        color_operand(rgb_in[2], (operand >> 8) & 0xFu)
-    );
-    float alpha = color_op == 7u
-        ? rgb.r
-        : combine_alpha(
-            alpha_op,
-            alpha_operand(alpha_in[0], (operand >> 12) & 0x7u),
-            alpha_operand(alpha_in[1], (operand >> 16) & 0x7u),
-            alpha_operand(alpha_in[2], (operand >> 20) & 0x7u)
+    // a stage handing the previous color on as it is changes nothing, as
+    // the color is between 0 and 1 already. titles leave most stages so,
+    // and the generic shader, which cannot drop them as it compiles, skips
+    // them as it runs
+    bool passes = (source & 0x000F000Fu) == 0x000F000Fu && (operand & 0x700Fu) == 0u
+        && (combiner & 0x000F000Fu) == 0u && scale == 0u;
+    if (!passes) {
+        vec4 constant = unpack_color(tev[stage * 2u].w);
+        vec4 rgb_in[3];
+        vec4 alpha_in[3];
+        for (uint i = 0u; i < 3u; i++) {
+            rgb_in[i] = source_value((source >> (i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
+            alpha_in[i] = source_value((source >> (16u + i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
+        }
+        uint color_op = operation(combiner);
+        uint alpha_op = operation(combiner >> 16);
+        vec3 rgb = combine_rgb(
+            color_op,
+            color_operand(rgb_in[0], operand & 0xFu),
+            color_operand(rgb_in[1], (operand >> 4) & 0xFu),
+            color_operand(rgb_in[2], (operand >> 8) & 0xFu)
         );
-    precise vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
-    previous = scaled;
+        float alpha = color_op == 7u
+            ? rgb.r
+            : combine_alpha(
+                alpha_op,
+                alpha_operand(alpha_in[0], (operand >> 12) & 0x7u),
+                alpha_operand(alpha_in[1], (operand >> 16) & 0x7u),
+                alpha_operand(alpha_in[2], (operand >> 20) & 0x7u)
+            );
+        precise vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
+        previous = scaled;
+    }
 
     held = next_buffer;
     if (stage < 4u) {
@@ -609,7 +618,7 @@ void main() {
 
     // the units the configuration turns on, unit 2 can read coordinate
     // set 1 instead of its own
-    uint texture_config = DYNAMIC != 0u ? misc.w & 0x2707u : TEXTURE_CONFIG;
+    uint texture_config = DYNAMIC != 0u ? (misc.w & 0x2307u) | (TEXTURE_CONFIG & 0x400u) : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
         textures[0] = sample_unit(0u, in_texcoords01.xy);
@@ -629,7 +638,7 @@ void main() {
     // color and there is no specular term
     vec4 fragment_primary = primary;
     vec4 fragment_secondary = vec4(0.0, 0.0, 0.0, 1.0);
-    if ((DYNAMIC != 0u ? flags.y : LIGHTING) != 0u) {
+    if (LIGHTING != 0u) {
         shade(textures, fragment_primary, fragment_secondary);
     }
 
