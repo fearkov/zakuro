@@ -196,7 +196,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
         SET_LCD_FORCE_BLACK => {
-            system.lcd_force_black = buffer.get(&mut system.memory, 1) != 0;
+            // a u8, the rest of the word is whatever was there before, OoT3D
+            // leaves a result code's top bytes in it after making its save
+            system.lcd_force_black = buffer.get(&mut system.memory, 1) & 0xFF != 0;
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -597,6 +599,23 @@ mod tests {
         );
         system.services.gsp.shared_memory_address = vaddr;
         (system, vaddr)
+    }
+
+    /// SetLcdForceBlack's flag is a u8. OoT3D sends false in a word whose top
+    /// bytes still hold the result code of the reply before, after making
+    /// its save on a first boot, and taking the whole word as the flag left
+    /// the screen black for good.
+    #[test]
+    fn force_black_reads_only_the_low_byte() {
+        let (mut system, vaddr) = system_with_mapped_gsp_shm();
+        let buffer = CommandBuffer::new(vaddr);
+        for (word, black) in [(1, true), (0xC8A0_4500, false), (0xC8A0_4501, true), (0, false)] {
+            let header = Header::new(command::SET_LCD_FORCE_BLACK, 1, 0);
+            buffer.set(&mut system.memory, 0, header.0);
+            buffer.set(&mut system.memory, 1, word);
+            handle(&mut system, &buffer, header);
+            assert_eq!(system.lcd_force_black, black, "word 0x{word:08X}");
+        }
     }
 
     /// this is the exact layout recovered by scanning a running Pokémon Alpha
