@@ -3,7 +3,7 @@
 use zakuro_common::memory_map::{CONFIG_MEM_SIZE, SHARED_PAGE_SIZE};
 use zakuro_common::ConsoleModel;
 
-use crate::kernel::thread::ticks_to_nanos;
+use crate::kernel::thread::{CPU_CLOCK_HZ, ticks_to_nanos};
 
 /// seconds between the 3DS epoch (1900-01-01) and the Unix epoch.
 const EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
@@ -98,8 +98,13 @@ pub fn update_datetime(page: &mut [u8], boot_clock: u64, tick: u64) {
     for slot in [0x20usize, 0x40] {
         write_u64(page, slot, date_time);
         write_u64(page, slot + 0x08, tick);
-        // the ARM11 timer runs at 268.111856 MHz / 2.
-        write_u64(page, slot + 0x10, 0x0000_0000_0001_0000);
+        // the rate of the ticks, which the SDK divides the ticks since the
+        // update by to get the milliseconds since, as PTM sets it. anything
+        // else makes the clock jump ahead within a frame and back at the
+        // next update, and a title that keeps a daily limit sees its clock
+        // set back
+        write_u32(page, slot + 0x10, CPU_CLOCK_HZ as u32);
+        write_u32(page, slot + 0x14, 0);
         write_u64(page, slot + 0x18, 0);
     }
 }
@@ -113,6 +118,40 @@ pub fn set_slider_3d(page: &mut [u8], value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the time a title reads, the way the SDK works it out of the page,
+    /// its selected slot's time plus the ticks since its update times 1000
+    /// over the rate in the slot.
+    fn sdk_time(page: &[u8], tick: u64) -> u64 {
+        let slot = 0x20;
+        let read = |at: usize, size: usize| page[at..at + size].iter().rev().fold(0u64, |v, b| v << 8 | *b as u64);
+        let (date_time, updated, rate) = (read(slot, 8), read(slot + 8, 8), read(slot + 0x10, 4) as i32 as i64);
+        let per_tick = (1000i64 << 32) / rate;
+        date_time + (((tick - updated) as i128 * per_tick as i128) >> 32) as u64
+    }
+
+    /// a title reads a clock that only ever goes forward, at the same pace
+    /// as the ticks, between the updates once a frame and across them.
+    #[test]
+    fn the_clock_titles_read_runs_at_the_ticks_pace() {
+        let mut page = vec![0u8; SHARED_PAGE_SIZE as usize];
+        let boot = 3_900_000_000_000;
+        let frame = crate::CYCLES_PER_FRAME;
+        update_datetime(&mut page, boot, 0);
+        let mut last = sdk_time(&page, 0);
+        for step in 1..=600u64 {
+            let tick = step * frame / 4;
+            if step % 4 == 0 {
+                update_datetime(&mut page, boot, tick);
+            }
+            let now = sdk_time(&page, tick);
+            assert!(now >= last, "the clock went back from {last} to {now}");
+            last = now;
+        }
+        // 150 frames, about 2.5 s
+        let elapsed = last - boot;
+        assert!((2500..=2510).contains(&elapsed), "{elapsed} ms");
+    }
 
     /// the clock starts at the local time, which is what the console shows.
     #[test]
