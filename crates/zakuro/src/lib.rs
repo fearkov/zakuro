@@ -483,8 +483,11 @@ impl App {
 
     /// starts the game at path, in place of any other.
     fn play(&mut self, path: &Path) -> Result<(), String> {
-        // the old game and what it holds on the GPU go first
+        // the old game and what it holds on the GPU go first, its sound too
         self.game = None;
+        if let Some(audio) = &self.audio {
+            audio.clear();
+        }
         let mut config = self.config();
         // a recording starts the clock at a known time, for playing it back
         let record = std::env::var_os("ZAKURO_RECORD").map(PathBuf::from);
@@ -532,6 +535,9 @@ impl App {
 
     fn back_to_library(&mut self) {
         self.game = None;
+        if let Some(audio) = &self.audio {
+            audio.clear();
+        }
         self.menus.menu_open = false;
         self.keyboard.release();
     }
@@ -794,6 +800,9 @@ impl App {
             let start = Instant::now();
             self.emulate();
             self.spent.emulating.add(start.elapsed());
+        } else if let Some(audio) = &self.audio {
+            // the sound stops with the game, which is not falling behind
+            audio.hold();
         }
 
         self.next_frame += FRAME_TIME;

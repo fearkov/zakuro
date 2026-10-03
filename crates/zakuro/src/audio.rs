@@ -29,6 +29,8 @@ struct Queue {
     last: [f32; 2],
     /// times the queue ran dry.
     underruns: u64,
+    /// how much a queue that ran dry waits for before it plays again.
+    refill: usize,
 }
 
 impl Queue {
@@ -39,11 +41,12 @@ impl Queue {
             self.underruns += 1;
         }
         if self.starved {
-            if self.samples.len() < RESUME {
+            if self.samples.len() < self.refill {
                 self.last = self.last.map(|v| v * 0.995);
                 return self.last;
             }
             self.starved = false;
+            self.refill = RESUME;
         }
         let (a, b) = (self.samples[0], self.samples[1]);
         let t = self.fraction as f32;
@@ -57,6 +60,23 @@ impl Queue {
             self.fraction -= 1.0;
         }
         out
+    }
+
+    /// stops it while the game is stopped, without counting that as running
+    /// dry, and has it fill all the way up before it plays again, so the
+    /// first frames after do not run it dry either.
+    fn hold(&mut self) {
+        self.starved = true;
+        self.refill = TARGET;
+        self.underruns = 0;
+    }
+
+    /// drops what is queued, holding as above, fading out from what played
+    /// last.
+    fn clear(&mut self) {
+        self.samples.clear();
+        self.fraction = 0.0;
+        self.hold();
     }
 }
 
@@ -92,6 +112,15 @@ impl Stretch {
         // a periodic Hann window, whose halves add up to one
         let window = (0..GRAIN).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / GRAIN as f32).cos()).collect();
         Stretch { input: Vec::new(), position: 0.0, last: None, tail: vec![[0.0; 2]; HOP], factor: 1.0, window }
+    }
+
+    /// forgets what came in, to start over on other sound.
+    fn clear(&mut self) {
+        self.input.clear();
+        self.position = 0.0;
+        self.last = None;
+        self.tail.fill([0.0; 2]);
+        self.factor = 1.0;
     }
 
     /// stretches samples by about factor, passing out what is ready.
@@ -167,6 +196,7 @@ impl Audio {
             starved: true,
             last: [0.0; 2],
             underruns: 0,
+            refill: RESUME,
         }));
         let stream = match format {
             SampleFormat::F32 => stream::<f32>(&device, &config, queue.clone()),
@@ -182,6 +212,22 @@ impl Audio {
     /// how many times the sound ran dry since the last call.
     pub fn take_underruns(&self) -> u64 {
         self.queue.lock().map(|mut queue| std::mem::take(&mut queue.underruns)).unwrap_or(0)
+    }
+
+    /// stops the sound while the game is stopped, see Queue::hold.
+    pub fn hold(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.hold();
+        }
+    }
+
+    /// drops the sound queued and half stretched, for a game starting or
+    /// stopping, so none of the last one's plays at the start of the next.
+    pub fn clear(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.clear();
+        }
+        self.stretch.borrow_mut().clear();
     }
 
     pub fn set_volume(&self, volume: f32) {
@@ -255,6 +301,7 @@ mod tests {
             starved: false,
             last: [0.0; 2],
             underruns: 0,
+            refill: RESUME,
         }
     }
 
@@ -321,6 +368,40 @@ mod tests {
         assert!(faded[0] < 0.5 && faded[0] > 0.4, "it fades out rather than stopping short");
         queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
         assert_eq!(queue.next(), [0.0, -0.0], "it starts again from where it stopped");
+    }
+
+    /// stopped while the game is, it does not count running dry, and plays
+    /// again only once it is full.
+    #[test]
+    fn a_held_queue_waits_to_fill_up_and_counts_nothing() {
+        let mut queue = queue(0, 1.0);
+        queue.last = [0.5, 0.5];
+        queue.hold();
+        assert!(queue.next()[0] < 0.5);
+        assert_eq!(queue.underruns, 0);
+        queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
+        assert!(queue.next()[0] < 0.5, "what is enough after running dry is not after a hold");
+        queue.samples.extend((0..TARGET).map(|_| [1.0, 1.0]));
+        assert_eq!(queue.next(), [1.0, 1.0]);
+        assert_eq!(queue.underruns, 0);
+        // running dry later is counted, and waits for the usual amount
+        queue.samples.clear();
+        queue.next();
+        assert_eq!(queue.underruns, 1);
+        queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
+        assert_eq!(queue.next(), [1.0, 1.0]);
+    }
+
+    /// a game starting or stopping drops what the last one queued, and the
+    /// new sound plays once there is enough of it.
+    #[test]
+    fn a_cleared_queue_plays_none_of_the_old_sound() {
+        let mut queue = queue(TARGET, 1.0);
+        queue.clear();
+        queue.next();
+        queue.samples.extend((0..TARGET).map(|_| [-1.0, -1.0]));
+        assert_eq!(queue.next(), [-1.0, -1.0]);
+        assert_eq!(queue.underruns, 0);
     }
 
     /// how far behind the picture the sound is, in ms, after each second of
