@@ -13,6 +13,8 @@ pub struct Keyboard {
     /// the circle pad keys held, up, down, left, right.
     circle: [bool; 4],
     touch: Option<(u16, u16)>,
+    /// how the mouse tilts the console, see InputState::tilt.
+    tilt: [f32; 2],
 }
 
 impl Keyboard {
@@ -30,6 +32,7 @@ impl Keyboard {
         self.buttons = PadState::default();
         self.circle = [false; 4];
         self.touch = None;
+        self.tilt = [0.0; 2];
     }
 
     fn button_for(&self, key: KeyCode) -> Option<PadState> {
@@ -73,6 +76,11 @@ impl Keyboard {
         self.touch = position;
     }
 
+    /// records the tilt the mouse gives the console.
+    pub fn tilt(&mut self, tilt: [f32; 2]) {
+        self.tilt = tilt;
+    }
+
     pub fn state(&self) -> InputState {
         // holding two opposite keys cancels out, which is what a real stick
         // would do
@@ -83,6 +91,7 @@ impl Keyboard {
             circle_x: axis(right, left),
             circle_y: axis(up, down),
             touch: self.touch,
+            tilt: self.tilt,
         }
     }
 }

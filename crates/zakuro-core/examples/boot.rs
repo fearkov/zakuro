@@ -129,6 +129,7 @@ fn main() {
                 touch,
                 circle_x: axis(PadState::CIRCLE_RIGHT, PadState::CIRCLE_LEFT),
                 circle_y: axis(PadState::CIRCLE_UP, PadState::CIRCLE_DOWN),
+                ..InputState::default()
             });
         } else if mash_buttons {
             let pressed = frame % 40 < 4;

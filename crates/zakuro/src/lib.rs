@@ -73,6 +73,7 @@ pub fn run(linked: Option<Linked>) {
         window: None,
         audio: None,
         mouse_down: false,
+        tilting_from: None,
         cursor: (0.0, 0.0),
         last_title_update: Instant::now(),
         next_frame: Instant::now(),
@@ -287,6 +288,9 @@ struct App {
     layout: Screens,
     /// the left button is down, and where the pointer is, in window pixels.
     mouse_down: bool,
+    /// where the pointer was when the right button went down, which tilts
+    /// the console while held.
+    tilting_from: Option<(f32, f32)>,
     cursor: (f32, f32),
     last_title_update: Instant,
     /// when the next frame is due. frames run to a schedule rather than one
@@ -367,10 +371,16 @@ impl ApplicationHandler for App {
                     self.mouse_down = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.touch();
                 }
+                if button == MouseButton::Right {
+                    let pressed = state == ElementState::Pressed && !self.pointer_taken(consumed);
+                    self.tilting_from = pressed.then_some(self.cursor);
+                    self.tilt();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
                 self.touch();
+                self.tilt();
             }
             WindowEvent::RedrawRequested => self.step(event_loop),
             _ => {}
@@ -552,6 +562,25 @@ impl App {
         self.keyboard.touch((self.mouse_down && inside).then(|| {
             ((x / bottom.width * 320.0) as u16, (y / bottom.height * 240.0) as u16)
         }));
+    }
+
+    /// tilts the console while the right button is held, toward where the
+    /// pointer went and by how far, as Citra's motion emulation does,
+    /// which titles were tried with. letting go stands it upright again.
+    fn tilt(&mut self) {
+        // radians a pixel, and the furthest it goes, a quarter turn
+        const PER_PIXEL: f32 = 0.01;
+        let tilt = match (self.tilting_from, &self.window) {
+            (Some((x, y)), Some(window)) => {
+                let scale = window.scale_factor() as f32;
+                let (dx, dy) = ((self.cursor.0 - x) / scale, (self.cursor.1 - y) / scale);
+                let distance = dx.hypot(dy);
+                let angle = (distance * PER_PIXEL).min(std::f32::consts::FRAC_PI_2);
+                if distance > 0.0 { [dx / distance * angle, dy / distance * angle] } else { [0.0; 2] }
+            }
+            _ => [0.0; 2],
+        };
+        self.keyboard.tilt(tilt);
     }
 
     fn toggle_fullscreen(&mut self) {

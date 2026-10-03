@@ -1,6 +1,7 @@
 //! a run's inputs written down frame by frame, with the clock it started
 //! at, so the run can be played back exactly. a line per change of input,
-//! the frame it starts at, the buttons, the circle pad and the touch.
+//! the frame it starts at, the buttons, the circle pad, the touch and the
+//! tilt, which recordings from before tilt leave out.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -27,7 +28,14 @@ impl Recorder {
     pub fn record(&mut self, input: InputState) {
         if self.last != Some(input) {
             let (x, y) = input.touch.map_or((-1, -1), |(x, y)| (x as i32, y as i32));
-            let line = format!("{} {:x} {:?} {:?} {x} {y}", self.frame, input.buttons.bits(), input.circle_x, input.circle_y);
+            let [tilt_x, tilt_y] = input.tilt;
+            let line = format!(
+                "{} {:x} {:?} {:?} {x} {y} {tilt_x:?} {tilt_y:?}",
+                self.frame,
+                input.buttons.bits(),
+                input.circle_x,
+                input.circle_y
+            );
             // written through at once, the run may end in a crash
             if writeln!(self.out, "{line}").and_then(|()| self.out.flush()).is_err() {
                 log::warn!("could not write to the input recording");
@@ -55,9 +63,15 @@ impl Replay {
         for line in lines {
             let line = line?;
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let [frame, buttons, x, y, tx, ty] = fields[..] else { return Err(bad(&line)) };
+            let (head, tilt) = fields.split_at(fields.len().min(6));
+            let [frame, buttons, x, y, tx, ty] = head[..] else { return Err(bad(&line)) };
             let parse = || -> Option<(u64, InputState)> {
                 let (tx, ty): (i32, i32) = (tx.parse().ok()?, ty.parse().ok()?);
+                let tilt = match tilt {
+                    [] => [0.0; 2],
+                    [x, y] => [x.parse().ok()?, y.parse().ok()?],
+                    _ => return None,
+                };
                 Some((
                     frame.parse().ok()?,
                     InputState {
@@ -65,6 +79,7 @@ impl Replay {
                         circle_x: x.parse().ok()?,
                         circle_y: y.parse().ok()?,
                         touch: (tx >= 0).then_some((tx as u16, ty as u16)),
+                        tilt,
                     },
                 ))
             };
@@ -99,7 +114,7 @@ mod tests {
     #[test]
     fn a_recording_plays_back() {
         let path = std::env::temp_dir().join(format!("zakuro-replay-{}.txt", std::process::id()));
-        let pressed = InputState { buttons: PadState::A, circle_x: 0.5, circle_y: -1.0, touch: Some((10, 20)) };
+        let pressed = InputState { buttons: PadState::A, circle_x: 0.5, circle_y: -1.0, touch: Some((10, 20)), tilt: [0.25, -0.5] };
         let mut recorder = Recorder::create(&path, 1234).unwrap();
         for frame in 0..10 {
             recorder.record(if (3..6).contains(&frame) { pressed } else { InputState::default() });
@@ -111,6 +126,17 @@ mod tests {
             let expected = if (3..6).contains(&frame) { pressed } else { InputState::default() };
             assert_eq!(replay.input(frame), expected);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// a recording from before tilt was written down plays back untilted.
+    #[test]
+    fn an_old_recording_has_no_tilt() {
+        let path = std::env::temp_dir().join(format!("zakuro-replay-old-{}.txt", std::process::id()));
+        std::fs::write(&path, "clock 7\n2 1 0.0 0.0 -1 -1\n").unwrap();
+        let mut replay = Replay::open(&path).unwrap();
+        let input = replay.input(2);
+        assert_eq!((input.buttons, input.tilt), (PadState::A, [0.0, 0.0]));
         let _ = std::fs::remove_file(path);
     }
 }

@@ -20,7 +20,12 @@ const MOTION_ENTRIES: u32 = 0x20;
 const ACCELEROMETER_SAMPLES: u32 = 8;
 const GYROSCOPE_SAMPLES: u32 = 32;
 /// what the accelerometer reads for one g.
-const ONE_G: i16 = 512;
+const ONE_G: f32 = 512.0;
+/// what the gyroscope reads for one degree a second, what
+/// GetGyroscopeLowRawToDpsCoefficient tells titles.
+const GYROSCOPE_PER_DPS: f32 = 14.375;
+/// how often the sensors are read, once a frame.
+const SAMPLE_RATE: f32 = 60.0;
 
 bitflags::bitflags! {
     /// button bits exactly as the hardware reports them.
@@ -56,6 +61,10 @@ pub struct InputState {
     pub circle_y: f32,
     /// touch position in screen pixels, when touched.
     pub touch: Option<(u16, u16)>,
+    /// how the console is tilted away from upright, in radians, toward the
+    /// right of the screen and toward its bottom, the way dragging the mouse
+    /// tilts it. the sensors report it, and how fast it changes.
+    pub tilt: [f32; 2],
 }
 
 #[derive(Default)]
@@ -78,6 +87,8 @@ pub struct HidState {
     /// the tick each section's ring last started over at, and the one
     /// before, for the pad, touch, accelerometer and gyroscope.
     pub reset_ticks: [(u64, u64); 4],
+    /// how the console was turned a frame ago, for how fast it turns.
+    pub orientation: Option<Quaternion>,
     /// the input the frontend gave last.
     pub input: InputState,
 }
@@ -272,13 +283,16 @@ pub fn update(system: &mut System, input: InputState) {
         system.kernel.signal_event(*object);
     }
 
-    // the sensors report the console held still and upright, titles that
-    // turn one on wait for its event
+    // the sensors report the tilt, and how fast it changes, kept track of
+    // whether or not they are on. titles that turn one on wait for its event
+    let (gravity, rate) = motion(&mut system.services.hid, input.tilt);
+    let accelerometer = gravity.map(|g| (g * ONE_G).round().clamp(-32768.0, 32767.0) as i16);
+    let gyroscope = rate.map(|r| (r * GYROSCOPE_PER_DPS).round().clamp(-32768.0, 32767.0) as i16);
     let hid = &system.services.hid;
     if hid.accelerometer_users > 0 {
         let index = (hid.accelerometer_index + 1) % ACCELEROMETER_SAMPLES;
         system.services.hid.accelerometer_index = index;
-        motion_sample(system, base + ACCELEROMETER_BASE, ACCELEROMETER, index, tick, [0, -ONE_G, 0]);
+        motion_sample(system, base + ACCELEROMETER_BASE, ACCELEROMETER, index, tick, accelerometer);
         if let Some(&event) = objects.get(2) {
             system.kernel.signal_event(event);
         }
@@ -287,11 +301,58 @@ pub fn update(system: &mut System, input: InputState) {
     if hid.gyroscope_users > 0 {
         let index = (hid.gyroscope_index + 1) % GYROSCOPE_SAMPLES;
         system.services.hid.gyroscope_index = index;
-        motion_sample(system, base + GYROSCOPE_BASE, GYROSCOPE, index, tick, [0, 0, 0]);
+        motion_sample(system, base + GYROSCOPE_BASE, GYROSCOPE, index, tick, gyroscope);
         if let Some(&event) = objects.get(3) {
             system.kernel.signal_event(event);
         }
     }
+}
+
+/// a rotation, w then x, y and z.
+pub type Quaternion = [f32; 4];
+
+fn multiply([aw, ax, ay, az]: Quaternion, [bw, bx, by, bz]: Quaternion) -> Quaternion {
+    [
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ]
+}
+
+fn inverse([w, x, y, z]: Quaternion) -> Quaternion {
+    [w, -x, -y, -z]
+}
+
+/// v turned by q.
+fn rotate(q: Quaternion, [x, y, z]: [f32; 3]) -> [f32; 3] {
+    let [_, x, y, z] = multiply(multiply(q, [0.0, x, y, z]), inverse(q));
+    [x, y, z]
+}
+
+/// what the accelerometer and the gyroscope read with the console tilted so,
+/// gravity in g and how fast it turns in degrees a second, both the
+/// console's way round. the console turns about the axis across the
+/// direction of the tilt, and lies upright with gravity down its y axis, as
+/// in the motion emulation of Citra, which titles were tried with.
+fn motion(hid: &mut HidState, [x, y]: [f32; 2]) -> ([f32; 3], [f32; 3]) {
+    let angle = x.hypot(y);
+    let q = if angle > 0.0 {
+        let (sin, cos) = (angle / 2.0).sin_cos();
+        [cos, -y / angle * sin, 0.0, x / angle * sin]
+    } else {
+        [1.0, 0.0, 0.0, 0.0]
+    };
+    let previous = hid.orientation.replace(q).unwrap_or(q);
+    let inverse = inverse(q);
+    let gravity = rotate(inverse, [0.0, -1.0, 0.0]);
+    // the derivative of q, twice, against q, turns a frame's change into
+    // radians a second about the axes of the world
+    let change = [q[0] - previous[0], q[1] - previous[1], q[2] - previous[2], q[3] - previous[3]];
+    let [_, rx, ry, rz] = multiply(change, inverse);
+    let degrees = 2.0 * SAMPLE_RATE * 180.0 / std::f32::consts::PI;
+    let rate = rotate(inverse, [rx * degrees, ry * degrees, rz * degrees]);
+    (gravity, rate)
 }
 
 /// writes a motion sensor's sample as both its raw one and entry index.
@@ -301,5 +362,54 @@ fn motion_sample(system: &mut System, section: u32, which: usize, index: u32, ti
         for (i, value) in sample.iter().enumerate() {
             put16(system, at + i as u32 * 2, *value as u16);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3)
+    }
+
+    /// upright and still, gravity is down the console's y axis and nothing
+    /// turns.
+    #[test]
+    fn untilted_the_console_reads_upright_and_still() {
+        let mut hid = HidState::default();
+        let (gravity, rate) = motion(&mut hid, [0.0, 0.0]);
+        assert!(close(gravity, [0.0, -1.0, 0.0]));
+        assert!(close(rate, [0.0, 0.0, 0.0]));
+    }
+
+    /// tilted a quarter turn, gravity leaves the y axis for the one the tilt
+    /// went toward, and a steady tilt does not turn.
+    #[test]
+    fn a_tilt_moves_gravity_and_holding_it_stops_the_turning() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let mut hid = HidState::default();
+        motion(&mut hid, [quarter, 0.0]);
+        let (gravity, rate) = motion(&mut hid, [quarter, 0.0]);
+        assert!(close(gravity, [-1.0, 0.0, 0.0]) || close(gravity, [1.0, 0.0, 0.0]), "{gravity:?}");
+        assert!(close(rate, [0.0, 0.0, 0.0]));
+        let mut hid = HidState::default();
+        motion(&mut hid, [0.0, quarter]);
+        let (gravity, _) = motion(&mut hid, [0.0, quarter]);
+        assert!(close(gravity, [0.0, 0.0, -1.0]) || close(gravity, [0.0, 0.0, 1.0]), "{gravity:?}");
+    }
+
+    /// tilting by a little in a frame turns at that much sixty times a
+    /// second, about the axis across the tilt.
+    #[test]
+    fn tilting_turns_as_fast_as_the_tilt_changes() {
+        let mut hid = HidState::default();
+        motion(&mut hid, [0.0, 0.0]);
+        let step = 0.01f32;
+        let (_, rate) = motion(&mut hid, [step, 0.0]);
+        let expected = step.to_degrees() * SAMPLE_RATE;
+        let speed = rate.iter().map(|r| r * r).sum::<f32>().sqrt();
+        assert!((speed - expected).abs() < expected * 0.01, "{speed} against {expected}");
+        assert!(rate[0].abs() < 1e-3 && rate[1].abs() < 1e-3, "{rate:?}");
     }
 }

@@ -407,6 +407,7 @@ impl Menus {
                 settings.keys = Keys::default();
                 self.rebinding = None;
             }
+            ui.label(RichText::new("Drag with the right mouse button to tilt the console, for games that use the motion sensors.").weak());
 
             ui.separator();
             ui.heading("Controller");
