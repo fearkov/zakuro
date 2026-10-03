@@ -424,6 +424,18 @@ struct Timing {
     /// compute invocations they added up to.
     statistics: Option<HashMap<vk::CommandBuffer, vk::QueryPool>>,
     counts: [u64; 4],
+    /// milliseconds the host waited for the GPU and how many times, for a
+    /// batch to record the next in, then for what it needed done.
+    waited: [(f64, u32); 2],
+}
+
+/// what the host waited for the GPU for.
+#[derive(Clone, Copy)]
+enum Wait {
+    /// a batch to record in, all of them in flight.
+    Room,
+    /// work done, to read what it wrote or reuse what it read.
+    Done,
 }
 
 /// a batch's command buffer, the fence the GPU signals once done with it and
@@ -1157,6 +1169,7 @@ impl Hardware {
                         draws: 0,
                         statistics: statistics.then(HashMap::new),
                         counts: [0; 4],
+                        waited: [(0.0, 0); 2],
                     }),
                 barriers: 0,
                 unfenced: true,
@@ -1461,14 +1474,17 @@ impl Hardware {
                 }
                 None => String::new(),
             };
+            let [(room, rooms), (done, dones)] = timing.waited;
             log::info!(
                 target: "zakuro_gpu::times",
-                "GPU over {TIMED_BATCHES} batches: {total:.1} ms, {}, {} barriers, {} render passes, {} draws{shaded}",
+                "GPU over {TIMED_BATCHES} batches: {total:.1} ms, {}, {} barriers, {} render passes, {} draws{shaded}, \
+                 the host waited {room:.1} ms for room {rooms} times and {done:.1} ms for work done {dones} times",
                 parts.join(", "),
                 timing.barriers,
                 timing.renderings,
                 timing.draws
             );
+            timing.waited = [(0.0, 0); 2];
             timing.totals = [0.0; WORK_NAMES.len()];
             timing.batches = 0;
             timing.barriers = 0;
@@ -3396,7 +3412,7 @@ impl Hardware {
         }
         self.retire_finished()?;
         if self.free.is_empty() {
-            self.retire_oldest()?;
+            self.block(Wait::Room)?;
         }
         // SAFETY: the command buffer is recording and gets submitted once
         unsafe {
@@ -3443,7 +3459,7 @@ impl Hardware {
     /// waits for the GPU to finish everything handed to it.
     fn wait(&mut self) -> Result<(), String> {
         while !self.in_flight.is_empty() {
-            self.retire_oldest()?;
+            self.block(Wait::Done)?;
         }
         Ok(())
     }
@@ -3455,7 +3471,20 @@ impl Hardware {
             self.submit()?;
         }
         while self.in_flight.front().is_some_and(|frame| frame.pending.is_some_and(|pending| pending <= batch)) {
-            self.retire_oldest()?;
+            self.block(Wait::Done)?;
+        }
+        Ok(())
+    }
+
+    /// retires the oldest batch in flight, timing the wait for it when the
+    /// GPU's times are being measured.
+    fn block(&mut self, why: Wait) -> Result<(), String> {
+        let start = self.timing.is_some().then(std::time::Instant::now);
+        self.retire_oldest()?;
+        if let (Some(start), Some(timing)) = (start, self.timing.as_mut()) {
+            let waited = &mut timing.waited[why as usize];
+            waited.0 += start.elapsed().as_secs_f64() * 1e3;
+            waited.1 += 1;
         }
         Ok(())
     }
