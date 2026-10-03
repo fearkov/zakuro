@@ -405,12 +405,29 @@ impl VulkanPresenter {
                 .get_physical_device_surface_present_modes(self.physical_device, self.surface)
         }
         .map_err(vk_fail("querying present modes"))?;
-        // FIFO is always available and matches the console's own vsync.
-        let present_mode = if present_modes.contains(&vk::PresentModeKHR::FIFO) {
-            vk::PresentModeKHR::FIFO
-        } else {
-            present_modes[0]
+        // mailbox where there is one, the frontend keeps the frames to the
+        // console's rate itself, and a present that waits for the display,
+        // as FIFO does on Mesa under Wayland, holds the next frame back with
+        // it. FIFO is always there otherwise. ZAKURO_PRESENT_MODE=fifo,
+        // mailbox or immediate picks one
+        let wanted = match std::env::var("ZAKURO_PRESENT_MODE").as_deref() {
+            Ok("fifo") => vec![vk::PresentModeKHR::FIFO],
+            Ok("immediate") => vec![vk::PresentModeKHR::IMMEDIATE],
+            Ok("mailbox") => vec![vk::PresentModeKHR::MAILBOX],
+            _ => vec![vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO],
         };
+        let present_mode = wanted.into_iter().find(|mode| present_modes.contains(mode)).unwrap_or(vk::PresentModeKHR::FIFO);
+        if self.swapchain == vk::SwapchainKHR::null() {
+            let name = |mode: vk::PresentModeKHR| match mode {
+                vk::PresentModeKHR::FIFO => "fifo".to_owned(),
+                vk::PresentModeKHR::MAILBOX => "mailbox".to_owned(),
+                vk::PresentModeKHR::IMMEDIATE => "immediate".to_owned(),
+                vk::PresentModeKHR::FIFO_RELAXED => "fifo relaxed".to_owned(),
+                other => format!("mode {}", other.as_raw()),
+            };
+            let all: Vec<String> = present_modes.iter().copied().map(name).collect();
+            log::info!("presenting in {} mode, of {}", name(present_mode), all.join(", "));
+        }
 
         let old = self.swapchain;
         let info = vk::SwapchainCreateInfoKHR::default()
