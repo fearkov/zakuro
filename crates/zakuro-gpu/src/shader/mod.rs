@@ -28,6 +28,11 @@ const DECODED_KEPT: usize = 64;
 
 pub const ZERO: Vec4 = [0.0; 4];
 
+/// what a temporary register holds before the program writes it, which
+/// titles count on. Project Mirai DX takes r15.w for a position's w before
+/// ever writing it, and a w of 0 leaves out the line its notes run along.
+pub const TEMP_START: Vec4 = [0.0, 0.0, 0.0, 1.0];
+
 /// shader state that persists between vertices.
 #[derive(Clone)]
 pub struct ShaderUnit {
@@ -238,7 +243,7 @@ impl ShaderState {
         ShaderState {
             input: [ZERO; INPUT_REGISTERS],
             output: [ZERO; OUTPUT_REGISTERS],
-            temp: [ZERO; TEMP_REGISTERS],
+            temp: [TEMP_START; TEMP_REGISTERS],
             address: [0; 3],
             condition: [false; 2],
             blocks: Vec::with_capacity(16),
@@ -247,7 +252,7 @@ impl ShaderState {
 
     fn reset(&mut self) {
         self.output = [ZERO; OUTPUT_REGISTERS];
-        self.temp = [ZERO; TEMP_REGISTERS];
+        self.temp = [TEMP_START; TEMP_REGISTERS];
         self.address = [0; 3];
         self.condition = [false; 2];
         self.blocks.clear();
@@ -1126,8 +1131,8 @@ mod tests {
         unit.prepare();
         let inputs = vec![[ZERO; INPUT_REGISTERS]; 5];
         let outputs = run_vertices(&unit, &inputs);
-        // four iterations, over c2 to c5
-        assert_eq!(outputs[4][0], [14.0; 4]);
+        // four iterations, over c2 to c5, onto r0's (0, 0, 0, 1)
+        assert_eq!(outputs[4][0], [14.0, 14.0, 14.0, 15.0]);
         assert!(same(&outputs, &one_by_one(&unit, &inputs)));
     }
 
@@ -1162,6 +1167,17 @@ mod tests {
         state.input[0] = [1.0, 2.0, 3.0, 4.0];
         run(&unit, &mut state);
         assert_eq!(state.output[0], [1.0, 0.0, 3.0, 0.0]);
+    }
+
+    /// a temporary read before anything is written to it holds a w of 1,
+    /// shaded on its own or in a batch.
+    #[test]
+    fn an_unwritten_temporary_has_a_w_of_one() {
+        // mov o0, r15, end
+        let unit = unit_with(&[(0x13 << 26) | (0x1F << 12), 0x22 << 26], &[IDENTITY]);
+        let inputs = [[ZERO; INPUT_REGISTERS]];
+        assert_eq!(one_by_one(&unit, &inputs)[0][0], [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(run_vertices(&unit, &inputs)[0][0], [0.0, 0.0, 0.0, 1.0]);
     }
 
     /// a shader with no end must still terminate.
@@ -1248,8 +1264,8 @@ mod tests {
         let mut state = ShaderState::new();
         state.input[0] = [1.0; 4];
         run(&unit, &mut state);
-        // three iterations of two additions each.
-        assert_eq!(state.output[0], [6.0; 4]);
+        // three iterations of two additions each, onto r0's (0, 0, 0, 1).
+        assert_eq!(state.output[0], [6.0, 6.0, 6.0, 7.0]);
     }
 
     #[test]

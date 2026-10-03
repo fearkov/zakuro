@@ -22,6 +22,9 @@ type Wide = [Lanes; 4];
 
 const ZERO: Wide = [f32x8::ZERO; 4];
 
+/// super::TEMP_START in every lane.
+const TEMP_START: Wide = [f32x8::ZERO, f32x8::ZERO, f32x8::ZERO, f32x8::ONE];
+
 /// a batch of vertices' registers.
 #[derive(Clone)]
 struct Batch {
@@ -117,7 +120,7 @@ fn start(program: &Program, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Batch {
     let mut batch = Batch {
         input: [ZERO; INPUT_REGISTERS],
         output: [ZERO; OUTPUT_REGISTERS],
-        temp: [ZERO; TEMP_REGISTERS],
+        temp: [TEMP_START; TEMP_REGISTERS],
         address: [[0; LANES]; 2],
         loop_counter: 0,
         condition: [[false; LANES]; 2],

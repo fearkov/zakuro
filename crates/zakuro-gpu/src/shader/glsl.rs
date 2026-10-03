@@ -190,7 +190,7 @@ impl<'a> Translator<'a> {
 
         out.push_str("void main() {\n");
         out.push_str("    for (int i = 0; i < 16; i++) {\n");
-        out.push_str("        temps[i] = vec4(0.0);\n");
+        out.push_str("        temps[i] = vec4(0.0, 0.0, 0.0, 1.0);\n");
         out.push_str("        outputs[i] = vec4(0.0);\n");
         out.push_str("    }\n");
         out.push_str("    address = ivec3(0);\n");

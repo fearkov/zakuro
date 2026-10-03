@@ -345,7 +345,7 @@ float semantic(uint which, float missing) {
 
 void main() {
     for (int i = 0; i < 16; i++) {
-        temps[i] = vec4(0.0);
+        temps[i] = vec4(0.0, 0.0, 0.0, 1.0);
         outputs[i] = vec4(0.0);
     }
     address = ivec3(0);
