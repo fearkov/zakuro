@@ -443,6 +443,34 @@ impl Kernel {
         self.reschedule_pending = true;
     }
 
+    /// ends a thread, which gives back every mutex it holds, all the way
+    /// down, the way the console's kernel does. one held by a dead thread
+    /// would block whoever waits on it next forever.
+    pub fn end_thread(&mut self, id: ThreadId) {
+        let thread = &mut self.threads[id as usize];
+        thread.status = ThreadStatus::Dead;
+        thread.clear_wait();
+        thread.wait_result = None;
+        thread.wait_syscall = None;
+        let held: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .filter(|(_, object)| matches!(object, KObject::Mutex(mutex) if mutex.owner == Some(id)))
+            .map(|(object, _)| object)
+            .collect();
+        for object in held {
+            if let Some(KObject::Mutex(mutex)) = self.objects.get_mut(object) {
+                log::debug!("thread {} ended holding {}, it goes to whoever waits on it", self.threads[id as usize].name, mutex.name);
+                mutex.owner = None;
+                mutex.lock_count = 0;
+            }
+        }
+        if self.current_thread == Some(id) {
+            self.current_thread = None;
+        }
+        self.reschedule_pending = true;
+    }
+
     /// signals an event, waking anything waiting on it at the next scheduling
     /// point.
     pub fn signal_event(&mut self, object: ObjectId) {
@@ -496,7 +524,19 @@ impl Kernel {
                             .get(object)
                             .map_or("missing", |o| o.type_name());
                         let signalled = self.is_signaled(object, id);
-                        format!("{label}:{kind}{}", if signalled { "(ready)" } else { "" })
+                        // who holds a mutex, a waiter stuck on one wants to know
+                        let owner = match self.objects.get(object) {
+                            Some(KObject::Mutex(mutex)) => match mutex.owner {
+                                Some(owner) => {
+                                    let holder = self.thread(owner);
+                                    let dead = if holder.status == ThreadStatus::Dead { " (dead)" } else { "" };
+                                    format!(" held by {}{dead}", holder.name)
+                                }
+                                None => String::new(),
+                            },
+                            _ => String::new(),
+                        };
+                        format!("{label}:{kind}{owner}{}", if signalled { "(ready)" } else { "" })
                     })
                     .collect();
                 format!(
@@ -515,5 +555,44 @@ impl Kernel {
             .iter()
             .filter(|t| t.status != ThreadStatus::Dead)
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a thread that ends holding a mutex, however many times it took it,
+    /// gives it back, so a thread waiting on it wakes and gets it, as on the
+    /// console. Project Mirai DX hung on its first screen without this.
+    #[test]
+    fn a_thread_that_ends_lets_go_of_its_mutexes() {
+        let mut kernel = Kernel::new(0, MemoryRegion::Application, 0x1400_0000);
+        let holder = kernel.create_thread("holder", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let waiter = kernel.create_thread("waiter", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        let mut mutex = sync::Mutex::new("Mutex");
+        mutex.owner = Some(holder);
+        mutex.lock_count = 2;
+        let object = kernel.objects.insert(KObject::Mutex(mutex));
+        let thread = &mut kernel.threads[waiter as usize];
+        thread.wait_objects = vec![object];
+        thread.status = ThreadStatus::WaitSync;
+        let mut cpu = Cpu::new();
+
+        // held, the waiter stays blocked
+        kernel.schedule(&mut cpu, 0);
+        assert_eq!(kernel.thread(waiter).status, ThreadStatus::WaitSync);
+
+        kernel.end_thread(holder);
+        assert_eq!(kernel.thread(holder).status, ThreadStatus::Dead);
+        let Some(KObject::Mutex(mutex)) = kernel.objects.get(object) else { panic!("the mutex is gone") };
+        assert_eq!((mutex.owner, mutex.lock_count), (None, 0));
+
+        kernel.schedule(&mut cpu, 1);
+        let thread = kernel.thread(waiter);
+        assert!(!thread.status.is_blocked());
+        assert!(matches!(thread.wait_result, Some(WaitResult::Signaled(0))));
+        let Some(KObject::Mutex(mutex)) = kernel.objects.get(object) else { panic!("the mutex is gone") };
+        assert_eq!((mutex.owner, mutex.lock_count), (Some(waiter), 1));
     }
 }

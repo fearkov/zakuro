@@ -18,7 +18,7 @@ use zakuro_cpu::{Bus, Cpu, Exit};
 use zakuro_fs::Title;
 use zakuro_gpu::{Gpu, GpuMemory, Renderer, SoftwareRenderer};
 
-use kernel::thread::{ThreadId, ThreadStatus, WaitResult, WaitSyscall, THREAD_EXIT_MAGIC};
+use kernel::thread::{ThreadId, WaitResult, WaitSyscall, THREAD_EXIT_MAGIC};
 use kernel::Kernel;
 use memory::{Memory, MemoryState, Permission};
 use services::hid::InputState;
@@ -312,11 +312,9 @@ impl System {
 
         // a thread whose entry point returned branches to this address.
         if self.cpu.regs[15] == THREAD_EXIT_MAGIC {
-            if let Some(thread) = self.kernel.current_mut() {
-                thread.status = ThreadStatus::Dead;
+            if let Some(id) = self.kernel.current_thread {
+                self.kernel.end_thread(id);
             }
-            self.kernel.current_thread = None;
-            self.kernel.reschedule_pending = true;
             return StepOutcome::Ran;
         }
 
@@ -355,11 +353,9 @@ impl System {
             }
             // stop the thread rather than the machine, the rest of the title
             // may still make progress, and the report says what happened.
-            if let Some(thread) = self.kernel.current_mut() {
-                thread.status = ThreadStatus::Dead;
+            if let Some(id) = self.kernel.current_thread {
+                self.kernel.end_thread(id);
             }
-            self.kernel.current_thread = None;
-            self.kernel.reschedule_pending = true;
             return StepOutcome::Ran;
         }
 
@@ -948,4 +944,136 @@ fn grow(pixels: &[u8], width: u32, scale: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::object::KObject;
+    use kernel::thread::ThreadStatus;
+
+    fn mutex_state(system: &System, handle: u32) -> (Option<ThreadId>, u32) {
+        let object = system.kernel.handles.resolve(handle).expect("a mutex handle");
+        match system.kernel.objects.get(object) {
+            Some(KObject::Mutex(mutex)) => (mutex.owner, mutex.lock_count),
+            _ => panic!("not a mutex"),
+        }
+    }
+
+    /// a holder that took a mutex twice, through svcCreateMutex locked and
+    /// svcWaitSynchronization1, and a waiter blocked on it, with the holder
+    /// back on the core.
+    fn holder_and_waiter(system: &mut System) -> (ThreadId, ThreadId, u32) {
+        let holder = system.kernel.create_thread("holder", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let waiter = system.kernel.create_thread("waiter", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        system.map_tls_page(holder);
+        system.map_tls_page(waiter);
+        system.kernel.schedule(&mut system.cpu, 0);
+        assert_eq!(system.kernel.current_thread, Some(holder));
+        system.cpu.regs[1] = 1;
+        kernel::svc::dispatch(system, 0x13);
+        let handle = system.cpu.regs[1];
+        let wait = |system: &mut System| {
+            system.cpu.regs[0] = handle;
+            system.cpu.regs[2] = u32::MAX;
+            system.cpu.regs[3] = u32::MAX;
+            kernel::svc::dispatch(system, 0x24);
+        };
+        wait(system);
+        assert_eq!(mutex_state(system, handle), (Some(holder), 2));
+        system.kernel.current_thread = Some(waiter);
+        system.kernel.thread_mut(waiter).status = ThreadStatus::Running;
+        system.kernel.thread_mut(holder).status = ThreadStatus::Ready;
+        wait(system);
+        assert_eq!(system.kernel.thread(waiter).status, ThreadStatus::WaitSync);
+        system.kernel.current_thread = Some(holder);
+        system.kernel.thread_mut(holder).status = ThreadStatus::Running;
+        system.kernel.reschedule_pending = false;
+        (holder, waiter, handle)
+    }
+
+    /// the holder ended with the mutex all given back, and the waiter gets it
+    /// once at the next schedule.
+    fn waiter_gets_it(system: &mut System, (holder, waiter, handle): (ThreadId, ThreadId, u32)) {
+        assert_eq!(system.kernel.thread(holder).status, ThreadStatus::Dead);
+        assert_eq!(mutex_state(system, handle), (None, 0));
+        let tick = system.cpu.cycles;
+        system.kernel.schedule(&mut system.cpu, tick);
+        assert_eq!(system.kernel.current_thread, Some(waiter), "{}", system.kernel.describe_wait(waiter));
+        assert!(matches!(system.kernel.thread(waiter).wait_result, Some(WaitResult::Signaled(0))));
+        assert_eq!(mutex_state(system, handle), (Some(waiter), 1));
+    }
+
+    #[test]
+    fn svc_exit_thread_lets_go_of_the_mutexes() {
+        let mut system = System::new(Config::default());
+        let threads = holder_and_waiter(&mut system);
+        kernel::svc::dispatch(&mut system, 0x09);
+        waiter_gets_it(&mut system, threads);
+    }
+
+    #[test]
+    fn returning_from_the_entry_point_lets_go_of_the_mutexes() {
+        let mut system = System::new(Config::default());
+        let threads = holder_and_waiter(&mut system);
+        system.cpu.regs[15] = THREAD_EXIT_MAGIC;
+        assert_eq!(system.step(None), StepOutcome::Ran);
+        waiter_gets_it(&mut system, threads);
+    }
+
+    #[test]
+    fn a_branch_to_unmapped_memory_lets_go_of_the_mutexes() {
+        let mut system = System::new(Config::default());
+        let threads = holder_and_waiter(&mut system);
+        system.cpu.regs[15] = 0x0000_1000;
+        assert!(!system.memory.is_executable(0x0000_1000));
+        assert_eq!(system.step(None), StepOutcome::Ran);
+        waiter_gets_it(&mut system, threads);
+    }
+
+    /// a thread whose timed arbiter wait ran out, and that then ended, left
+    /// its entry on the arbiter. a signal for one waiter on the address
+    /// passes over it to the thread really waiting there, and the dead one
+    /// stays dead.
+    #[test]
+    fn an_arbiter_signal_wakes_only_threads_still_waiting() {
+        let mut system = System::new(Config::default());
+        let ended = system.kernel.create_thread("ended", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let signaller = system.kernel.create_thread("signaller", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        let parked = system.kernel.create_thread("parked", 0x0010_0000, 0x0FE0_0000, 0, 0x30, 0);
+        for id in [ended, signaller, parked] {
+            system.map_tls_page(id);
+        }
+        system.kernel.schedule(&mut system.cpu, 0);
+        assert_eq!(system.kernel.current_thread, Some(ended));
+        kernel::svc::dispatch(&mut system, 0x21);
+        let arbiter = system.cpu.regs[1];
+        let address = system.kernel.thread(ended).tls + 0x100;
+        system.memory.write32(address, 0);
+        let arbitrate = |system: &mut System, who: ThreadId, kind: u32| {
+            system.kernel.current_thread = Some(who);
+            system.kernel.thread_mut(who).status = ThreadStatus::Running;
+            system.cpu.regs[0] = arbiter;
+            system.cpu.regs[1] = address;
+            system.cpu.regs[2] = kind;
+            system.cpu.regs[3] = 1;
+            system.cpu.regs[4] = 1000;
+            kernel::svc::dispatch(system, 0x22);
+        };
+        // waits if less than 1, for a microsecond, and times out
+        arbitrate(&mut system, ended, 3);
+        system.kernel.current_thread = None;
+        system.kernel.schedule(&mut system.cpu, 1_000_000);
+        assert!(matches!(system.kernel.thread(ended).wait_result, Some(WaitResult::TimedOut)));
+        // then ends
+        system.kernel.current_thread = Some(ended);
+        system.kernel.thread_mut(ended).status = ThreadStatus::Running;
+        kernel::svc::dispatch(&mut system, 0x09);
+        // another waits for good, and a third signals one waiter
+        arbitrate(&mut system, parked, 1);
+        assert_eq!(system.kernel.thread(parked).status, ThreadStatus::WaitArbiter);
+        arbitrate(&mut system, signaller, 0);
+        assert_eq!(system.kernel.thread(ended).status, ThreadStatus::Dead);
+        assert_eq!(system.kernel.thread(parked).status, ThreadStatus::Ready);
+    }
 }

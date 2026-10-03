@@ -396,13 +396,10 @@ fn create_thread(system: &mut System) {
 }
 
 fn exit_thread(system: &mut System) {
-    if let Some(thread) = system.kernel.current_mut() {
-        log::debug!("thread {} exited", thread.name);
-        thread.status = ThreadStatus::Dead;
-        thread.clear_wait();
+    if let Some(id) = system.kernel.current_thread {
+        log::debug!("thread {} exited", system.kernel.thread(id).name);
+        system.kernel.end_thread(id);
     }
-    system.kernel.current_thread = None;
-    system.kernel.reschedule_pending = true;
 }
 
 fn exit_process(system: &mut System) {
@@ -693,9 +690,21 @@ fn arbitrate_address(system: &mut System) {
         let mut woken = 0;
         let unlimited = value < 0;
         let mut to_wake = Vec::new();
-        if let Some(KObject::AddressArbiter(arbiter)) = system.kernel.objects.get_mut(object) {
+        let kernel = &mut system.kernel;
+        let threads = &kernel.threads;
+        if let Some(KObject::AddressArbiter(arbiter)) = kernel.objects.get_mut(object) {
             arbiter.waiters.retain(|&(thread, addr)| {
-                if addr == address && (unlimited || woken < value) {
+                if addr != address {
+                    return true;
+                }
+                // a thread whose wait timed out, or that ended since, left its
+                // entry behind, it goes without counting, a dead thread must
+                // never run again
+                let parked = &threads[thread as usize];
+                if parked.status != ThreadStatus::WaitArbiter || parked.wait_address != Some(address) || to_wake.contains(&thread) {
+                    return false;
+                }
+                if unlimited || woken < value {
                     woken += 1;
                     to_wake.push(thread);
                     false
