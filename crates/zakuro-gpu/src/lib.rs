@@ -555,13 +555,13 @@ impl Gpu {
         1
     }
 
-    /// the newest picture the host's GPU drew scaled for a screen's
-    /// buffer, while guest memory still holds the same picture. size is the
-    /// pixels of a row the screen shows and its rows, stride the pixels a
-    /// row takes in memory.
+    /// the newest picture the host's GPU drew for a screen's buffer, at the
+    /// scale it draws at, while guest memory still holds the same picture.
+    /// size is the pixels of a row the screen shows and its rows, stride the
+    /// pixels a row takes in memory.
     pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
         #[cfg(feature = "vulkan")]
-        if let Some(hardware) = self.resources.hardware.as_mut().filter(|hardware| hardware.scale() > 1) {
+        if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.screen(addr, size, stride, format, guest);
         }
         #[cfg(not(feature = "vulkan"))]

@@ -734,16 +734,14 @@ impl System {
     }
 
     /// a screen as RGBA at the resolution the host's GPU draws at, and its
-    /// width and height. a picture the GPU did not draw scaled, or the CPU
-    /// changed since, is the console's own grown to it, so the size stays
-    /// the same from frame to frame.
+    /// width and height. a picture the GPU did not draw, or the CPU changed
+    /// since, is the console's own grown to it, so the size stays the same
+    /// from frame to frame.
     pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> Screen {
         let (width, height) = (screen.width(), screen.height());
         let scale = self.gpu.scale();
-        if scale > 1 {
-            if let Some(scaled) = self.scaled_screen(screen) {
-                return scaled;
-            }
+        if let Some(scaled) = self.scaled_screen(screen) {
+            return scaled;
         }
         let native = self.read_screen(screen);
         if scale == 1 {

@@ -2787,9 +2787,9 @@ impl Hardware {
         self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
         self.surfaces[target].changed();
         self.capture(target)?;
-        if self.scale > 1 {
-            self.capture_screen(target)?;
-        }
+        // turned upright for showing at any scale, at the console's own too
+        // that beats the CPU waiting for the GPU and decoding the buffer
+        self.capture_screen(target)?;
         self.submit()?;
         Ok(true)
     }
