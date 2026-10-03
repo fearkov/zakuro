@@ -445,6 +445,9 @@ impl System {
         self.recompiled_instructions += ran;
         if ran == 0 && matches!(stop, recompiled::Stop::Left) {
             // not enough budget left for a whole block
+            if let Some(hints) = &mut self.hints {
+                hints.library_declined();
+            }
             return None;
         }
         Some(match stop {

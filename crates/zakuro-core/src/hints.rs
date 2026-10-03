@@ -41,6 +41,13 @@ impl Hints {
         self.interpreting = false;
     }
 
+    /// the library had code but not budget for the whole block, so the
+    /// interpreter goes on through it. what it runs until the library takes
+    /// over again is known code, not missing code.
+    pub fn library_declined(&mut self) {
+        self.interpreting = true;
+    }
+
     /// the interpreter ran an instruction at pc that the library has no
     /// code for. where that follows the library's code, missing code starts,
     /// what it goes on to call the next build finds from there.
@@ -66,5 +73,25 @@ impl Hints {
             Ok(()) => self.saved = self.seen.len(),
             Err(error) => log::warn!("could not write {}, {error}", self.path.display()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_runs_after_the_library_declines_is_no_hint() {
+        let library = std::env::temp_dir().join(format!("zakuro-hints-{}", std::process::id())).join("lib.so");
+        let mut hints = Hints::new(&library, 0x0010_0000..0x0020_0000);
+        // the rest of a block the budget did not cover
+        hints.library_declined();
+        hints.interpreted(0x0010_0004, false);
+        hints.interpreted(0x0010_0008, false);
+        assert!(hints.seen.is_empty());
+        // code the library does not have, right after it ran
+        hints.library_ran();
+        hints.interpreted(0x0010_0100, true);
+        assert_eq!(hints.seen.iter().copied().collect::<Vec<_>>(), vec![0x0010_0101]);
     }
 }
