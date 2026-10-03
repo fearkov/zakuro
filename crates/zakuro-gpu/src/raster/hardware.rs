@@ -542,6 +542,68 @@ fn generic(fragment: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
 /// works depth out itself.
 const WRITES_DEPTH: u32 = 4;
 
+/// the state draws set as they go rather than their pipelines hold, when
+/// the device can, so that draws differing only in it share a pipeline.
+/// the generic pipelines are then few enough to make them all at the start,
+/// rather than each on the draw that first needs it, which stalled the game
+/// for as long as the driver took, up to a third of a second.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Dynamic {
+    /// blending on or off, its equation, and the color write mask.
+    pub(crate) blend: bool,
+    /// the logic op on or off, and which.
+    pub(crate) logic_op: bool,
+}
+
+/// every generic pipeline a draw can need when the blend state is dynamic,
+/// with the vertex stages that draws have.
+fn generic_keys(shades: bool) -> Vec<PipelineKey> {
+    let vertices: &[VertexStage] = if shades { &[VertexStage::Interpreted, VertexStage::Placed] } else { &[VertexStage::Placed] };
+    let mut keys = Vec::new();
+    for &vertex in vertices {
+        for depth in [true, false] {
+            for lighting in [0, 1] {
+                for procedural in [0, 0x400] {
+                    for writes in [0, WRITES_DEPTH] {
+                        let mut fragment = GENERIC;
+                        fragment[25] = procedural;
+                        fragment[26] = lighting;
+                        fragment[28] = writes;
+                        keys.push(PipelineKey { blend: None, logic_op: None, mask: 0xF, depth, vertex, fragment });
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// what the PICA's blend function register asks for.
+fn blend_equation(config: u32) -> vk::ColorBlendEquationEXT {
+    let factor = |raw: u32| {
+        if raw & 0xF == 15 {
+            vk::BlendFactor::ONE
+        } else {
+            // the PICA numbers its factors the way Vulkan does
+            vk::BlendFactor::from_raw((raw & 0xF) as i32)
+        }
+    };
+    let equation = |raw: u32| {
+        if raw & 7 > 4 {
+            vk::BlendOp::ADD
+        } else {
+            vk::BlendOp::from_raw((raw & 7) as i32)
+        }
+    };
+    vk::ColorBlendEquationEXT::default()
+        .color_blend_op(equation(config))
+        .alpha_blend_op(equation(config >> 8))
+        .src_color_blend_factor(factor(config >> 16))
+        .dst_color_blend_factor(factor(config >> 20))
+        .src_alpha_blend_factor(factor(config >> 24))
+        .dst_alpha_blend_factor(factor(config >> 28))
+}
+
 /// the build of raster.frag a pipeline runs, of the one leaving depth to
 /// the rasterizer and the one working it out.
 fn fragment_module([plain, writing]: [vk::ShaderModule; 2], key: &PipelineKey) -> vk::ShaderModule {
@@ -594,10 +656,12 @@ enum Made {
 }
 
 /// the jobs waiting for the compiler threads, translations first, as they
-/// are quick and pipelines wait for them, then the pipelines asked for last,
+/// are quick and pipelines wait for them, then the generic pipelines made at
+/// the start, which draws fall back on, then the pipelines asked for last,
 /// as those are what is being drawn now, and whether the threads should stop.
 struct Queue {
     translations: VecDeque<Job>,
+    generic: VecDeque<Job>,
     compiles: Vec<Job>,
     stopped: bool,
     /// pipelines compiled since the cache was last kept on disk, and when
@@ -625,9 +689,16 @@ impl Compiler {
     /// pipelines, which are drawn through the slower generic shader until
     /// then, so there is one for each core the emulation and the driver
     /// leave, up to three.
-    fn start(device: ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragments: [vk::ShaderModule; 2]) -> Compiler {
+    fn start(
+        device: ash::Device,
+        cache: vk::PipelineCache,
+        layout: vk::PipelineLayout,
+        fragments: [vk::ShaderModule; 2],
+        dynamic: Dynamic,
+    ) -> Compiler {
         let waiting = Queue {
             translations: VecDeque::new(),
+            generic: VecDeque::new(),
             compiles: Vec::new(),
             stopped: false,
             compiled: 0,
@@ -641,11 +712,23 @@ impl Compiler {
                 let (jobs, sent, device) = (queue.clone(), sent.clone(), device.clone());
                 thread::Builder::new()
                     .name("shader compiler".into())
-                    .spawn(move || compile(&jobs, &sent, &device, cache, layout, fragments))
+                    .spawn(move || compile(&jobs, &sent, &device, cache, layout, fragments, dynamic))
                     .ok()
             })
             .collect();
         Compiler { queue, made, outstanding: 0, asked: HashSet::new(), threads }
+    }
+
+    /// queues a generic pipeline ahead of the pipelines asked for, unless
+    /// there are no threads, when it is not made until a draw needs it.
+    fn send_generic(&mut self, job: Job) {
+        if self.threads.is_empty() {
+            return;
+        }
+        let (queue, ready) = &*self.queue;
+        queue.lock().unwrap_or_else(PoisonError::into_inner).generic.push_back(job);
+        ready.notify_one();
+        self.outstanding += 1;
     }
 
     /// queues a job for the threads, or gives it back when there are none.
@@ -671,6 +754,7 @@ impl Compiler {
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
         waiting.stopped = true;
         waiting.translations.clear();
+        waiting.generic.clear();
         waiting.compiles.clear();
         ready.notify_all();
         drop(waiting);
@@ -694,6 +778,7 @@ fn compile(
     cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
     fragments: [vk::ShaderModule; 2],
+    dynamic: Dynamic,
 ) {
     let (queue, ready) = jobs;
     let lock = || queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -703,7 +788,9 @@ fn compile(
             if waiting.stopped {
                 return;
             }
-            if let Some(job) = waiting.translations.pop_front().or_else(|| waiting.compiles.pop()) {
+            if let Some(job) =
+                waiting.translations.pop_front().or_else(|| waiting.generic.pop_front()).or_else(|| waiting.compiles.pop())
+            {
                 break job;
             }
             if waiting.compiled == 0 {
@@ -720,7 +807,7 @@ fn compile(
         };
         drop(waiting);
         let compiles = matches!(job, Job::Compile(..));
-        let made = work(job, device, cache, layout, fragments);
+        let made = work(job, device, cache, layout, fragments, dynamic);
         lock().compiled += compiles as usize;
         if sent.send(made).is_err() {
             return;
@@ -730,7 +817,14 @@ fn compile(
 
 /// a job done, on the compiler thread or, when waiting for it, on the
 /// caller's.
-fn work(job: Job, device: &ash::Device, cache: vk::PipelineCache, layout: vk::PipelineLayout, fragments: [vk::ShaderModule; 2]) -> Made {
+fn work(
+    job: Job,
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    fragments: [vk::ShaderModule; 2],
+    dynamic: Dynamic,
+) -> Made {
     let started = std::time::Instant::now();
     match job {
         Job::Translate(key, program) => {
@@ -758,7 +852,7 @@ fn work(job: Job, device: &ash::Device, cache: vk::PipelineCache, layout: vk::Pi
         }
         Job::Compile(key, module) => {
             let modules = [module, fragment_module(fragments, &key)];
-            let made = compile_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty());
+            let made = compile_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty(), dynamic);
             log::debug!(
                 target: "zakuro_gpu::pipelines",
                 "compiled a pipeline while drawing went on, in {:.1} ms",
@@ -777,6 +871,7 @@ fn compile_pipeline(
     [vertex, fragment]: [vk::ShaderModule; 2],
     key: &PipelineKey,
     flags: vk::PipelineCreateFlags,
+    dynamic: Dynamic,
 ) -> Result<vk::Pipeline, String> {
     let entries: Vec<vk::SpecializationMapEntry> = (0..FRAGMENT_CONSTANTS as u32)
         .map(|id| vk::SpecializationMapEntry::default().constant_id(id).offset(id * 4).size(4))
@@ -829,39 +924,25 @@ fn compile_pipeline(
     let multisample =
         vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
-    let factor = |raw: u32| {
-        if raw & 0xF == 15 {
-            vk::BlendFactor::ONE
-        } else {
-            // the PICA numbers its factors the way Vulkan does
-            vk::BlendFactor::from_raw((raw & 0xF) as i32)
-        }
-    };
-    let equation = |raw: u32| {
-        if raw & 7 > 4 {
-            vk::BlendOp::ADD
-        } else {
-            vk::BlendOp::from_raw((raw & 7) as i32)
-        }
-    };
     let mut attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::from_raw(key.mask));
     if let Some(config) = key.blend {
+        let equation = blend_equation(config);
         attachment = attachment
             .blend_enable(true)
-            .color_blend_op(equation(config))
-            .alpha_blend_op(equation(config >> 8))
-            .src_color_blend_factor(factor(config >> 16))
-            .dst_color_blend_factor(factor(config >> 20))
-            .src_alpha_blend_factor(factor(config >> 24))
-            .dst_alpha_blend_factor(factor(config >> 28));
+            .color_blend_op(equation.color_blend_op)
+            .alpha_blend_op(equation.alpha_blend_op)
+            .src_color_blend_factor(equation.src_color_blend_factor)
+            .dst_color_blend_factor(equation.dst_color_blend_factor)
+            .src_alpha_blend_factor(equation.src_alpha_blend_factor)
+            .dst_alpha_blend_factor(equation.dst_alpha_blend_factor);
     }
     let attachments = [attachment];
     let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
     if let Some(op) = key.logic_op {
         blend = blend.logic_op_enable(true).logic_op(logic_op(op));
     }
-    let dynamic_states = [
+    let mut dynamic_states = vec![
         vk::DynamicState::VIEWPORT,
         vk::DynamicState::SCISSOR,
         vk::DynamicState::DEPTH_TEST_ENABLE,
@@ -875,6 +956,16 @@ fn compile_pipeline(
         vk::DynamicState::BLEND_CONSTANTS,
         vk::DynamicState::CULL_MODE,
     ];
+    if dynamic.blend {
+        dynamic_states.extend([
+            vk::DynamicState::COLOR_BLEND_ENABLE_EXT,
+            vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
+            vk::DynamicState::COLOR_WRITE_MASK_EXT,
+        ]);
+    }
+    if dynamic.logic_op {
+        dynamic_states.extend([vk::DynamicState::LOGIC_OP_ENABLE_EXT, vk::DynamicState::LOGIC_OP_EXT]);
+    }
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let color_formats = [COLOR_FORMAT];
     let depth_format = if key.depth { DEPTH_FORMAT } else { vk::Format::UNDEFINED };
@@ -946,6 +1037,10 @@ pub struct Hardware {
     compiler: Compiler,
     /// whether the device does logic ops.
     logic_ops: bool,
+    /// the state draws set as they go, and what sets it.
+    dynamic: Dynamic,
+    blend_state: Option<ash::ext::extended_dynamic_state3::Device>,
+    logic_op_state: Option<ash::ext::extended_dynamic_state2::Device>,
     /// where the batch copied programs, by their fingerprints.
     programs: HashMap<u64, u64>,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
@@ -1004,7 +1099,7 @@ impl Hardware {
     /// share, and then shows screens straight from the GPU when direct.
     pub fn with_device(shared: Arc<SharedDevice>, direct: bool) -> Result<Hardware, String> {
         let (instance, device, physical, family) = (shared.instance.clone(), shared.device.clone(), shared.physical, shared.family);
-        let (logic_ops, statistics) = (shared.logic_ops, shared.statistics);
+        let (logic_ops, statistics, dynamic) = (shared.logic_ops, shared.statistics, shared.dynamic);
         // SAFETY: the physical device came from this instance
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1094,7 +1189,9 @@ impl Hardware {
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
-            let compiler = Compiler::start(device.clone(), pipeline_cache, layout, [fragment_shader, depth_fragment_shader]);
+            let compiler = Compiler::start(device.clone(), pipeline_cache, layout, [fragment_shader, depth_fragment_shader], dynamic);
+            let blend_state = dynamic.blend.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
+            let logic_op_state = dynamic.logic_op.then(|| ash::ext::extended_dynamic_state2::Device::new(&instance, &device));
             let mut hardware = Hardware {
                 ring: unmade(),
                 in_flight: VecDeque::with_capacity(IN_FLIGHT),
@@ -1137,6 +1234,9 @@ impl Hardware {
                 generic: std::env::var_os("ZAKURO_GENERIC_SHADERS").is_some(),
                 compiler,
                 logic_ops,
+                dynamic,
+                blend_state,
+                logic_op_state,
                 programs: HashMap::new(),
                 pipelines: HashMap::new(),
                 transfer: None,
@@ -1195,6 +1295,14 @@ impl Hardware {
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
                 vk::ImageAspectFlags::COLOR,
             )?;
+            // the generic pipelines, while the title starts. a draw that
+            // needs one before it is made makes it itself, as before
+            if dynamic.blend && !hardware.waits {
+                for key in generic_keys(hardware.shades) {
+                    let module = hardware.vertex_module(key.vertex);
+                    hardware.compiler.send_generic(Job::Compile(key, module));
+                }
+            }
             Ok(hardware)
         }
     }
@@ -1924,8 +2032,15 @@ impl Hardware {
         }
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
-        let pipeline =
-            compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, vk::PipelineCreateFlags::empty())?;
+        let pipeline = compile_pipeline(
+            &self.device,
+            self.pipeline_cache,
+            self.layout,
+            modules,
+            &key,
+            vk::PipelineCreateFlags::empty(),
+            self.dynamic,
+        )?;
         log::debug!(
             target: "zakuro_gpu::pipelines",
             "compiled pipeline {} on the draw in {:.1} ms",
@@ -1942,7 +2057,7 @@ impl Hardware {
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
         let flags = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
-        let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags).ok()?;
+        let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags, self.dynamic).ok()?;
         log::debug!(
             target: "zakuro_gpu::pipelines",
             "took pipeline {} from the cache in {:.1} ms",
@@ -2199,6 +2314,12 @@ impl Hardware {
         self.generic = generic;
     }
 
+    /// whether the device does logic ops, without which draws leave them out.
+    #[cfg(test)]
+    pub(super) fn logic_ops(&self) -> bool {
+        self.logic_ops
+    }
+
     /// the programs that run translated so far.
     #[cfg(test)]
     pub(super) fn translations(&self) -> usize {
@@ -2255,7 +2376,7 @@ impl Hardware {
                 None => return,
             },
         };
-        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules());
+        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic);
         self.take(made);
     }
 
@@ -2297,9 +2418,14 @@ impl Hardware {
             Made::Translated(key, Err(_)) => {
                 self.translated.insert(key, Translation::Failed);
             }
-            Made::Compiled(key, Ok(pipeline)) => {
-                self.pipelines.insert(key, pipeline);
-            }
+            Made::Compiled(key, Ok(pipeline)) => match self.pipelines.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(pipeline);
+                }
+                // a draw made it meanwhile
+                // SAFETY: nothing recorded uses the one just made
+                Entry::Occupied(_) => unsafe { self.device.destroy_pipeline(pipeline, None) },
+            },
             Made::Compiled(key, Err(error)) => match key.vertex {
                 // a translated program the driver turns down goes back to
                 // the interpreter
@@ -2541,8 +2667,17 @@ impl Hardware {
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
         fragment[28] = depth_flags | ((writes_depth as u32) * WRITES_DEPTH);
         // what stands in for a translated program's pipeline, the
-        // interpreter, has the program staged and bound all the same
-        let key = PipelineKey { blend, logic_op, mask: color_mask, depth: depth.is_some(), vertex, fragment };
+        // interpreter, has the program staged and bound all the same. what
+        // is dynamic is set below rather than held by the pipeline
+        let dynamic = self.dynamic;
+        let key = PipelineKey {
+            blend: blend.filter(|_| !dynamic.blend),
+            logic_op: logic_op.filter(|_| !dynamic.logic_op),
+            mask: if dynamic.blend { 0xF } else { color_mask },
+            depth: depth.is_some(),
+            vertex,
+            fragment,
+        };
         let pipeline = self.pipeline_for(key, translating)?;
 
         self.mark(Work::Draw, false);
@@ -2672,6 +2807,15 @@ impl Hardware {
             device.cmd_set_stencil_write_mask(commands, face, if writable { (test >> 8) & 0xFF } else { 0 });
             device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
             device.cmd_set_blend_constants(commands, &constant);
+            if let Some(state) = &self.blend_state {
+                state.cmd_set_color_blend_enable(commands, 0, &[blend.is_some().into()]);
+                state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(blend.unwrap_or(0))]);
+                state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(color_mask)]);
+                if let Some(ops) = &self.logic_op_state {
+                    state.cmd_set_logic_op_enable(commands, logic_op.is_some());
+                    ops.cmd_set_logic_op(commands, logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
+                }
+            }
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &writes);
             self.draws += 1;
             match vertex_infos {
@@ -3877,6 +4021,19 @@ pub(crate) fn render_device(
     // SAFETY: the physical device came from this instance
     let supported = unsafe { instance.get_physical_device_features(physical) };
     let logic_ops = supported.logic_op == vk::TRUE;
+    let dynamic = dynamic_state(instance, physical, logic_ops);
+    if dynamic.blend {
+        extensions.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
+    }
+    if dynamic.logic_op {
+        extensions.push(ash::ext::extended_dynamic_state2::NAME.as_ptr());
+    }
+    let mut blend_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default()
+        .extended_dynamic_state3_color_blend_enable(true)
+        .extended_dynamic_state3_color_blend_equation(true)
+        .extended_dynamic_state3_color_write_mask(true)
+        .extended_dynamic_state3_logic_op_enable(dynamic.logic_op);
+    let mut logic_op_state = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default().extended_dynamic_state2_logic_op(true);
     // what the GPU shades counted along with its times
     let statistics = std::env::var_os("ZAKURO_GPU_TIMES").is_some() && supported.pipeline_statistics_query == vk::TRUE;
     let features = vk::PhysicalDeviceFeatures::default()
@@ -3889,17 +4046,58 @@ pub(crate) fn render_device(
         .dynamic_rendering(true)
         .synchronization2(true)
         .pipeline_creation_cache_control(true);
-    let info = vk::DeviceCreateInfo::default()
+    let mut info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queues)
         .enabled_extension_names(&extensions)
         .enabled_features(&features)
         .push_next(&mut features13);
+    if dynamic.blend {
+        info = info.push_next(&mut blend_state);
+    }
+    if dynamic.logic_op {
+        info = info.push_next(&mut logic_op_state);
+    }
     // SAFETY: the caller checked the device has all of this
     let device = unsafe { instance.create_device(physical, &info, None) }.map_err(vk_error("create a device"))?;
     // SAFETY: a queue the device was made with
     let queue = unsafe { device.get_device_queue(family, 0) };
     let (_entry, instance) = (entry.clone(), instance.clone());
-    Ok(SharedDevice { _entry, instance, physical, family, device, queue, logic_ops, statistics })
+    Ok(SharedDevice { _entry, instance, physical, family, device, queue, logic_ops, statistics, dynamic })
+}
+
+/// which of the blend state the device lets draws set as they go, none
+/// with ZAKURO_STATIC_BLEND set, to compare the two.
+fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_ops: bool) -> Dynamic {
+    if std::env::var_os("ZAKURO_STATIC_BLEND").is_some() {
+        return Dynamic::default();
+    }
+    // SAFETY: the physical device came from this instance
+    let available = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let has = |name: &std::ffi::CStr| available.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+    let (three, two) = (has(ash::ext::extended_dynamic_state3::NAME), has(ash::ext::extended_dynamic_state2::NAME));
+    let mut supported3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
+    let mut supported2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
+    {
+        let mut features = vk::PhysicalDeviceFeatures2::default();
+        if three {
+            features = features.push_next(&mut supported3);
+        }
+        if two {
+            features = features.push_next(&mut supported2);
+        }
+        // SAFETY: as above, with a chain of structures that live as long
+        unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    }
+    let blend = three
+        && supported3.extended_dynamic_state3_color_blend_enable == vk::TRUE
+        && supported3.extended_dynamic_state3_color_blend_equation == vk::TRUE
+        && supported3.extended_dynamic_state3_color_write_mask == vk::TRUE;
+    let logic_op = blend
+        && logic_ops
+        && two
+        && supported2.extended_dynamic_state2_logic_op == vk::TRUE
+        && supported3.extended_dynamic_state3_logic_op_enable == vk::TRUE;
+    Dynamic { blend, logic_op }
 }
 
 /// a device of the renderer's own, on the GPU pick chooses.
@@ -3944,4 +4142,31 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
     }
     best.map(|(_, device, family)| (device, family))
         .ok_or_else(|| "no GPU with Vulkan 1.3, push descriptors and a D24S8 depth format".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the generic pipelines made at the start are every one a draw can ask
+    /// for while the blend state is dynamic.
+    #[test]
+    fn the_generic_pipelines_made_at_the_start_are_all_a_draw_needs() {
+        let made: HashSet<PipelineKey> = generic_keys(true).into_iter().collect();
+        let mut seed = 5u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for _ in 0..1000 {
+            let mut fragment: [u32; FRAGMENT_CONSTANTS] = std::array::from_fn(|_| random());
+            // whether the draw is lit
+            fragment[26] &= 1;
+            for vertex in [VertexStage::Placed, VertexStage::Interpreted] {
+                let key = PipelineKey { blend: None, logic_op: None, mask: 0xF, depth: random() & 1 != 0, vertex, fragment };
+                // as pipeline_for asks for it
+                assert!(made.contains(&PipelineKey { fragment: generic(&key.fragment), ..key }));
+            }
+        }
+    }
 }

@@ -2501,6 +2501,78 @@ mod tests {
         assert_eq!(differing, 0);
     }
 
+    /// blending, color masks and logic ops come out on the GPU as in
+    /// software, over draws one after another that each do something else,
+    /// as draws sharing a pipeline do when the GPU sets that as it goes.
+    /// each draw covers a row of its own, so none blends over another's.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_gpu_blends_and_masks_like_the_cpu() {
+        const REG_BLEND_COLOR: usize = 0x103;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        // a device without logic ops draws without them
+        let logic_ops = hardware.logic_ops();
+        let mut seed = 7u32;
+        let mut random = move |range: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % range
+        };
+        let row = |k: u32, color: Vec4| -> Vec<Vertex> {
+            let (bottom, top) = (k as f32 / 4.0 - 1.0, (k + 1) as f32 / 4.0 - 1.0);
+            let corner = |x: f32, y: f32| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color,
+                texcoords: [[0.0; 2]; 3],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+            };
+            vec![corner(-1.0, bottom), corner(1.0, bottom), corner(1.0, top), corner(-1.0, bottom), corner(1.0, top), corner(-1.0, top)]
+        };
+        let mut software = ConsoleMemory::default();
+        let mut gpu = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        for round in 0..40 {
+            let start: Vec<u8> = (0..64 * 4).map(|_| random(256) as u8).collect();
+            software.write(COLOR, &start);
+            gpu.write(COLOR, &start);
+            // software blends in floats and truncates, GPUs round, so a
+            // blended row can be a step off, a logic op's not at all
+            let mut steps = [0u8; 8];
+            for (k, steps) in steps.iter_mut().enumerate() {
+                let mut registers = target_registers();
+                if !logic_ops || random(2) == 0 {
+                    let (color, alpha) = (random(6), random(6));
+                    let factors = [random(16), random(16), random(16), random(16)];
+                    registers[REG_COLOR_OPERATION] = 0x100;
+                    registers[REG_BLEND_FUNC] =
+                        color | alpha << 8 | factors[0] << 16 | factors[1] << 20 | factors[2] << 24 | factors[3] << 28;
+                    registers[REG_BLEND_COLOR] = random(1 << 16) << 16 | random(1 << 16);
+                    *steps = 1;
+                } else {
+                    registers[REG_COLOR_OPERATION] = 0;
+                    registers[REG_LOGIC_OP] = random(16);
+                }
+                registers[REG_DEPTH_COLOR_MASK] = random(16) << 8;
+                // a quarter above a byte, which software truncates and the
+                // GPU rounds to the same byte
+                let color = std::array::from_fn(|_| (random(255) as f32 + 0.25) / 255.0);
+                rasterize_shaded(&registers, &mut software, &mut Resources::default(), &row(k as u32, color));
+                rasterize_shaded(&registers, &mut gpu, &mut resources, &row(k as u32, color));
+            }
+            resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
+            for (y, &steps) in steps.iter().enumerate() {
+                for x in 0..8 {
+                    let at = COLOR + crate::format::morton_offset(x, 7 - y as u32, 8, 4);
+                    let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
+                    software.read(at, &mut a);
+                    gpu.read(at, &mut b);
+                    let off = a.iter().zip(&b).map(|(p, q)| p.abs_diff(*q)).max().unwrap_or(0);
+                    assert!(off <= steps, "round {round}, row {y} is off by {off}, {a:?} against {b:?}");
+                }
+            }
+        }
+    }
+
     /// vertices the GPU shades come out as the CPU shades them, clipped and
     /// culled the same, through a program with a loop, a call, both kinds
     /// of if, indexed uniforms and an output past a gap in the mask.

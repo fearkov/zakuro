@@ -17,6 +17,8 @@ pub struct SharedDevice {
     /// whether the device does logic ops, and counts pipeline statistics.
     pub(crate) logic_ops: bool,
     pub(crate) statistics: bool,
+    /// the blend state draws set as they go.
+    pub(crate) dynamic: crate::raster::hardware::Dynamic,
 }
 
 impl SharedDevice {
