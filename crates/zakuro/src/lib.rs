@@ -353,8 +353,9 @@ impl std::fmt::Display for Times {
     }
 }
 
-/// one 3DS frame at 60 Hz.
-const FRAME_TIME: Duration = Duration::from_nanos(16_666_667);
+/// one 3DS frame, about 16.71 ms.
+const FRAME_TIME: Duration =
+    Duration::from_nanos(zakuro_core::CYCLES_PER_FRAME * 1_000_000_000 / zakuro_core::kernel::thread::CPU_CLOCK_HZ);
 /// how far behind the schedule may fall before it starts over instead of
 /// running fast to catch up, after a pause say.
 const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);

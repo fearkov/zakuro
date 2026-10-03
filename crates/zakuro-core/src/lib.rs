@@ -147,8 +147,11 @@ pub struct System {
     pub recompiled_instructions: u64,
 }
 
-/// cycles in one 60 Hz frame at the ARM11's clock.
-pub const CYCLES_PER_FRAME: u64 = kernel::thread::CPU_CLOCK_HZ / 60;
+/// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
+/// about 59.83 Hz and not 60. a title that keeps time by frames runs that
+/// much ahead of its sound otherwise, a rhythm game's notes drift off the
+/// music over a song.
+pub const CYCLES_PER_FRAME: u64 = 4_481_136;
 
 /// cycles in one audio frame, 160 samples, each exactly 8192 cycles long
 /// (the DSP's 32728 Hz is the CPU clock divided by 8192).
