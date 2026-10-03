@@ -3688,7 +3688,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "zakuro"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "cpal",
  "egui",
@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-common"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "bitflags 2.13.2",
  "chrono",
@@ -3740,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-cpu"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "log",
  "zakuro-common",
@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-fs"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "log",
  "memmap2",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-gpu"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "ash",
  "ash-window",
