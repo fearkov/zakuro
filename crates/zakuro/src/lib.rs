@@ -79,6 +79,7 @@ pub fn run(linked: Option<Linked>) {
         next_frame: Instant::now(),
         skipped: 0,
         shown: 0,
+        spent: Spent::default(),
         paused: false,
         stop: false,
     };
@@ -241,6 +242,10 @@ struct Running {
     /// the inputs written down, ZAKURO_RECORD=file, for playing the run
     /// back.
     recorder: Option<zakuro_core::replay::Recorder>,
+    /// the inputs a recording wrote down, ZAKURO_REPLAY=file, played back in
+    /// place of the keyboard's and the controllers', and the frames run.
+    replay: Option<zakuro_core::replay::Replay>,
+    frame: u64,
     /// frames run since counting_since, for the frame rate.
     frames: u32,
     counting_since: Instant,
@@ -249,7 +254,17 @@ struct Running {
 
 impl Running {
     fn new(system: System, path: PathBuf, name: String) -> Running {
-        Running { system, path, name, recorder: None, frames: 0, counting_since: Instant::now(), fps: 0.0 }
+        Running {
+            system,
+            path,
+            name,
+            recorder: None,
+            replay: None,
+            frame: 0,
+            frames: 0,
+            counting_since: Instant::now(),
+            fps: 0.0,
+        }
     }
 
     fn count_frame(&mut self) {
@@ -301,9 +316,41 @@ struct App {
     skipped: u32,
     /// frames shown since the title was last updated.
     shown: u32,
+    /// how long emulating and showing frames took since the title was last
+    /// updated, for the frame rate's log.
+    spent: Spent,
     /// stopped with F1, without the menu.
     paused: bool,
     stop: bool,
+}
+
+/// how long each step of the loop took, its mean and its longest.
+#[derive(Default)]
+struct Spent {
+    emulating: Times,
+    showing: Times,
+}
+
+#[derive(Default)]
+struct Times {
+    total: Duration,
+    longest: Duration,
+    count: u32,
+}
+
+impl Times {
+    fn add(&mut self, time: Duration) {
+        self.total += time;
+        self.longest = self.longest.max(time);
+        self.count += 1;
+    }
+}
+
+impl std::fmt::Display for Times {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mean = self.total.as_secs_f64() * 1e3 / self.count.max(1) as f64;
+        write!(f, "{mean:.1} ms, at most {:.1}", self.longest.as_secs_f64() * 1e3)
+    }
 }
 
 /// one 3DS frame at 60 Hz.
@@ -444,6 +491,16 @@ impl App {
         if record.is_some() {
             config.clock = Some(clock);
         }
+        // and plays back from the clock it was made at
+        let replay = match std::env::var_os("ZAKURO_REPLAY").map(PathBuf::from) {
+            Some(file) => {
+                let replay = zakuro_core::replay::Replay::open(&file).map_err(|error| format!("could not read {}, {error}", file.display()))?;
+                log::info!("playing back the inputs in {}", file.display());
+                config.clock = Some(replay.clock());
+                Some(replay)
+            }
+            None => None,
+        };
         let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
         let name = self
             .library
@@ -454,6 +511,7 @@ impl App {
             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .unwrap_or_default();
         let mut game = Running::new(system, path.to_owned(), name);
+        game.replay = replay;
         if let Some(record) = record {
             match zakuro_core::replay::Recorder::create(&record, clock) {
                 Ok(recorder) => {
@@ -732,7 +790,9 @@ impl App {
         let playing =
             self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open && !typing;
         if playing {
+            let start = Instant::now();
             self.emulate();
+            self.spent.emulating.add(start.elapsed());
         }
 
         self.next_frame += FRAME_TIME;
@@ -743,7 +803,9 @@ impl App {
             self.skipped += 1;
         } else {
             self.skipped = 0;
+            let start = Instant::now();
             self.present(event_loop);
+            self.spent.showing.add(start.elapsed());
             self.shown += 1;
         }
 
@@ -752,7 +814,12 @@ impl App {
             self.shown = 0;
             self.last_title_update = Instant::now();
             if let Some(game) = &self.game {
-                log::debug!(target: "zakuro::fps", "{:.1} frames emulated and {shown:.1} shown a second", game.fps);
+                let Spent { emulating, showing } = std::mem::take(&mut self.spent);
+                log::debug!(
+                    target: "zakuro::fps",
+                    "{:.1} frames emulated and {shown:.1} shown a second, emulating took {emulating}, showing {showing}",
+                    game.fps
+                );
             }
             if let Some(window) = &self.window {
                 let title = match &self.game {
@@ -776,7 +843,11 @@ impl App {
     /// runs one frame of the game.
     fn emulate(&mut self) {
         let Some(game) = &mut self.game else { return };
-        let input = self.gamepads.apply(self.keyboard.state());
+        let input = match &mut game.replay {
+            Some(replay) => replay.input(game.frame),
+            None => self.gamepads.apply(self.keyboard.state()),
+        };
+        game.frame += 1;
         if let Some(recorder) = &mut game.recorder {
             recorder.record(input);
         }
