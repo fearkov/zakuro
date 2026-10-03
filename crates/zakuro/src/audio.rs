@@ -194,16 +194,22 @@ impl Audio {
         let scale = self.volume.get() / 32768.0;
         let samples: Vec<[f32; 2]> = samples.iter().map(|s| s.map(|v| v as f32 * scale)).collect();
         let Ok(mut queue) = self.queue.lock() else { return };
-        let short = TARGET.saturating_sub(queue.samples.len()) as f64 / TARGET as f64;
-        let mut stretched = Vec::with_capacity(samples.len() * 2);
-        self.stretch.borrow_mut().process(&samples, (1.0 + short).min(MOST_STRETCH), &mut stretched);
-        queue.samples.extend(stretched);
-        // far ahead, after a stall on the output side, it drops the oldest
-        // rather than lag behind the picture
-        if queue.samples.len() > TARGET * 4 {
-            let excess = queue.samples.len() - TARGET;
-            queue.samples.drain(..excess);
-        }
+        enqueue(&mut queue, &mut self.stretch.borrow_mut(), &samples);
+    }
+}
+
+/// adds what the console played to the queue, stretched by how far the
+/// queue is from its target.
+fn enqueue(queue: &mut Queue, stretch: &mut Stretch, samples: &[[f32; 2]]) {
+    let short = TARGET.saturating_sub(queue.samples.len()) as f64 / TARGET as f64;
+    let mut stretched = Vec::with_capacity(samples.len() * 2);
+    stretch.process(samples, (1.0 + short).min(MOST_STRETCH), &mut stretched);
+    queue.samples.extend(stretched);
+    // far ahead, after a stall on the output side, it drops the oldest
+    // rather than lag behind the picture
+    if queue.samples.len() > TARGET * 4 {
+        let excess = queue.samples.len() - TARGET;
+        queue.samples.drain(..excess);
     }
 }
 
@@ -315,6 +321,57 @@ mod tests {
         assert!(faded[0] < 0.5 && faded[0] > 0.4, "it fades out rather than stopping short");
         queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
         assert_eq!(queue.next(), [0.0, -0.0], "it starts again from where it stopped");
+    }
+
+    /// how far behind the picture the sound is, in ms, after each second of
+    /// a minute where the console makes exactly as much sound as the output
+    /// plays, but a frame now and then comes late and the next ones catch up,
+    /// as when the emulation hitches.
+    fn latency_with_hitches() -> Vec<f64> {
+        const CONSOLE: f64 = 32728.498;
+        const OUTPUT: f64 = 48000.0;
+        let mut queue = queue(0, CONSOLE / OUTPUT);
+        let mut stretch = Stretch::new();
+        let mut seconds = Vec::new();
+        let tone = tone(40_000);
+        let mut at = 0;
+        let mut late: Vec<[f32; 2]> = Vec::new();
+        for frame in 0..3600usize {
+            // a frame's worth of sound, held back every 45th frame for three
+            // frames' time
+            let count = (CONSOLE * (frame + 1) as f64 / 60.0) as usize - (CONSOLE * frame as f64 / 60.0) as usize;
+            let mut chunk: Vec<[f32; 2]> = (0..count).map(|i| tone[(at + i) % tone.len()]).collect();
+            at += count;
+            if frame % 45 == 0 {
+                late.append(&mut chunk);
+            } else if frame % 45 == 3 {
+                late.append(&mut chunk);
+                enqueue(&mut queue, &mut stretch, &late);
+                late.clear();
+            } else if late.is_empty() {
+                enqueue(&mut queue, &mut stretch, &chunk);
+            } else {
+                late.append(&mut chunk);
+            }
+            for _ in 0..(OUTPUT / 60.0) as usize {
+                queue.next();
+            }
+            if frame % 60 == 59 {
+                seconds.push(queue.samples.len() as f64 / CONSOLE * 1000.0);
+            }
+        }
+        seconds
+    }
+
+    #[test]
+    fn hitches_do_not_put_the_sound_further_and_further_behind() {
+        let seconds = latency_with_hitches();
+        let first = seconds[5];
+        let last = *seconds.last().unwrap();
+        let most = seconds.iter().cloned().fold(0.0, f64::max);
+        eprintln!("latency by second {:?}", seconds.iter().map(|ms| ms.round() as i64).collect::<Vec<_>>());
+        assert!(last < first + 30.0, "behind by {first:.0} ms after 5 s and {last:.0} ms after a minute");
+        assert!(most < 160.0, "up to {most:.0} ms behind");
     }
 
     #[test]
