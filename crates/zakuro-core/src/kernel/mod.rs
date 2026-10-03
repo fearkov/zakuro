@@ -130,6 +130,11 @@ impl Kernel {
         self.current_thread.map(|id| self.thread(id))
     }
 
+    /// whether a thread other than the running one could take the core.
+    pub fn others_runnable(&self) -> bool {
+        self.threads.iter().enumerate().any(|(id, thread)| Some(id as ThreadId) != self.current_thread && thread.is_runnable())
+    }
+
     pub fn current_mut(&mut self) -> Option<&mut Thread> {
         let id = self.current_thread?;
         Some(self.thread_mut(id))

@@ -436,7 +436,16 @@ impl System {
         if !library.has_code(self.cpu.regs[15] | self.cpu.cpsr.thumb as u32) {
             return None;
         }
-        let mut limit = self.next_preempt.min(self.next_frame_boundary).min(self.next_audio_frame);
+        let mut limit = self.next_frame_boundary.min(self.next_audio_frame);
+        // a stop for the scheduler unwinds every guest call the code is in,
+        // which the host then enters again one at a time. it only changes
+        // anything when another thread can run, otherwise the run goes on to
+        // the next tick a thread or a timer wakes at
+        if self.kernel.others_runnable() {
+            limit = limit.min(self.next_preempt);
+        } else if let Some(tick) = self.next_wakeup().filter(|tick| *tick > self.cpu.cycles) {
+            limit = limit.min(tick);
+        }
         if let Some(deadline) = deadline {
             limit = limit.min(deadline);
         }
