@@ -132,7 +132,115 @@ impl VertexLayout {
     }
 }
 
+/// a draw's vertices as the shader takes them, worked out once for the
+/// draw: what each input register holds when no array feeds it, and the
+/// fields the arrays do give, each going straight to its register.
+struct InputPlan {
+    template: [Vec4; shader::INPUT_REGISTERS],
+    loaders: Vec<LoaderPlan>,
+}
+
+/// the fields one array gives, and where a vertex of it is.
+struct LoaderPlan {
+    offset: u32,
+    stride: u32,
+    size: u32,
+    fields: Vec<PlacedField>,
+}
+
+/// a field of an array's vertex, and the input register it lands in.
+struct PlacedField {
+    offset: u32,
+    ty: u32,
+    count: u32,
+    register: usize,
+}
+
+impl InputPlan {
+    /// what fetch_vertex works out for every vertex, the same way: an
+    /// attribute an array gives is read, one flagged fixed takes the value
+    /// the command list set, the rest read (0, 0, 0, 1), and the unit's
+    /// permutation places them, a later attribute over an earlier one in
+    /// the same register.
+    fn new(registers: &[u32], layout: &VertexLayout, fixed: &[Vec4; 16]) -> InputPlan {
+        // the array field that gives each attribute, the last when several do
+        let mut source = [None; 12];
+        for (l, loader) in layout.loaders.iter().enumerate() {
+            for (f, field) in loader.fields.iter().enumerate() {
+                source[field.id] = Some((l, f));
+            }
+        }
+        let count = (((registers[REG_VS_NUM_INPUT_ATTRIBUTES] & 0xF) + 1) as usize).min(12);
+        let map = registers[REG_VS_BLOCK + SHADER_INPUT_MAP_LOW] as u64
+            | ((registers[REG_VS_BLOCK + SHADER_INPUT_MAP_HIGH] as u64) << 32);
+        let mut owner = [None; shader::INPUT_REGISTERS];
+        for id in 0..count {
+            owner[((map >> (id * 4)) & 0xF) as usize] = Some(id);
+        }
+        let fixed_mask = (registers[REG_ATTRIBUTE_FORMAT_HIGH] >> 16) & 0xFFF;
+        let mut template = [shader::ZERO; shader::INPUT_REGISTERS];
+        let mut loaders: Vec<LoaderPlan> = layout
+            .loaders
+            .iter()
+            .map(|loader| LoaderPlan { offset: loader.offset, stride: loader.stride, size: loader.size, fields: Vec::new() })
+            .collect();
+        for (register, id) in owner.iter().enumerate() {
+            let Some(id) = *id else { continue };
+            match source[id] {
+                Some((l, f)) => {
+                    let field = &layout.loaders[l].fields[f];
+                    loaders[l].fields.push(PlacedField { offset: field.offset, ty: field.ty, count: field.count, register });
+                }
+                None if fixed_mask & (1 << id) != 0 => template[register] = fixed[id],
+                None => template[register] = [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+        loaders.retain(|loader| !loader.fields.is_empty());
+        InputPlan { template, loaders }
+    }
+
+    /// one vertex's input registers.
+    fn fetch<M: GpuMemory>(&self, memory: &mut M, base: u32, vertex_index: u32) -> [Vec4; shader::INPUT_REGISTERS] {
+        let mut input = self.template;
+        for loader in &self.loaders {
+            // base is physical, and a loader's offset can carry it from one
+            // region into another, titles point the base at the start of VRAM
+            // and reach vertex data in FCRAM through the offset.
+            let vertex = memory.translate(base + loader.offset + vertex_index * loader.stride);
+            let size = loader.size as usize;
+            match memory.slice(vertex, size) {
+                Some(bytes) => loader.place(bytes, &mut input),
+                None => {
+                    // twelve fields of sixteen bytes, and their alignment, fit
+                    let mut bytes = [0u8; 256];
+                    memory.read(vertex, &mut bytes[..size]);
+                    loader.place(&bytes[..size], &mut input);
+                }
+            }
+        }
+        input
+    }
+}
+
+impl LoaderPlan {
+    /// puts the fields of a vertex's bytes in their registers. components
+    /// an array does not provide read as (0, 0, 0, 1), a two-component
+    /// texture coordinate arrives as (u, v, 0, 1).
+    fn place(&self, bytes: &[u8], input: &mut [Vec4; shader::INPUT_REGISTERS]) {
+        for field in &self.fields {
+            let size = component_size(field.ty) as usize;
+            let mut value = [0.0f32, 0.0, 0.0, 1.0];
+            for (i, slot) in value.iter_mut().enumerate().take(field.count as usize) {
+                let at = field.offset as usize + i * size;
+                *slot = component(&bytes[at..at + size], field.ty);
+            }
+            input[field.register] = value;
+        }
+    }
+}
+
 /// fetches one vertex's attributes and lays them out as shader input
+#[cfg(test)]
 fn fetch_vertex<M: GpuMemory>(
     registers: &[u32],
     memory: &mut M,
@@ -142,46 +250,7 @@ fn fetch_vertex<M: GpuMemory>(
     fixed: &[Vec4; 16],
     vertex_index: u32,
 ) -> [Vec4; shader::INPUT_REGISTERS] {
-    // components an array does not provide read as (0, 0, 0, 1), a
-    // two-component texture coordinate arrives as (u, v, 0, 1).
-    let mut attributes = [[0.0, 0.0, 0.0, 1.0]; 12];
-    let mut loaded = [false; 12];
-
-    // twelve fields of sixteen bytes, and their alignment, fit
-    let mut bytes = [0u8; 256];
-    for loader in &layout.loaders {
-        // base is physical, and a loader's offset can carry it from one
-        // region into another, titles point the base at the start of VRAM and
-        // reach vertex data in FCRAM through the offset.
-        let vertex = memory.translate(base + loader.offset + vertex_index * loader.stride);
-        let size = loader.size as usize;
-        match memory.slice(vertex, size) {
-            Some(slice) => bytes[..size].copy_from_slice(slice),
-            None => memory.read(vertex, &mut bytes[..size]),
-        }
-        for field in &loader.fields {
-            let size = component_size(field.ty) as usize;
-            let mut value = [0.0f32, 0.0, 0.0, 1.0];
-            for (i, slot) in value.iter_mut().enumerate().take(field.count as usize) {
-                let at = field.offset as usize + i * size;
-                *slot = component(&bytes[at..at + size], field.ty);
-            }
-            attributes[field.id] = value;
-            loaded[field.id] = true;
-        }
-    }
-
-    // attributes flagged as fixed take the value the command list set,
-    // unless an array feeds them after all.
-    let fixed_mask = (registers[REG_ATTRIBUTE_FORMAT_HIGH] >> 16) & 0xFFF;
-    for (id, attribute) in attributes.iter_mut().enumerate() {
-        if !loaded[id] && fixed_mask & (1 << id) != 0 {
-            *attribute = fixed[id];
-        }
-    }
-
-    let count = ((registers[REG_VS_NUM_INPUT_ATTRIBUTES] & 0xF) + 1) as usize;
-    map_inputs(registers, REG_VS_BLOCK, &attributes[..count.min(12)])
+    InputPlan::new(registers, layout, fixed).fetch(memory, base, vertex_index)
 }
 
 /// places attributes in a shader unit's input registers (v0-v15), as the
@@ -351,14 +420,16 @@ fn to_vertex(map: &OutputMap, attributes: &[Vec4; 16]) -> Vertex {
 /// takes shader inputs through the vertex shader, over threads when there
 /// are enough of them, and the geometry shader when one is enabled,
 /// producing the vertices the rasterizer assembles. order says which input
-/// each vertex comes from when an index buffer repeats them.
-fn process_vertices(
+/// each vertex comes from when an index buffer repeats them, and comes back
+/// to say which of the vertices made each one is, none for the geometry
+/// shader's, which come in order.
+fn process_vertices<'a>(
     registers: &[u32],
     vertex_shader: &ShaderUnit,
     geometry_shader: &ShaderUnit,
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
-    order: Option<&[usize]>,
-) -> Vec<Vertex> {
+    order: Option<&'a [usize]>,
+) -> (Vec<Vertex>, Option<&'a [usize]>) {
     if log::log_enabled!(log::Level::Trace) {
         if let Some(input) = inputs.first() {
             let used_uniforms = vertex_shader.float_uniforms.iter().filter(|u| **u != shader::ZERO).count();
@@ -371,23 +442,21 @@ fn process_vertices(
             );
         }
     }
-    let shaded = shade(registers, vertex_shader, inputs);
-    // the results in draw order, which repeats vertices an index buffer
-    // names more than once
     let map = read_output_map(registers);
     if registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 {
+        // the results in draw order, which repeats vertices an index buffer
+        // names more than once
+        let shaded = shade(registers, vertex_shader, inputs);
         let outputs: Box<dyn Iterator<Item = [Vec4; 16]>> = match order {
             Some(order) => Box::new(order.iter().map(|&i| shaded[i])),
             None => Box::new(shaded.iter().copied()),
         };
-        return geometry_stage(registers, geometry_shader, &map, outputs);
+        return (geometry_stage(registers, geometry_shader, &map, outputs), None);
     }
-    // each vertex made once, then repeated
-    let vertices: Vec<Vertex> = shaded.iter().map(|attributes| to_vertex(&map, attributes)).collect();
-    match order {
-        Some(order) => order.iter().map(|&i| vertices[i]).collect(),
-        None => vertices,
-    }
+    // each vertex made once, by the threads that shade it
+    let mask = registers[REG_VS_OUTPUT_MASK];
+    let vertices = shade_with(vertex_shader, inputs, |outputs| to_vertex(&map, &pack_outputs(&outputs, mask)));
+    (vertices, order)
 }
 
 /// a draw's vertices, as shader inputs or already through the shaders.
@@ -448,18 +517,30 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
 
 /// vertices a draw needs before shading them is worth splitting over threads.
 const PARALLEL_VERTICES: usize = 128;
-/// vertices each thread takes at a time, whole batches of the shader's.
+/// the fewest vertices each thread takes at a time, whole batches of the
+/// shader's.
 const PARALLEL_CHUNK: usize = 64;
 
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
     let mask = registers[REG_VS_OUTPUT_MASK];
-    let shade = |inputs: &[[Vec4; shader::INPUT_REGISTERS]]| {
-        shader::run_vertices(unit, inputs).into_iter().map(move |outputs| pack_outputs(&outputs, mask))
-    };
+    shade_with(unit, inputs, |outputs| pack_outputs(&outputs, mask))
+}
+
+/// runs the vertex shader over inputs, over threads when there are enough
+/// of them, and what to do with each one's outputs on the thread that made
+/// them, in the inputs' order.
+fn shade_with<T: Send>(
+    unit: &ShaderUnit,
+    inputs: &[[Vec4; shader::INPUT_REGISTERS]],
+    then: impl Fn([Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
+) -> Vec<T> {
     if inputs.len() < PARALLEL_VERTICES {
-        return shade(inputs).collect();
+        return shader::run_vertices(unit, inputs).into_iter().map(then).collect();
     }
-    inputs.par_chunks(PARALLEL_CHUNK).flat_map_iter(shade).collect()
+    // a few chunks a thread, handing out many small ones costs more than
+    // the threads waiting on the last
+    let chunk = (inputs.len() / (rayon::current_num_threads() * 4)).next_multiple_of(8).max(PARALLEL_CHUNK);
+    inputs.par_chunks(chunk).flat_map_iter(|chunk| shader::run_vertices(unit, chunk).into_iter().map(&then)).collect()
 }
 
 fn geometry_stage(
@@ -541,7 +622,7 @@ struct Screen {
     view_over_w: [f32; 3],
 }
 
-fn to_screen(vertex: Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
+fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
     let (vx, vy, vw, vh) = viewport;
     let w = vertex.clip[3];
     if w.abs() < 1e-8 {
@@ -567,16 +648,19 @@ fn to_screen(vertex: Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
     })
 }
 
-/// clips a triangle to the volume the PICA draws, w positive, and -w <= z <= 0.
+/// signed distances to the planes of the volume the PICA draws, w
+/// positive, and -w <= z <= 0, a vertex is inside when all are >= 0.
+const CLIP_PLANES: [fn(&Vertex) -> f32; 3] = [|v| v.clip[3] - 1e-5, |v| -v.clip[2], |v| v.clip[2] + v.clip[3]];
+
+/// whether a vertex is inside the volume the PICA draws.
+fn inside(vertex: &Vertex) -> bool {
+    CLIP_PLANES.iter().all(|plane| plane(vertex) >= 0.0)
+}
+
+/// clips a triangle to the volume the PICA draws.
 fn clip_triangle(triangle: [Vertex; 3]) -> Vec<Vertex> {
-    const EPSILON: f32 = 1e-5;
-    // signed distances to each plane, a vertex is inside when all are >= 0.
-    let planes: [fn(&Vertex) -> f32; 3] = [
-        |v| v.clip[3] - EPSILON,
-        |v| -v.clip[2],
-        |v| v.clip[2] + v.clip[3],
-    ];
-    if triangle.iter().all(|v| planes.iter().all(|plane| plane(v) >= 0.0)) {
+    let planes = CLIP_PLANES;
+    if triangle.iter().all(inside) {
         return triangle.to_vec();
     }
 
@@ -1694,10 +1778,8 @@ pub fn draw<M: GpuMemory>(
     } else {
         (indices, None)
     };
-    let inputs: Vec<_> = unique
-        .iter()
-        .map(|&vertex_index| fetch_vertex(registers, memory, attribute_base, &layout, fixed_attributes, vertex_index))
-        .collect();
+    let plan = InputPlan::new(registers, &layout, fixed_attributes);
+    let inputs: Vec<_> = unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)).collect();
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: order.as_deref() };
     rasterize(registers, memory, resources, vertices);
     vertex_count
@@ -1878,37 +1960,67 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         }
     }
     let processed;
-    let shaded = match vertices {
-        Vertices::Shaded(shaded) => shaded,
+    let (shaded, order) = match vertices {
+        Vertices::Shaded(shaded) => (shaded, None),
         Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
             processed = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
-            &processed[..]
+            (&processed.0[..], processed.1)
         }
     };
-    let triangle_indices = assemble(topology, shaded.len());
+    // which of the vertices made each vertex of the draw is
+    let at = |i: usize| order.map_or(i, |order| order[i]);
+    let triangle_indices = assemble(topology, order.map_or(shaded.len(), <[usize]>::len));
 
     let triangle_count = triangle_indices.len();
     let mut clipped_away = 0u32;
     let mut culled = 0u32;
     let mut stats = FillStats::default();
-    let mut triangles = Vec::new();
+    // where each vertex inside the volume lands, worked out once however
+    // many triangles share it, and the triangles as indices into those, a
+    // triangle of such vertices needs no clipping. what clipping makes goes
+    // after them
+    const OUTSIDE: u32 = u32::MAX;
+    let mut placed: Vec<Screen> = Vec::with_capacity(shaded.len());
+    let slots: Vec<u32> = shaded
+        .iter()
+        .map(|vertex| match inside(vertex).then(|| to_screen(vertex, viewport)).flatten() {
+            Some(screen) => {
+                placed.push(screen);
+                placed.len() as u32 - 1
+            }
+            None => OUTSIDE,
+        })
+        .collect();
+    let mut indices: Vec<u32> = Vec::with_capacity(triangle_count * 3);
+    let culls = |p: &Screen, q: &Screen, r: &Screen| {
+        let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
+        cull_mode != 0 && counter_clockwise == (cull_mode == 1)
+    };
     for (ia, ib, ic) in triangle_indices {
-        let polygon = clip_triangle([shaded[ia], shaded[ib], shaded[ic]]);
-        let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(*v, viewport)).collect();
+        let (a, b, c) = (at(ia), at(ib), at(ic));
+        let [sa, sb, sc] = [slots[a], slots[b], slots[c]];
+        if sa != OUTSIDE && sb != OUTSIDE && sc != OUTSIDE {
+            if culls(&placed[sa as usize], &placed[sb as usize], &placed[sc as usize]) {
+                culled += 1;
+            } else {
+                indices.extend([sa, sb, sc]);
+            }
+            continue;
+        }
+        let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
+        let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(v, viewport)).collect();
         if screen.len() < 3 || screen.len() != polygon.len() {
             clipped_away += 1;
             continue;
         }
-        if cull_mode != 0 {
-            let [p, q, r] = [screen[0], screen[1], screen[2]];
-            let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
-            if counter_clockwise == (cull_mode == 1) {
-                culled += 1;
-                continue;
-            }
+        if culls(&screen[0], &screen[1], &screen[2]) {
+            culled += 1;
+            continue;
         }
-        for i in 1..screen.len() - 1 {
-            triangles.push([screen[0], screen[i], screen[i + 1]]);
+        let first = placed.len() as u32;
+        placed.extend_from_slice(&screen);
+        for i in 1..screen.len() as u32 - 1 {
+            indices.extend([first, first + i, first + i + 1]);
         }
     }
 
@@ -1917,7 +2029,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         let target = &state.target;
         // tiles are whole in any buffer a title really draws into
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
-            match hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Triangles(&triangles))) {
+            let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
+            match hardware.draw(memory, &state.hardware(registers, geometry)) {
                 Ok(()) => return triangle_count as u32,
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
             }
@@ -1931,12 +2044,15 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         // were not
         if drawn.iter().any(Option::is_some) {
             let hardware = resources.hardware.take();
-            let drawn = rasterize(registers, memory, resources, Vertices::Shaded(shaded));
+            let in_order: Vec<Vertex> = (0..order.map_or(shaded.len(), <[usize]>::len)).map(|i| shaded[at(i)]).collect();
+            let drawn = rasterize(registers, memory, resources, Vertices::Shaded(&in_order));
             resources.hardware = hardware;
             return drawn;
         }
     }
 
+    let triangles: Vec<[Screen; 3]> =
+        indices.as_chunks::<3>().0.iter().map(|&[a, b, c]| [placed[a as usize], placed[b as usize], placed[c as usize]]).collect();
     // the rows the triangles can reach, as window rows and then as rows of
     // the buffer, which counts from the other end.
     let target = &state.target;
@@ -1970,7 +2086,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     }
 
     if log::log_enabled!(log::Level::Trace) {
-        let first_screen = shaded.first().and_then(|v| to_screen(*v, viewport));
+        let first_screen = shaded.first().and_then(|v| to_screen(v, viewport));
         log::trace!(
             "draw result: {vertex_count} verts, {triangle_count} tris ({clipped_away} clipped \
              away, {culled} culled), {} pixels written ({} failed depth, {} failed stencil, {} failed alpha), \

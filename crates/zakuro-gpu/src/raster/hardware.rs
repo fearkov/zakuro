@@ -128,8 +128,9 @@ pub(super) struct Draw<'a> {
 /// the triangles of a draw.
 #[derive(Clone, Copy)]
 pub(super) enum Geometry<'a> {
-    /// shaded, clipped and culled on the CPU.
-    Triangles(&'a [[Screen; 3]]),
+    /// shaded, clipped and culled on the CPU, placed vertices and the
+    /// triangles, three indices each, that share them.
+    Placed { vertices: &'a [Screen], indices: &'a [u32] },
     /// for the GPU to shade.
     Shaded(&'a Shading<'a>),
 }
@@ -2022,12 +2023,11 @@ impl Hardware {
                 let bpp = surface.kind.bytes() as usize;
                 if filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
                     let pixel = filled[..bpp].to_vec();
-                    let filled = filled.to_vec();
                     self.clear_rows(index, rows, &pixel)?;
                     let surface = &mut self.surfaces[index];
                     let range = rows.0 as usize * row..rows.1 as usize * row;
                     if let Some(shadow) = surface.shadow.get_mut(range) {
-                        shadow.copy_from_slice(&filled);
+                        shadow.copy_from_slice(filled);
                     }
                     surface.replaced();
                 } else {
@@ -2051,7 +2051,6 @@ impl Hardware {
                 continue;
             }
             let pixel = filled[..bpp].to_vec();
-            let filled = filled.to_vec();
             let (image, kind) = (surface.image.image, surface.kind);
             self.begin()?;
             self.mark(Work::Clear, false);
@@ -2091,7 +2090,10 @@ impl Hardware {
             }
             self.uploads = true;
             let surface = &mut self.surfaces[index];
-            surface.shadow = filled;
+            // in what the shadow already holds, which a fill each frame
+            // would otherwise allocate anew
+            surface.shadow.clear();
+            surface.shadow.extend_from_slice(filled);
             surface.dirty = None;
             surface.checked = false;
             surface.replaced();
@@ -2127,18 +2129,24 @@ impl Hardware {
         Ok(())
     }
 
-    /// records one draw.
-    /// copies triangles the CPU shaded into the batch, with the target's
-    /// pixels as clip space and w kept for perspective, and says where.
-    fn triangles(&mut self, triangles: &[[Screen; 3]], (width, height): (f32, f32), depth_map: DepthMap) -> Result<u64, String> {
-        let vertex_bytes = (triangles.len() * 3 * VERTEX_SIZE) as u64;
+    /// copies the vertices the CPU shaded and placed into the batch, with
+    /// the target's pixels as clip space and w kept for perspective, then
+    /// the indices of the triangles, and says where both start.
+    fn place(&mut self, vertices: &[Screen], indices: &[u32], (width, height): (f32, f32), depth_map: DepthMap) -> Result<(u64, u64), String> {
+        let index_bytes = (indices.len() * 4) as u64;
+        let index_offset = self.stage(index_bytes, 4)?;
+        let staging = self.ring(index_offset, index_bytes);
+        for (out, index) in staging.as_chunks_mut::<4>().0.iter_mut().zip(indices) {
+            *out = index.to_le_bytes();
+        }
+        let vertex_bytes = (vertices.len() * VERTEX_SIZE) as u64;
         let vertex_offset = self.stage(vertex_bytes, 16)?;
         // a pixel whose center sits exactly on an edge goes to the triangle
         // on its right, or above it for a flat edge, on the PICA, and in
         // Vulkan to the one on its right or further down the image, so the
         // images run bottom up
         let staging = self.ring(vertex_offset, vertex_bytes);
-        for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(triangles.iter().flatten()) {
+        for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(vertices) {
             let w = 1.0 / v.inv_w;
             let x = v.x / width * 2.0 - 1.0;
             let y = v.y / height * 2.0 - 1.0;
@@ -2174,7 +2182,7 @@ impl Hardware {
                 *bytes = value.to_le_bytes();
             }
         }
-        Ok(vertex_offset)
+        Ok((vertex_offset, index_offset))
     }
 
     /// whether programs get translated, for comparing the two, and whether
@@ -2379,7 +2387,7 @@ impl Hardware {
         let (left, bottom) = (left.max(0), bottom.max(0));
         let (right, top) = (right.min(draw.width as i32), top.min(draw.height as i32));
         let empty = match draw.geometry {
-            Geometry::Triangles(triangles) => triangles.is_empty(),
+            Geometry::Placed { indices, .. } => indices.is_empty(),
             Geometry::Shaded(shading) => shading.indices.is_empty(),
         };
         if empty || right <= left || top <= bottom {
@@ -2441,14 +2449,14 @@ impl Hardware {
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
         self.collect();
-        let (vertex_count, vertex_offset, shaded, (vertex, translating)) = match draw.geometry {
-            Geometry::Triangles(triangles) => {
-                let count = triangles.len() * 3;
-                (count, self.triangles(triangles, (width, height), depth_map)?, None, (VertexStage::Placed, false))
+        let (vertex_count, (vertex_offset, index_offset), shaded, (vertex, translating)) = match draw.geometry {
+            Geometry::Placed { vertices, indices } => {
+                let offsets = self.place(vertices, indices, (width, height), depth_map)?;
+                (indices.len(), offsets, None, (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
                 let staged = self.stage_shading(shading, depth_map)?;
-                (shading.indices.len(), 0, Some(staged), self.vertex_stage(shading))
+                (shading.indices.len(), (0, 0), Some(staged), self.vertex_stage(shading))
             }
         };
 
@@ -2472,7 +2480,7 @@ impl Hardware {
         let mapped = (depth_map.offset, depth_map.offset - depth_map.scale);
         let (writes_depth, depth_range) = match draw.geometry {
             _ if depth_map.w_buffer => (true, (0.0, 1.0)),
-            Geometry::Triangles(_) => (false, (0.0, 1.0)),
+            Geometry::Placed { .. } => (false, (0.0, 1.0)),
             Geometry::Shaded(_) if [mapped.0, mapped.1].iter().all(|d| (0.0..=1.0).contains(d)) => (false, mapped),
             Geometry::Shaded(_) => (true, (0.0, 1.0)),
         };
@@ -2604,7 +2612,7 @@ impl Hardware {
         // shades, the whole target for what the CPU placed on it
         let (x, y, viewport_width, viewport_height) = match draw.geometry {
             Geometry::Shaded(shading) => shading.viewport,
-            Geometry::Triangles(_) => (0.0, 0.0, width, height),
+            Geometry::Placed { .. } => (0.0, 0.0, width, height),
         };
         let y = y + raise as f32;
         let cull = match draw.geometry {
@@ -2673,7 +2681,8 @@ impl Hardware {
                 }
                 None => {
                     device.cmd_bind_vertex_buffers(commands, 0, &[self.ring.buffer], &[vertex_offset]);
-                    device.cmd_draw(commands, vertex_count as u32, 1, 0, 0);
+                    device.cmd_bind_index_buffer(commands, self.ring.buffer, index_offset, vk::IndexType::UINT32);
+                    device.cmd_draw_indexed(commands, vertex_count as u32, 1, 0, 0, 0);
                 }
             }
         }

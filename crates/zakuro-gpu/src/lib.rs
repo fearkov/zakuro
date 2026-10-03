@@ -298,11 +298,8 @@ impl Gpu {
             _ => value.to_le_bytes().to_vec(),
         };
 
-        let mut buffer = Vec::with_capacity(length);
-        while buffer.len() < length {
-            let remaining = length - buffer.len();
-            buffer.extend_from_slice(&pattern[..pattern.len().min(remaining)]);
-        }
+        let mut buffer = pattern.repeat(length.div_ceil(pattern.len()));
+        buffer.truncate(length);
         log::debug!(
             "memory fill: 0x{start:08X}..0x{end:08X} with 0x{value:08X} ({width}-byte pattern)"
         );
