@@ -24,7 +24,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, Overlay, PresentError, RendererKind, ScreenImage};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
 
 use gui::Gui;
 use input::Keyboard;
@@ -82,25 +82,8 @@ pub fn run(linked: Option<Linked>) {
         stop: false,
     };
 
-    if app.options.test_pattern {
-        // the test pattern has no CPU program to run, paused keeps just
-        // presenting what is there
-        let system = paint_test_pattern(app.config());
-        app.game = Some(Running::new(system, PathBuf::new(), "test pattern".to_owned()));
-        app.paused = true;
-    } else if let Some(rom) = app.options.rom.clone() {
-        if let Err(error) = app.play(Path::new(&rom)) {
-            eprintln!("zakuro: {error}");
-            std::process::exit(1);
-        }
-    }
-    if app.options.profile {
-        if let Some(game) = &mut app.game {
-            game.system.enable_profiler();
-        }
-    }
-
     if let Some(frames) = app.options.headless {
+        app.start();
         if let Some(game) = &mut app.game {
             run_headless(&mut game.system, frames);
         }
@@ -355,6 +338,9 @@ impl ApplicationHandler for App {
                 self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
+                // the game the command line names starts on the device the
+                // presenter may lend the renderer, once there is one
+                self.start();
             }
             Err(error) => {
                 eprintln!("zakuro: could not start the {renderer:?} backend: {error}");
@@ -411,7 +397,29 @@ impl App {
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
             resolution: self.settings.resolution,
+            device: self.backend.as_ref().and_then(Backend::shared_device),
             ..Config::default()
+        }
+    }
+
+    /// starts what the command line asks for, the test pattern or a game.
+    fn start(&mut self) {
+        if self.options.test_pattern {
+            // the test pattern has no CPU program to run, paused keeps just
+            // presenting what is there
+            let system = paint_test_pattern(self.config());
+            self.game = Some(Running::new(system, PathBuf::new(), "test pattern".to_owned()));
+            self.paused = true;
+        } else if let Some(rom) = self.options.rom.clone() {
+            if let Err(error) = self.play(Path::new(&rom)) {
+                eprintln!("zakuro: {error}");
+                std::process::exit(1);
+            }
+        }
+        if self.options.profile {
+            if let Some(game) = &mut self.game {
+                game.system.enable_profiler();
+            }
         }
     }
 
@@ -798,15 +806,16 @@ impl App {
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {
         let overlay = self.interface(event_loop);
-        let blank = |screen: Screen| (std::sync::Arc::new(Vec::new()), screen.width(), screen.height());
+        let blank = |screen: Screen| ((std::sync::Arc::new(Vec::new()), screen.width(), screen.height()), None);
         let (top, bottom) = match &mut self.game {
-            Some(game) => (game.system.read_screen_scaled(Screen::Top), game.system.read_screen_scaled(Screen::Bottom)),
+            Some(game) => (shown(&mut game.system, Screen::Top), shown(&mut game.system, Screen::Bottom)),
             None => (blank(Screen::Top), blank(Screen::Bottom)),
         };
         let Some(backend) = &mut self.backend else { return };
+        let (((top, top_width, top_height), top_gpu), ((bottom, bottom_width, bottom_height), bottom_gpu)) = (top, bottom);
         let result = backend.present(
-            ScreenImage { width: top.1, height: top.2, pixels: &top.0 },
-            ScreenImage { width: bottom.1, height: bottom.2, pixels: &bottom.0 },
+            ScreenImage { width: top_width, height: top_height, pixels: &top, gpu: top_gpu },
+            ScreenImage { width: bottom_width, height: bottom_height, pixels: &bottom, gpu: bottom_gpu },
             &overlay,
         );
         match result {
@@ -817,6 +826,17 @@ impl App {
             }
         }
     }
+}
+
+/// a screen as the presenter takes it, straight from the GPU when it shares
+/// the renderer's device and the GPU drew what the screen shows, else its
+/// pixels.
+fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<GpuScreen>) {
+    if let Some(gpu) = system.gpu_screen(screen) {
+        let scale = system.gpu.scale();
+        return ((std::sync::Arc::new(Vec::new()), screen.width() * scale, screen.height() * scale), Some(gpu));
+    }
+    (system.read_screen_scaled(screen), None)
 }
 
 /// keeps the renderer kind referenced even when a backend feature is off.

@@ -29,6 +29,15 @@ fn main() {
         // ZAKURO_CLOCK=milliseconds since 1900 starts the clock there, so that
         // runs repeat exactly.
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),
+        // ZAKURO_PRESENT=direct draws on a device of the kind a Vulkan
+        // presenter shares, which shows the screens straight from the GPU.
+        device: std::env::var("ZAKURO_PRESENT").is_ok_and(|v| v == "direct").then(|| {
+            let device = zakuro_gpu::SharedDevice::new().unwrap_or_else(|error| {
+                eprintln!("no device to show the screens from: {error}");
+                std::process::exit(1);
+            });
+            std::sync::Arc::new(device)
+        }),
         ..Config::default()
     };
     // ZAKURO_REPLAY=file plays back what ZAKURO_RECORD wrote down in the
@@ -90,7 +99,8 @@ fn main() {
     let mut audio: Vec<[i16; 2]> = Vec::new();
 
     // reads both screens after every frame the way a window showing them
-    // does, for timing a run like one, ZAKURO_PRESENT=1.
+    // does, for timing a run like one, ZAKURO_PRESENT=1, or ZAKURO_PRESENT=
+    // direct for one whose presenter shares the renderer's device.
     let present = std::env::var("ZAKURO_PRESENT").is_ok();
 
     // what gets typed when a title opens the software keyboard,
@@ -161,7 +171,9 @@ fn main() {
         }
         if present {
             for (screen, _) in SCREENS {
-                std::hint::black_box(system.read_screen_scaled(screen));
+                if system.gpu_screen(screen).is_none() {
+                    std::hint::black_box(system.read_screen_scaled(screen));
+                }
             }
         }
         frame_times.push(frame_start.elapsed());

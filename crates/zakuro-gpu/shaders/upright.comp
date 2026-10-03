@@ -3,11 +3,16 @@
 // a scaled screen's picture turned upright for showing it. the surface has a
 // row per column of the screen, rows bottom first and each running up the
 // screen, the buffer gets the screen's rows top first, a packed rgba8 word
-// per pixel.
+// per pixel. built with TO_IMAGE it writes an image instead, rows top first,
+// which a presenter sharing the device draws straight from.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, rgba8) uniform readonly image2D source;
+#ifdef TO_IMAGE
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D upright;
+#else
 layout(set = 0, binding = 1) writeonly buffer Upright { uint pixels[]; };
+#endif
 
 layout(push_constant) uniform Screen {
     // the screen's width and height
@@ -20,5 +25,9 @@ void main() {
         return;
     }
     vec4 color = imageLoad(source, ivec2(screen.size.y - 1 - at.y, screen.size.x - 1 - at.x));
+#ifdef TO_IMAGE
+    imageStore(upright, at, color);
+#else
     pixels[at.y * screen.size.x + at.x] = packUnorm4x8(color);
+#endif
 }

@@ -49,6 +49,9 @@ pub struct Config {
     pub hardware_renderer: bool,
     /// how many times the console's resolution the host's GPU draws at.
     pub resolution: u32,
+    /// the Vulkan presenter's device, to draw on and show the screens
+    /// straight from, when it can.
+    pub device: Option<std::sync::Arc<zakuro_gpu::SharedDevice>>,
     /// the time the console's clock starts at, in milliseconds since 1900,
     /// the host's when none, a fixed one makes runs repeat exactly.
     pub clock: Option<u64>,
@@ -68,6 +71,7 @@ impl Default for Config {
             data_dir: None,
             hardware_renderer: false,
             resolution: 1,
+            device: None,
             clock: None,
         }
     }
@@ -750,9 +754,41 @@ impl System {
         (std::sync::Arc::new(grow(&native, width, scale)), width * scale, height * scale)
     }
 
+    /// where a screen's picture is on the host's GPU, for a presenter sharing
+    /// its device to draw straight from, none when the GPU does not show the
+    /// screens itself or did not draw what the screen shows, read_screen_scaled
+    /// has that. the presenter's work runs after the GPU draws the picture, so
+    /// the newest goes up.
+    pub fn gpu_screen(&mut self, screen: zakuro_common::Screen) -> Option<zakuro_gpu::GpuScreen> {
+        if !self.gpu.shows_directly() {
+            return None;
+        }
+        let now = self.screen_ref(screen)?;
+        self.gpu.screen_image(now)
+    }
+
     /// the picture the host's GPU drew scaled for a screen, when it is still
     /// what the screen shows.
     fn scaled_screen(&mut self, screen: zakuro_common::Screen) -> Option<Screen> {
+        let (width, height) = (screen.width(), screen.height());
+        let index = match screen {
+            zakuro_common::Screen::Top => 0,
+            zakuro_common::Screen::Bottom => 1,
+        };
+        let Some(now) = self.screen_ref(screen) else {
+            self.showing[index] = None;
+            return None;
+        };
+        // what the screen had a presentation ago goes up now, always that
+        // one, so each picture stays up as long as the title kept it
+        let show = self.showing[index].replace(now).unwrap_or(now);
+        let (image, scale) = self.gpu.scaled_picture(show).or_else(|| self.gpu.scaled_picture(now))?;
+        Some((image, width * scale, height * scale))
+    }
+
+    /// the picture the host's GPU drew for a screen, when it is still what
+    /// the screen shows.
+    fn screen_ref(&mut self, screen: zakuro_common::Screen) -> Option<zakuro_gpu::ScreenRef> {
         let (width, height) = (screen.width(), screen.height());
         let index = match screen {
             zakuro_common::Screen::Top => 0,
@@ -773,15 +809,7 @@ impl System {
         let len = width * stride;
         let mut guest = vec![0u8; len as usize];
         self.memory.read_bytes(base, &mut guest);
-        let Some(now) = self.gpu.scaled_screen(base, (height, width), stride / bpp, format, &guest) else {
-            self.showing[index] = None;
-            return None;
-        };
-        // what the screen had a presentation ago goes up now, always that
-        // one, so each picture stays up as long as the title kept it
-        let show = self.showing[index].replace(now).unwrap_or(now);
-        let (image, scale) = self.gpu.scaled_picture(show).or_else(|| self.gpu.scaled_picture(now))?;
-        Some((image, width * scale, height * scale))
+        self.gpu.scaled_screen(base, (height, width), stride / bpp, format, &guest)
     }
 
     /// reads one screen into a straight RGBA8 buffer for presentation.

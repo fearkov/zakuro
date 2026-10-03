@@ -3174,4 +3174,89 @@ mod tests {
             }
         }
     }
+
+    /// a screen shown straight from the GPU's image is the picture the host
+    /// gets a copy of otherwise, where the image says the screen lies in it,
+    /// for a screen some rows into a buffer with longer rows than it shows.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn screens_shown_from_the_gpu_match_the_copies() {
+        use crate::format::ColorFormat::Rgba8;
+        const SIZE: u32 = 32;
+        const OUTPUT: u32 = 0x10_0000;
+        for scale in [1, 3] {
+            let Ok(copied) = hardware::Hardware::new() else { return };
+            let device = hardware::own_device().unwrap();
+            let direct = hardware::Hardware::with_device(std::sync::Arc::new(device), true).unwrap();
+            let mut pictures = Vec::new();
+            for mut hardware in [copied, direct] {
+                let scale = hardware.set_scale(scale);
+                let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+                let mut registers = target_registers();
+                registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+                registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+                let mut seed = 11u32;
+                let mut random = move || {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1 << 24) as f32
+                };
+                let mut memory = ConsoleMemory::default();
+                for _ in 0..40 {
+                    let color = [random(), random(), random(), 1.0];
+                    let triangle: Vec<Vertex> = (0..3)
+                        .map(|_| Vertex {
+                            clip: [random() * 2.0 - 1.0, random() * 2.0 - 1.0, -0.5, 1.0],
+                            color,
+                            texcoords: [[0.0; 2]; 3],
+                            quaternion: [0.0, 0.0, 0.0, 1.0],
+                            view: [0.0; 3],
+                        })
+                        .collect();
+                    rasterize_shaded(&registers, &mut memory, &mut resources, &triangle);
+                }
+                let hardware = resources.hardware.as_mut().unwrap();
+                let transfer = hardware::Transfer {
+                    input: COLOR,
+                    output: OUTPUT,
+                    input_width: SIZE,
+                    input_height: SIZE,
+                    output_width: SIZE,
+                    output_height: SIZE,
+                    copy: (SIZE, SIZE),
+                    scale: (1, 1),
+                    flip: false,
+                    input_linear: false,
+                    output_tiled: false,
+                    input_format: Rgba8,
+                    output_format: Rgba8,
+                };
+                assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+                // 20 rows from the fourth, of 24 pixels each
+                let screen = hardware.screen(OUTPUT + 4 * SIZE * 4, (24, 20), SIZE, Rgba8, &[]).expect("drawn on the GPU");
+                let picture = match hardware.screen_image(screen).unwrap() {
+                    Some(image) => {
+                        let (pixels, width) = hardware.upright_pixels(screen).unwrap();
+                        let height = pixels.len() as u32 / 4 / width;
+                        let [x, y, w, h] = image.area.map(f64::from);
+                        let [left, top] = [(x * width as f64).round() as usize, (y * height as f64).round() as usize];
+                        let [right, bottom] = [((x + w) * width as f64).round() as usize, ((y + h) * height as f64).round() as usize];
+                        // the bounds half a texel in from the area's edges
+                        let [l, t, r, b] = image.bounds.map(f64::from);
+                        let half = [0.5 / width as f64, 0.5 / height as f64];
+                        assert!((l - x - half[0]).abs() < 1e-6 && (t - y - half[1]).abs() < 1e-6);
+                        assert!((x + w - r - half[0]).abs() < 1e-6 && (y + h - b - half[1]).abs() < 1e-6);
+                        let width = width as usize;
+                        (top..bottom).flat_map(|row| pixels[(row * width + left) * 4..(row * width + right) * 4].to_vec()).collect()
+                    }
+                    None => hardware.picture(screen).unwrap().expect("copied").0.to_vec(),
+                };
+                assert_eq!(picture.len(), (20 * 24 * 4 * scale * scale) as usize);
+                pictures.push(picture);
+            }
+            let colors: std::collections::HashSet<&[u8]> = pictures[0].chunks(4).collect();
+            assert!(colors.len() > 8, "something worth comparing");
+            assert!(pictures[0] == pictures[1], "at {scale}x");
+        }
+    }
 }

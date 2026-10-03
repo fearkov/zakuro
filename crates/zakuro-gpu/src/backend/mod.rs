@@ -7,17 +7,33 @@ pub mod vulkan;
 #[cfg(feature = "vulkan")]
 mod vulkan_overlay;
 
-/// one screen's pixels, already converted to straight RGBA8.
+/// one screen's pixels, already converted to straight RGBA8, or where they
+/// are on the GPU, for a presenter sharing the renderer's device.
 pub struct ScreenImage<'a> {
     pub width: u32,
     pub height: u32,
     pub pixels: &'a [u8],
+    pub gpu: Option<GpuScreen>,
 }
 
 impl ScreenImage<'_> {
     pub fn is_empty(&self) -> bool {
-        self.width == 0 || self.height == 0 || self.pixels.is_empty()
+        self.width == 0 || self.height == 0 || (self.pixels.is_empty() && self.gpu.is_none())
     }
+}
+
+/// a screen's picture upright in an image of the renderer's, in the general
+/// layout, which the Vulkan presenter draws straight from when the two share
+/// a device.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuScreen {
+    #[cfg(feature = "vulkan")]
+    pub(crate) view: ash::vk::ImageView,
+    /// where the screen's pixels lie in the image, as texture coordinates,
+    /// the corner and the size, then the corners inset by half a texel,
+    /// which filtering keeps within.
+    pub(crate) area: [f32; 4],
+    pub(crate) bounds: [f32; 4],
 }
 
 /// what is drawn over the screens, a user interface, as textured triangles

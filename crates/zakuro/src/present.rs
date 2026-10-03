@@ -12,7 +12,7 @@ use winit::window::{Window, WindowAttributes};
 
 use zakuro_gpu::backend::gl::GlPresenter;
 use zakuro_gpu::backend::vulkan::VulkanPresenter;
-use zakuro_gpu::{Overlay, PresentError, Presenter, RendererKind, ScreenImage, ScreenLayout};
+use zakuro_gpu::{Overlay, PresentError, Presenter, RendererKind, ScreenImage, ScreenLayout, SharedDevice};
 
 // exactly one backend exists per process, so the size of the largest variant
 // is not worth an extra allocation to avoid.
@@ -72,6 +72,15 @@ impl Backend {
             }
             Backend::Vulkan(presenter) => presenter.resize(width, height),
             Backend::None => {}
+        }
+    }
+
+    /// the Vulkan presenter's device, for the renderer to draw on so the
+    /// screens are shown straight from it, when the two can share one.
+    pub fn shared_device(&self) -> Option<std::sync::Arc<SharedDevice>> {
+        match self {
+            Backend::Vulkan(presenter) => presenter.shared_device(),
+            _ => None,
         }
     }
 

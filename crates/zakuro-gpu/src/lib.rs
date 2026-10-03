@@ -2,6 +2,8 @@
 
 pub mod backend;
 pub mod blend;
+#[cfg(feature = "vulkan")]
+mod device;
 pub mod proctex;
 pub mod format;
 pub mod lighting;
@@ -14,8 +16,10 @@ pub mod texture;
 
 use format::ColorFormat;
 use registers::*;
-pub use backend::{layout, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
+pub use backend::{layout, GpuScreen, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
+#[cfg(feature = "vulkan")]
+pub use device::SharedDevice;
 
 /// how the GPU reaches guest memory.
 pub trait GpuMemory {
@@ -534,15 +538,45 @@ impl Gpu {
     /// draws on the host's GPU from now on, rather than in software, and
     /// says which GPU that is.
     /// scale is how many times the console's resolution it draws at, for
-    /// sharper pictures.
+    /// sharper pictures. on the device of a Vulkan presenter, when it gives
+    /// one, the screens are shown straight from the images drawn.
     #[cfg(feature = "vulkan")]
-    pub fn enable_hardware_renderer(&mut self, scale: u32) -> Result<String, String> {
-        let mut hardware = raster::hardware::Hardware::new()?;
+    pub fn enable_hardware_renderer(&mut self, scale: u32, device: Option<std::sync::Arc<SharedDevice>>) -> Result<String, String> {
+        let mut hardware = match device {
+            Some(device) => raster::hardware::Hardware::with_device(device, true)?,
+            None => raster::hardware::Hardware::new()?,
+        };
         let scale = hardware.set_scale(scale);
         let shaded = if hardware.shades() { "" } else { ", vertices shaded on the CPU," };
-        let name = format!("{} at {scale}x{shaded}", hardware.name());
+        let direct = if hardware.direct() { ", shown straight from the GPU," } else { "" };
+        let name = format!("{} at {scale}x{shaded}{direct}", hardware.name());
         self.resources.hardware = Some(hardware);
         Ok(name)
+    }
+
+    /// whether the screens the host's GPU draws are shown straight from it,
+    /// by a presenter sharing its device, see screen_image.
+    pub fn shows_directly(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_ref() {
+            return hardware.direct();
+        }
+        false
+    }
+
+    /// where a screen's picture is on the GPU, for a presenter sharing the
+    /// device to draw it straight from, the batch that drew it submitted.
+    pub fn screen_image(&mut self, screen: ScreenRef) -> Option<GpuScreen> {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            match hardware.screen_image(screen) {
+                Ok(image) => return image,
+                Err(error) => log::error!("the GPU could not show a screen, {error}"),
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = screen;
+        None
     }
 
     /// how many times the console's resolution the host's GPU draws at, 1

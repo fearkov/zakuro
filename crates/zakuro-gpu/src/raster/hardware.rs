@@ -29,6 +29,7 @@ use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
 use crate::lighting::{Lighting, Tables};
 use crate::registers::*;
+use crate::device::SharedDevice;
 use crate::shader::glsl::{self, SEMANTICS};
 use crate::shader::{Program, ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
@@ -42,6 +43,8 @@ const FRAGMENT_DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/raster_depth.f
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
 const DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/depth.comp.spv");
 const UPRIGHT_SPIRV: &[u8] = include_bytes!("../../shaders/upright.comp.spv");
+/// upright.comp built with TO_IMAGE, for a presenter sharing the device.
+const UPRIGHT_IMAGE_SPIRV: &[u8] = include_bytes!("../../shaders/upright_image.comp.spv");
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
@@ -205,6 +208,9 @@ struct Surface {
     /// copy of the scaled image for showing it.
     native: Option<Image>,
     screen: Option<Capture>,
+    /// the picture screen would copy out, kept on the GPU instead when the
+    /// presenter shares the device.
+    upright: Option<Upright>,
     /// counts the changes to the image, for the textures copied from it.
     generation: u64,
 }
@@ -253,6 +259,9 @@ impl Surface {
         self.generation += 1;
         for capture in [&mut self.capture, &mut self.screen].into_iter().flatten() {
             capture.current = false;
+        }
+        if let Some(upright) = &mut self.upright {
+            upright.current = false;
         }
     }
 
@@ -340,6 +349,17 @@ fn pixel_offset(tiled: bool, x: u32, y: u32, width: u32, bpp: u32) -> usize {
     } else {
         ((y * width + x) * bpp) as usize
     }
+}
+
+/// a screen's newest picture turned upright into an image that a presenter
+/// sharing the device draws straight from, and the batch that drew it. one
+/// is enough, every batch starts with a barrier that waits for the presents
+/// submitted before it, so no picture is drawn over while one shows it.
+struct Upright {
+    image: Image,
+    batch: u64,
+    /// nothing changed the surface since.
+    current: bool,
 }
 
 /// a copy of a surface on its way to the host, recorded along with what
@@ -870,8 +890,11 @@ fn compile_pipeline(
 }
 
 pub struct Hardware {
-    _entry: ash::Entry,
-    instance: ash::Instance,
+    /// the device, maybe the presenter's too, kept until this lets go.
+    _shared: Arc<SharedDevice>,
+    /// whether the presenter shares the device, and shows screens straight
+    /// from the images the GPU turns them upright into.
+    direct: bool,
     device: ash::Device,
     push: ash::khr::push_descriptor::Device,
     queue: vk::Queue,
@@ -920,6 +943,8 @@ pub struct Hardware {
     depth: Option<Compute>,
     /// made the first time a scaled screen is captured.
     upright: Option<Compute>,
+    /// the same writing an image, made the first time it is needed.
+    upright_image: Option<Compute>,
     samples: Option<Local>,
     samplers: HashMap<(bool, Wrap, Wrap), vk::Sampler>,
     ring: Buffer,
@@ -959,59 +984,23 @@ pub struct Hardware {
 
 impl Hardware {
     pub fn new() -> Result<Hardware, String> {
-        // SAFETY: loads the system's Vulkan library, which has no other
-        // requirements
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader, {e}"))?;
-        let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
-        // SAFETY: a plain instance with no layers or extensions
-        let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
-            .map_err(vk_error("create an instance"))?;
-        match Hardware::with_instance(entry, instance.clone()) {
-            Ok(hardware) => Ok(hardware),
-            Err(error) => {
-                // SAFETY: nothing was made from the instance that outlives it
-                unsafe { instance.destroy_instance(None) };
-                Err(error)
-            }
-        }
+        Hardware::with_device(Arc::new(own_device()?), false)
     }
 
-    fn with_instance(entry: ash::Entry, instance: ash::Instance) -> Result<Hardware, String> {
-        let (physical, family) = pick(&instance)?;
+    /// draws with a device made by render_device, which the presenter may
+    /// share, and then shows screens straight from the GPU when direct.
+    pub fn with_device(shared: Arc<SharedDevice>, direct: bool) -> Result<Hardware, String> {
+        let (instance, device, physical, family) = (shared.instance.clone(), shared.device.clone(), shared.physical, shared.family);
+        let (logic_ops, statistics) = (shared.logic_ops, shared.statistics);
         // SAFETY: the physical device came from this instance
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let priorities = [1.0];
-        let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
-        let extensions = [ash::khr::push_descriptor::NAME.as_ptr()];
-        // SAFETY: as above
-        let supported = unsafe { instance.get_physical_device_features(physical) };
-        let logic_ops = supported.logic_op == vk::TRUE;
-        // what the GPU shades counted along with its times
-        let statistics = std::env::var_os("ZAKURO_GPU_TIMES").is_some() && supported.pipeline_statistics_query == vk::TRUE;
-        let features = vk::PhysicalDeviceFeatures::default()
-            .depth_clamp(true)
-            .logic_op(logic_ops)
-            .pipeline_statistics_query(statistics);
-        // the cache control, to make a pipeline only when the cache on disk
-        // has it, every Vulkan 1.3 device does
-        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
-            .dynamic_rendering(true)
-            .synchronization2(true)
-            .pipeline_creation_cache_control(true);
-        let info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queues)
-            .enabled_extension_names(&extensions)
-            .enabled_features(&features)
-            .push_next(&mut features13);
-        // SAFETY: pick checked the device has all of this
-        let device = unsafe { instance.create_device(physical, &info, None) }.map_err(vk_error("create a device"))?;
         let push = ash::khr::push_descriptor::Device::new(&instance, &device);
 
         // SAFETY: everything below is made from the device just created,
         // with create infos that live as long as each call
         unsafe {
-            let queue = device.get_device_queue(family, 0);
+            let queue = shared.queue;
             let memory_types = instance.get_physical_device_memory_properties(physical);
             let pool = device
                 .create_command_pool(
@@ -1098,8 +1087,8 @@ impl Hardware {
                 in_flight: VecDeque::with_capacity(IN_FLIGHT),
                 free: spares.into_iter().map(|(commands, fence)| Frame { commands, fence, ring: unmade(), pending: None }).collect(),
                 blank: Image { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null() },
-                _entry: entry,
-                instance,
+                _shared: shared,
+                direct,
                 device,
                 push,
                 queue,
@@ -1140,6 +1129,7 @@ impl Hardware {
                 transfer: None,
                 depth: None,
                 upright: None,
+                upright_image: None,
                 samples: None,
                 samplers: HashMap::new(),
                 used: 0,
@@ -1669,6 +1659,7 @@ impl Hardware {
                     capture: None,
                     native,
                     screen: None,
+                    upright: None,
                     generation: 0,
                 });
                 self.surfaces.len() - 1
@@ -2994,6 +2985,9 @@ impl Hardware {
 
     /// records a copy of a scaled surface turned upright, for showing it.
     fn capture_screen(&mut self, index: usize) -> Result<(), String> {
+        if self.direct {
+            return self.upright_image(index);
+        }
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
         let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
@@ -3042,6 +3036,132 @@ impl Hardware {
         Ok(())
     }
 
+    /// records a surface turned upright into the image a presenter sharing
+    /// the device draws it from. the batch's first barrier waits for the
+    /// presents submitted before, which may still read the image.
+    fn upright_image(&mut self, index: usize) -> Result<(), String> {
+        self.mark(Work::Capture, false);
+        // a row of the surface is a column of the screen
+        let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
+        if self.surfaces[index].upright.is_none() {
+            let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+            let image = self.image(width, height, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
+            self.surfaces[index].upright = Some(Upright { image, batch: 0, current: false });
+        }
+        let (layout, pipeline) = self.upright_image_pipeline()?;
+        self.end_rendering();
+        self.barrier();
+        let batch = self.batch;
+        let surface = &mut self.surfaces[index];
+        let Some(upright) = surface.upright.as_mut() else { unreachable!("made above") };
+        upright.batch = batch;
+        upright.current = true;
+        let source = [vk::DescriptorImageInfo::default().image_view(surface.image.view).image_layout(vk::ImageLayout::GENERAL)];
+        let target = [vk::DescriptorImageInfo::default().image_view(upright.image.view).image_layout(vk::ImageLayout::GENERAL)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&source),
+            vk::WriteDescriptorSet::default()
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&target),
+        ];
+        let constants: Vec<u8> = [width as i32, height as i32].iter().flat_map(|c| c.to_le_bytes()).collect();
+        // SAFETY: recording, outside rendering, between two images in the
+        // general layout, the presenter reads the target only in a later
+        // submission, behind a barrier of its own
+        unsafe {
+            self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
+            self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
+            self.unfenced = true;
+            self.device.cmd_dispatch(self.commands, width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        Ok(())
+    }
+
+    /// whether screens are shown straight from images on the GPU.
+    pub(crate) fn direct(&self) -> bool {
+        self.direct
+    }
+
+    /// the image a screen's picture is upright in, read back, and its width.
+    #[cfg(test)]
+    pub(crate) fn upright_pixels(&mut self, screen: ScreenRef) -> Result<(Vec<u8>, u32), String> {
+        let (row_pixels, rows) = screen.size;
+        let index = self.surfaces.iter().position(|s| s.addr == screen.addr && s.width == row_pixels && s.height == rows).ok_or("no surface")?;
+        let image = self.surfaces[index].upright.as_ref().ok_or("nothing upright")?.image.image;
+        let (width, height) = (rows * self.scale, row_pixels * self.scale);
+        let buffer = self.buffer(u64::from(width * height * 4), vk::BufferUsageFlags::TRANSFER_DST, true)?;
+        self.begin()?;
+        self.end_rendering();
+        self.unfenced = true;
+        self.barrier();
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+            .image_extent(vk::Extent3D { width, height, depth: 1 });
+        let to_host = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        // SAFETY: recording, outside rendering, into a buffer the image fits
+        unsafe {
+            self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, buffer.buffer, &[region]);
+            self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
+        }
+        self.submit()?;
+        self.wait()?;
+        // SAFETY: the GPU is done with the buffer, which is mapped and goes
+        // right after
+        unsafe {
+            if buffer.incoherent {
+                let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
+                self.device.invalidate_mapped_memory_ranges(&range).map_err(vk_error("invalidate memory"))?;
+            }
+            let pixels = std::slice::from_raw_parts(buffer.mapped, (width * height * 4) as usize).to_vec();
+            self.device.destroy_buffer(buffer.buffer, None);
+            self.device.free_memory(buffer.memory, None);
+            Ok((pixels, width))
+        }
+    }
+
+    /// the image a screen's picture is upright in, for a presenter sharing
+    /// the device, and where the screen's pixels lie in it. none once a later
+    /// picture took its image. the batch that drew it goes to the GPU first,
+    /// so it runs before whatever the presenter submits next.
+    pub(crate) fn screen_image(&mut self, screen: ScreenRef) -> Result<Option<crate::GpuScreen>, String> {
+        if !self.direct {
+            return Ok(None);
+        }
+        let (row_pixels, rows) = screen.size;
+        let found = self.surfaces.iter().position(|s| {
+            s.addr == screen.addr && s.width == row_pixels && s.height == rows && s.kind == Kind::Color(screen.format) && !s.tiled
+        });
+        let Some(index) = found else { return Ok(None) };
+        let Some(upright) = self.surfaces[index].upright.as_ref().filter(|upright| upright.batch == screen.batch) else {
+            return Ok(None);
+        };
+        let view = upright.image.view;
+        if screen.batch >= self.batch {
+            self.submit()?;
+        }
+        // the rows of the surface the screen shows are columns of the upright
+        // picture, the pixels of each run down it from the bottom of a row
+        let scale = self.scale;
+        let (first, count) = screen.rows;
+        let (width, height) = ((rows * scale) as f32, (row_pixels * scale) as f32);
+        let (left, right) = ((first * scale) as f32, ((first + count) * scale) as f32);
+        let (top, bottom) = (((row_pixels - screen.columns) * scale) as f32, (row_pixels * scale) as f32);
+        Ok(Some(crate::GpuScreen {
+            view,
+            area: [left / width, top / height, (right - left) / width, (bottom - top) / height],
+            bounds: [(left + 0.5) / width, (top + 0.5) / height, (right - 0.5) / width, (bottom - 0.5) / height],
+        }))
+    }
+
     /// the newest picture a display transfer left in a buffer for a screen,
     /// while guest memory still holds what the transfer wrote there, or the
     /// GPU has not written it back yet. from now on each picture it gets is
@@ -3065,15 +3185,25 @@ impl Hardware {
             return None;
         }
         let (surface, size) = (s.addr, (s.width, s.height));
-        let screen = s.screen.as_mut().filter(|screen| screen.current)?;
-        screen.watched = true;
-        Some(ScreenRef { addr: surface, size, format, batch: screen.batch, rows: (first, height), columns: width })
+        let batch = match &mut s.upright {
+            Some(upright) => upright.current.then_some(upright.batch)?,
+            None => {
+                let screen = s.screen.as_mut().filter(|screen| screen.current)?;
+                screen.watched = true;
+                screen.batch
+            }
+        };
+        Some(ScreenRef { addr: surface, size, format, batch, rows: (first, height), columns: width })
     }
 
     /// a screen's picture upright, RGBA the way the screen shows it, and the
     /// scale it is at, waiting for the GPU to finish it when it has not yet.
     /// none once a later picture took its buffer.
     pub(crate) fn picture(&mut self, screen: ScreenRef) -> Result<Option<Picture>, String> {
+        // a presenter sharing the device has the pictures, the host none
+        if self.direct {
+            return Ok(None);
+        }
         let (width, height) = screen.size;
         let find = |surfaces: &[Surface]| {
             surfaces.iter().position(|s| {
@@ -3130,6 +3260,17 @@ impl Hardware {
         }
         let transfer = self.transfer.as_ref().expect("made above");
         Ok((transfer.layout, transfer.pipeline))
+    }
+
+    /// the pipeline screens are turned upright into an image with, for a
+    /// presenter sharing the device, made the first time.
+    fn upright_image_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
+        if self.upright_image.is_none() {
+            let bindings = [vk::DescriptorType::STORAGE_IMAGE; 2];
+            self.upright_image = Some(self.compute(UPRIGHT_IMAGE_SPIRV, &bindings, 2 * 4)?);
+        }
+        let upright = self.upright_image.as_ref().expect("made above");
+        Ok((upright.layout, upright.pipeline))
     }
 
     /// the pipeline scaled screens are turned upright with, made the first
@@ -3561,6 +3702,9 @@ impl Drop for Hardware {
                 if let Some(native) = &surface.native {
                     self.destroy_image(native);
                 }
+                if let Some(upright) = &surface.upright {
+                    self.destroy_image(&upright.image);
+                }
             }
             self.destroy_image(&self.blank);
             let captures = self.surfaces.iter().flat_map(|s| [&s.capture, &s.screen]).filter_map(|c| c.as_ref().map(|c| &c.buffer));
@@ -3570,7 +3714,7 @@ impl Drop for Hardware {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
-            for compute in [&self.transfer, &self.depth, &self.upright].into_iter().flatten() {
+            for compute in [&self.transfer, &self.depth, &self.upright, &self.upright_image].into_iter().flatten() {
                 self.device.destroy_pipeline(compute.pipeline, None);
                 self.device.destroy_pipeline_layout(compute.layout, None);
                 self.device.destroy_descriptor_set_layout(compute.set_layout, None);
@@ -3600,8 +3744,7 @@ impl Drop for Hardware {
                 self.device.destroy_fence(frame.fence, None);
             }
             self.device.destroy_command_pool(self.pool, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            // the device goes with the last of the presenter and this
         }
     }
 }
@@ -3651,6 +3794,93 @@ fn logic_op(op: LogicOp) -> vk::LogicOp {
     }
 }
 
+/// whether the renderer can draw on a GPU, Vulkan 1.3, push descriptors,
+/// depth clamping and a D24S8 depth format.
+fn renders_on(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
+    // SAFETY: queries on a GPU of the instance
+    let (properties, features, depth, extensions) = unsafe {
+        (
+            instance.get_physical_device_properties(device),
+            instance.get_physical_device_features(device),
+            instance.get_physical_device_format_properties(device, DEPTH_FORMAT),
+            instance.enumerate_device_extension_properties(device).unwrap_or_default(),
+        )
+    };
+    let push = extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::khr::push_descriptor::NAME));
+    properties.api_version >= vk::API_VERSION_1_3
+        && features.depth_clamp == vk::TRUE
+        && depth.optimal_tiling_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        && push
+}
+
+/// whether the renderer can draw on a GPU through a family of its queues,
+/// which has to do compute as well, for display transfers.
+pub(crate) fn can_render(instance: &ash::Instance, device: vk::PhysicalDevice, family: u32) -> bool {
+    // SAFETY: as above
+    let families = unsafe { instance.get_physical_device_queue_family_properties(device) };
+    let both = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
+    families.get(family as usize).is_some_and(|f| f.queue_flags.contains(both)) && renders_on(instance, device)
+}
+
+/// a device the renderer draws with, on a GPU can_render or pick chose,
+/// with the extensions given besides its own. it owns the instance from then
+/// on, destroying it when it goes, which stays the caller's when it fails.
+pub(crate) fn render_device(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    family: u32,
+    extra: &[*const std::ffi::c_char],
+) -> Result<SharedDevice, String> {
+    let priorities = [1.0];
+    let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
+    let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
+    extensions.extend_from_slice(extra);
+    // SAFETY: the physical device came from this instance
+    let supported = unsafe { instance.get_physical_device_features(physical) };
+    let logic_ops = supported.logic_op == vk::TRUE;
+    // what the GPU shades counted along with its times
+    let statistics = std::env::var_os("ZAKURO_GPU_TIMES").is_some() && supported.pipeline_statistics_query == vk::TRUE;
+    let features = vk::PhysicalDeviceFeatures::default()
+        .depth_clamp(true)
+        .logic_op(logic_ops)
+        .pipeline_statistics_query(statistics);
+    // the cache control, to make a pipeline only when the cache on disk
+    // has it, every Vulkan 1.3 device does
+    let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+        .dynamic_rendering(true)
+        .synchronization2(true)
+        .pipeline_creation_cache_control(true);
+    let info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queues)
+        .enabled_extension_names(&extensions)
+        .enabled_features(&features)
+        .push_next(&mut features13);
+    // SAFETY: the caller checked the device has all of this
+    let device = unsafe { instance.create_device(physical, &info, None) }.map_err(vk_error("create a device"))?;
+    // SAFETY: a queue the device was made with
+    let queue = unsafe { device.get_device_queue(family, 0) };
+    let (_entry, instance) = (entry.clone(), instance.clone());
+    Ok(SharedDevice { _entry, instance, physical, family, device, queue, logic_ops, statistics })
+}
+
+/// a device of the renderer's own, on the GPU pick chooses.
+pub(crate) fn own_device() -> Result<SharedDevice, String> {
+    // SAFETY: loads the system's Vulkan library, which has no other
+    // requirements
+    let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader, {e}"))?;
+    let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
+    // SAFETY: a plain instance with no layers or extensions
+    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
+        .map_err(vk_error("create an instance"))?;
+    let made = pick(&instance).and_then(|(physical, family)| render_device(&entry, &instance, physical, family, &[]));
+    if made.is_err() {
+        // SAFETY: nothing made from the instance is left
+        unsafe { instance.destroy_instance(None) };
+    }
+    made
+}
+
 /// the device to draw with and its graphics queue family, a discrete GPU
 /// when there is one.
 fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
@@ -3659,22 +3889,10 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
     let mut best: Option<(u32, vk::PhysicalDevice, u32)> = None;
     for device in devices {
         // SAFETY: as above
-        let (properties, features, depth, extensions, families) = unsafe {
-            (
-                instance.get_physical_device_properties(device),
-                instance.get_physical_device_features(device),
-                instance.get_physical_device_format_properties(device, DEPTH_FORMAT),
-                instance.enumerate_device_extension_properties(device).unwrap_or_default(),
-                instance.get_physical_device_queue_family_properties(device),
-            )
-        };
-        let push = extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::khr::push_descriptor::NAME));
-        let usable = properties.api_version >= vk::API_VERSION_1_3
-            && features.depth_clamp == vk::TRUE
-            && depth.optimal_tiling_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
-            && push;
+        let (properties, families) =
+            unsafe { (instance.get_physical_device_properties(device), instance.get_physical_device_queue_family_properties(device)) };
         let Some(family) = families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS)) else { continue };
-        if !usable {
+        if !renders_on(instance, device) {
             continue;
         }
         let rank = match properties.device_type {
