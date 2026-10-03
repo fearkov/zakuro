@@ -35,7 +35,15 @@ pub struct Library {
 type Found = Cell<(u32, Option<Code>)>;
 
 /// slots of Library::found, a power of two.
-const FOUND: usize = 4096;
+const FOUND: usize = 65536;
+
+/// the slot of Library::found an address goes in, the top bits of the
+/// address times the golden ratio. ARM addresses step by four and Thumb ones
+/// by two with bit 0 set, and taking low bits would leave half the slots to
+/// one of them.
+fn slot(address: u32) -> usize {
+    (address.wrapping_mul(0x9E37_79B1) >> (32 - FOUND.trailing_zeros())) as usize
+}
 
 /// why a run of recompiled code ended.
 pub enum Stop {
@@ -172,9 +180,7 @@ impl Library {
     /// the code that can run from address, bit 0 set for Thumb, in the
     /// executable or in a module that is loaded.
     fn lookup(&self, address: u32) -> Option<Code> {
-        // instructions are two bytes apart at least, the low bit is the
-        // instruction set
-        let slot = &self.found[(address as usize >> 1) & (FOUND - 1)];
+        let slot = &self.found[slot(address)];
         match slot.get() {
             (seen, code) if seen == address => code,
             _ => {
@@ -265,5 +271,18 @@ impl Library {
         // the budget already has
         machine.cpu.cycles = cycles + ran;
         (ran, stop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arm_and_thumb_code_use_every_slot() {
+        let arm: std::collections::BTreeSet<usize> = (0..FOUND as u32).map(|i| slot(0x0010_0000 + 4 * i)).collect();
+        let thumb: std::collections::BTreeSet<usize> = (0..FOUND as u32).map(|i| slot(0x0010_0001 + 2 * i)).collect();
+        assert!(arm.len() > FOUND * 3 / 4, "{} of {FOUND}", arm.len());
+        assert!(thumb.len() > FOUND * 3 / 4, "{} of {FOUND}", thumb.len());
     }
 }
