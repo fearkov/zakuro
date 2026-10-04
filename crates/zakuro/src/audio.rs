@@ -6,11 +6,14 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
-/// how much sound to keep waiting, in the console's samples, about 90 ms.
+/// how much sound to keep waiting, in the console's samples, about 125 ms.
 /// more rides out uneven frames, less answers sooner.
-const TARGET: usize = 3072;
+const TARGET: usize = 4096;
 /// how much a queue that ran dry waits for before it plays again.
 const RESUME: usize = TARGET / 4;
+/// the queue stretches sound only once it is down to this, about 63 ms.
+/// every stretch splices the sound, so smaller shortfalls are left to DRIFT.
+const STRETCH_BELOW: usize = TARGET / 2;
 /// how much faster or slower than the rates say playback may go to keep
 /// the queue near its target, too little to hear.
 const DRIFT: f64 = 0.005;
@@ -127,8 +130,17 @@ impl Stretch {
     fn process(&mut self, samples: &[[f32; 2]], factor: f64, out: &mut Vec<[f32; 2]>) {
         self.input.extend_from_slice(samples);
         self.factor += (factor - self.factor) * 0.2;
+        // close to not stretching any more, it stops
+        if factor == 1.0 && self.factor < 1.001 {
+            self.factor = 1.0;
+        }
         let mono = |s: [f32; 2]| s[0] + s[1];
         loop {
+            // not stretching, each piece follows on from the last, with no
+            // search and so no splice
+            if let Some(last) = self.last.filter(|_| self.factor == 1.0) {
+                self.position = (last + HOP) as f64;
+            }
             let due = self.position as usize;
             let natural = self.last.map_or(due, |last| last + HOP);
             if due + SEARCH + GRAIN > self.input.len() || natural + GRAIN > self.input.len() {
@@ -149,7 +161,12 @@ impl Stretch {
                     }
                     dot / energy.sqrt()
                 };
-                (due.saturating_sub(SEARCH)..=due + SEARCH).max_by(|&a, &b| score(a).total_cmp(&score(b))).unwrap_or(due)
+                (due.saturating_sub(SEARCH)..=due + SEARCH)
+                    .map(|candidate| (score(candidate), candidate))
+                    // a tie, as in silence, goes to the piece nearest the
+                    // natural one
+                    .max_by(|(a, x), (b, y)| a.total_cmp(b).then(natural.abs_diff(*y).cmp(&natural.abs_diff(*x))))
+                    .map_or(due, |(_, candidate)| candidate)
             };
             let piece = &self.input[start..start + GRAIN];
             let (first, second) = piece.split_at(HOP);
@@ -245,9 +262,9 @@ impl Audio {
 }
 
 /// adds what the console played to the queue, stretched by how far the
-/// queue is from its target.
+/// queue has run down.
 fn enqueue(queue: &mut Queue, stretch: &mut Stretch, samples: &[[f32; 2]]) {
-    let short = TARGET.saturating_sub(queue.samples.len()) as f64 / TARGET as f64;
+    let short = STRETCH_BELOW.saturating_sub(queue.samples.len()) as f64 / STRETCH_BELOW as f64;
     let mut stretched = Vec::with_capacity(samples.len() * 2);
     stretch.process(samples, (1.0 + short).min(MOST_STRETCH), &mut stretched);
     queue.samples.extend(stretched);
@@ -332,6 +349,66 @@ mod tests {
         assert!(out.len() > 18_000);
         for (a, b) in out[HOP..].iter().zip(&input[HOP..]) {
             assert!((a[0] - b[0]).abs() < 1e-4);
+        }
+    }
+
+    /// a sound that repeats nowhere, with a stretch of silence in the
+    /// middle, so where any piece of it came from is clear.
+    fn noise_with_a_pause(count: usize) -> Vec<[f32; 2]> {
+        let mut x = 1u32;
+        (0..count)
+            .map(|i| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let v = if (30_000..33_000).contains(&i) { 0.0 } else { (x >> 8) as f32 / (1 << 24) as f32 - 0.5 };
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// a queue a little short of its target is left to DRIFT, its sound goes
+    /// in as it came, with no splice.
+    #[test]
+    fn a_queue_a_little_short_is_not_stretched() {
+        let mut queue = queue(TARGET - 1000, 1.0);
+        let mut stretch = Stretch::new();
+        let input = noise_with_a_pause(20_000);
+        let mut out = Vec::new();
+        for chunk in input.chunks(546) {
+            let before = queue.samples.len();
+            enqueue(&mut queue, &mut stretch, chunk);
+            out.extend(queue.samples.range(before..).copied());
+            // the output plays as much as came in
+            queue.samples.drain(..chunk.len());
+        }
+        assert!(out.len() > 19_000);
+        for (a, b) in out[HOP..].iter().zip(&input[HOP..]) {
+            assert!((a[0] - b[0]).abs() < 1e-4);
+        }
+    }
+
+    /// once the queue is full again the stretcher stops, and the sound
+    /// follows on as it came in, silence included, with no splice.
+    #[test]
+    fn stretching_stops_cleanly() {
+        let input = noise_with_a_pause(60_000);
+        let mut stretch = Stretch::new();
+        let mut out = Vec::new();
+        for (i, chunk) in input.chunks(546).enumerate() {
+            stretch.process(chunk, if i < 20 { 1.5 } else { 1.0 }, &mut out);
+        }
+        assert_eq!(stretch.factor, 1.0);
+        // where the last of it came from, found in noise, which matches in
+        // one place only
+        let end = &out[out.len() - 10_000..];
+        let from = (0..input.len() - end.len())
+            .find(|&at| end.iter().zip(&input[at..]).take(64).all(|(a, b)| (a[0] - b[0]).abs() < 1e-4))
+            .expect("the end is somewhere in the input");
+        // and the input in a row back from there, through the end of the pause
+        let tail = &out[out.len() - 28_000..];
+        let start = from - 18_000;
+        assert!(start < 33_000, "it covers the pause");
+        for (a, b) in tail.iter().zip(&input[start..]) {
+            assert!((a[0] - b[0]).abs() < 1e-4, "spliced");
         }
     }
 
