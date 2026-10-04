@@ -1015,7 +1015,7 @@ fn open_system_archive(system: &mut System, path: NcchArchivePath) -> Option<u32
         return None;
     };
 
-    let data = system_archive_data(path);
+    let data = system_archive_data(path, system.config.data_dir.as_deref());
     log::debug!("fs: opened the system's {name} ({} bytes)", data.len());
     Some(system.services.fs.add_file(OpenFile {
         path: format!("nand:/{name}"),
@@ -1024,12 +1024,12 @@ fn open_system_archive(system: &mut System, path: NcchArchivePath) -> Option<u32
 }
 
 /// stand-in contents for a shared data archive.
-fn system_archive_data(path: NcchArchivePath) -> Vec<u8> {
+fn system_archive_data(path: NcchArchivePath, data_dir: Option<&std::path::Path>) -> Vec<u8> {
     use crate::services::system_archives;
     match (path.high_program_id, path.low_program_id) {
         (SHARED_DATA_ARCHIVE, SYSTEM_FILE_REGION_MANIFEST) => system_archives::region_manifest(),
         (SYSTEM_DATA_ARCHIVE, SYSTEM_FILE_BAD_WORD_LIST) => system_archives::bad_word_list(),
-        (SHARED_DATA_ARCHIVE, SYSTEM_FILE_MII_DATA) => system_archives::mii_data(),
+        (SHARED_DATA_ARCHIVE, SYSTEM_FILE_MII_DATA) => system_archives::mii_data(data_dir),
         _ => Vec::new(),
     }
 }
