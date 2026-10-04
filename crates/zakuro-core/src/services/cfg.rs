@@ -11,6 +11,9 @@ pub const REGION_EUROPE: u8 = 2;
 /// language codes.
 pub const LANGUAGE_ENGLISH: u8 = 1;
 
+/// what GenHashConsoleUnique answers for every salt, this console's hash.
+pub const CONSOLE_HASH: u64 = 0x0000_5255_3341_5A55;
+
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     match header.command_id() {
         // GetConfigInfoBlk2(size, block id) with the result written to a
@@ -30,7 +33,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         // GenHashConsoleUnique(salt) -> a 64-bit hash.
         0x0003 => {
-            buffer.reply(&mut system.memory, 0x0003, &[0x3341_5A55, 0x0000_5255]);
+            buffer.reply(&mut system.memory, 0x0003, &[CONSOLE_HASH as u32, (CONSOLE_HASH >> 32) as u32]);
             true
         }
         // GetRegionCanadaUSA

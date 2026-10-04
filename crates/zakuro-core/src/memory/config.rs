@@ -8,6 +8,9 @@ use crate::kernel::thread::{CPU_CLOCK_HZ, ticks_to_nanos};
 /// seconds between the 3DS epoch (1900-01-01) and the Unix epoch.
 const EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
 
+/// a plausible MAC. Games only ever show it or hash it.
+pub const MAC_ADDRESS: [u8; 6] = [0x40, 0xF4, 0x07, 0x00, 0x00, 0x01];
+
 fn write_u32(page: &mut [u8], offset: usize, value: u32) {
     page[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -66,8 +69,7 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, cl
 
     update_datetime(page, clock, 0);
 
-    // a plausible MAC. Games only ever show it or hash it.
-    page[0x60..0x66].copy_from_slice(&[0x40, 0xF4, 0x07, 0x00, 0x00, 0x01]);
+    page[0x60..0x66].copy_from_slice(&MAC_ADDRESS);
     page[0x66] = 3; // full wifi signal
     page[0x67] = 2; // wifi enabled and connected
 

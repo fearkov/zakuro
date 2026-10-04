@@ -17,6 +17,7 @@ pub mod hid;
 pub mod ir;
 pub mod keyboard;
 pub mod ldr_ro;
+pub mod mii_selector;
 pub mod misc;
 pub mod nfc;
 pub mod shared_font;
@@ -395,5 +396,43 @@ pub(crate) mod tests {
         handle_request(&mut system, apt());
         assert_eq!(receive(&mut system)[..4], [0, 0x406, 10, 0x40], "and closes, handing back a result");
         assert!(system.services.unimplemented.is_empty());
+    }
+
+    /// the Mii selector answers with the console's Mii. a title that saves a
+    /// blank one takes the file for a new one at the next boot, Super Mario
+    /// 3D Land does.
+    #[test]
+    fn the_mii_selector_picks_the_consoles_mii() {
+        use crate::kernel::ipc::Descriptor;
+        use zakuro_common::memory_map::TLS_IPC_STATIC_BUFFERS;
+
+        let (mut system, buffer) = system_with_thread();
+        let tls = system.kernel.current().unwrap().tls;
+        let page = tls & !0xFFF;
+        let apt = || Target::service("APT:U".into(), 0);
+        let word = |value: u32| value.to_le_bytes();
+        system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS, &word(Descriptor::static_buffer(0x100, 0)));
+        system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS + 4, &word(page + 0xC00));
+
+        // StartLibraryApplet(Mii selector, size, handle, buffer)
+        buffer.set(&mut system.memory, 0, Header::new(0x001E, 2, 4).0);
+        for (i, value) in [0x402, 0x104, 0, 0, Descriptor::static_buffer(0x104, 0), page + 0x800]
+            .into_iter()
+            .enumerate()
+        {
+            buffer.set(&mut system.memory, i as u32 + 1, value);
+        }
+        handle_request(&mut system, apt());
+
+        // ReceiveParameter(application, size)
+        buffer.set(&mut system.memory, 0, Header::new(0x000D, 2, 0).0);
+        buffer.set(&mut system.memory, 1, 0x300);
+        buffer.set(&mut system.memory, 2, 0x100);
+        handle_request(&mut system, apt());
+        let reply: Vec<u32> = (1..=4).map(|i| buffer.get(&mut system.memory, i)).collect();
+        assert_eq!(reply, [0, 0x402, 10, 0x84]);
+        let mut answer = vec![0; 0x84];
+        system.memory.read_bytes(page + 0xC00, &mut answer);
+        assert_eq!(answer, mii_selector::result());
     }
 }
