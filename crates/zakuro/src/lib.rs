@@ -678,7 +678,9 @@ impl App {
             if let Some(backend) = &mut self.backend {
                 backend.set_layout(self.layout.screens());
             }
-            if let Some(window) = &self.window {
+            // a full screen or maximized window keeps its size, resizing
+            // it would take it out of that
+            if let Some(window) = self.window.as_ref().filter(|window| window.fullscreen().is_none() && !window.is_maximized()) {
                 let _ = window.request_inner_size(self.window_size());
             }
         }
