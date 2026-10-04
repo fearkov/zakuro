@@ -16,6 +16,9 @@ pub const SIGNAL_WAKEUP_BY_EXIT: u32 = 10;
 
 /// the running title's own applet id.
 pub(crate) const APPLICATION: u32 = 0x300;
+/// the id a title asks IsRegistered about for whatever library applet it
+/// may have running.
+const ANY_LIBRARY_APPLET: u32 = 0x400;
 
 #[derive(Debug, Clone)]
 pub struct Parameter {
@@ -224,10 +227,15 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             );
             true
         }
-        // IsRegistered -> true, so a title believes the applet it asked about
-        // exists.
+        // IsRegistered(app id) -> true, so a title believes the applet it
+        // asked about exists. any library applet is there only while the
+        // title prepares or runs one, a title told one is there cancels it
+        // and waits for it to close, Yo-kai Watch 2 as it starts
         0x0009 => {
-            buffer.reply(&mut system.memory, 0x0009, &[1]);
+            let applet = buffer.get(&mut system.memory, 1);
+            let apt = &system.services.apt;
+            let registered = applet != ANY_LIBRARY_APPLET || apt.library_applet.is_some() || apt.keyboard.is_some();
+            buffer.reply(&mut system.memory, 0x0009, &[registered as u32]);
             true
         }
         // InquireNotification -> no pending notification.
