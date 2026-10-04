@@ -739,8 +739,10 @@ pub struct TextureCache {
 type TextureKey = (u32, TextureFormat, u32, u32);
 
 struct Decoded {
-    /// the hash of the bytes it was decoded from.
+    /// the hash of the bytes it was decoded from, and the bytes, so that a
+    /// change decodes again only the tiles it touched.
     hash: u64,
+    bytes: Vec<u8>,
     texels: Arc<[[u8; 4]]>,
     /// the list it was last checked in, and how many writes that list had
     /// made by then.
@@ -780,9 +782,31 @@ impl TextureCache {
         let (_, format, width, height) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
-        if let Some(decoded) = self.entries.get_mut(&key).filter(|decoded| decoded.hash == hash) {
-            decoded.checked = checked;
-            return decoded.texels.clone();
+        if let Some(decoded) = self.entries.get_mut(&key) {
+            if decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
+                // a title changing a few sprites of an atlas rewrites a
+                // handful of its 8x8 tiles, those alone are decoded again,
+                // into a copy, as the old texels may still be uploading
+                let mut copy: Arc<[[u8; 4]]> = Arc::from(&decoded.texels[..]);
+                let texels = Arc::get_mut(&mut copy).expect("a copy no one else holds");
+                let tile = data.len() / (width * height / 64) as usize;
+                let tiles = decoded.bytes.chunks(tile).zip(data.chunks(tile)).enumerate();
+                for (index, _) in tiles.filter(|(_, (old, new))| old != new) {
+                    let (tile_x, tile_y) = (index as u32 % (width / 8) * 8, index as u32 / (width / 8) * 8);
+                    for y in tile_y..tile_y + 8 {
+                        for x in tile_x..tile_x + 8 {
+                            texels[(y * width + x) as usize] = crate::texture::sample_texel(data, format, width, x, y);
+                        }
+                    }
+                }
+                decoded.bytes.copy_from_slice(data);
+                decoded.texels = copy;
+                decoded.hash = hash;
+            }
+            if decoded.hash == hash {
+                decoded.checked = checked;
+                return decoded.texels.clone();
+            }
         }
         let count = (width * height) as usize;
         if self.texels + count > CACHED_TEXELS {
@@ -793,7 +817,8 @@ impl TextureCache {
             .flat_map(|y| (0..width).map(move |x| (x, y)))
             .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
             .collect();
-        if let Some(old) = self.entries.insert(key, Decoded { hash, texels: texels.clone(), checked }) {
+        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked };
+        if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
         }
         self.texels += count;
@@ -2402,6 +2427,33 @@ mod tests {
         assert!(cache.checked(key, 256).is_some(), "checked again after the draw");
         cache.begin_list();
         assert!(cache.checked(key, 256).is_none(), "a new list");
+    }
+
+    /// a few tiles of a texture rewritten, as a title animating sprites in
+    /// an atlas, come out the same as the whole texture decoded again.
+    #[test]
+    fn a_partly_changed_texture_decodes_as_a_whole_one_would() {
+        for format in [TextureFormat::Etc1, TextureFormat::Etc1A4, TextureFormat::Rgba8] {
+            let (width, height) = (32, 16);
+            let size = (width * height * format.bits_per_pixel() / 8) as usize;
+            let before: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+            let mut after = before.clone();
+            // the third tile of the second row
+            let tile = size / 8;
+            after[6 * tile..7 * tile].iter_mut().for_each(|byte| *byte = byte.wrapping_mul(3).wrapping_add(1));
+            let key = (0x1000, format, width, height);
+            let mut cache = TextureCache::default();
+            let old = cache.decoded(key, &before);
+            let updated = cache.decoded(key, &after);
+            let whole = TextureCache::default().decoded(key, &after);
+            assert_eq!(updated, whole, "{format:?}");
+            let changed = old.iter().zip(updated.iter()).enumerate().filter(|(_, (a, b))| a != b);
+            assert!(changed.clone().count() > 0, "{format:?} changed nothing");
+            for (index, _) in changed {
+                let (x, y) = (index as u32 % width, index as u32 / width);
+                assert_eq!((x / 8, y / 8), (2, 1), "{format:?} changed outside the tile, at {x}, {y}");
+            }
+        }
     }
 
     #[test]
