@@ -69,6 +69,16 @@ pub struct Memory {
     /// host pointer for each 4 KiB page, or null when unmapped.
     read_table: Vec<*mut u8>,
     write_table: Vec<*mut u8>,
+    /// the same for the CPU's reads, which recompiled code reads too, but
+    /// null over pages the host GPU drew and guest memory does not have yet,
+    /// so that the CPU reading one asks for it first, see guard_cpu_reads.
+    cpu_read_table: Vec<*mut u8>,
+    /// the bytes of those pages the GPU drew, start to end, apart and in
+    /// order. pages are shared, a buffer's first and last with whatever
+    /// the title keeps next to it, which the CPU reads without waiting.
+    guards: BTreeMap<VAddr, VAddr>,
+    /// how the GPU's drawing comes down for such a read, while the CPU runs.
+    gpu_sync: Option<GpuSync>,
 
     /// mappings keyed by base address, for svcQueryMemory and unmapping.
     mappings: BTreeMap<VAddr, Mapping>,
@@ -78,9 +88,24 @@ pub struct Memory {
     faults: BTreeMap<VAddr, u32>,
 }
 
+/// what writes back the host GPU's drawing over a range, for a read of the
+/// CPU waiting on it. the system sets it to its GPU while the CPU runs, when
+/// nothing else holds the GPU.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuSync {
+    pub gpu: *mut (),
+    pub linear_base: u32,
+    /// # Safety
+    ///
+    /// gpu has to point at what the function takes it for, which nothing
+    /// else holds while it runs.
+    pub sync: unsafe fn(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr: VAddr, len: u32),
+}
+
 // SAFETY: the pointers in the page tables all point into allocations owned by
 // phys, which lives in the same struct and whose buffers are never
-// reallocated. Nothing hands them out.
+// reallocated. Nothing hands them out. the GPU sync's is only followed while
+// the system that set it runs the CPU.
 unsafe impl Send for Memory {}
 
 impl Memory {
@@ -89,6 +114,9 @@ impl Memory {
             phys: PhysicalMemory::new(new3ds, app_bytes),
             read_table: vec![std::ptr::null_mut(); PAGE_TABLE_ENTRIES],
             write_table: vec![std::ptr::null_mut(); PAGE_TABLE_ENTRIES],
+            cpu_read_table: vec![std::ptr::null_mut(); PAGE_TABLE_ENTRIES],
+            guards: BTreeMap::new(),
+            gpu_sync: None,
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
         }
@@ -119,6 +147,9 @@ impl Memory {
             let index = (page_vaddr >> PAGE_BITS) as usize;
             if permission.contains(Permission::READ) {
                 self.read_table[index] = ptr;
+                if !self.page_guarded(index) {
+                    self.cpu_read_table[index] = ptr;
+                }
             }
             if permission.contains(Permission::WRITE) {
                 self.write_table[index] = ptr;
@@ -167,6 +198,7 @@ impl Memory {
             let index = ((vaddr + page * PAGE_SIZE) >> PAGE_BITS) as usize;
             self.read_table[index] = std::ptr::null_mut();
             self.write_table[index] = std::ptr::null_mut();
+            self.cpu_read_table[index] = std::ptr::null_mut();
         }
         self.mappings.retain(|_, m| {
             !(m.base >= vaddr && m.base + m.size <= vaddr.wrapping_add(size))
@@ -369,8 +401,108 @@ impl Memory {
 
     /// the read and write page tables, a host pointer per 4 KiB page or
     /// null, for code that reads memory without going through the bus.
+    /// the CPU's tables, for recompiled code.
     pub fn page_tables(&self) -> (*const *mut u8, *const *mut u8) {
-        (self.read_table.as_ptr(), self.write_table.as_ptr())
+        (self.cpu_read_table.as_ptr(), self.write_table.as_ptr())
+    }
+
+    /// the host GPU drew over a range, which guest memory gets only when
+    /// asked, so the CPU's reads there ask first. games read what the GPU
+    /// drew, Ocarina of Time 3D the depth where the sun is, to tell whether
+    /// to draw its lens flare. the rest of a page the range shares is read
+    /// the slow way while it is guarded, without asking.
+    pub fn guard_cpu_reads(&mut self, vaddr: VAddr, len: u32) {
+        let (mut start, mut end) = (vaddr, vaddr.saturating_add(len));
+        if start >= end {
+            return;
+        }
+        // one range of the ranges it overlaps. buffers packed end to end
+        // stay apart, a read of one does not have the other written back
+        let joined: Vec<(VAddr, VAddr)> =
+            self.guards.range(..end).rev().take_while(|(_, &to)| to > start).map(|(&from, &to)| (from, to)).collect();
+        for (from, to) in joined {
+            self.guards.remove(&from);
+            (start, end) = (start.min(from), end.max(to));
+        }
+        self.guards.insert(start, end);
+        for index in (vaddr >> PAGE_BITS) as usize..=((vaddr.saturating_add(len - 1)) >> PAGE_BITS) as usize {
+            self.cpu_read_table[index] = std::ptr::null_mut();
+        }
+    }
+
+    /// whether any of a page is still behind what the GPU drew.
+    fn page_guarded(&self, index: usize) -> bool {
+        let start = (index as u32) << PAGE_BITS;
+        let end = start.wrapping_add(PAGE_SIZE);
+        // the ranges are apart, only the last one starting before the
+        // page's end can reach into it
+        self.guards.range(..end).next_back().is_some_and(|(_, &to)| to > start)
+    }
+
+    /// how the CPU's reads of what the GPU drew come down from now on.
+    ///
+    /// # Safety
+    ///
+    /// sync.gpu has to stay what sync.sync takes it for, and nothing else
+    /// may hold it, until clear_gpu_sync, as reads of the CPU follow it.
+    pub unsafe fn set_gpu_sync(&mut self, sync: GpuSync) {
+        self.gpu_sync = Some(sync);
+    }
+
+    /// the CPU stopped running, its reads of what the GPU drew see memory
+    /// as it is.
+    pub fn clear_gpu_sync(&mut self) {
+        self.gpu_sync = None;
+    }
+
+    /// the page a read of the CPU of len bytes falls in, after what the GPU
+    /// drew there came down.
+    #[inline(always)]
+    fn cpu_page_read(&mut self, addr: VAddr, len: u32) -> Option<&[u8]> {
+        let ptr = self.cpu_read_table[(addr >> PAGE_BITS) as usize];
+        if ptr.is_null() {
+            return self.cpu_page_read_guarded(addr, len);
+        }
+        // SAFETY: as page_read, the CPU's table holds the same pointers
+        Some(unsafe { std::slice::from_raw_parts(ptr, PAGE_SIZE as usize) })
+    }
+
+    #[cold]
+    fn cpu_page_read_guarded(&mut self, addr: VAddr, len: u32) -> Option<&[u8]> {
+        self.unguard(addr, len);
+        self.page_read(addr)
+    }
+
+    /// has the GPU write back what it drew where a read of the CPU falls,
+    /// the whole of each range it guarded there, and lets the CPU read the
+    /// pages nothing guarded is left on. without a sync, outside the CPU,
+    /// they stay guarded.
+    fn unguard(&mut self, addr: VAddr, len: u32) {
+        let Some(sync) = self.gpu_sync else { return };
+        let end = addr.saturating_add(len.max(1));
+        let hit: Vec<(VAddr, VAddr)> =
+            self.guards.range(..end).rev().take_while(|(_, &to)| to > addr).map(|(&from, &to)| (from, to)).collect();
+        for &(from, to) in &hit {
+            self.guards.remove(&from);
+            // SAFETY: the system set it while it runs the CPU, which is the
+            // only thing reading through this
+            unsafe { (sync.sync)(sync.gpu, sync.linear_base, self, from, to - from) };
+        }
+        for (from, to) in hit {
+            for index in (from >> PAGE_BITS) as usize..=((to - 1) >> PAGE_BITS) as usize {
+                if !self.page_guarded(index) {
+                    self.cpu_read_table[index] = self.read_table[index];
+                }
+            }
+        }
+    }
+
+    /// a word of guest memory as anything but the CPU reads it, what the GPU
+    /// drew there or not.
+    pub fn peek32(&mut self, addr: VAddr) -> u32 {
+        let mut buf = [0u8; 4];
+        self.read_bytes(addr, &mut buf);
+        u32::from_le_bytes(buf)
     }
 
     fn note_fault(&mut self, addr: VAddr) {
@@ -395,7 +527,7 @@ impl Memory {
 impl Bus for Memory {
     #[inline(always)]
     fn read8(&mut self, addr: u32) -> u8 {
-        match self.page_read(addr) {
+        match self.cpu_page_read(addr, 1) {
             Some(page) => page[(addr & PAGE_MASK) as usize],
             None => {
                 self.note_fault(addr);
@@ -408,7 +540,7 @@ impl Bus for Memory {
     fn read16(&mut self, addr: u32) -> u16 {
         let offset = (addr & PAGE_MASK) as usize;
         if offset <= PAGE_SIZE as usize - 2 {
-            match self.page_read(addr) {
+            match self.cpu_page_read(addr, 2) {
                 Some(page) => u16::from_le_bytes([page[offset], page[offset + 1]]),
                 None => {
                     self.note_fault(addr);
@@ -417,6 +549,7 @@ impl Bus for Memory {
             }
         } else {
             // straddles a page boundary.
+            self.unguard(addr, 2);
             let mut buf = [0u8; 2];
             self.read_bytes(addr, &mut buf);
             u16::from_le_bytes(buf)
@@ -427,7 +560,7 @@ impl Bus for Memory {
     fn read32(&mut self, addr: u32) -> u32 {
         let offset = (addr & PAGE_MASK) as usize;
         if offset <= PAGE_SIZE as usize - 4 {
-            match self.page_read(addr) {
+            match self.cpu_page_read(addr, 4) {
                 Some(page) => u32::from_le_bytes([
                     page[offset],
                     page[offset + 1],
@@ -440,6 +573,7 @@ impl Bus for Memory {
                 }
             }
         } else {
+            self.unguard(addr, 4);
             let mut buf = [0u8; 4];
             self.read_bytes(addr, &mut buf);
             u32::from_le_bytes(buf)
@@ -478,5 +612,74 @@ impl Bus for Memory {
         } else {
             self.write_bytes(addr, &value.to_le_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a GPU that writes back 0xAB over what it is asked for, counting.
+    struct Drawn {
+        asked: u32,
+    }
+
+    unsafe fn write_back(gpu: *mut (), _linear_base: u32, memory: &mut Memory, addr: VAddr, len: u32) {
+        let drawn = unsafe { &mut *(gpu as *mut Drawn) };
+        drawn.asked += 1;
+        memory.write_bytes(addr, &vec![0xAB; len as usize]);
+    }
+
+    /// a read of the CPU where the GPU drew has it written back first, once
+    /// for the whole of what was guarded, while the emulator's own reads,
+    /// and the CPU's with no GPU to ask, see memory as it is.
+    #[test]
+    fn the_cpu_reads_what_the_gpu_drew() {
+        let mut memory = Memory::new(false, 0x0400_0000);
+        let block = memory.phys.allocate(MemoryRegion::Application, 0x3000).unwrap();
+        memory.map(0x1F00_0000, block.addr, 0x3000, Permission::RW, MemoryState::Private);
+        memory.guard_cpu_reads(0x1F00_1000, 0x2000);
+        assert_eq!(memory.read32(0x1F00_1000), 0);
+
+        let mut drawn = Drawn { asked: 0 };
+        let gpu = &mut drawn as *mut Drawn as *mut ();
+        // SAFETY: drawn outlives the reads below, which are all that use it
+        unsafe { memory.set_gpu_sync(GpuSync { gpu, linear_base: 0, sync: write_back }) };
+        let mut bytes = [0u8; 4];
+        memory.read_bytes(0x1F00_1000, &mut bytes);
+        assert_eq!(bytes, [0; 4]);
+        assert_eq!(memory.read32(0x1F00_0000), 0);
+        assert_eq!(drawn.asked, 0);
+
+        assert_eq!(memory.read32(0x1F00_2004), 0xABAB_ABAB);
+        assert_eq!(memory.read8(0x1F00_1000), 0xAB);
+        assert_eq!(drawn.asked, 1);
+        // until the GPU draws there again
+        memory.guard_cpu_reads(0x1F00_1000, 4);
+        assert_eq!(memory.read16(0x1F00_1002), 0xABAB);
+        assert_eq!(drawn.asked, 2);
+        // a page the GPU drew only part of, the title keeping its own next
+        // to it, which the CPU reads without waiting
+        memory.write32(0x1F00_2000, 0x1234_5678);
+        memory.guard_cpu_reads(0x1F00_2800, 0x100);
+        assert_eq!(memory.read32(0x1F00_2000), 0x1234_5678);
+        assert_eq!(drawn.asked, 2);
+        assert_eq!(memory.read32(0x1F00_28FC), 0xABAB_ABAB);
+        assert_eq!(drawn.asked, 3);
+        // a read starting before a range and ending in it asks too
+        memory.guard_cpu_reads(0x1F00_2808, 0x10);
+        assert_eq!(memory.read32(0x1F00_2806), 0xABAB_ABAB);
+        assert_eq!(drawn.asked, 4);
+        // buffers end to end stay apart
+        memory.guard_cpu_reads(0x1F00_1000, 0x800);
+        memory.guard_cpu_reads(0x1F00_1800, 0x800);
+        memory.read32(0x1F00_1C00);
+        assert_eq!(drawn.asked, 5);
+        assert_eq!(memory.guards.len(), 1);
+        // and mapping a page again keeps what is guarded on it
+        memory.map(0x1F00_1000, block.addr + 0x1000, 0x1000, Permission::RW, MemoryState::Private);
+        memory.read32(0x1F00_1000);
+        assert_eq!(drawn.asked, 6);
+        memory.clear_gpu_sync();
     }
 }

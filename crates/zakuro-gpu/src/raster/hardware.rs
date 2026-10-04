@@ -203,6 +203,8 @@ struct Surface {
     /// the rows drawn into since guest memory last got the image, rows of
     /// memory from the buffer's start, whole rows of tiles.
     dirty: Option<(u32, u32)>,
+    /// the rows of those whose reads the CPU was told to ask for first.
+    guarded: Option<(u32, u32)>,
     capture: Option<Capture>,
     /// when drawing scaled, an image at the console's resolution the
     /// surface goes through on its way to and from guest memory, and a
@@ -253,6 +255,19 @@ impl Surface {
     /// the GPU changed the whole image.
     fn changed(&mut self) {
         self.drew((0, self.height));
+    }
+
+    /// has the CPU's reads of the rows drawn ask for them first, until
+    /// guest memory gets them.
+    fn guard<M: GpuMemory>(&mut self, memory: &mut M) {
+        let Some((start, end)) = self.dirty else { return };
+        if self.guarded.is_some_and(|(from, to)| from <= start && end <= to) {
+            return;
+        }
+        // all of it, which overlaps what was guarded before and joins it
+        let (start, end) = self.guarded.map_or((start, end), |(from, to)| (from.min(start), to.max(end)));
+        memory.guard(self.addr + start * self.row_bytes(), (end - start) * self.row_bytes());
+        self.guarded = Some((start, end));
     }
 
     /// the image holds something new, the copies of it are old.
@@ -1781,6 +1796,7 @@ impl Hardware {
                     shadow: Vec::new(),
                     checked: false,
                     dirty: None,
+                    guarded: None,
                     capture: None,
                     native,
                     screen: None,
@@ -2162,6 +2178,7 @@ impl Hardware {
             if !filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
                 let surface = &mut self.surfaces[index];
                 surface.dirty = None;
+                surface.guarded = None;
                 surface.checked = false;
                 continue;
             }
@@ -2210,6 +2227,7 @@ impl Hardware {
             surface.shadow.clear();
             surface.shadow.extend_from_slice(filled);
             surface.dirty = None;
+            surface.guarded = None;
             surface.checked = false;
             surface.replaced();
         }
@@ -2693,10 +2711,12 @@ impl Hardware {
         }
         if color_mask != 0 {
             self.surfaces[color].drew(rows);
+            self.surfaces[color].guard(memory);
         }
         if let Some(depth) = depth {
             if depth_write || (stencil_test && writable) {
                 self.surfaces[depth].drew(rows);
+                self.surfaces[depth].guard(memory);
             }
         }
 
@@ -2946,6 +2966,7 @@ impl Hardware {
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
         self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
         self.surfaces[target].changed();
+        self.surfaces[target].guard(memory);
         self.capture(target)?;
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer
@@ -3850,6 +3871,7 @@ impl Hardware {
         let surface = &mut self.surfaces[index];
         surface.shadow = bytes;
         surface.dirty = None;
+        surface.guarded = None;
     }
 }
 

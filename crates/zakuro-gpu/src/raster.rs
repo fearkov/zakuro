@@ -2573,6 +2573,38 @@ mod tests {
         }
     }
 
+    /// the GPU has the CPU's reads of the rows it draws ask for them first,
+    /// once until guest memory gets them, and again after.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_gpu_guards_what_it_draws() {
+        struct Guarded<'a>(&'a mut ConsoleMemory, Vec<(u32, u32)>);
+        impl GpuMemory for Guarded<'_> {
+            fn read(&mut self, addr: u32, out: &mut [u8]) {
+                self.0.read(addr, out)
+            }
+            fn write(&mut self, addr: u32, data: &[u8]) {
+                self.0.write(addr, data)
+            }
+            fn guard(&mut self, addr: u32, len: u32) {
+                self.1.push((addr, len))
+            }
+        }
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let registers = target_registers();
+        let mut memory = ConsoleMemory::default();
+        let mut guarded = Guarded(&mut memory, Vec::new());
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
+        // the whole 8 by 8 color buffer, of four bytes a pixel
+        assert_eq!(guarded.1, [(COLOR, 8 * 8 * 4)]);
+        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
+        assert_eq!(guarded.1.len(), 1);
+        resources.hardware.as_mut().unwrap().flush(&mut guarded).unwrap();
+        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
+        assert_eq!(guarded.1.len(), 2);
+    }
+
     /// vertices the GPU shades come out as the CPU shades them, clipped and
     /// culled the same, through a program with a loop, a call, both kinds
     /// of if, indexed uniforms and an output past a gap in the mask.

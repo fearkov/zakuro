@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zakuro_common::memory_map::*;
 use zakuro_common::ConsoleModel;
-use zakuro_cpu::{Bus, Cpu, Exit};
+use zakuro_cpu::{Cpu, Exit};
 use zakuro_fs::Title;
 use zakuro_gpu::{Gpu, GpuMemory, Renderer, SoftwareRenderer};
 
@@ -384,7 +384,14 @@ impl System {
                         hints.interpreted(pc, thumb);
                     }
                 }
-                self.cpu.step(&mut self.memory)
+                let gpu = &mut self.gpu as *mut Gpu as *mut ();
+                let linear_base = self.kernel.linear_base;
+                // SAFETY: the GPU stays where it is, and nothing but the CPU's
+                // reads follow the pointer, until the step is over
+                unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu }) };
+                let exit = self.cpu.step(&mut self.memory);
+                self.memory.clear_gpu_sync();
+                exit
             }
         };
         match exit {
@@ -453,7 +460,14 @@ impl System {
             limit = limit.min(deadline);
         }
         let budget = limit.saturating_sub(self.cpu.cycles).max(1);
+        // a read of the CPU from where the GPU drew has that come down
+        // first, with nothing else holding the GPU until the run is over
+        let gpu = &mut self.gpu as *mut Gpu as *mut ();
+        let linear_base = self.kernel.linear_base;
+        // SAFETY: as in step, until the run is over
+        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu }) };
         let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
+        self.memory.clear_gpu_sync();
         self.recompiled_instructions += ran;
         if ran == 0 && matches!(stop, recompiled::Stop::Left) {
             // not enough budget left for a whole block
@@ -906,7 +920,13 @@ impl GpuMemory for GuestMemory<'_> {
     }
 
     fn read_u32(&mut self, addr: u32) -> u32 {
-        self.memory.read32(addr)
+        // not as the CPU reads, which could have the GPU write back from
+        // inside itself
+        self.memory.peek32(addr)
+    }
+
+    fn guard(&mut self, addr: u32, len: u32) {
+        self.memory.guard_cpu_reads(addr, len);
     }
 
     fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
@@ -931,6 +951,23 @@ impl GpuMemory for GuestMemory<'_> {
             paddr
         }
     }
+}
+
+/// writes back what the GPU drew over a range, for a read of the CPU
+/// waiting on it.
+///
+/// # Safety
+///
+/// gpu has to be the system's GPU, which nothing else holds while the CPU
+/// runs.
+unsafe fn sync_for_cpu(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr: u32, len: u32) {
+    log::debug!(
+        target: "zakuro_core::memory",
+        "the CPU reads 0x{addr:08X}..0x{:08X}, which the GPU drew, written back first",
+        addr.wrapping_add(len)
+    );
+    let gpu = unsafe { &mut *(gpu as *mut Gpu) };
+    gpu.sync_memory(&mut GuestMemory { memory, linear_base }, addr, len);
 }
 
 impl Drop for System {
@@ -966,6 +1003,7 @@ mod tests {
     use super::*;
     use kernel::object::KObject;
     use kernel::thread::ThreadStatus;
+    use zakuro_cpu::Bus;
 
     fn mutex_state(system: &System, handle: u32) -> (Option<ThreadId>, u32) {
         let object = system.kernel.handles.resolve(handle).expect("a mutex handle");
