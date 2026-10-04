@@ -55,6 +55,10 @@ pub struct Kernel {
     /// CUR_THREAD_HANDLE twice yields the same object.
     thread_objects: std::collections::HashMap<ThreadId, ObjectId>,
     process_object: Option<ObjectId>,
+
+    /// the timers, gone through for the next one due instead of every
+    /// object, gathered again each frame.
+    pub timers: Vec<ObjectId>,
 }
 
 impl Kernel {
@@ -76,6 +80,7 @@ impl Kernel {
             relief: false,
             thread_objects: std::collections::HashMap::new(),
             process_object: None,
+            timers: Vec::new(),
         }
     }
 

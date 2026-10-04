@@ -564,11 +564,9 @@ impl System {
             .iter()
             .filter(|t| t.status.is_blocked())
             .filter_map(|t| t.wakeup_at);
-        let timers = self.kernel.objects.iter().filter_map(|(_, object)| {
-            match object {
-                kernel::object::KObject::Timer(timer) => timer.fire_at,
-                _ => None,
-            }
+        let timers = self.kernel.timers.iter().filter_map(|&id| match self.kernel.objects.get(id) {
+            Some(kernel::object::KObject::Timer(timer)) => timer.fire_at,
+            _ => None,
         });
         threads.chain(timers).min()
     }
@@ -586,10 +584,13 @@ impl System {
         let tick = self.cpu.cycles;
         memory::config::update_datetime(self.memory.phys.shared_page_mut(), self.boot_clock, tick);
 
-        // fire the expired timers.
+        // fire the expired timers, and gather them all again for
+        // next_wakeup, without the ones closed since
         let mut signalled = Vec::new();
+        self.kernel.timers.clear();
         for (id, object) in self.kernel.objects.iter() {
             if let kernel::object::KObject::Timer(timer) = object {
+                self.kernel.timers.push(id);
                 if timer.fire_at.is_some_and(|at| tick >= at) {
                     signalled.push(id);
                 }

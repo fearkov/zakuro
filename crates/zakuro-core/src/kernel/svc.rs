@@ -597,6 +597,7 @@ fn create_timer(system: &mut System) {
         fire_at: None,
         interval: 0,
     }));
+    system.kernel.timers.push(object);
     let handle = system
         .kernel
         .handles
