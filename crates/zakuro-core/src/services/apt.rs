@@ -111,7 +111,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         .insert(crate::kernel::object::KObject::SharedMemory(
             crate::kernel::object::SharedMemory {
                 name: "SharedFont".into(),
-                address: 0,
+                address,
                 size,
                 paddr: block.addr,
                 mapped_at: None,

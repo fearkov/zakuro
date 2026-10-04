@@ -305,8 +305,12 @@ fn map_memory_block(system: &mut System) {
         return;
     };
 
-    let (paddr, size) = (block.paddr, block.size);
-    let addr = if addr == 0 {
+    let (paddr, size, own) = (block.paddr, block.size, block.address);
+    let addr = if addr == 0 && own != 0 {
+        // a block the system keeps somewhere, as the shared font, goes where
+        // it already is, the address the title was told
+        own
+    } else if addr == 0 {
         // let the kernel choose, the first place in the shared memory region
         // the whole block fits, a big one mapped over the next block along
         // would hide it
