@@ -2627,11 +2627,12 @@ mod tests {
 
     /// the GPU has the CPU's reads of the depth it draws ask for it first,
     /// once until guest memory gets it, and again after. the color buffer
-    /// the same draws go to is read as memory holds it.
+    /// the same draws go to is read as memory holds it. writes over either
+    /// ask the same way.
     #[cfg(feature = "vulkan")]
     #[test]
     fn the_gpu_guards_what_it_draws() {
-        struct Guarded<'a>(&'a mut ConsoleMemory, Vec<(u32, u32)>);
+        struct Guarded<'a>(&'a mut ConsoleMemory, Vec<(u32, u32)>, Vec<(u32, u32)>);
         impl GpuMemory for Guarded<'_> {
             fn read(&mut self, addr: u32, out: &mut [u8]) {
                 self.0.read(addr, out)
@@ -2642,24 +2643,28 @@ mod tests {
             fn guard(&mut self, addr: u32, len: u32) {
                 self.1.push((addr, len))
             }
+            fn guard_writes(&mut self, addr: u32, len: u32) {
+                self.2.push((addr, len))
+            }
         }
         let Ok(hardware) = hardware::Hardware::new() else { return };
         let mut registers = target_registers();
         // depth written, with no test
         registers[REG_DEPTH_COLOR_MASK] |= 1 << 12;
         let mut memory = ConsoleMemory::default();
-        let mut guarded = Guarded(&mut memory, Vec::new());
+        let mut guarded = Guarded(&mut memory, Vec::new(), Vec::new());
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
         // the whole 8 by 8 depth buffer, of four bytes a pixel
         assert_eq!(guarded.1, [(DEPTH, 8 * 8 * 4)]);
+        assert_eq!(guarded.2, [(COLOR, 8 * 8 * 4), (DEPTH, 8 * 8 * 4)]);
         rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
-        assert_eq!(guarded.1.len(), 1);
+        assert_eq!((guarded.1.len(), guarded.2.len()), (1, 2));
         resources.hardware.as_mut().unwrap().flush(&mut guarded).unwrap();
         // depth memory the next draw writes over
         guarded.0.write(DEPTH, &[0xFF; 8 * 8 * 4]);
         rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, GREEN));
-        assert_eq!(guarded.1.len(), 2);
+        assert_eq!((guarded.1.len(), guarded.2.len()), (2, 4));
 
         // what the CPU's read brings back is the depth, the color stays as
         // memory had it, red from the flush
@@ -2670,6 +2675,25 @@ mod tests {
         memory.read(DEPTH, &mut depth);
         // the stencil byte stays, nothing wrote it
         assert!(depth.as_chunks::<4>().0.iter().all(|sample| sample[..3] != [0xFF; 3]), "the depth drawn came back");
+    }
+
+    /// memory written after the GPU drew over it by something that does not
+    /// wait for the drawing, a service reading a file into a buffer the
+    /// title is done with, stays when the drawing is written back.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn writes_after_drawing_survive_the_write_back() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let registers = target_registers();
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        memory.write(COLOR, &[0x5A; 16]);
+        resources.hardware.as_mut().unwrap().sync(&mut memory, COLOR, 8 * 8 * 4).unwrap();
+        let mut start = [0u8; 16];
+        memory.read(COLOR, &mut start);
+        assert_eq!(start, [0x5A; 16], "what was written after the drawing stays");
+        assert!(pixels(&mut memory)[4..].iter().all(|&p| p == [255, 0, 0, 255]), "and the drawing is the rest");
     }
 
     /// vertices the GPU shades come out as the CPU shades them, clipped and

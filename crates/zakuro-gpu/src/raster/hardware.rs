@@ -205,6 +205,8 @@ struct Surface {
     dirty: Option<(u32, u32)>,
     /// the rows of those whose reads the CPU was told to ask for first.
     guarded: Option<(u32, u32)>,
+    /// and those its writes have to wait for, see guard_writes.
+    write_guarded: Option<(u32, u32)>,
     capture: Option<Capture>,
     /// when drawing scaled, an image at the console's resolution the
     /// surface goes through on its way to and from guest memory, and a
@@ -260,14 +262,21 @@ impl Surface {
     /// has the CPU's reads of the rows drawn ask for them first, until
     /// guest memory gets them. draw does it for depth buffers alone.
     fn guard<M: GpuMemory>(&mut self, memory: &mut M) {
-        let Some((start, end)) = self.dirty else { return };
-        if self.guarded.is_some_and(|(from, to)| from <= start && end <= to) {
-            return;
+        let row = self.row_bytes();
+        if let Some((addr, len)) = widen(&mut self.guarded, self.dirty, self.addr, row) {
+            memory.guard(addr, len);
         }
-        // all of it, which overlaps what was guarded before and joins it
-        let (start, end) = self.guarded.map_or((start, end), |(from, to)| (from.min(start), to.max(end)));
-        memory.guard(self.addr + start * self.row_bytes(), (end - start) * self.row_bytes());
-        self.guarded = Some((start, end));
+    }
+
+    /// has the rows drawn reach guest memory before the CPU writes over
+    /// them, as on the console, where the GPU put its pixels there at once.
+    /// a title can put something else where a buffer it is done with was,
+    /// which the drawing written back later would break.
+    fn guard_writes<M: GpuMemory>(&mut self, memory: &mut M) {
+        let row = self.row_bytes();
+        if let Some((addr, len)) = widen(&mut self.write_guarded, self.dirty, self.addr, row) {
+            memory.guard_writes(addr, len);
+        }
     }
 
     /// the image holds something new, the copies of it are old.
@@ -1797,6 +1806,7 @@ impl Hardware {
                     checked: false,
                     dirty: None,
                     guarded: None,
+                    write_guarded: None,
                     capture: None,
                     native,
                     screen: None,
@@ -2179,6 +2189,7 @@ impl Hardware {
                 let surface = &mut self.surfaces[index];
                 surface.dirty = None;
                 surface.guarded = None;
+                surface.write_guarded = None;
                 surface.checked = false;
                 continue;
             }
@@ -2228,6 +2239,7 @@ impl Hardware {
             surface.shadow.extend_from_slice(filled);
             surface.dirty = None;
             surface.guarded = None;
+            surface.write_guarded = None;
             surface.checked = false;
             surface.replaced();
         }
@@ -2711,6 +2723,7 @@ impl Hardware {
         }
         if color_mask != 0 {
             self.surfaces[color].drew(rows);
+            self.surfaces[color].guard_writes(memory);
         }
         if let Some(depth) = depth {
             if depth_write || (stencil_test && writable) {
@@ -2720,6 +2733,7 @@ impl Hardware {
                 // loading a course and stalls on what the GPU drew there,
                 // it goes on with them as memory holds them
                 self.surfaces[depth].guard(memory);
+                self.surfaces[depth].guard_writes(memory);
             }
         }
 
@@ -2987,6 +3001,7 @@ impl Hardware {
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
         self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
         self.surfaces[target].changed();
+        self.surfaces[target].guard_writes(memory);
         self.capture(target)?;
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer
@@ -3885,14 +3900,42 @@ impl Hardware {
         }
         let row = s.row_bytes() as usize;
         let addr = s.addr;
-        memory.write(addr + (first as usize * row) as u32, &bytes[first as usize * row..last as usize * row]);
+        let rows = first as usize * row..last as usize * row;
+        // what was written over the buffer since the image last matched it
+        // came after the drawing and stays, the console's GPU had put its
+        // pixels in memory first. the CPU's writes wait for them, see
+        // guard_writes, a service's do not
+        if s.shadow.len() == bytes.len() {
+            let mut now = vec![0u8; rows.len()];
+            memory.read(addr + rows.start as u32, &mut now);
+            for ((out, &held), &was) in bytes[rows.clone()].iter_mut().zip(&now).zip(&s.shadow[rows.clone()]) {
+                if held != was {
+                    *out = held;
+                }
+            }
+        }
+        memory.write(addr + rows.start as u32, &bytes[rows]);
         // what memory holds now, the rows drawn and the others as they were
         memory.read(addr, &mut bytes);
         let surface = &mut self.surfaces[index];
         surface.shadow = bytes;
         surface.dirty = None;
         surface.guarded = None;
+        surface.write_guarded = None;
     }
+}
+
+/// the range of memory to guard for the rows drawn, which joins the rows
+/// guarded before, none when they all were.
+fn widen(guarded: &mut Option<(u32, u32)>, dirty: Option<(u32, u32)>, addr: u32, row: u32) -> Option<(u32, u32)> {
+    let (start, end) = dirty?;
+    if guarded.is_some_and(|(from, to)| from <= start && end <= to) {
+        return None;
+    }
+    // all of it, which overlaps what was guarded before and joins it
+    let (start, end) = guarded.map_or((start, end), |(from, to)| (from.min(start), to.max(end)));
+    *guarded = Some((start, end));
+    Some((addr + start * row, (end - start) * row))
 }
 
 /// a color format as the transfer shader numbers it, the register's value.

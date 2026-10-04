@@ -47,6 +47,9 @@ pub trait GpuMemory {
     /// the host GPU drew over a range that memory gets only when something
     /// asks for it, so the CPU's reads there have to ask first.
     fn guard(&mut self, _addr: u32, _len: u32) {}
+
+    /// the same for the CPU's writes there.
+    fn guard_writes(&mut self, _addr: u32, _len: u32) {}
 }
 
 /// what one LCD controller holds.

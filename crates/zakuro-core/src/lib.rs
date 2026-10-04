@@ -387,8 +387,8 @@ impl System {
                 let gpu = &mut self.gpu as *mut Gpu as *mut ();
                 let linear_base = self.kernel.linear_base;
                 // SAFETY: the GPU stays where it is, and nothing but the CPU's
-                // reads follow the pointer, until the step is over
-                unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu }) };
+                // reads and writes follow the pointer, until the step is over
+                unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
                 let exit = self.cpu.step(&mut self.memory);
                 self.memory.clear_gpu_sync();
                 exit
@@ -465,7 +465,7 @@ impl System {
         let gpu = &mut self.gpu as *mut Gpu as *mut ();
         let linear_base = self.kernel.linear_base;
         // SAFETY: as in step, until the run is over
-        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu }) };
+        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
         let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
         self.memory.clear_gpu_sync();
         self.recompiled_instructions += ran;
@@ -930,6 +930,10 @@ impl GpuMemory for GuestMemory<'_> {
         self.memory.guard_cpu_reads(addr, len);
     }
 
+    fn guard_writes(&mut self, addr: u32, len: u32) {
+        self.memory.guard_cpu_writes(addr, len);
+    }
+
     fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
         // the linear heap and VRAM are physical memory in order, so what
         // translate made of a physical address leads back to it
@@ -969,6 +973,22 @@ unsafe fn sync_for_cpu(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr
     );
     let gpu = unsafe { &mut *(gpu as *mut Gpu) };
     gpu.sync_depth(&mut GuestMemory { memory, linear_base }, addr, len);
+}
+
+/// writes back what the GPU drew over a range, for a write of the CPU
+/// landing over it.
+///
+/// # Safety
+///
+/// as sync_for_cpu.
+unsafe fn sync_for_cpu_write(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr: u32, len: u32) {
+    log::debug!(
+        target: "zakuro_core::memory",
+        "the CPU writes 0x{addr:08X}..0x{:08X}, which the GPU drew, written back first",
+        addr.wrapping_add(len)
+    );
+    let gpu = unsafe { &mut *(gpu as *mut Gpu) };
+    gpu.sync_memory(&mut GuestMemory { memory, linear_base }, addr, len);
 }
 
 impl Drop for System {
