@@ -942,7 +942,14 @@ fn get_system_tick(system: &mut System) {
     let tick = system.cpu.cycles;
     system.cpu.regs[0] = tick as u32;
     system.cpu.regs[1] = (tick >> 32) as u32;
+    // the call itself takes this long on the console, two in a row read
+    // ticks this far apart. a title spinning on the clock until a frame's
+    // time is up would otherwise spin many times longer
+    system.cpu.cycles += SYSTEM_TICK_COST;
 }
+
+/// ticks between two svcGetSystemTick calls in a row on the console.
+const SYSTEM_TICK_COST: u64 = 150;
 
 /// svcGetSystemInfo, r1 = type, r2 = parameter.
 fn get_system_info(system: &mut System) {
@@ -1123,3 +1130,21 @@ pub const THREAD_EXIT_ADDRESS: VAddr = THREAD_EXIT_MAGIC;
 /// unused placeholder keeping CURRENT_PROCESS referenced until process
 /// handles are wired up.
 pub const _CURRENT_PROCESS: u32 = CURRENT_PROCESS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// two reads of the clock in a row are as far apart as on the console,
+    /// so a title spinning on it until a frame is over spins no longer.
+    #[test]
+    fn reading_the_clock_takes_time() {
+        let mut system = System::new(crate::Config::default());
+        let mut read = || {
+            dispatch(&mut system, 0x28);
+            system.cpu.regs[0] as u64 | (system.cpu.regs[1] as u64) << 32
+        };
+        let first = read();
+        assert_eq!(read() - first, SYSTEM_TICK_COST);
+    }
+}
