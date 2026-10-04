@@ -266,7 +266,8 @@ impl Menus {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
         if let Some(fps) = fps {
-            egui::Area::new(egui::Id::new("fps")).fixed_pos(egui::pos2(8.0, 8.0)).show(&ctx, |ui| {
+            // clicks go through to the screen under it
+            egui::Area::new(egui::Id::new("fps")).fixed_pos(egui::pos2(8.0, 8.0)).interactable(false).show(&ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.label(RichText::new(format!("{fps:.0} fps")).monospace());
                 });
