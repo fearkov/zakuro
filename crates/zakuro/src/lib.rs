@@ -82,6 +82,8 @@ pub fn run(linked: Option<Linked>) {
         spent: Spent::default(),
         paused: false,
         stop: false,
+        maximized_before_full_screen: false,
+        resize_after_full_screen: false,
     };
 
     if let Some(frames) = app.options.headless {
@@ -322,6 +324,12 @@ struct App {
     /// stopped with F1, without the menu.
     paused: bool,
     stop: bool,
+    /// the window was maximized when it went full screen, which leaving
+    /// full screen brings back.
+    maximized_before_full_screen: bool,
+    /// the layout or the scale changed while the window was full screen,
+    /// which kept its size, so leaving full screen fits the window to them.
+    resize_after_full_screen: bool,
 }
 
 /// how long each step of the loop took, its mean and its longest.
@@ -657,10 +665,15 @@ impl App {
     fn toggle_fullscreen(&mut self) {
         if let Some(window) = &self.window {
             let full = window.fullscreen().is_some();
+            if !full {
+                self.maximized_before_full_screen = window.is_maximized();
+                self.resize_after_full_screen = false;
+            }
             window.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
             // the layout may have changed meanwhile, which full screen kept
-            // the window's size through
-            if full {
+            // the window's size through. a window maximized before comes
+            // back maximized, resizing it would take it out of that
+            if full && self.resize_after_full_screen && !self.maximized_before_full_screen {
                 let _ = window.request_inner_size(self.window_size());
             }
         }
@@ -692,9 +705,13 @@ impl App {
                 backend.set_layout(self.layout.screens());
             }
             // a full screen or maximized window keeps its size, resizing
-            // it would take it out of that
-            if let Some(window) = self.window.as_ref().filter(|window| window.fullscreen().is_none() && !window.is_maximized()) {
-                let _ = window.request_inner_size(self.window_size());
+            // it would take it out of that, full screen fits it on leaving
+            match &self.window {
+                Some(window) if window.fullscreen().is_some() => self.resize_after_full_screen = true,
+                Some(window) if !window.is_maximized() => {
+                    let _ = window.request_inner_size(self.window_size());
+                }
+                _ => {}
             }
         }
     }
