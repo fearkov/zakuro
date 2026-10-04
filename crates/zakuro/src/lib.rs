@@ -573,11 +573,13 @@ impl App {
                 }
                 KeyCode::F9 => {
                     self.settings.layout = self.settings.layout.next();
-                    self.apply_settings();
+                    self.settings.save();
+                    self.apply_layout();
                 }
-                KeyCode::F10 => {
+                KeyCode::F10 if self.settings.layout.other_screen() != self.settings.layout => {
                     self.settings.layout = self.settings.layout.other_screen();
-                    self.apply_settings();
+                    self.settings.save();
+                    self.apply_layout();
                 }
                 KeyCode::F11 => self.toggle_fullscreen(),
                 _ => {}
@@ -656,6 +658,11 @@ impl App {
         if let Some(window) = &self.window {
             let full = window.fullscreen().is_some();
             window.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
+            // the layout may have changed meanwhile, which full screen kept
+            // the window's size through
+            if full {
+                let _ = window.request_inner_size(self.window_size());
+            }
         }
     }
 
@@ -671,6 +678,12 @@ impl App {
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
         self.apply_volume();
+        self.apply_layout();
+    }
+
+    /// puts the screens' arrangement and the window scale to use, sizing
+    /// the window to them.
+    fn apply_layout(&mut self) {
         let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
         if scale != self.scale || self.settings.layout != self.layout {
             self.scale = scale;
