@@ -1,6 +1,7 @@
 //! high-level service emulation.
 
 pub mod apt;
+pub mod boss;
 pub mod cecd;
 pub mod err;
 pub mod cfg;
@@ -68,6 +69,7 @@ pub struct ServiceState {
     pub y2r: y2r::Y2rState,
     pub nfc: nfc::NfcState,
     pub cecd: cecd::CecdState,
+    pub boss: boss::BossState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
     pub unimplemented: BTreeMap<(String, u16), u32>,
@@ -104,6 +106,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "frd:u" | "frd:a" => frd::handle(system, &buffer, header),
         "nfc:u" | "nfc:m" => nfc::handle(system, &buffer, header),
         "cecd:u" | "cecd:s" => cecd::handle(system, &buffer, header),
+        "boss:U" | "boss:P" => boss::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 
@@ -121,7 +124,6 @@ fn is_network_service(name: &str) -> bool {
     matches!(
         name,
         "frd:u" | "frd:a"
-            | "boss:U" | "boss:P"
             | "nwm::UDS"
             | "http:C"
             | "ssl:C"
@@ -188,13 +190,13 @@ pub fn unimplemented(system: &mut System, buffer: &CommandBuffer, header: Header
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Config;
 
     /// a system with one running thread, whose TLS holds the command buffer
     /// a request is read from and replied into.
-    fn system_with_thread() -> (System, CommandBuffer) {
+    pub(crate) fn system_with_thread() -> (System, CommandBuffer) {
         let mut system = System::new(Config::default());
         let id = system
             .kernel
