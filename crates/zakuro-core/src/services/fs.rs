@@ -873,9 +873,7 @@ fn directory_command(
             };
             for (i, entry) in entries.iter().enumerate() {
                 let raw = encode_directory_entry(entry);
-                system
-                    .memory
-                    .write_bytes(dest + i as u32 * DIRECTORY_ENTRY_SIZE, &raw);
+                system.write_from_service(dest + i as u32 * DIRECTORY_ENTRY_SIZE, &raw);
             }
             buffer.set(&mut system.memory, 0, Header::new(command, 2, 2).0);
             buffer.set(&mut system.memory, 1, 0);
@@ -1102,13 +1100,13 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             // copying through a temporary keeps the borrow of title from
             // overlapping the mutable borrow of memory.
             let data = slice.to_vec();
-            system.memory.write_bytes(dest, &data);
+            system.write_from_service(dest, &data);
             count as u32
         }
         FileBacking::Host(path) => {
             let mut data = vec![0u8; size as usize];
             let count = host_archive::read_at(&path, offset, &mut data);
-            system.memory.write_bytes(dest, &data[..count]);
+            system.write_from_service(dest, &data[..count]);
             count as u32
         }
         FileBacking::Memory(data) => {
@@ -1117,7 +1115,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             }
             let start = offset as usize;
             let count = (size as usize).min(data.len() - start);
-            system.memory.write_bytes(dest, &data[start..start + count]);
+            system.write_from_service(dest, &data[start..start + count]);
             count as u32
         }
     }

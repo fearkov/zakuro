@@ -697,6 +697,17 @@ impl System {
         self.gpu.sync_memory(&mut guest, addr, len);
     }
 
+    /// writes what a service hands the title, a file it read among them,
+    /// over guest memory, after what the host GPU drew there. on the console
+    /// the drawing was in memory long before, and the title can have put
+    /// the buffer where one it was done drawing to was.
+    pub fn write_from_service(&mut self, addr: u32, data: &[u8]) {
+        if !data.is_empty() {
+            self.sync_gpu(addr, data.len() as u32);
+        }
+        self.memory.write_bytes(addr, data);
+    }
+
     pub fn memory_fill(&mut self, start: u32, end: u32, value: u32, width: u32) {
         let linear_base = self.kernel.linear_base;
         let mut guest = GuestMemory {

@@ -3903,8 +3903,9 @@ impl Hardware {
         let rows = first as usize * row..last as usize * row;
         // what was written over the buffer since the image last matched it
         // came after the drawing and stays, the console's GPU had put its
-        // pixels in memory first. the CPU's writes wait for them, see
-        // guard_writes, a service's do not
+        // pixels in memory first. the CPU's writes and the files services
+        // read have them written back first, see guard_writes, this keeps
+        // what anything else wrote, but for bytes it left as they were
         if s.shadow.len() == bytes.len() {
             let mut now = vec![0u8; rows.len()];
             memory.read(addr + rows.start as u32, &mut now);

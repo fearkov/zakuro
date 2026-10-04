@@ -128,7 +128,7 @@ fn decode(system: &mut System, request: &[u8; MESSAGE]) -> [u8; MESSAGE] {
         }
         let bytes: Vec<u8> = channel.iter().flat_map(|sample| sample.to_le_bytes()).collect();
         let address = super::gsp::physical_to_virtual(system, target);
-        system.memory.write_bytes(address, &bytes);
+        system.write_from_service(address, &bytes);
     }
     let rate = RATES.iter().find(|(hz, _)| *hz == stream.0).map_or(0, |&(_, index)| index);
     put(8, rate);

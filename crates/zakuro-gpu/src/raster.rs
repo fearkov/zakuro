@@ -2678,8 +2678,7 @@ mod tests {
     }
 
     /// memory written after the GPU drew over it by something that does not
-    /// wait for the drawing, a service reading a file into a buffer the
-    /// title is done with, stays when the drawing is written back.
+    /// wait for the drawing stays when the drawing is written back.
     #[cfg(feature = "vulkan")]
     #[test]
     fn writes_after_drawing_survive_the_write_back() {
@@ -2693,6 +2692,29 @@ mod tests {
         let mut start = [0u8; 16];
         memory.read(COLOR, &mut start);
         assert_eq!(start, [0x5A; 16], "what was written after the drawing stays");
+        assert!(pixels(&mut memory)[4..].iter().all(|&p| p == [255, 0, 0, 255]), "and the drawing is the rest");
+    }
+
+    /// a service that has the drawing written back before it writes, as a
+    /// file read does, keeps every byte it wrote, those equal to what memory
+    /// held under the drawing too, when a write of the CPU later asks for
+    /// the drawing again.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn writes_after_the_drawing_came_down_stay() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let registers = target_registers();
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.sync(&mut memory, COLOR, 16).unwrap();
+        // zeros, as memory held before the drawing
+        memory.write(COLOR, &[0; 16]);
+        hardware.sync(&mut memory, COLOR, 8 * 8 * 4).unwrap();
+        let mut start = [0xFFu8; 16];
+        memory.read(COLOR, &mut start);
+        assert_eq!(start, [0; 16], "what the service wrote stays");
         assert!(pixels(&mut memory)[4..].iter().all(|&p| p == [255, 0, 0, 255]), "and the drawing is the rest");
     }
 
