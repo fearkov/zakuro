@@ -48,6 +48,30 @@ pub fn handle(
             _ => false,
         },
 
+        // -- SSL, which works without a network, its connections do not -----
+        "ssl:C" => match command {
+            // Initialize(process id). Pokémon Ultra Sun and Moon set it up
+            // when saving, and stop when it fails
+            0x0001 => {
+                buffer.reply(&mut system.memory, command, &[]);
+                true
+            }
+            // GenerateRandomData(size, buffer)
+            0x0011 => {
+                let size = buffer.get(&mut system.memory, 1).min(0x10_0000);
+                let descriptor = buffer.get(&mut system.memory, 2);
+                let pointer = buffer.get(&mut system.memory, 3);
+                let bytes = random_bytes(system.cpu.cycles, size as usize);
+                system.memory.write_bytes(pointer, &bytes);
+                buffer.set(&mut system.memory, 0, Header::new(command, 1, 2).0);
+                buffer.set(&mut system.memory, 1, 0);
+                buffer.set(&mut system.memory, 2, descriptor);
+                buffer.set(&mut system.memory, 3, pointer);
+                true
+            }
+            _ => false,
+        },
+
         // -- Network daemons ------------------------------------------------
         "ndm:u" => match command {
             // EnterExclusiveState / LeaveExclusiveState / SuspendDaemons /
@@ -120,4 +144,23 @@ pub fn handle(
 
         _ => false,
     }
+}
+
+/// bytes no one can tell from random, the same for the same moment of a run
+/// so that runs repeat, SplitMix64 from the console's clock.
+fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(len + 8);
+    while bytes.len() < len {
+        bytes.extend_from_slice(&next().to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
 }

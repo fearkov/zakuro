@@ -235,6 +235,21 @@ mod tests {
         );
     }
 
+    /// SSL sets itself up on the console, which works offline, Pokémon Ultra
+    /// Sun and Moon stop saving when it does not.
+    #[test]
+    fn ssl_initializes_offline() {
+        let (mut system, buffer) = system_with_thread();
+        // ssl:C Initialize(process id)
+        buffer.set(&mut system.memory, 0, Header::new(0x0001, 0, 2).0);
+        buffer.set(&mut system.memory, 1, 0x20);
+
+        handle_request(&mut system, Target::service("ssl:C".into(), 0));
+
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        assert!(system.services.unimplemented.is_empty());
+    }
+
     /// the friend list lives on the console, asking about it works offline.
     #[test]
     fn friends_answer_offline() {
