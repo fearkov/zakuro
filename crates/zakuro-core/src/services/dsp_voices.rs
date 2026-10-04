@@ -15,9 +15,6 @@ const STATUS_SIZE: u32 = 12;
 const COEFFICIENTS_SIZE: u32 = 32;
 /// region 1 of the shared memory starts this many bytes after region 0.
 pub const REGION_STRIDE: u32 = 0x2_0000;
-/// the longest embedded buffer taken at face value, some titles give the
-/// embedded buffer a nonsensical length.
-const MAX_EMBEDDED_LENGTH: u32 = 44_100;
 
 /// one frame of stereo samples.
 pub type Frame = [[i16; 2]; FRAME_SAMPLES];
@@ -216,6 +213,10 @@ struct Voice {
     position: u32,
     /// what the voice played this frame.
     frame: Frame,
+    /// the buffer ran out on the frame's last sample, so the next one
+    /// waiting follows on from the next frame's first, as on the console,
+    /// rather than after a frame of silence.
+    ran_out_at_frame_end: bool,
 }
 
 impl Default for Voice {
@@ -243,6 +244,7 @@ impl Default for Voice {
             buffer_update: false,
             position: 0,
             frame: [[0; 2]; FRAME_SAMPLES],
+            ran_out_at_frame_end: false,
         }
     }
 }
@@ -326,7 +328,8 @@ impl Voice {
     /// plays one audio frame's worth of input.
     fn play_frame(&mut self, memory: &mut impl SampleMemory) {
         self.frame = [[0; 2]; FRAME_SAMPLES];
-        if self.remaining == 0 {
+        let follows_on = std::mem::take(&mut self.ran_out_at_frame_end) && !self.queue.is_empty();
+        if self.remaining == 0 && !follows_on {
             if self.dequeue(memory) {
                 return;
             }
@@ -355,6 +358,7 @@ impl Voice {
             self.fraction = (input - consumed as f64).max(0.0);
             self.remaining -= consumed;
         }
+        self.ran_out_at_frame_end = self.remaining == 0 && output == FRAME_SAMPLES;
         self.filters.process(&mut self.frame[..output]);
     }
 
@@ -511,9 +515,11 @@ fn parse_config(voice: &mut Voice, memory: &mut Memory, base: u32, coefficients:
     }
     if flags & dirty::PARTIAL_RESET != 0 {
         voice.queue.clear();
+        voice.ran_out_at_frame_end = false;
     }
     if flags & dirty::ENABLE != 0 {
         voice.enabled = memory.read8(base + config::ENABLE) != 0;
+        voice.ran_out_at_frame_end = false;
     }
     if flags & dirty::SYNC_COUNT != 0 {
         voice.sync_count = memory.read16(base + config::SYNC_COUNT);
@@ -604,7 +610,7 @@ fn parse_config(voice: &mut Voice, memory: &mut Memory, base: u32, coefficients:
         let flags2 = memory.read16(base + config::FLAGS2);
         voice.queue.push(Buffer {
             address: read_dsp32(memory, base + config::ADDRESS),
-            length: read_dsp32(memory, base + config::LENGTH).min(MAX_EMBEDDED_LENGTH),
+            length: read_dsp32(memory, base + config::LENGTH),
             format: voice.format,
             stereo: voice.stereo,
             looping: flags2 & 0x2 != 0,
@@ -729,6 +735,22 @@ mod tests {
         assert_eq!(voice.current_buffer_id, 2);
     }
 
+    /// a buffer that ends on a frame's last sample is followed by the next
+    /// with no silent frame between, a stream of them would stutter.
+    #[test]
+    fn queued_buffers_play_on_without_a_gap() {
+        let mut memory = Samples(1000i16.to_le_bytes().repeat(0x8000));
+        let mut voice = voice_with(&[(1, 320), (2, 320)]);
+        voice.play_frame(&mut memory); // starts buffer 1
+        for frame in 0..4 {
+            voice.play_frame(&mut memory);
+            assert!(voice.frame.iter().all(|s| s[0] == 1000), "frame {frame} has a gap");
+        }
+        assert_eq!((voice.current_buffer_id, voice.remaining), (2, 0));
+        voice.play_frame(&mut memory);
+        assert!(!voice.enabled, "and still switches off as soon as it runs out");
+    }
+
     #[test]
     fn a_higher_rate_consumes_input_faster() {
         let mut memory = silence();
@@ -798,6 +820,24 @@ mod tests {
         let samples = decode_adpcm(&frame, 4, &coefficients, &mut history);
         assert_eq!(samples, [101, 103, 106, 106]);
         assert_eq!(history, [106, 106]);
+    }
+
+    /// an embedded buffer plays as long as it says, a sound of a second or
+    /// two is common.
+    #[test]
+    fn an_embedded_buffer_keeps_its_length() {
+        use crate::memory::{MemoryState, Permission};
+        use zakuro_common::memory_map::{DSP_RAM_PADDR, DSP_RAM_SIZE, DSP_RAM_VADDR};
+        let mut system = crate::System::new(crate::Config::default());
+        let memory = &mut system.memory;
+        memory.map(DSP_RAM_VADDR, DSP_RAM_PADDR, DSP_RAM_SIZE, Permission::RW, MemoryState::Static);
+        let base = DSP_RAM_VADDR + 0x4_0000;
+        write_dsp32(memory, base + config::ADDRESS, 0x2000_0000);
+        write_dsp32(memory, base + config::LENGTH, 69_057);
+        memory.write32(base + config::DIRTY, dirty::EMBEDDED_BUFFER);
+        let mut voice = Voice::default();
+        parse_config(&mut voice, memory, base, base + 0x1000);
+        assert_eq!(voice.queue[0].length, 69_057);
     }
 
     #[test]
