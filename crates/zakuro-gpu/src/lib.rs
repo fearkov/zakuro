@@ -410,6 +410,25 @@ impl Gpu {
         // preserve whatever was already there outside the copied rectangle.
         memory.read(output_base, &mut output);
 
+        // halving a tiled RGBA8 buffer into another, which titles do to a
+        // frame every frame for their effects, goes a tile at a time
+        let whole_tiles = [copy_width, copy_height, input_width, output_width].iter().all(|n| n % 8 == 0);
+        if input_format == ColorFormat::Rgba8
+            && output_format == ColorFormat::Rgba8
+            && !input_linear
+            && output_tiled
+            && !flip_vertically
+            && (scale_x, scale_y) == (2, 2)
+            && whole_tiles
+            && copy_width * 2 <= input_width
+            && copy_height * 2 <= input_height
+        {
+            halve_tiles(&input, input_width, &mut output, output_width, (copy_width, copy_height));
+            memory.write(output_base, &output);
+            self.transfers += 1;
+            return;
+        }
+
         let trace_pixels = std::env::var("ZAKURO_TRACE_PIXELS").is_ok();
         let mut distinct = std::collections::HashSet::new();
 
@@ -927,6 +946,30 @@ fn morton(x: u32, y: u32, width: u32, bytes_per_pixel: usize) -> usize {
     format::morton_offset(x, y, width, bytes_per_pixel as u32) as usize
 }
 
+/// the top left of a tiled RGBA8 buffer halved each way into another, size
+/// pixels of the output, each the rounded average of four, as the transfer
+/// does it a pixel at a time. the four follow one another in their tile, and
+/// a tile of the input makes a quarter of one of the output.
+fn halve_tiles(input: &[u8], input_width: u32, output: &mut [u8], output_width: u32, (width, height): (u32, u32)) {
+    for y in (0..height).step_by(8) {
+        for x in (0..width).step_by(8) {
+            let tile = morton(x, y, output_width, 4);
+            for quarter in 0..4 {
+                let (dx, dy) = (quarter & 1, quarter >> 1);
+                let from = morton(x * 2 + dx * 8, y * 2 + dy * 8, input_width, 4);
+                let to = tile + (dx as usize * 16 + dy as usize * 32) * 4;
+                let pixels = input[from..from + 256].as_chunks::<16>().0;
+                for (four, out) in pixels.iter().zip(output[to..to + 64].as_chunks_mut::<4>().0) {
+                    for (channel, value) in out.iter_mut().enumerate() {
+                        let sum: u32 = (0..4).map(|pixel| four[pixel * 4 + channel] as u32).sum();
+                        *value = ((sum + 2) / 4) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// converts a GSP register offset to an index into our external register file.
 fn external_index(gsp_offset: u32) -> Option<usize> {
     // GSP offsets are relative to 0x1EB00000, but the GPU's registers start at
@@ -1007,6 +1050,37 @@ mod tests {
                 gpu.write_internal(memory, renderer, REG_FIXED_ATTRIBUTE_DATA + i, word, 0xF);
             }
         }
+    }
+
+    /// halving tiled RGBA8 a tile at a time gives what averaging each
+    /// pixel's four from their Morton places does.
+    #[test]
+    fn halving_tiles_matches_halving_pixels() {
+        let (input_width, input_height, output_width) = (64u32, 32u32, 48u32);
+        let mut seed = 7u32;
+        let input: Vec<u8> = (0..input_width * input_height * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            })
+            .collect();
+        let size = (32, 16);
+        let mut output = vec![0xAB; (output_width * 16 * 4) as usize];
+        let mut expected = output.clone();
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let at = morton(x, y, output_width, 4);
+                for channel in 0..4 {
+                    let sum: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                        .iter()
+                        .map(|&(dx, dy)| input[morton(x * 2 + dx, y * 2 + dy, input_width, 4) + channel] as u32)
+                        .sum();
+                    expected[at + channel] = ((sum + 2) / 4) as u8;
+                }
+            }
+        }
+        halve_tiles(&input, input_width, &mut output, output_width, size);
+        assert_eq!(output, expected);
     }
 
     #[test]
