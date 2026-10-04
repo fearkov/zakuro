@@ -236,8 +236,8 @@ impl Presenter for GlPresenter {
         }
 
         let (top_viewport, bottom_viewport) = layout(self.window.0, self.window.1, self.arrangement);
-        if !top.is_empty() {
-            self.draw_screen(0, top_viewport);
+        if let Some(viewport) = top_viewport.filter(|_| !top.is_empty()) {
+            self.draw_screen(0, viewport);
         }
         if let Some(viewport) = bottom_viewport.filter(|_| !bottom.is_empty()) {
             self.draw_screen(1, viewport);

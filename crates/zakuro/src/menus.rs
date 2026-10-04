@@ -350,7 +350,9 @@ impl Menus {
                     ui.selectable_value(&mut settings.layout, layout, layout.name());
                 }
             });
-            ui.label(RichText::new("F9 switches them while playing. With the top screen alone there is nothing to touch.").weak());
+            ui.label(
+                RichText::new("F9 switches them while playing, F10 between the top and the bottom screen alone.").weak(),
+            );
             ui.label(RichText::new("The presenter changes the next time Zakuro starts, the 3D with the next game.").weak());
 
             ui.separator();

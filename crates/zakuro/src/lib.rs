@@ -575,6 +575,10 @@ impl App {
                     self.settings.layout = self.settings.layout.next();
                     self.apply_settings();
                 }
+                KeyCode::F10 => {
+                    self.settings.layout = self.settings.layout.other_screen();
+                    self.apply_settings();
+                }
                 KeyCode::F11 => self.toggle_fullscreen(),
                 _ => {}
             }

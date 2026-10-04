@@ -24,16 +24,18 @@ pub enum Screens {
     Stacked,
     SideBySide,
     TopOnly,
+    BottomOnly,
 }
 
 impl Screens {
-    pub const ALL: [Screens; 3] = [Screens::Stacked, Screens::SideBySide, Screens::TopOnly];
+    pub const ALL: [Screens; 4] = [Screens::Stacked, Screens::SideBySide, Screens::TopOnly, Screens::BottomOnly];
 
     pub fn name(self) -> &'static str {
         match self {
             Screens::Stacked => "Top over bottom",
             Screens::SideBySide => "Side by side",
             Screens::TopOnly => "Top screen only",
+            Screens::BottomOnly => "Bottom screen only",
         }
     }
 
@@ -42,6 +44,7 @@ impl Screens {
             Screens::Stacked => ScreenLayout::Stacked,
             Screens::SideBySide => ScreenLayout::SideBySide,
             Screens::TopOnly => ScreenLayout::TopOnly,
+            Screens::BottomOnly => ScreenLayout::BottomOnly,
         }
     }
 
@@ -49,6 +52,15 @@ impl Screens {
     pub fn next(self) -> Screens {
         let at = Screens::ALL.iter().position(|&layout| layout == self).unwrap_or(0);
         Screens::ALL[(at + 1) % Screens::ALL.len()]
+    }
+
+    /// with one screen showing, the other one alone, else the same.
+    pub fn other_screen(self) -> Screens {
+        match self {
+            Screens::TopOnly => Screens::BottomOnly,
+            Screens::BottomOnly => Screens::TopOnly,
+            both => both,
+        }
     }
 }
 

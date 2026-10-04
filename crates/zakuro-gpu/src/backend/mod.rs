@@ -99,6 +99,8 @@ pub enum ScreenLayout {
     SideBySide,
     /// the top screen alone.
     TopOnly,
+    /// the bottom screen alone.
+    BottomOnly,
 }
 
 impl ScreenLayout {
@@ -108,14 +110,14 @@ impl ScreenLayout {
             ScreenLayout::Stacked => (400, 480),
             ScreenLayout::SideBySide => (720, 240),
             ScreenLayout::TopOnly => (400, 240),
+            ScreenLayout::BottomOnly => (320, 240),
         }
     }
 }
 
 /// works out where the screens go inside a window, keeping the 3DS's
-/// aspect ratio and centring them. the bottom screen has no place when only
-/// the top one shows.
-pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout) -> (Viewport, Option<Viewport>) {
+/// aspect ratio and centring them. a screen that does not show has no place.
+pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout) -> (Option<Viewport>, Option<Viewport>) {
     let (total_width, total_height) = arrangement.size();
     let (total_width, total_height) = (total_width as f32, total_height as f32);
 
@@ -123,12 +125,12 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout) 
     let offset_x = (window_width as f32 - total_width * scale) / 2.0;
     let offset_y = (window_height as f32 - total_height * scale) / 2.0;
 
-    let top = Viewport {
+    let top = (arrangement != ScreenLayout::BottomOnly).then_some(Viewport {
         x: offset_x,
         y: offset_y,
         width: 400.0 * scale,
         height: 240.0 * scale,
-    };
+    });
     let bottom = match arrangement {
         // the bottom screen is narrower, so it is centered under the top one.
         ScreenLayout::Stacked => Some(Viewport {
@@ -144,6 +146,12 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout) 
             height: 240.0 * scale,
         }),
         ScreenLayout::TopOnly => None,
+        ScreenLayout::BottomOnly => Some(Viewport {
+            x: offset_x,
+            y: offset_y,
+            width: 320.0 * scale,
+            height: 240.0 * scale,
+        }),
     };
     (top, bottom)
 }
@@ -182,7 +190,7 @@ mod tests {
     fn layout_keeps_the_aspect_ratio_and_centers() {
         // a window exactly 400x480 needs no scaling or offset.
         let (top, bottom) = layout(400, 480, ScreenLayout::Stacked);
-        let bottom = bottom.unwrap();
+        let (top, bottom) = (top.unwrap(), bottom.unwrap());
         assert_eq!(top.x, 0.0);
         assert_eq!(top.y, 0.0);
         assert_eq!(top.width, 400.0);
@@ -191,12 +199,12 @@ mod tests {
         assert_eq!(bottom.width, 320.0);
 
         // doubling both dimensions doubles the scale.
-        let (top, _) = layout(800, 960, ScreenLayout::Stacked);
+        let top = layout(800, 960, ScreenLayout::Stacked).0.unwrap();
         assert_eq!(top.width, 800.0);
         assert_eq!(top.height, 480.0);
 
         // a window that is too wide letterboxes horizontally.
-        let (top, _) = layout(1000, 480, ScreenLayout::Stacked);
+        let top = layout(1000, 480, ScreenLayout::Stacked).0.unwrap();
         assert_eq!(top.width, 400.0);
         assert_eq!(top.x, 300.0);
     }
@@ -205,7 +213,7 @@ mod tests {
     fn the_other_layouts_place_the_screens_their_way() {
         // side by side, the bottom screen starts where the top one ends
         let (top, bottom) = layout(1440, 480, ScreenLayout::SideBySide);
-        let bottom = bottom.unwrap();
+        let (top, bottom) = (top.unwrap(), bottom.unwrap());
         assert_eq!((top.x, top.y, top.width), (0.0, 0.0, 800.0));
         assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (800.0, 0.0, 640.0, 480.0));
 
@@ -213,6 +221,13 @@ mod tests {
         // one centers it
         let (top, bottom) = layout(800, 960, ScreenLayout::TopOnly);
         assert!(bottom.is_none());
+        let top = top.unwrap();
         assert_eq!((top.x, top.y, top.width, top.height), (0.0, 240.0, 800.0, 480.0));
+
+        // and so does the bottom screen alone, a wider window centering it
+        let (top, bottom) = layout(800, 480, ScreenLayout::BottomOnly);
+        assert!(top.is_none());
+        let bottom = bottom.unwrap();
+        assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (80.0, 0.0, 640.0, 480.0));
     }
 }

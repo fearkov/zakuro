@@ -690,7 +690,7 @@ impl VulkanPresenter {
             );
 
             let (top, bottom) = layout(self.extent.width, self.extent.height, self.arrangement);
-            for (index, viewport) in [Some(top), bottom].into_iter().enumerate() {
+            for (index, viewport) in [top, bottom].into_iter().enumerate() {
                 let Some(viewport) = viewport else { continue };
                 let (descriptor, crop) = match sources[index] {
                     Source::Nothing => continue,
