@@ -258,7 +258,7 @@ impl Surface {
     }
 
     /// has the CPU's reads of the rows drawn ask for them first, until
-    /// guest memory gets them.
+    /// guest memory gets them. draw does it for depth buffers alone.
     fn guard<M: GpuMemory>(&mut self, memory: &mut M) {
         let Some((start, end)) = self.dirty else { return };
         if self.guarded.is_some_and(|(from, to)| from <= start && end <= to) {
@@ -2711,11 +2711,14 @@ impl Hardware {
         }
         if color_mask != 0 {
             self.surfaces[color].drew(rows);
-            self.surfaces[color].guard(memory);
         }
         if let Some(depth) = depth {
             if depth_write || (stencil_test && writable) {
                 self.surfaces[depth].drew(rows);
+                // only depth, which titles read to tell what is in view.
+                // Super Mario 3D Land reads small color buffers back on
+                // loading a course and stalls on what the GPU drew there,
+                // it goes on with them as memory holds them
                 self.surfaces[depth].guard(memory);
             }
         }
@@ -2893,7 +2896,25 @@ impl Hardware {
     /// is about to read or write, what the GPU drew there comes down, and
     /// the next draw looks at the memory again.
     pub(crate) fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
-        let overlapping: Vec<usize> = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].overlaps(addr, len)).collect();
+        self.sync_where(memory, addr, len, |_| true)
+    }
+
+    /// the same over the depth buffers alone, for the CPU reading where a
+    /// depth buffer was drawn. the color buffers there it reads as memory
+    /// holds them, see draw, even over memory a depth buffer had before.
+    pub(crate) fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+        self.sync_where(memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_)))
+    }
+
+    fn sync_where<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        addr: u32,
+        len: u32,
+        kept: impl Fn(&Surface) -> bool,
+    ) -> Result<(), String> {
+        let overlapping: Vec<usize> =
+            (0..self.surfaces.len()).filter(|&i| kept(&self.surfaces[i]) && self.surfaces[i].overlaps(addr, len)).collect();
         let dirty: Vec<usize> = overlapping.iter().copied().filter(|&i| self.surfaces[i].dirty_overlaps(addr, len)).collect();
         self.write_back(memory, dirty)?;
         for i in overlapping {
@@ -2966,7 +2987,6 @@ impl Hardware {
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
         self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
         self.surfaces[target].changed();
-        self.surfaces[target].guard(memory);
         self.capture(target)?;
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer

@@ -967,7 +967,7 @@ unsafe fn sync_for_cpu(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr
         addr.wrapping_add(len)
     );
     let gpu = unsafe { &mut *(gpu as *mut Gpu) };
-    gpu.sync_memory(&mut GuestMemory { memory, linear_base }, addr, len);
+    gpu.sync_depth(&mut GuestMemory { memory, linear_base }, addr, len);
 }
 
 impl Drop for System {

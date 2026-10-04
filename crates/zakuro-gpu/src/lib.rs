@@ -632,6 +632,20 @@ impl Gpu {
         let _ = (memory, addr, len);
     }
 
+    /// makes guest memory hold what the host GPU drew of the depth buffers
+    /// over a range, for the CPU reading there. the CPU reads color buffers
+    /// as memory holds them.
+    pub fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            if let Err(error) = hardware.sync_depth(memory, addr, len) {
+                log::error!("the GPU could not write back a buffer, {error}");
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (memory, addr, len);
+    }
+
     fn run_command_list<M: GpuMemory>(
         &mut self,
         memory: &mut M,

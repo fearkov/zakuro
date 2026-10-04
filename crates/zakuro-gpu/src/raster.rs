@@ -2573,8 +2573,9 @@ mod tests {
         }
     }
 
-    /// the GPU has the CPU's reads of the rows it draws ask for them first,
-    /// once until guest memory gets them, and again after.
+    /// the GPU has the CPU's reads of the depth it draws ask for it first,
+    /// once until guest memory gets it, and again after. the color buffer
+    /// the same draws go to is read as memory holds it.
     #[cfg(feature = "vulkan")]
     #[test]
     fn the_gpu_guards_what_it_draws() {
@@ -2591,18 +2592,32 @@ mod tests {
             }
         }
         let Ok(hardware) = hardware::Hardware::new() else { return };
-        let registers = target_registers();
+        let mut registers = target_registers();
+        // depth written, with no test
+        registers[REG_DEPTH_COLOR_MASK] |= 1 << 12;
         let mut memory = ConsoleMemory::default();
         let mut guarded = Guarded(&mut memory, Vec::new());
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
-        // the whole 8 by 8 color buffer, of four bytes a pixel
-        assert_eq!(guarded.1, [(COLOR, 8 * 8 * 4)]);
+        // the whole 8 by 8 depth buffer, of four bytes a pixel
+        assert_eq!(guarded.1, [(DEPTH, 8 * 8 * 4)]);
         rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
         assert_eq!(guarded.1.len(), 1);
         resources.hardware.as_mut().unwrap().flush(&mut guarded).unwrap();
-        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
+        // depth memory the next draw writes over
+        guarded.0.write(DEPTH, &[0xFF; 8 * 8 * 4]);
+        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, GREEN));
         assert_eq!(guarded.1.len(), 2);
+
+        // what the CPU's read brings back is the depth, the color stays as
+        // memory had it, red from the flush
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.sync_depth(&mut memory, COLOR, DEPTH + 8 * 8 * 4 - COLOR).unwrap();
+        assert!(pixels(&mut memory).iter().all(|&p| p == [255, 0, 0, 255]));
+        let mut depth = [0u8; 8 * 8 * 4];
+        memory.read(DEPTH, &mut depth);
+        // the stencil byte stays, nothing wrote it
+        assert!(depth.as_chunks::<4>().0.iter().all(|sample| sample[..3] != [0xFF; 3]), "the depth drawn came back");
     }
 
     /// vertices the GPU shades come out as the CPU shades them, clipped and
