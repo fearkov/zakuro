@@ -675,6 +675,20 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
+        // SetThisSaveDataSecureValue(slot, value) / GetThisSaveDataSecureValue
+        // (slot) -> exists, on a game card, value. the value only keeps a
+        // save from being swapped for an older one, which nothing here
+        // checks, and a title finding none takes the save as it is, the
+        // Pokémon games that set one when saving among them
+        0x086E => {
+            buffer.reply(&mut system.memory, command, &[]);
+            true
+        }
+        0x086F => {
+            buffer.reply(&mut system.memory, command, &[0, 0, 0, 0]);
+            true
+        }
+
         _ => false,
     }
 }
