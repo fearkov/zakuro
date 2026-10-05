@@ -4,14 +4,15 @@ use zakuro_common::VAddr;
 
 use super::thread::ThreadId;
 
-/// how an event behaves once a waiter picks it up.
+/// how an event or a timer behaves once a waiter picks it up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetType {
-    /// stays signalled until svcClearEvent.
-    OneShot,
     /// releases exactly one waiter and clears itself.
+    OneShot,
+    /// stays signalled until it is cleared.
     Sticky,
-    /// timer-only, fires repeatedly.
+    /// releases what waits on it when signalled and clears, lost when
+    /// nothing waits.
     Pulse,
 }
 

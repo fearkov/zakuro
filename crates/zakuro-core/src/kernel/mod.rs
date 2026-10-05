@@ -59,6 +59,9 @@ pub struct Kernel {
     /// the timers, gone through for the next one due instead of every
     /// object, gathered again each frame.
     pub timers: Vec<ObjectId>,
+    /// pulse events and timers signalled since the last schedule, which
+    /// clear once it released whatever waited on them.
+    pub pulsed: Vec<ObjectId>,
 }
 
 impl Kernel {
@@ -81,6 +84,7 @@ impl Kernel {
             thread_objects: std::collections::HashMap::new(),
             process_object: None,
             timers: Vec::new(),
+            pulsed: Vec::new(),
         }
     }
 
@@ -189,8 +193,16 @@ impl Kernel {
     /// wakes anything whose wait has been satisfied, then switches to the
     /// highest-priority runnable thread.
     pub fn schedule(&mut self, cpu: &mut Cpu, tick: u64) -> bool {
+        self.fire_timers(tick);
         for id in 0..self.threads.len() as ThreadId {
             self.try_satisfy_wait(id, tick);
+        }
+        for id in std::mem::take(&mut self.pulsed) {
+            match self.objects.get_mut(id) {
+                Some(KObject::Event(event)) => event.signaled = false,
+                Some(KObject::Timer(timer)) => timer.signaled = false,
+                _ => {}
+            }
         }
 
         if let Some(current) = self.current_thread {
@@ -299,6 +311,63 @@ impl Kernel {
                 t.is_runnable() && t.priority == best
             })
             .map(|index| index as ThreadId)
+    }
+
+    /// fires the timers whose time has come, once however many periods went
+    /// by, and arms the periodic ones again for their first period after
+    /// tick, counted from when they came due as the console counts. a pulse
+    /// releases what waits on it then, and clears after. whether any fired.
+    fn fire_timers(&mut self, tick: u64) -> bool {
+        let mut fired = false;
+        for &id in &self.timers {
+            if let Some(KObject::Timer(timer)) = self.objects.get_mut(id) {
+                let Some(at) = timer.fire_at.filter(|&at| at <= tick) else { continue };
+                timer.signaled = true;
+                timer.fire_at = (timer.interval > 0)
+                    .then(|| at.saturating_add(timer.interval.saturating_mul((tick - at) / timer.interval + 1)));
+                if timer.reset_type == ResetType::Pulse {
+                    self.pulsed.push(id);
+                }
+                fired = true;
+            }
+        }
+        fired
+    }
+
+    /// fires what came due before a title sets, clears, cancels or waits on
+    /// a timer, as the console's interrupt had by then. a pulse nobody waits
+    /// on is lost.
+    pub(crate) fn catch_up_timers(&mut self, tick: u64) {
+        if !self.fire_timers(tick) {
+            return;
+        }
+        self.reschedule_pending = true;
+        let threads = &self.threads;
+        let objects = &mut self.objects;
+        self.pulsed.retain(|&id| {
+            let waited = threads.iter().any(|t| t.status == ThreadStatus::WaitSync && t.wait_objects.contains(&id));
+            if !waited {
+                if let Some(KObject::Timer(timer)) = objects.get_mut(id) {
+                    timer.signaled = false;
+                }
+            }
+            waited
+        });
+    }
+
+    /// the earliest tick a blocked thread or a timer wants the scheduler at.
+    /// a timer only matters then to a thread waiting on it, the rest fire
+    /// when the scheduler next looks or the title next touches them.
+    pub fn next_event(&self) -> Option<u64> {
+        let blocked = || self.threads.iter().filter(|t| t.status.is_blocked());
+        let threads = blocked().filter_map(|t| t.wakeup_at);
+        let timers = self.timers.iter().filter(|&&id| blocked().any(|t| t.wait_objects.contains(&id))).filter_map(|&id| {
+            match self.objects.get(id) {
+                Some(KObject::Timer(timer)) => timer.fire_at,
+                _ => None,
+            }
+        });
+        threads.chain(timers).min()
     }
 
     /// checks one blocked thread's condition and unblocks it if satisfied.
@@ -484,7 +553,16 @@ impl Kernel {
     /// signals an event, waking anything waiting on it at the next scheduling
     /// point.
     pub fn signal_event(&mut self, object: ObjectId) {
+        let waited = self.threads.iter().any(|t| t.status == ThreadStatus::WaitSync && t.wait_objects.contains(&object));
         if let Some(KObject::Event(event)) = self.objects.get_mut(object) {
+            // a pulse wakes what waits on it now, and is gone after, lost
+            // when nothing does
+            if event.reset_type == ResetType::Pulse {
+                if !waited {
+                    return;
+                }
+                self.pulsed.push(object);
+            }
             event.signaled = true;
             self.reschedule_pending = true;
         }

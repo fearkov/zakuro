@@ -611,19 +611,21 @@ fn create_timer(system: &mut System) {
 }
 
 /// svcSetTimer, r0 = handle, r2:r3 = initial delay, r1:r4 = interval, both
-/// in nanoseconds.
+/// in nanoseconds, a negative one taken as zero.
 fn set_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
-    let initial = (system.cpu.regs[2] as u64) | ((system.cpu.regs[3] as u64) << 32);
-    let interval = (system.cpu.regs[1] as u64) | ((system.cpu.regs[4] as u64) << 32);
+    let nanos = |low: u32, high: u32| ((low as u64) | ((high as u64) << 32)) as i64;
+    let initial = nanos(system.cpu.regs[2], system.cpu.regs[3]).max(0) as u64;
+    let interval = nanos(system.cpu.regs[1], system.cpu.regs[4]).max(0) as u64;
     let now = system.cpu.cycles;
+    system.kernel.catch_up_timers(now);
 
     let Some(object) = system.kernel.resolve(handle) else {
         system.cpu.regs[0] = invalid_handle(system, handle, "svcSetTimer");
         return;
     };
     if let Some(KObject::Timer(timer)) = system.kernel.objects.get_mut(object) {
-        timer.fire_at = Some(now + nanos_to_ticks(initial));
+        timer.fire_at = Some(now.saturating_add(nanos_to_ticks(initial)));
         timer.interval = nanos_to_ticks(interval);
         timer.signaled = false;
         system.cpu.regs[0] = 0;
@@ -634,6 +636,7 @@ fn set_timer(system: &mut System) {
 
 fn cancel_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
+    system.kernel.catch_up_timers(system.cpu.cycles);
     if let Some(object) = system.kernel.resolve(handle) {
         if let Some(KObject::Timer(timer)) = system.kernel.objects.get_mut(object) {
             timer.fire_at = None;
@@ -644,6 +647,7 @@ fn cancel_timer(system: &mut System) {
 
 fn clear_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
+    system.kernel.catch_up_timers(system.cpu.cycles);
     if let Some(object) = system.kernel.resolve(handle) {
         if let Some(KObject::Timer(timer)) = system.kernel.objects.get_mut(object) {
             timer.signaled = false;
@@ -666,7 +670,7 @@ fn create_address_arbiter(system: &mut System) {
 }
 
 /// svcArbitrateAddress, r0 = handle, r1 = address, r2 = type, r3 = value,
-/// r4 = timeout in nanoseconds.
+/// r4:r5 = timeout in nanoseconds, a negative one waiting for good.
 fn arbitrate_address(system: &mut System) {
     let handle = system.cpu.regs[0];
     let address = system.cpu.regs[1];
@@ -675,7 +679,7 @@ fn arbitrate_address(system: &mut System) {
         return;
     };
     let value = system.cpu.regs[3] as i32;
-    let timeout_nanos = system.cpu.regs[4] as u64;
+    let timeout_nanos = ((system.cpu.regs[4] as u64) | ((system.cpu.regs[5] as u64) << 32)) as i64;
 
     let Some(object) = system.kernel.resolve(handle) else {
         system.cpu.regs[0] = invalid_handle(system, handle, "svcArbitrateAddress");
@@ -748,8 +752,8 @@ fn arbitrate_address(system: &mut System) {
     let thread = system.kernel.thread_mut(thread_id);
     thread.clear_wait();
     thread.wait_address = Some(address);
-    thread.wakeup_at = if kind.has_timeout() {
-        Some(now + nanos_to_ticks(timeout_nanos))
+    thread.wakeup_at = if kind.has_timeout() && timeout_nanos >= 0 {
+        Some(now.saturating_add(nanos_to_ticks(timeout_nanos as u64)))
     } else {
         None
     };
@@ -761,6 +765,7 @@ fn arbitrate_address(system: &mut System) {
 /// svcWaitSynchronization1, r0 = handle, r2:r3 = timeout in nanoseconds.
 fn wait_synchronization1(system: &mut System) {
     let handle = system.cpu.regs[0];
+    system.kernel.catch_up_timers(system.cpu.cycles);
     let timeout = (system.cpu.regs[2] as u64) | ((system.cpu.regs[3] as u64) << 32);
     let signed_timeout = timeout as i64;
 
@@ -796,6 +801,7 @@ fn wait_synchronization1(system: &mut System) {
 /// svcWaitSynchronizationN, r0 = timeout low, r1 = handle array, r2 = count,
 /// r3 = wait-for-all, r4 = timeout high.
 fn wait_synchronization_n(system: &mut System) {
+    system.kernel.catch_up_timers(system.cpu.cycles);
     let handles_ptr = system.cpu.regs[1];
     let count = system.cpu.regs[2];
     let wait_all = system.cpu.regs[3] != 0;
