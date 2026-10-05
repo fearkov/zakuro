@@ -24,11 +24,7 @@ layout(std430, set = 0, binding = 6) readonly buffer Shading {
     ivec4 integers[4];
     uint bools;
     uint entry;
-    // the vec4s each vertex takes in the inputs
-    uint stride;
-    uint pad;
-    // the slot each input register reads in a vertex, or none
-    uint slots[16];
+    uint pad[2];
     // per semantic component, the output register times four plus the
     // component, or none, position xyzw, color rgba, texture coordinates
     // 0, 1 and 2 uv, quaternion xyzw and view xyz
@@ -37,15 +33,25 @@ layout(std430, set = 0, binding = 6) readonly buffer Shading {
     vec4 depth_map;
     // left, bottom, width and height
     vec4 viewport;
+    // per input register, the byte its attribute starts at in the first
+    // vertex, the bytes from a vertex to the next, and the attribute's
+    // offset in its vertex | type << 8 | components << 16, no components
+    // reading the default alone
+    uvec4 attributes[16];
+    // what each register reads where its attribute gives no component
+    vec4 defaults[16];
 };
 
+// the vertex arrays as guest memory holds them, or the registers the CPU
+// worked out, as floats
 layout(std430, set = 0, binding = 7) readonly buffer Inputs {
-    vec4 inputs[];
+    uint vertex_bytes[];
 };
 
 const uint NONE = 0xFFFFFFFFu;
 const int BLOCKS = 16;
 
+vec4 inputs[16];
 vec4 temps[16];
 vec4 outputs[16];
 ivec3 address;
@@ -83,16 +89,69 @@ float dot4(vec4 a, vec4 b) {
     return dot3(a, b) + multiply(a.w, b.w);
 }
 
-vec4 input_register(uint register) {
-    uint slot = slots[register];
-    return slot == NONE ? vec4(0.0) : inputs[uint(gl_VertexIndex) * stride + slot];
+// a byte of the arrays
+uint byte_at(uint at) {
+    return (vertex_bytes[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu;
+}
+
+// the little-endian word from a byte of the arrays on, which can run into
+// the word after
+uint word_at(uint at) {
+    uint shift = (at & 3u) * 8u;
+    uint low = vertex_bytes[at >> 2u];
+    if (shift == 0u) {
+        return low;
+    }
+    return (low >> shift) | (vertex_bytes[(at >> 2u) + 1u] << (32u - shift));
+}
+
+// a component of a type, a signed byte, a byte, a signed short or a
+// float, whose bits come as they are
+float component(uint at, uint type) {
+    if (type == 0u) {
+        float value = float(byte_at(at));
+        return value >= 128.0 ? value - 256.0 : value;
+    }
+    if (type == 1u) {
+        return float(byte_at(at));
+    }
+    if (type == 2u) {
+        float value = float(word_at(at) & 0xFFFFu);
+        return value >= 32768.0 ? value - 65536.0 : value;
+    }
+    return uintBitsToFloat(word_at(at));
+}
+
+// an input register of this vertex, its attribute's components over the
+// default
+vec4 input_register(uint r) {
+    uvec4 field = attributes[r];
+    vec4 value = defaults[r];
+    uint count = field.z >> 16u;
+    if (count == 0u) {
+        return value;
+    }
+    uint type = (field.z >> 8u) & 0xFFu;
+    uint size = type == 3u ? 4u : (type == 2u ? 2u : 1u);
+    uint at = field.x + uint(gl_VertexIndex) * field.y + (field.z & 0xFFu);
+    value.x = component(at, type);
+    if (count > 1u) {
+        value.y = component(at + size, type);
+    }
+    if (count > 2u) {
+        value.z = component(at + 2u * size, type);
+    }
+    if (count > 3u) {
+        value.w = component(at + 3u * size, type);
+    }
+    return value;
 }
 
 // a register's value, the wide ones reaching the uniforms, offset by an
 // address register when index says so
 vec4 source(uint register, uint index) {
     if (register < 0x10u) {
-        return input_register(register);
+        return inputs[register];
     }
     if (register < 0x20u) {
         return temps[register - 0x10u];
@@ -344,6 +403,10 @@ float semantic(uint which, float missing) {
 }
 
 void main() {
+    // each input register worked out once, operands read them many times
+    for (uint r = 0u; r < 16u; r++) {
+        inputs[r] = input_register(r);
+    }
     for (int i = 0; i < 16; i++) {
         temps[i] = vec4(0.0, 0.0, 0.0, 1.0);
         outputs[i] = vec4(0.0);

@@ -175,15 +175,10 @@ impl<'a> Translator<'a> {
             out.push_str(BLOCKS);
         }
         out.push_str("void run() {\n");
-        // the inputs the code reads, each once, where stage_shading packed
-        // them, a vertex's read registers in order
-        let stride = self.packed.count_ones();
-        if self.read != 0 {
-            let _ = writeln!(out, "    uint base = uint(gl_VertexIndex) * {stride}u;");
-        }
+        // the inputs the code reads, each worked out once from the arrays
+        // the way the draw's attributes say
         for register in (0..16).filter(|register| self.read & (1 << register) != 0) {
-            let slot = (self.packed & ((1u16 << register) - 1)).count_ones();
-            let _ = writeln!(out, "    vec4 v{register} = inputs[base + {slot}u];");
+            let _ = writeln!(out, "    vec4 v{register} = input_register({register}u);");
         }
         out.push_str(&run);
         out.push_str("}\n\n");
@@ -709,16 +704,16 @@ layout(std430, set = 0, binding = 6) readonly buffer Shading {
     ivec4 integers[4];
     uint bools;
     uint entry;
-    uint stride;
-    uint pad;
-    uint slots[16];
+    uint pad[2];
     uint semantics[24];
     vec4 depth_map;
     vec4 viewport;
+    uvec4 attributes[16];
+    vec4 defaults[16];
 };
 
 layout(std430, set = 0, binding = 7) readonly buffer Inputs {
-    vec4 inputs[];
+    uint vertex_bytes[];
 };
 
 vec4 temps[16];
@@ -749,6 +744,57 @@ float dot4(vec4 a, vec4 b) {
 
 vec4 uniform_at(int index) {
     return index >= 0 && index < 96 ? floats[index] : vec4(0.0);
+}
+
+uint byte_at(uint at) {
+    return (vertex_bytes[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu;
+}
+
+uint word_at(uint at) {
+    uint shift = (at & 3u) * 8u;
+    uint low = vertex_bytes[at >> 2u];
+    if (shift == 0u) {
+        return low;
+    }
+    return (low >> shift) | (vertex_bytes[(at >> 2u) + 1u] << (32u - shift));
+}
+
+float component(uint at, uint type) {
+    if (type == 0u) {
+        float value = float(byte_at(at));
+        return value >= 128.0 ? value - 256.0 : value;
+    }
+    if (type == 1u) {
+        return float(byte_at(at));
+    }
+    if (type == 2u) {
+        float value = float(word_at(at) & 0xFFFFu);
+        return value >= 32768.0 ? value - 65536.0 : value;
+    }
+    return uintBitsToFloat(word_at(at));
+}
+
+vec4 input_register(uint r) {
+    uvec4 field = attributes[r];
+    vec4 value = defaults[r];
+    uint count = field.z >> 16u;
+    if (count == 0u) {
+        return value;
+    }
+    uint type = (field.z >> 8u) & 0xFFu;
+    uint size = type == 3u ? 4u : (type == 2u ? 2u : 1u);
+    uint at = field.x + uint(gl_VertexIndex) * field.y + (field.z & 0xFFu);
+    value.x = component(at, type);
+    if (count > 1u) {
+        value.y = component(at + size, type);
+    }
+    if (count > 2u) {
+        value.z = component(at + 2u * size, type);
+    }
+    if (count > 3u) {
+        value.w = component(at + 3u * size, type);
+    }
+    return value;
 }
 
 "#;

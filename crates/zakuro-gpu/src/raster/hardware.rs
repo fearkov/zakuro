@@ -78,9 +78,10 @@ const TABLES_SIZE: u64 = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COL
 /// a shader program and its operand descriptors.
 const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
 /// the words of what a vertex shader reads besides its program, the float
-/// uniforms, the integer ones, the bools, the entry point, the inputs'
-/// stride and slots, the semantics, the depth map and the viewport.
-const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 16 + 24 + 4 + 4;
+/// uniforms, the integer ones, the bools and the entry point, the
+/// semantics, the depth map, the viewport, and where each input register
+/// finds its attribute and what it reads without one.
+const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 24 + 4 + 4 + 16 * 4 + 16 * 4;
 const SHADING_SIZE: u64 = (SHADING_WORDS * 4) as u64;
 /// a semantic no output register carries, which takes its default.
 pub(super) const MISSING: u32 = u32::MAX;
@@ -144,8 +145,7 @@ pub(super) enum Geometry<'a> {
 /// vertices the GPU runs the vertex shader over.
 pub(super) struct Shading<'a> {
     pub(super) unit: &'a ShaderUnit,
-    /// each vertex's input registers.
-    pub(super) inputs: &'a [[Vec4; INPUT_REGISTERS]],
+    pub(super) inputs: Inputs<'a>,
     /// three inputs a triangle.
     pub(super) indices: &'a [u32],
     /// where each varying is in the output registers.
@@ -154,6 +154,39 @@ pub(super) struct Shading<'a> {
     pub(super) viewport: (f32, f32, f32, f32),
     /// the face culling register.
     pub(super) cull: u32,
+}
+
+/// a draw's input registers, as the vertex shader gets them.
+#[derive(Clone, Copy)]
+pub(super) enum Inputs<'a> {
+    /// each vertex's registers, worked out on the CPU.
+    Decoded(&'a [[Vec4; INPUT_REGISTERS]]),
+    /// the vertex arrays as guest memory holds them, the shader working
+    /// out each vertex's registers itself.
+    Raw(&'a RawInputs),
+}
+
+/// a draw's vertex arrays for the GPU to decode.
+pub(super) struct RawInputs {
+    /// each array's bytes from the first vertex the draw uses to the last,
+    /// as an address and a length in one piece of host memory.
+    pub(super) arrays: Vec<(u32, u32)>,
+    /// for each input register, the attribute an array gives it.
+    pub(super) fields: [Option<RawField>; INPUT_REGISTERS],
+    /// what each register reads where no attribute gives a component.
+    pub(super) defaults: [Vec4; INPUT_REGISTERS],
+}
+
+/// where an attribute is in its array, and what it is.
+#[derive(Clone, Copy)]
+pub(super) struct RawField {
+    pub(super) array: usize,
+    /// from one vertex to the next, and from a vertex's start, in bytes.
+    pub(super) stride: u32,
+    pub(super) offset: u32,
+    /// signed byte, byte, signed short or float, and how many components.
+    pub(super) ty: u32,
+    pub(super) count: u32,
 }
 
 fn vk_error(what: &'static str) -> impl Fn(vk::Result) -> String {
@@ -2557,7 +2590,7 @@ impl Hardware {
     /// copies what the vertex shader reads into the batch, and says where
     /// the program, the rest of what it reads, the inputs and the indices
     /// went.
-    fn stage_shading(&mut self, shading: &Shading, depth_map: DepthMap) -> Result<[(u64, u64); 4], String> {
+    fn stage_shading<M: GpuMemory>(&mut self, memory: &mut M, shading: &Shading, depth_map: DepthMap) -> Result<[(u64, u64); 4], String> {
         let unit = shading.unit;
         let fingerprint = unit.fingerprint();
         let program = match self.programs.get(&fingerprint) {
@@ -2573,41 +2606,80 @@ impl Hardware {
             }
         };
 
-        // only the input registers the program reads go
+        // only the input registers the program reads are worked out, the
+        // others read zero. for each, the byte its attribute starts at in
+        // the first vertex, the bytes from one vertex to the next, and
+        // offset | type << 8 | count << 16, no count reading the default
         let read = unit.inputs_read();
         let registers: Vec<usize> = (0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0).collect();
-        let mut slots = [MISSING; INPUT_REGISTERS];
-        for (slot, &register) in registers.iter().enumerate() {
-            slots[register] = slot as u32;
-        }
+        let mut attributes = [[0u32; 4]; INPUT_REGISTERS];
+        let mut defaults = [crate::shader::ZERO; INPUT_REGISTERS];
+        let mut starts = Vec::new();
+        let input_bytes = match shading.inputs {
+            Inputs::Decoded(decoded) => {
+                // the registers a vertex reads in turn, four floats each
+                let stride = registers.len() as u32 * 16;
+                for (slot, &register) in registers.iter().enumerate() {
+                    attributes[register] = [0, stride, (slot as u32 * 16) | 3 << 8 | 4 << 16, 0];
+                }
+                ((decoded.len() * registers.len()).max(1) * 16) as u64
+            }
+            Inputs::Raw(raw) => {
+                // each array from a word on, and a word after the last, a
+                // value can run into the word after its own
+                let mut total = 0;
+                for &(_, len) in &raw.arrays {
+                    starts.push(total);
+                    total += len.div_ceil(4) * 4;
+                }
+                for &register in &registers {
+                    defaults[register] = raw.defaults[register];
+                    if let Some(field) = raw.fields[register] {
+                        let format = field.offset | field.ty << 8 | field.count << 16;
+                        attributes[register] = [starts[field.array], field.stride, format, 0];
+                    }
+                }
+                total as u64 + 4
+            }
+        };
         let mut words = Vec::with_capacity(SHADING_WORDS);
         words.extend(unit.float_uniforms.iter().flatten().map(|value| value.to_bits()));
         for [count, start, step, _] in unit.int_uniforms {
             words.extend([count as u32, start as u32, step as i8 as u32, 0]);
         }
-        words.extend([unit.bool_uniforms as u32, unit.entry_point, registers.len() as u32, 0]);
-        words.extend(slots);
+        words.extend([unit.bool_uniforms as u32, unit.entry_point, 0, 0]);
         words.extend(shading.semantics);
         words.extend([depth_map.scale.to_bits(), depth_map.offset.to_bits(), 0, 0]);
         let (x, y, width, height) = shading.viewport;
         words.extend([x, y, width, height].map(f32::to_bits));
+        words.extend(attributes.iter().flatten());
+        words.extend(defaults.iter().flatten().map(|value| value.to_bits()));
         debug_assert_eq!(words.len(), SHADING_WORDS);
         let uniforms = self.stage(SHADING_SIZE, self.storage_alignment)?;
         for (out, word) in self.ring(uniforms, SHADING_SIZE).as_chunks_mut::<4>().0.iter_mut().zip(&words) {
             *out = word.to_le_bytes();
         }
 
-        let input_bytes = ((shading.inputs.len() * registers.len()).max(1) * 16) as u64;
         let inputs = self.stage(input_bytes, self.storage_alignment)?;
-        let staging = self.ring(inputs, input_bytes);
-        // the inner loop copies a register at a time, simple enough to run
-        // at memory speed, a vertex can have thousands of them
-        let mut out = staging.as_chunks_mut::<16>().0.iter_mut();
-        for input in shading.inputs {
-            for &register in &registers {
-                let Some(slot) = out.next() else { break };
-                let [x, y, z, w] = input[register].map(f32::to_le_bytes);
-                *slot = [x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], w[0], w[1], w[2], w[3]];
+        match shading.inputs {
+            Inputs::Decoded(decoded) => {
+                let staging = self.ring(inputs, input_bytes);
+                // the inner loop copies a register at a time, simple enough to
+                // run at memory speed, a vertex can have thousands of them
+                let mut out = staging.as_chunks_mut::<16>().0.iter_mut();
+                for input in decoded {
+                    for &register in &registers {
+                        let Some(slot) = out.next() else { break };
+                        let [x, y, z, w] = input[register].map(f32::to_le_bytes);
+                        *slot = [x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], w[0], w[1], w[2], w[3]];
+                    }
+                }
+            }
+            Inputs::Raw(raw) => {
+                for (&(addr, len), &start) in raw.arrays.iter().zip(&starts) {
+                    let bytes = memory.slice(addr, len as usize).ok_or("a vertex array is not in one piece")?;
+                    self.ring(inputs + start as u64, len as u64).copy_from_slice(bytes);
+                }
             }
         }
 
@@ -2692,7 +2764,7 @@ impl Hardware {
                 (indices.len(), offsets, None, (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
-                let staged = self.stage_shading(shading, depth_map)?;
+                let staged = self.stage_shading(memory, shading, depth_map)?;
                 (shading.indices.len(), (0, 0), Some(staged), self.vertex_stage(shading))
             }
         };

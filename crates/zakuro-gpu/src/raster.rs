@@ -469,6 +469,14 @@ enum Vertices<'a> {
         /// which input each vertex is, when an index buffer repeats them.
         order: Option<&'a [usize]>,
     },
+    /// vertex arrays for the GPU to decode and shade.
+    #[cfg(feature = "vulkan")]
+    Raw {
+        vertex_shader: &'a ShaderUnit,
+        raw: &'a hardware::RawInputs,
+        /// each vertex of the draw, counted from the first of the arrays.
+        vertices: &'a [u32],
+    },
     Shaded(&'a [Vertex]),
 }
 
@@ -476,6 +484,8 @@ impl Vertices<'_> {
     fn len(&self) -> usize {
         match self {
             Vertices::Unshaded { inputs, order, .. } => order.map_or(inputs.len(), <[usize]>::len),
+            #[cfg(feature = "vulkan")]
+            Vertices::Raw { vertices, .. } => vertices.len(),
             Vertices::Shaded(shaded) => shaded.len(),
         }
     }
@@ -746,6 +756,8 @@ struct Scratch {
     unique: Vec<u32>,
     order: Vec<usize>,
     inputs: Vec<[Vec4; shader::INPUT_REGISTERS]>,
+    /// each vertex of a draw counted from the first one it uses.
+    relative: Vec<u32>,
 }
 
 impl Scratch {
@@ -1846,12 +1858,38 @@ pub fn draw<M: GpuMemory>(
         } else {
             scratch.indices.extend(scratch.bytes.iter().map(|&b| b as u32));
         }
+    }
+    let plan = InputPlan::new(registers, &layout, fixed_attributes);
+    // the GPU decodes the arrays itself when it shades the draw, from the
+    // first vertex the draw uses to the last
+    #[cfg(feature = "vulkan")]
+    if resources.hardware.as_ref().is_some_and(|hardware| hardware.shades()) && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
+        let (first, span) = if indexed {
+            let (low, high) = scratch.indices.iter().fold((u32::MAX, 0), |(low, high), &index| (low.min(index), high.max(index)));
+            (low, high - low + 1)
+        } else {
+            (first_vertex, vertex_count)
+        };
+        if let Some(raw) = raw_inputs(&plan, memory, attribute_base, first, span) {
+            scratch.relative.clear();
+            if indexed {
+                scratch.relative.extend(scratch.indices.iter().map(|&index| index - first));
+            } else {
+                scratch.relative.extend(0..vertex_count);
+            }
+            let vertices = Vertices::Raw { vertex_shader, raw: &raw, vertices: &scratch.relative };
+            if rasterize(registers, memory, resources, vertices).is_some() {
+                resources.scratch = scratch;
+                return vertex_count;
+            }
+        }
+    }
+    if indexed {
         scratch.unique();
     } else {
         scratch.unique.clear();
         scratch.unique.extend((0..vertex_count).map(|i| first_vertex + i));
     }
-    let plan = InputPlan::new(registers, &layout, fixed_attributes);
     scratch.inputs.clear();
     scratch.inputs.extend(scratch.unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)));
     let order = indexed.then_some(&scratch.order[..]);
@@ -1879,7 +1917,43 @@ pub fn draw_immediate<M: GpuMemory>(
         .map(|attributes| map_inputs(registers, REG_VS_BLOCK, &attributes[..count]))
         .collect();
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: None };
-    rasterize(registers, memory, resources, vertices)
+    rasterize(registers, memory, resources, vertices).unwrap_or(0)
+}
+
+/// a draw's arrays for the GPU to decode, from the first vertex the draw
+/// uses on, none when they cost more to hand over than to decode on the
+/// CPU or do not lie in one piece of memory.
+#[cfg(feature = "vulkan")]
+fn raw_inputs<M: GpuMemory>(plan: &InputPlan, memory: &mut M, base: u32, first: u32, span: u32) -> Option<hardware::RawInputs> {
+    // past this the vertices between the ones a draw uses cost too much
+    const LIMIT: u64 = 4 << 20;
+    let mut raw = hardware::RawInputs { arrays: Vec::new(), fields: [None; shader::INPUT_REGISTERS], defaults: plan.template };
+    let mut total = 0u64;
+    for loader in &plan.loaders {
+        let start = base.wrapping_add(loader.offset).wrapping_add(first.wrapping_mul(loader.stride));
+        let len = (span - 1) * loader.stride + loader.size;
+        total += len as u64;
+        if total > LIMIT {
+            return None;
+        }
+        // a vertex's address is translated on its own on the CPU, which
+        // comes to the same where the array is in one piece
+        let addr = memory.translate(start);
+        memory.slice(addr, len as usize)?;
+        for field in &loader.fields {
+            // a field fills its components over (0, 0, 0, 1)
+            raw.defaults[field.register] = [0.0, 0.0, 0.0, 1.0];
+            raw.fields[field.register] = Some(hardware::RawField {
+                array: raw.arrays.len(),
+                stride: loader.stride,
+                offset: field.offset,
+                ty: field.ty,
+                count: field.count,
+            });
+        }
+        raw.arrays.push((addr, len));
+    }
+    Some(raw)
 }
 
 /// the vertices of each triangle out of count of them, as assemble puts
@@ -1905,7 +1979,9 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
 
 /// assembles shaded vertices into triangles the way the primitive configuration
 /// says, and fills them with the current back-end state.
-fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> u32 {
+/// the triangles drawn, none for arrays the GPU could not decode, which the
+/// CPU decodes then.
+fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
     let vertex_count = vertices.len();
     // the offset is two signed 10-bit fields.
     let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
@@ -1917,7 +1993,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let viewport_width = read_float24(registers, REG_VIEWPORT_WIDTH) * 2.0;
     let viewport_height = read_float24(registers, REG_VIEWPORT_HEIGHT) * 2.0;
     if viewport_width <= 0.0 || viewport_height <= 0.0 {
-        return 0;
+        return Some(0);
     }
     let viewport = (viewport_x, viewport_y, viewport_width, viewport_height);
 
@@ -2025,17 +2101,22 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // the GPU runs the vertex shader itself, unless a geometry shader
     // comes after it
     #[cfg(feature = "vulkan")]
-    if let (Vertices::Unshaded { vertex_shader, inputs, order, .. }, Some(hardware)) =
-        (vertices, resources.hardware.as_mut())
-    {
+    if let Some(hardware) = resources.hardware.as_mut() {
         let target = &state.target;
         let whole = target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8);
-        if hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
-            let vertex = |i: usize| order.map_or(i, |order| order[i]) as u32;
+        let unshaded = match vertices {
+            Vertices::Unshaded { vertex_shader, inputs, order, .. } => {
+                Some((vertex_shader, hardware::Inputs::Decoded(inputs), order, None))
+            }
+            Vertices::Raw { vertex_shader, raw, vertices } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(vertices))),
+            Vertices::Shaded(_) => None,
+        };
+        if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
+            let vertex = |i: usize| raw.map_or_else(|| order.map_or(i, |order| order[i]) as u32, |vertices| vertices[i]);
             let mut indices = std::mem::take(&mut resources.triangles);
             assemble_into(topology, vertex_count, vertex, &mut indices);
             let shading = hardware::Shading {
-                unit: vertex_shader,
+                unit,
                 inputs,
                 indices: &indices,
                 semantics: output_semantics(registers),
@@ -2046,7 +2127,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             let triangles = (indices.len() / 3) as u32;
             resources.triangles = indices;
             match drawn {
-                Ok(()) => return triangles,
+                Ok(()) => return Some(triangles),
                 Err(error) => log::error!("the GPU could not shade, {error}, shading on the CPU"),
             }
         }
@@ -2058,6 +2139,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             processed = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
             (&processed.0[..], processed.1)
         }
+        // arrays the GPU did not draw, which the CPU decodes first
+        #[cfg(feature = "vulkan")]
+        Vertices::Raw { .. } => return None,
     };
     // which of the vertices made each vertex of the draw is
     let at = |i: usize| order.map_or(i, |order| order[i]);
@@ -2123,7 +2207,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
             let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
             match hardware.draw(memory, &state.hardware(registers, geometry)) {
-                Ok(()) => return triangle_count as u32,
+                Ok(()) => return Some(triangle_count as u32),
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
             }
         }
@@ -2202,7 +2286,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         );
     }
 
-    stats.written
+    Some(stats.written)
 }
 
 #[cfg(test)]
@@ -2272,7 +2356,7 @@ mod tests {
 
     /// an 8x8 RGBA8 target with color writes on and a D24S8 buffer beside it.
     fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
-        rasterize(registers, memory, resources, Vertices::Shaded(shaded))
+        rasterize(registers, memory, resources, Vertices::Shaded(shaded)).unwrap_or(0)
     }
 
     fn target_registers() -> Vec<u32> {
@@ -3168,6 +3252,239 @@ mod tests {
         assert!(drawn > 2000);
         assert!(differing * 100 < drawn, "{differing} of {drawn} pixels differ");
         assert!(deepest < 1 << 8, "depth differs by {deepest}");
+    }
+
+    /// guest memory with a stretch of it in one piece, from the linear
+    /// heap's start, which slice hands out the way a title's vertex arrays
+    /// lie, so draws from it go to the GPU as they are.
+    #[cfg(feature = "vulkan")]
+    struct ArrayMemory {
+        rest: ConsoleMemory,
+        arrays: Vec<u8>,
+        /// how long each slice handed out was, a whole array's for the GPU
+        /// among them, a vertex's when the CPU decodes them.
+        sliced: Vec<usize>,
+    }
+
+    #[cfg(feature = "vulkan")]
+    impl ArrayMemory {
+        const START: u32 = 0x1400_0000;
+
+        fn new() -> ArrayMemory {
+            ArrayMemory { rest: ConsoleMemory::default(), arrays: vec![0; 0x1_0000], sliced: Vec::new() }
+        }
+
+        fn at(&self, addr: u32) -> Option<usize> {
+            addr.checked_sub(Self::START).map(|at| at as usize).filter(|&at| at < self.arrays.len())
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    impl GpuMemory for ArrayMemory {
+        fn read(&mut self, addr: u32, out: &mut [u8]) {
+            for (i, byte) in out.iter_mut().enumerate() {
+                let addr = addr + i as u32;
+                *byte = match self.at(addr) {
+                    Some(at) => self.arrays[at],
+                    None => self.rest.0.get(&addr).copied().unwrap_or(0),
+                };
+            }
+        }
+
+        fn write(&mut self, addr: u32, data: &[u8]) {
+            for (i, &byte) in data.iter().enumerate() {
+                let addr = addr + i as u32;
+                match self.at(addr) {
+                    Some(at) => self.arrays[at] = byte,
+                    None => {
+                        self.rest.0.insert(addr, byte);
+                    }
+                }
+            }
+        }
+
+        fn translate(&self, paddr: u32) -> u32 {
+            self.rest.translate(paddr)
+        }
+
+        fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+            let at = self.at(addr)?;
+            let end = at.checked_add(len).filter(|&end| end <= self.arrays.len())?;
+            self.sliced.push(len);
+            Some(&self.arrays[at..end])
+        }
+    }
+
+    /// draws from vertex arrays the GPU decodes itself come out as those
+    /// whose vertices the CPU decodes, for each type of component, one to
+    /// four of them, a fixed attribute, padding, one array or several,
+    /// strides and offsets off a word, u8 and u16 indices and none, and
+    /// lists, strips and fans.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_gpu_decodes_vertex_arrays_like_the_cpu() {
+        for translates in [true, false] {
+            let Ok(mut hardware) = hardware::Hardware::new() else { return };
+            hardware.set_translates(translates, true);
+            gpu_decodes_vertex_arrays_like_the_cpu(hardware);
+        }
+    }
+
+    /// the arrays drawn through one GPU, translating programs or not.
+    #[cfg(feature = "vulkan")]
+    fn gpu_decodes_vertex_arrays_like_the_cpu(hardware: hardware::Hardware) {
+        const SIZE: u32 = 32;
+        // the arrays' base, physical FCRAM, at the linear heap's start
+        const BASE: u32 = 0x2000_0000;
+        const INDICES: u32 = 0x6000;
+        const VERTICES: u32 = 24;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut unit = ShaderUnit::new();
+        unit.descriptors[0] = 0xF | IDENTITY;
+        let op = |opcode: u32, destination: u32, src1: u32, src2: u32| opcode << 26 | destination << 21 | src1 << 12 | src2 << 7;
+        // o0 = c0 * v0, o1 = c1 * v1 + c2 + v2, v2 the fixed attribute
+        let program = [op(0x08, 0x00, 0x20, 0x00), op(0x08, 0x10, 0x21, 0x01), op(0x00, 0x10, 0x22, 0x10), op(0x00, 0x01, 0x10, 0x02), 0x22 << 26];
+        unit.program[..program.len()].copy_from_slice(&program);
+        unit.prepare();
+        let mut fixed = [shader::ZERO; 16];
+        fixed[2] = [0.1, -0.05, 0.02, 0.0];
+
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        registers[REG_VS_OUTPUT_MASK] = 0b11;
+        registers[REG_ATTRIBUTE_BASE] = BASE >> 3;
+        // three attributes, the third fixed, each to the register of its
+        // number
+        registers[REG_VS_NUM_INPUT_ATTRIBUTES] = 2;
+        registers[REG_VS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x210;
+
+        struct Case {
+            /// each array's offset from the base, stride, and attribute ids
+            /// or padding in order.
+            loaders: Vec<(u32, u32, Vec<u32>)>,
+            /// type and count of the position and of the color.
+            position: (u32, u32),
+            color: (u32, u32),
+            /// u16 indices, u8 or none, and the first vertex used.
+            indices: Option<bool>,
+            first: u32,
+        }
+        let cases = [
+            Case { loaders: vec![(0x100, 8, vec![0]), (0x800, 4, vec![1])], position: (3, 2), color: (1, 4), indices: Some(true), first: 0 },
+            // a short at odd addresses, and a vertex longer than its stride
+            Case { loaders: vec![(0x1001, 9, vec![0, 1, 12])], position: (2, 2), color: (0, 3), indices: Some(false), first: 0 },
+            Case { loaders: vec![(0x2003, 3, vec![0]), (0x3002, 10, vec![1])], position: (0, 2), color: (2, 4), indices: None, first: 3 },
+            // floats off a word, and one component of color
+            Case { loaders: vec![(0x4001, 13, vec![0]), (0x5002, 6, vec![1])], position: (3, 2), color: (3, 1), indices: Some(true), first: 5 },
+        ];
+        let mut seed = 11u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        for (number, case) in cases.iter().enumerate() {
+            let nibble = |(ty, count): (u32, u32)| (count - 1) << 2 | ty;
+            registers[REG_ATTRIBUTE_FORMAT_LOW] = nibble(case.position) | nibble(case.color) << 4;
+            registers[REG_ATTRIBUTE_FORMAT_HIGH] = 1 << 18 | 2 << 28;
+            for loader in 0..12 {
+                let at = REG_ATTRIBUTE_LOADER + loader * 3;
+                registers[at..at + 3].fill(0);
+            }
+            for (i, (offset, stride, entries)) in case.loaders.iter().enumerate() {
+                let at = REG_ATTRIBUTE_LOADER + i * 3;
+                let packed = entries.iter().enumerate().fold(0u64, |packed, (k, &id)| packed | (id as u64) << (k * 4));
+                registers[at] = *offset;
+                registers[at + 1] = packed as u32;
+                registers[at + 2] = (packed >> 32) as u32 | stride << 16 | (entries.len() as u32) << 28;
+            }
+            registers[REG_PRIMITIVE_CONFIG] = (number as u32 % 3) << 8;
+            registers[REG_VERTEX_COUNT] = VERTICES;
+            registers[REG_VERTEX_OFFSET] = case.first;
+            registers[REG_INDEX_ARRAY] = INDICES | if case.indices == Some(true) { 1 << 31 } else { 0 };
+            // scales that bring each type to the screen and to colors
+            let scale = |ty: u32| match ty {
+                0 => 1.0 / 128.0,
+                1 => 1.0 / 255.0,
+                2 => 1.0 / 32768.0,
+                _ => 1.0,
+            };
+            let ps = scale(case.position.0) * 0.9;
+            unit.float_uniforms[0] = [ps, ps, 1.0, 1.0];
+            let cs = scale(case.color.0) * if matches!(case.color.0, 0 | 2) { 0.5 } else { 1.0 };
+            let offset = if matches!(case.color.0, 0 | 2) { 0.5 } else { 0.0 };
+            unit.float_uniforms[1] = [cs; 4];
+            unit.float_uniforms[2] = [offset; 4];
+
+            // the arrays' bytes, floats kept to the screen and to colors,
+            // and how long each array's vertex is
+            let mut bytes = vec![0u8; 0x6000];
+            let mut sizes = Vec::new();
+            for (offset, stride, entries) in &case.loaders {
+                let mut field = 0u32;
+                for &id in entries {
+                    if id >= 12 {
+                        field = field.next_multiple_of(4) + (id - 11) * 4;
+                        continue;
+                    }
+                    let (ty, count) = if id == 0 { case.position } else { case.color };
+                    let size: u32 = [1, 1, 2, 4][ty as usize];
+                    field = field.next_multiple_of(size);
+                    for vertex in 0..case.first + VERTICES + 8 {
+                        for component in 0..count {
+                            let at = (offset + vertex * stride + field + component * size) as usize;
+                            let value = random();
+                            let value = if ty == 3 {
+                                let float = (value & 0xFFFF) as f32 / 65536.0;
+                                (if id == 0 { float * 1.8 - 0.9 } else { float }).to_bits()
+                            } else {
+                                value
+                            };
+                            bytes[at..at + size as usize].copy_from_slice(&value.to_le_bytes()[..size as usize]);
+                        }
+                    }
+                    field += size * count;
+                }
+                sizes.push(field);
+            }
+            let indices: Vec<u32> = (0..VERTICES).map(|_| case.first + random() % 20).collect();
+            let index_bytes: Vec<u8> = match case.indices {
+                Some(true) => indices.iter().flat_map(|&index| (index as u16).to_le_bytes()).collect(),
+                _ => indices.iter().map(|&index| index as u8).collect(),
+            };
+
+            let mut decoded = ConsoleMemory::default();
+            let mut raw = ArrayMemory::new();
+            decoded.write(0x1400_0000, &bytes);
+            decoded.write(0x1400_0000 + INDICES, &index_bytes);
+            raw.write(0x1400_0000, &bytes);
+            raw.write(0x1400_0000 + INDICES, &index_bytes);
+            decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+            raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+            let indexed = case.indices.is_some();
+            draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed);
+            resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
+            draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed);
+            resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
+            // the first array whole, from the first vertex used to the last
+            let span = match indexed {
+                true => indices.iter().max().unwrap() - indices.iter().min().unwrap() + 1,
+                false => VERTICES,
+            };
+            let whole = ((span - 1) * case.loaders[0].1 + sizes[0]) as usize;
+            assert!(raw.sliced.contains(&whole), "case {number}, the arrays went to the GPU as they are");
+            let (mut a, mut b) = (vec![0u8; (SIZE * SIZE * 4) as usize], vec![0u8; (SIZE * SIZE * 4) as usize]);
+            decoded.read(COLOR, &mut a);
+            raw.read(COLOR, &mut b);
+            let drawn = a.chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+            assert!(drawn > 50, "case {number}, only {drawn} pixels drawn");
+            assert!(a == b, "case {number}, the arrays decode differently");
+        }
     }
 
     /// a random number generator for the translation tests, the same
