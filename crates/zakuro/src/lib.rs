@@ -11,6 +11,7 @@ mod library;
 mod menus;
 mod present;
 mod recompile;
+mod report;
 mod settings;
 
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ pub use zakuro_core::recompiled::Linked;
 /// runs the emulator as the command line says, on recompiled code linked
 /// into the program when there is some.
 pub fn run(linked: Option<Linked>) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    report::init();
 
     let options = match cli::parse() {
         Ok(options) => options,
@@ -52,6 +53,7 @@ pub fn run(linked: Option<Linked>) {
 
     let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
     if let Some(dir) = &data_dir {
+        report::to_file(dir);
         bring_saves(dir);
     }
 
@@ -805,6 +807,12 @@ impl App {
             }
             Action::Library => self.back_to_library(),
             Action::Fullscreen => self.toggle_fullscreen(),
+            Action::CopyReport => {
+                if let (Some(game), Some(gui)) = (&self.game, &self.gui) {
+                    gui.ctx.copy_text(report::text(&game.name, &game.system));
+                    self.menus.message = Some("The game's details and the end of the log are copied. Paste them in your report and fill in what happens.".into());
+                }
+            }
             Action::Quit => event_loop.exit(),
             Action::Settings => self.apply_settings(),
             Action::Keyboard(text, button) => {
@@ -916,7 +924,9 @@ impl App {
                 if !errors.is_empty() {
                     log::error!("{errors}");
                 }
-                self.menus.message = Some(format!("The game stopped on a fault. {errors}"));
+                let message = format!("The game stopped on a fault. {errors}");
+                self.menus.report = Some((message.clone(), report::text(&game.name, &game.system)));
+                self.menus.message = Some(message);
                 self.back_to_library();
             }
         }

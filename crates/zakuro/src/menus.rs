@@ -27,6 +27,8 @@ pub enum Action {
     Reset,
     Library,
     Fullscreen,
+    /// copy what a report on the game wants.
+    CopyReport,
     Quit,
     /// the settings changed, to save and apply.
     Settings,
@@ -46,6 +48,9 @@ pub struct Menus {
     pub rebinding_pad: Option<usize>,
     /// something to tell the user, until they close it.
     pub message: Option<String>,
+    /// a report on the game, to copy from the message it goes with, and
+    /// from no other.
+    pub report: Option<(String, String)>,
     /// what is being typed into the game's keyboard, and what it asked for.
     typing: Option<(Request, String)>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
@@ -297,6 +302,9 @@ impl Menus {
                 if wide(ui, "Settings") {
                     self.settings_open = true;
                 }
+                if wide(ui, "Copy info for a report") {
+                    actions.push(Action::CopyReport);
+                }
                 if wide(ui, "Back to the library") {
                     actions.push(Action::Library);
                 }
@@ -495,10 +503,18 @@ impl Menus {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(text);
-                if ui.button("OK").clicked() {
-                    self.message = None;
-                }
+                ui.label(text.as_str());
+                ui.horizontal(|ui| {
+                    if let Some((_, report)) = self.report.as_ref().filter(|(about, _)| *about == text) {
+                        if ui.button("Copy info for a report").clicked() {
+                            ui.ctx().copy_text(report.clone());
+                        }
+                    }
+                    if ui.button("OK").clicked() {
+                        self.message = None;
+                        self.report = None;
+                    }
+                });
             });
     }
 }
