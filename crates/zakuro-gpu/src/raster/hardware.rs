@@ -2253,6 +2253,9 @@ impl Hardware {
             // the GPU drew is gone
             if !filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
                 let surface = &mut self.surfaces[index];
+                // the image is not what memory holds, even when the fill left
+                // memory as the shadow had it
+                surface.shadow.clear();
                 surface.dirty = None;
                 surface.guarded = None;
                 surface.write_guarded = None;
@@ -3008,31 +3011,38 @@ impl Hardware {
         Ok(())
     }
 
-    /// a display transfer out of a buffer the GPU drew, done on the GPU,
-    /// false when the input is anything else, for the CPU to do. the output
-    /// stays on the GPU, and a copy of it heads for the host in the same
-    /// batch, which goes to the GPU right away without waiting for it.
+    /// a display transfer out of a buffer the GPU holds, one it drew or an
+    /// earlier transfer wrote, done on the GPU, false when the input is
+    /// anything else, for the CPU to do. the output stays on the GPU, and a
+    /// copy of it heads for the host in the same batch, which goes to the
+    /// GPU right away without waiting for it.
     pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
         let t = transfer;
         let input_kind = Kind::Color(t.input_format);
         let output_kind = Kind::Color(t.output_format);
         let output_size = (t.output_width, t.output_height);
-        if t.input_linear || t.copy.0 == 0 || t.copy.1 == 0 {
+        // a tiled output of part of a tile goes to the CPU, which leaves out
+        // the pixels the layout puts past its end, as draws do
+        let whole = t.output_width.is_multiple_of(8) && t.output_height.is_multiple_of(8);
+        if t.copy.0 == 0 || t.copy.1 == 0 || (t.output_tiled && !whole) {
             return Ok(false);
         }
-        // the input rows read, which can start a few rows of tiles into a
-        // buffer the GPU drew, titles draw both screens into one
+        // the input rows read, which can start some rows into a buffer the
+        // GPU holds, titles draw both screens into one, a tiled buffer a
+        // row of tiles at a time
+        let tiled = !t.input_linear;
         let rows = t.copy.1 * t.scale.1;
         let first = if t.flip { t.input_height - rows } else { 0 };
-        let tile_rows = 8 * t.input_width * input_kind.bytes();
+        let step = if tiled { 8 } else { 1 };
+        let step_bytes = step * t.input_width * input_kind.bytes();
         let row_in = |s: &Surface| {
-            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * 8;
+            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % step_bytes == 0)? / step_bytes * step;
             (offset + first + rows <= s.height).then_some(offset)
         };
         let Some((addr, input_size, row)) = self
             .surfaces
             .iter()
-            .filter(|s| s.kind == input_kind && s.tiled && s.width == t.input_width)
+            .filter(|s| s.kind == input_kind && s.tiled == tiled && s.width == t.input_width)
             .filter_map(|s| Some((s, row_in(s)?)))
             .max_by_key(|&(s, row)| newest(s, (row + first, row + first + rows)))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
@@ -3048,7 +3058,7 @@ impl Hardware {
         // a flush looking one of them up drops what the other had checked
         let (source, target) = loop {
             // the rows it reads, what is drawn over the rest stays on the GPU
-            let source = self.surface_rows(memory, addr, input_size, input_kind, true, Some((row + first, row + first + rows)))?;
+            let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, Some((row + first, row + first + rows)))?;
             let target = self.surface(memory, t.output, output_size, output_kind, t.output_tiled)?;
             if self.surfaces[source].checked && self.surfaces[target].checked {
                 break (source, target);

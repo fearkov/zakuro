@@ -3761,6 +3761,201 @@ mod tests {
         }
     }
 
+    /// a drawing a transfer turned into a linear buffer, and another
+    /// transfer turned back into one to sample, as titles do with a frame
+    /// for their effects, stays on the GPU the whole way and leaves the bytes
+    /// the CPU's two transfers do. a linear buffer only memory has the CPU
+    /// transfers.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn transfers_out_of_linear_buffers_the_gpu_holds_match_the_cpu() {
+        use crate::format::ColorFormat::*;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const SIZE: u32 = 32;
+        const LINEAR: u32 = 0x10_0000;
+        const OUTPUT: u32 = 0x18_0000;
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut seed = 13u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        let mut drawn = ConsoleMemory::default();
+        for _ in 0..40 {
+            let color = [random(), random(), random(), random()];
+            let triangle: Vec<Vertex> = (0..3)
+                .map(|_| Vertex {
+                    clip: [random() * 2.0 - 1.0, random() * 2.0 - 1.0, -0.5, 1.0],
+                    color,
+                    texcoords: [[0.0; 2]; 3],
+                    quaternion: [0.0, 0.0, 0.0, 1.0],
+                    view: [0.0; 3],
+                })
+                .collect();
+            rasterize_shaded(&registers, &mut drawn, &mut resources, &triangle);
+        }
+        resources.hardware.as_mut().unwrap().flush(&mut drawn).unwrap();
+        let flags = |flip: bool, input_linear: bool, output_tiled: bool, input: ColorFormat, output: ColorFormat, downscale: u32| {
+            flip as u32
+                | (input_linear as u32) << 1
+                | ((input_linear != output_tiled) as u32) << 5
+                | (hardware::format_index(input) as u32) << 8
+                | (hardware::format_index(output) as u32) << 12
+                | downscale << 24
+        };
+        for linear_format in [Rgba8, Rgb565] {
+            for output_format in [Rgba8, Rgb565, Rgba4] {
+                for (flip, downscale, tiled) in [(false, 0, true), (true, 0, true), (false, 2, true), (true, 1, false)] {
+                    let hardware = resources.hardware.as_mut().unwrap();
+                    let (mut gpu, mut cpu) = (drawn.clone(), drawn.clone());
+                    let (scale_x, scale_y) = [(1, 1), (2, 1), (2, 2)][downscale as usize];
+                    let (width, height) = (SIZE / scale_x, SIZE / scale_y);
+                    let to_linear = hardware::Transfer {
+                        input: COLOR,
+                        output: LINEAR,
+                        input_width: SIZE,
+                        input_height: SIZE,
+                        output_width: SIZE,
+                        output_height: SIZE,
+                        copy: (SIZE, SIZE),
+                        scale: (1, 1),
+                        flip: false,
+                        input_linear: false,
+                        output_tiled: false,
+                        input_format: Rgba8,
+                        output_format: linear_format,
+                    };
+                    let back = hardware::Transfer {
+                        input: LINEAR,
+                        output: OUTPUT,
+                        output_width: width,
+                        output_height: height,
+                        copy: (width, height),
+                        scale: (scale_x, scale_y),
+                        flip,
+                        input_linear: true,
+                        output_tiled: tiled,
+                        input_format: linear_format,
+                        output_format,
+                        ..to_linear
+                    };
+                    assert!(hardware.display_transfer(&mut gpu, &to_linear).unwrap());
+                    assert!(hardware.display_transfer(&mut gpu, &back).unwrap(), "out of the linear buffer on the GPU");
+                    hardware.flush(&mut gpu).unwrap();
+                    let mut software = crate::Gpu::new();
+                    let size = SIZE | SIZE << 16;
+                    software.display_transfer(&mut cpu, COLOR, LINEAR, size, size, flags(false, false, false, Rgba8, linear_format, 0));
+                    let output_size = (width * scale_x) | ((height * scale_y) << 16);
+                    let back_flags = flags(flip, true, tiled, linear_format, output_format, downscale);
+                    software.display_transfer(&mut cpu, LINEAR, OUTPUT, size, output_size, back_flags);
+                    let len = (width * height) as usize * output_format.bytes_per_pixel();
+                    let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+                    cpu.read(OUTPUT, &mut a);
+                    gpu.read(OUTPUT, &mut b);
+                    assert!(a == b, "{linear_format:?} to {output_format:?}, flip {flip}, downscale {downscale}, tiled {tiled}");
+                    let colors: std::collections::HashSet<&[u8]> = a.chunks(output_format.bytes_per_pixel()).collect();
+                    assert!(colors.len() > 8);
+                }
+            }
+        }
+        // nothing the GPU holds there
+        let hardware = resources.hardware.as_mut().unwrap();
+        let elsewhere = hardware::Transfer {
+            input: 0x0C_0000,
+            output: OUTPUT,
+            input_width: SIZE,
+            input_height: SIZE,
+            output_width: SIZE,
+            output_height: SIZE,
+            copy: (SIZE, SIZE),
+            scale: (1, 1),
+            flip: false,
+            input_linear: true,
+            output_tiled: true,
+            input_format: Rgb565,
+            output_format: Rgb565,
+        };
+        assert!(!hardware.display_transfer(&mut drawn.clone(), &elsewhere).unwrap());
+        // an output of part of a tile is the CPU's too
+        let partial = hardware::Transfer { input: LINEAR, output_height: SIZE - 4, copy: (SIZE, SIZE - 4), ..elsewhere };
+        assert!(!hardware.display_transfer(&mut drawn.clone(), &partial).unwrap());
+    }
+
+    /// a fill over a whole linear buffer the GPU wrote, with a pattern that
+    /// does not line up with its pixels, is what a transfer out of it reads,
+    /// also when memory had that pattern already.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_transfer_reads_the_fill_over_a_linear_buffer_the_gpu_wrote() {
+        use crate::format::ColorFormat::*;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const SIZE: u32 = 32;
+        const LINEAR: u32 = 0x10_0000;
+        const OUTPUT: u32 = 0x18_0000;
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        let mut gpu = ConsoleMemory::default();
+        let triangle: Vec<Vertex> = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
+            .into_iter()
+            .map(|[x, y]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: [0.2, 0.6, 0.9, 1.0],
+                texcoords: [[0.0; 2]; 3],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+            })
+            .collect();
+        rasterize_shaded(&registers, &mut gpu, &mut resources, &triangle);
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.flush(&mut gpu).unwrap();
+        let mut cpu = gpu.clone();
+        // halves of a pixel that differ
+        let pattern: Vec<u8> = [0xFF, 0xFF, 0x00, 0x00].repeat((SIZE * SIZE / 2) as usize);
+        let fill = |hardware: &mut hardware::Hardware, memory: &mut ConsoleMemory| {
+            hardware.before_fill(memory, LINEAR, pattern.len() as u32, 4).unwrap();
+            memory.write(LINEAR, &pattern);
+            hardware.filled(LINEAR, &pattern).unwrap();
+        };
+        let to_linear = hardware::Transfer {
+            input: COLOR,
+            output: LINEAR,
+            input_width: SIZE,
+            input_height: SIZE,
+            output_width: SIZE,
+            output_height: SIZE,
+            copy: (SIZE, SIZE),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: Rgba8,
+            output_format: Rgb565,
+        };
+        let back = hardware::Transfer { input: LINEAR, output: OUTPUT, input_linear: true, output_tiled: true, input_format: Rgb565, ..to_linear };
+        fill(hardware, &mut gpu);
+        assert!(hardware.display_transfer(&mut gpu, &to_linear).unwrap());
+        fill(hardware, &mut gpu);
+        assert!(hardware.display_transfer(&mut gpu, &back).unwrap());
+        hardware.flush(&mut gpu).unwrap();
+        // the CPU's, the drawing gone under the fill
+        let mut software = crate::Gpu::new();
+        cpu.write(LINEAR, &pattern);
+        let size = SIZE | SIZE << 16;
+        software.display_transfer(&mut cpu, LINEAR, OUTPUT, size, size, 1 << 1 | (hardware::format_index(Rgb565) as u32) << 8 | (hardware::format_index(Rgb565) as u32) << 12);
+        let len = (SIZE * SIZE * 2) as usize;
+        let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+        cpu.read(OUTPUT, &mut a);
+        gpu.read(OUTPUT, &mut b);
+        assert!(a == b, "the transfer read what the GPU drew under the fill");
+    }
+
     /// a screen shown straight from the GPU's image is the picture the host
     /// gets a copy of otherwise, where the image says the screen lies in it,
     /// for a screen some rows into a buffer with longer rows than it shows.
