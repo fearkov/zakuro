@@ -822,12 +822,18 @@ impl System {
         if self.lcd_force_black || address == 0 || !stride.is_multiple_of(bpp) || stride < height * bpp {
             return None;
         }
-        // no sync first, that would wait for the GPU to finish the picture
+        // no sync first, that would wait for the GPU to finish the picture.
+        // compared where it lies, a copy of both screens every frame costs
+        // more than the comparing
         let base = services::gsp::physical_to_virtual(self, address);
         let len = width * stride;
-        let mut guest = vec![0u8; len as usize];
-        self.memory.read_bytes(base, &mut guest);
-        self.gpu.scaled_screen(base, (height, width), stride / bpp, format, &guest)
+        let mut guest = GuestMemory { linear_base: self.kernel.linear_base, memory: &mut self.memory };
+        if let Some(bytes) = guest.slice(base, len as usize) {
+            return self.gpu.scaled_screen(base, (height, width), stride / bpp, format, bytes);
+        }
+        let mut bytes = vec![0u8; len as usize];
+        self.memory.read_bytes(base, &mut bytes);
+        self.gpu.scaled_screen(base, (height, width), stride / bpp, format, &bytes)
     }
 
     /// reads one screen into a straight RGBA8 buffer for presentation.
@@ -928,11 +934,12 @@ impl GpuMemory for GuestMemory<'_> {
 
     fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
         // the linear heap and VRAM are physical memory in order, so what
-        // translate made of a physical address leads back to it
-        let physical = if addr >= self.linear_base && addr - self.linear_base < FCRAM_SIZE_NEW3DS {
-            FCRAM_PADDR + (addr - self.linear_base)
-        } else if (VRAM_VADDR..VRAM_VADDR + VRAM_SIZE).contains(&addr) {
+        // translate made of a physical address leads back to it. VRAM first,
+        // from the old linear heap's base a New 3DS's heap size reaches it
+        let physical = if (VRAM_VADDR..VRAM_VADDR + VRAM_SIZE).contains(&addr) {
             VRAM_PADDR + (addr - VRAM_VADDR)
+        } else if addr >= self.linear_base && addr - self.linear_base < FCRAM_SIZE_NEW3DS {
+            FCRAM_PADDR + (addr - self.linear_base)
         } else {
             return None;
         };
