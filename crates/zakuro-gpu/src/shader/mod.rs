@@ -409,9 +409,10 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
     let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
     let mut state = ShaderState::new();
+    let uniforms = batch::Uniforms::new(unit);
     for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
         if !trace_nan {
-            batch::run(unit, program, inputs, outputs, &mut blocks, &mut forks);
+            batch::run(unit, &uniforms, program, inputs, outputs, &mut blocks, &mut forks);
             continue;
         }
         for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
@@ -446,6 +447,7 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut triangles = Vec::with_capacity(inputs.len());
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    let uniforms = batch::Uniforms::new(unit);
     for inputs in inputs.chunks(batch::LANES) {
         if trace_nan {
             for input in inputs {
@@ -458,7 +460,7 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
             continue;
         }
         let mut emitters = batch::Emitters::new();
-        batch::run_geometry(unit, program, inputs, &mut emitters, &mut blocks, &mut forks);
+        batch::run_geometry(unit, &uniforms, program, inputs, &mut emitters, &mut blocks, &mut forks);
         triangles.extend(emitters.triangles.into_iter().take(inputs.len()));
     }
     triangles

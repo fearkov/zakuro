@@ -525,8 +525,10 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
     semantics
 }
 
-/// vertices a draw needs before shading them is worth splitting over threads.
-const PARALLEL_VERTICES: usize = 128;
+/// vertices a draw needs before shading them is worth splitting over
+/// threads, fewer cost more in handing them out than the threads save, on
+/// a laptop's four cores most of all.
+const PARALLEL_VERTICES: usize = 512;
 /// the fewest vertices each thread takes at a time, whole batches of the
 /// shader's.
 const PARALLEL_CHUNK: usize = 64;

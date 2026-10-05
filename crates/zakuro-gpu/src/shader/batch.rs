@@ -25,6 +25,25 @@ const ZERO: Wide = [f32x8::ZERO; 4];
 /// super::TEMP_START in every lane.
 const TEMP_START: Wide = [f32x8::ZERO, f32x8::ZERO, f32x8::ZERO, f32x8::ONE];
 
+/// the float uniforms in every lane, put there once for all of a draw's
+/// batches instead of at every read.
+pub(super) struct Uniforms([Wide; FLOAT_UNIFORMS]);
+
+impl Uniforms {
+    pub(super) fn new(unit: &ShaderUnit) -> Uniforms {
+        Uniforms(unit.float_uniforms.map(|uniform| uniform.map(f32x8::splat)))
+    }
+
+    /// a uniform, none past the last one.
+    #[inline(always)]
+    fn at(&self, index: i32) -> &Wide {
+        match usize::try_from(index).ok().and_then(|index| self.0.get(index)) {
+            Some(value) => value,
+            None => &ZERO,
+        }
+    }
+}
+
 /// a batch of vertices' registers.
 #[derive(Clone)]
 struct Batch {
@@ -69,6 +88,7 @@ impl Emitters {
 /// shades up to LANES vertices, writing their output registers.
 pub(super) fn run(
     unit: &ShaderUnit,
+    uniforms: &Uniforms,
     program: &Program,
     inputs: &[[Vec4; INPUT_REGISTERS]],
     outputs: &mut [[Vec4; OUTPUT_REGISTERS]],
@@ -79,7 +99,7 @@ pub(super) fn run(
     let mut batch = start(program, inputs);
     blocks.clear();
     forks.clear();
-    let finished = execute(unit, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, None);
+    let finished = execute(unit, uniforms, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, None);
     forks.push((finished, batch.output));
     // each lane's outputs from the copy it finished in. the registers
     // nothing writes stay zero, as they come
@@ -102,6 +122,7 @@ pub(super) fn run(
 /// repeat it and what they emit is theirs to drop.
 pub(super) fn run_geometry(
     unit: &ShaderUnit,
+    uniforms: &Uniforms,
     program: &Program,
     inputs: &[[Vec4; INPUT_REGISTERS]],
     emitters: &mut Emitters,
@@ -112,7 +133,7 @@ pub(super) fn run_geometry(
     let mut batch = start(program, inputs);
     blocks.clear();
     forks.clear();
-    execute(unit, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, Some(emitters));
+    execute(unit, uniforms, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, Some(emitters));
 }
 
 /// a batch with the inputs in its lanes and everything else zero.
@@ -164,6 +185,7 @@ fn emit(batch: &Batch, program: &Program, active: u8, emitters: &mut Emitters) {
 #[allow(clippy::too_many_arguments)]
 fn execute(
     unit: &ShaderUnit,
+    uniforms: &Uniforms,
     program: &Program,
     batch: &mut Batch,
     blocks: &mut Vec<Block>,
@@ -220,9 +242,9 @@ fn execute(
             }
             OpCode::Mad | OpCode::MadI => {
                 let [sa, sb, sc] = &mut scratch;
-                let a = operand(unit, batch, &op.sources[0], sa);
-                let b = operand(unit, batch, &op.sources[1], sb);
-                let c = operand(unit, batch, &op.sources[2], sc);
+                let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+                let b = operand(unit, uniforms, batch, &op.sources[1], sb);
+                let c = operand(unit, uniforms, batch, &op.sources[2], sc);
                 let result: Wide = std::array::from_fn(|i| multiply(a.row(i), b.row(i)) + c.row(i));
                 write(batch, op, &result);
                 pc += 1;
@@ -259,14 +281,14 @@ fn execute(
                     let mut copy_blocks = blocks.clone();
                     let next = branch(op, pc, false, &mut copy_blocks);
                     let finished =
-                        execute(unit, program, &mut copy, &mut copy_blocks, forks, next, budget, others, emitters.as_deref_mut());
+                        execute(unit, uniforms, program, &mut copy, &mut copy_blocks, forks, next, budget, others, emitters.as_deref_mut());
                     forks.push((finished, copy.output));
                     active = taken;
                 }
                 pc = branch(op, pc, taken != 0, blocks);
             }
             _ => {
-                arithmetic(unit, batch, op, &mut scratch);
+                arithmetic(unit, uniforms, batch, op, &mut scratch);
                 pc += 1;
             }
         }
@@ -349,25 +371,25 @@ impl Source<'_> {
 
 /// a source's value in every lane, swizzled and negated as its descriptor
 /// says. a uniform is the same in every lane unless an address register
-/// offsets it, and is put in scratch.
+/// offsets it, which puts it together in scratch.
 #[inline(always)]
-fn operand<'a>(unit: &ShaderUnit, batch: &'a Batch, operand: &Operand, scratch: &'a mut Wide) -> Source<'a> {
+fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, operand: &Operand, scratch: &'a mut Wide) -> Source<'a> {
     let register = operand.register;
     let value: &'a Wide = match register {
         0x00..=0x0F => &batch.input[register as usize],
         0x10..=0x1F => &batch.temp[(register - 0x10) as usize],
         _ => {
             let base = register as i32 - 0x20;
-            *scratch = match operand.index {
-                0 => uniform(unit, base).map(f32x8::splat),
-                3 => uniform(unit, base.wrapping_add(batch.loop_counter)).map(f32x8::splat),
+            match operand.index {
+                0 => uniforms.at(base),
+                3 => uniforms.at(base.wrapping_add(batch.loop_counter)),
                 index => {
                     let offsets = &batch.address[index as usize - 1];
                     let picked: [Vec4; LANES] = std::array::from_fn(|lane| uniform(unit, base.wrapping_add(offsets[lane])));
-                    std::array::from_fn(|component| f32x8::from(picked.map(|value| value[component])))
+                    *scratch = std::array::from_fn(|component| f32x8::from(picked.map(|value| value[component])));
+                    scratch
                 }
-            };
-            scratch
+            }
         }
     };
     Source { rows: operand.swizzle.map(|component| &value[component as usize]), negate: operand.negate }
@@ -401,6 +423,15 @@ fn sum_start() -> f32 {
 fn dot(a: &Source, b: &Source, count: usize) -> Lanes {
     let mut sum = f32x8::splat(sum_start());
     for component in 0..count {
+        sum += a.row(component) * b.row(component);
+    }
+    // a lane without NaN had none in its products, where the shader's
+    // multiply changes nothing, so the sum is looked at once
+    if !sum.is_nan().any() {
+        return sum;
+    }
+    let mut sum = f32x8::splat(sum_start());
+    for component in 0..count {
         sum += multiply(a.row(component), b.row(component));
     }
     sum
@@ -413,10 +444,10 @@ fn select(mask: Lanes) -> Lanes {
 }
 
 #[inline(always)]
-fn arithmetic(unit: &ShaderUnit, batch: &mut Batch, op: &Op, scratch: &mut [Wide; 3]) {
+fn arithmetic(unit: &ShaderUnit, uniforms: &Uniforms, batch: &mut Batch, op: &Op, scratch: &mut [Wide; 3]) {
     let [sa, sb, _] = scratch;
-    let a = operand(unit, batch, &op.sources[0], sa);
-    let b = operand(unit, batch, &op.sources[1], sb);
+    let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+    let b = operand(unit, uniforms, batch, &op.sources[1], sb);
     let pairs = |f: fn(Lanes, Lanes) -> Lanes| -> Wide { std::array::from_fn(|i| f(a.row(i), b.row(i))) };
     let result: Wide = match op.opcode {
         OpCode::Add => pairs(|x, y| x + y),
