@@ -24,6 +24,7 @@ use ash::vk;
 
 use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
 use crate::blend::LogicOp;
+use crate::fog;
 use crate::proctex;
 use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
@@ -65,13 +66,15 @@ const VERTEX_SIZE: usize = 24 * 4;
 /// and the flags, then the lighting.
 /// the procedural texture's registers, at the end of the uniforms.
 const PROCTEX_WORDS: usize = 8;
-const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328 + PROCTEX_WORDS;
+/// the fog's color, and room.
+const FOG_WORDS: usize = 4;
+const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328 + PROCTEX_WORDS + FOG_WORDS;
 const UNIFORM_SIZE: u64 = (UNIFORM_WORDS * 4) as u64;
 /// 24 lighting tables of 256 entries, each a value and a step.
 /// the lighting tables, then the procedural texture's, its noise, color
 /// map and alpha map as values and steps and its colors and their steps as
-/// two pairs each.
-const TABLES_SIZE: u64 = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES) as u64 * 8;
+/// two pairs each, then the fog's, a value and a step an entry.
+const TABLES_SIZE: u64 = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES + fog::ENTRIES) as u64 * 8;
 /// a shader program and its operand descriptors.
 const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
 /// the words of what a vertex shader reads besides its program, the float
@@ -123,6 +126,9 @@ pub(super) struct Draw<'a> {
     /// whether the procedural texture is on, and its tables.
     pub(super) proctex: bool,
     pub(super) proctex_tables: &'a proctex::Tables,
+    /// whether the fog is on, and its table.
+    pub(super) fog: bool,
+    pub(super) fog_table: &'a fog::Table,
 }
 
 /// the triangles of a draw.
@@ -1108,7 +1114,7 @@ pub struct Hardware {
     /// what unused texture units sample.
     blank: Image,
     /// the tables' generation and where the batch copied them.
-    tables: Option<((u64, u64), u64)>,
+    tables: Option<((u64, u64, u64), u64)>,
     recording: bool,
     /// uploads waiting for a barrier before anything reads them.
     uploads: bool,
@@ -2066,8 +2072,8 @@ impl Hardware {
     }
 
     /// where the batch holds the current lighting tables.
-    fn tables(&mut self, tables: &Tables, procedural: &proctex::Tables) -> Result<u64, String> {
-        let generation = (tables.generation(), procedural.generation());
+    fn tables(&mut self, tables: &Tables, procedural: &proctex::Tables, fog: &fog::Table) -> Result<u64, String> {
+        let generation = (tables.generation(), procedural.generation(), fog.generation());
         if let Some((staged, offset)) = self.tables {
             if staged == generation {
                 return Ok(offset);
@@ -2083,6 +2089,7 @@ impl Hardware {
             procedural.maps().as_flattened().as_flattened(),
             colors.as_flattened(),
             steps.as_flattened(),
+            fog.entries().as_flattened(),
         ];
         let mut out = staging.as_chunks_mut::<4>().0;
         for part in parts {
@@ -2658,8 +2665,8 @@ impl Hardware {
                 None => samplers[unit] = self.sampler(false, Wrap::ClampToEdge, Wrap::ClampToEdge)?,
             }
         }
-        let tables = match draw.lighting.is_some() || draw.proctex {
-            true => self.tables(draw.tables, draw.proctex_tables)?,
+        let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
+            true => self.tables(draw.tables, draw.proctex_tables, draw.fog_table)?,
             false => 0,
         };
 
@@ -2704,7 +2711,7 @@ impl Hardware {
         words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
         match draw.lighting {
             Some(lighting) => lighting.pack(&mut words),
-            None => words.resize(UNIFORM_WORDS - PROCTEX_WORDS, 0),
+            None => words.resize(UNIFORM_WORDS - PROCTEX_WORDS - FOG_WORDS, 0),
         }
         let procedural = [
             proctex::REG_CONFIG,
@@ -2716,6 +2723,7 @@ impl Hardware {
         ];
         words.extend(procedural.map(|register| r[register]));
         words.extend([0, 0]);
+        words.extend([r[fog::REG_COLOR], 0, 0, 0]);
         debug_assert_eq!(words.len(), UNIFORM_WORDS);
         let uniform_offset = self.stage(UNIFORM_SIZE, self.uniform_alignment)?;
         let staging = self.ring(uniform_offset, UNIFORM_SIZE);

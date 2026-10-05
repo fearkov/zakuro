@@ -5,6 +5,7 @@ pub mod blend;
 #[cfg(feature = "vulkan")]
 mod device;
 pub mod proctex;
+pub mod fog;
 pub mod format;
 pub mod lighting;
 pub mod raster;
@@ -876,6 +877,9 @@ impl Gpu {
             }
             proctex::REG_TABLE_DATA..=proctex::REG_TABLE_DATA_END => {
                 self.resources.proctex_tables.write(&mut self.internal, new);
+            }
+            fog::REG_TABLE_DATA..=fog::REG_TABLE_DATA_END => {
+                self.resources.fog_table.write(&mut self.internal, new);
             }
             REG_GS_BLOCK..=REG_GS_BLOCK_END => {
                 configure_shader(&mut self.geometry_shader, register - REG_GS_BLOCK, new);

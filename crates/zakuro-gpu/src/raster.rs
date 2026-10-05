@@ -715,6 +715,7 @@ pub struct Resources {
     pub textures: TextureCache,
     pub light_tables: Tables,
     pub proctex_tables: crate::proctex::Tables,
+    pub fog_table: crate::fog::Table,
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
@@ -1389,6 +1390,8 @@ struct DrawState<'a> {
     /// texture 3, made up from its coordinates, and its tables.
     proctex: Option<crate::proctex::ProcTex<'a>>,
     proctex_tables: &'a crate::proctex::Tables,
+    fog: Option<crate::fog::Fog<'a>>,
+    fog_table: &'a crate::fog::Table,
 }
 
 #[cfg(feature = "vulkan")]
@@ -1411,6 +1414,8 @@ impl DrawState<'_> {
             tables: self.tables,
             proctex: self.proctex.is_some(),
             proctex_tables: self.proctex_tables,
+            fog: self.fog.is_some(),
+            fog_table: self.fog_table,
         }
     }
 }
@@ -1558,6 +1563,9 @@ fn fill_triangle(
                     stats.alpha_failed += 1;
                     continue;
                 }
+            }
+            if let Some(fog) = &state.fog {
+                fog.apply(&mut rgba, depth);
             }
 
             if let (Some(buffer), Some((stored_depth, stored_stencil)), Some(surface)) =
@@ -1941,6 +1949,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         tables: &resources.light_tables,
         proctex: crate::proctex::ProcTex::read(registers, &resources.proctex_tables),
         proctex_tables: &resources.proctex_tables,
+        fog: crate::fog::Fog::read(registers, &resources.fog_table),
+        fog_table: &resources.fog_table,
     };
     // what the draw writes, which the textures of later draws in the list
     // may be
@@ -2675,6 +2685,37 @@ mod tests {
         memory.read(DEPTH, &mut depth);
         // the stencil byte stays, nothing wrote it
         assert!(depth.as_chunks::<4>().0.iter().all(|sample| sample[..3] != [0xFF; 3]), "the depth drawn came back");
+    }
+
+    /// fog mixes into what the combiners made by the fragment's depth, on
+    /// the GPU as the software path does it.
+    #[test]
+    fn fog_mixes_in_by_depth() {
+        let mut registers = target_registers();
+        // a z-buffer, depth 0.5 at clip z -0.5
+        registers[REG_DEPTHMAP_ENABLE] = 1;
+        registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        registers[REG_VIEWPORT_DEPTH_NEAR] = float24(0.0);
+        registers[crate::fog::REG_MODE] |= 5;
+        registers[crate::fog::REG_COLOR] = 0x00_80_40_20;
+        let mut resources = Resources::default();
+        // a factor falling from 1 to 0 across the table, a half at 0.5
+        for entry in 0..crate::fog::ENTRIES as u32 {
+            let factor = (2048 - entry * 16).min(2047);
+            resources.fog_table.write(&mut registers, (factor << 13) | (0x2000 - 16));
+        }
+        let mut memory = ConsoleMemory::default();
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        assert!(pixels(&mut memory).iter().all(|&p| p == [143, 32, 64, 255]), "{:?}", pixels(&mut memory)[0]);
+
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            let mut gpu = ConsoleMemory::default();
+            resources.hardware = Some(hardware);
+            rasterize_shaded(&registers, &mut gpu, &mut resources, &cover(-0.5, RED));
+            resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
+            assert!(pixels(&mut gpu).iter().all(|&p| p == [143, 32, 64, 255]), "{:?}", pixels(&mut gpu)[0]);
+        }
     }
 
     /// the target at another size, the viewport over all of it.

@@ -99,6 +99,8 @@ layout(std140, set = 0, binding = 3) uniform Draw {
     // u and v and its frequencies, then its table's configuration and
     // offset
     uvec4 proctex[2];
+    // x, the fog's color
+    uvec4 fog;
 };
 
 // a combiner stage's source, operand, combiner and scale registers, the
@@ -114,13 +116,15 @@ uvec4 stage_registers(uint stage, uvec4 constants) {
 layout(std430, set = 0, binding = 4) readonly buffer Tables {
     // 24 tables of 256 entries, a value and the step to the next, then the
     // procedural texture's noise, color map and alpha map, 128 entries
-    // each, and its 256 colors and their steps, two pairs an entry
+    // each, and its 256 colors and their steps, two pairs an entry, then
+    // the fog's 128, a value and a step
     vec2 tables[];
 };
 
 const uint PROCTEX_MAPS = 24u * 256u;
 const uint PROCTEX_COLORS = PROCTEX_MAPS + 3u * 128u;
 const uint PROCTEX_STEPS = PROCTEX_COLORS + 2u * 256u;
+const uint FOG_TABLE = PROCTEX_STEPS + 2u * 256u;
 
 const uint DISTRIBUTION0 = 0u;
 const uint DISTRIBUTION1 = 1u;
@@ -613,6 +617,29 @@ void combine_stage(
     }
 }
 
+#ifdef WRITES_DEPTH
+// what the GPU shaded maps z/w itself, which the clipper got exactly.
+// precise as the combiners are. built so only for a w-buffer and for a
+// depth map the viewport can't hold, the rest leave depth to the
+// rasterizer, which lets the GPU skip what is hidden before shading it
+float fragment_depth() {
+    precise float depth = in_depth;
+    uint depth_mode = DYNAMIC != 0u ? flags.x : DEPTH_MODE;
+    if ((depth_mode & 2u) != 0u) {
+        depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
+    }
+    if ((depth_mode & 1u) != 0u) {
+        depth /= gl_FragCoord.w;
+    }
+    return clamp(depth, 0.0, 1.0);
+}
+#else
+// the viewport mapped the depth as the PICA does
+float fragment_depth() {
+    return gl_FragCoord.z;
+}
+#endif
+
 void main() {
     vec4 primary = clamp(in_color, 0.0, 1.0);
 
@@ -664,22 +691,22 @@ void main() {
     if ((alpha_test & 1u) != 0u && !compare((alpha_test >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
         discard;
     }
+    // the fog, by the fragment's depth through its table, the table's factor
+    // of the color and the rest of the fog's, which the alpha test came
+    // before. 5 turns it on, 7 is gas
+    if ((misc.x & 7u) == 5u) {
+        float depth = fragment_depth();
+        precise float index = ((misc.x & 0x10000u) != 0u ? 1.0 - depth : depth) * 128.0;
+        precise float entry = clamp(floor(index), 0.0, 127.0);
+        vec2 lookup = tables[FOG_TABLE + uint(entry)];
+        precise float factor = clamp(lookup.x + lookup.y * (index - entry), 0.0, 1.0);
+        vec3 fog_color = vec3(fog.x & 0xFFu, (fog.x >> 8) & 0xFFu, (fog.x >> 16) & 0xFFu);
+        color.rgb = floor(factor * color.rgb + (1.0 - factor) * fog_color);
+    }
     precise vec4 written = color / 255.0;
     out_color = written;
 
 #ifdef WRITES_DEPTH
-    // what the GPU shaded maps z/w itself, which the clipper got exactly.
-    // precise as the combiners are. built so only for a w-buffer and for a
-    // depth map the viewport can't hold, the rest leave depth to the
-    // rasterizer, which lets the GPU skip what is hidden before shading it
-    precise float depth = in_depth;
-    uint depth_mode = DYNAMIC != 0u ? flags.x : DEPTH_MODE;
-    if ((depth_mode & 2u) != 0u) {
-        depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
-    }
-    if ((depth_mode & 1u) != 0u) {
-        depth /= gl_FragCoord.w;
-    }
-    gl_FragDepth = clamp(depth, 0.0, 1.0);
+    gl_FragDepth = fragment_depth();
 #endif
 }
