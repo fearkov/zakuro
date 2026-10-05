@@ -72,6 +72,10 @@ fn main() {
     // intro or "press start" screen, which is most titles, most of the time,
     // would sit there for the entire run no matter how many frames are given.
     let mash_buttons = std::env::var("ZAKURO_MASH_BUTTONS").is_ok();
+    // mashing up to a frame and following ZAKURO_INPUT from there, to get
+    // through the screens before one quickly and then act on it,
+    // ZAKURO_MASH_UNTIL=4400 with ZAKURO_MASH_BUTTONS.
+    let mash_until: Option<u64> = std::env::var("ZAKURO_MASH_UNTIL").ok().and_then(|f| f.parse().ok());
 
     // a scripted alternative for reaching a specific screen reproducibly,
     // ZAKURO_INPUT=300:A,420:DOWN+A holds each listed button from that
@@ -116,9 +120,10 @@ fn main() {
             log::set_max_level(log::LevelFilter::Trace);
             println!("--- verbose logging from frame {frame} ---");
         }
+        let mashing = mash_buttons && (script.is_empty() || mash_until.is_some_and(|until| frame < until));
         if let Some(replay) = &mut replay {
             system.set_input(replay.input(frame));
-        } else if !script.is_empty() {
+        } else if !script.is_empty() && !mashing {
             let held = || script.iter().filter(|(start, ..)| (*start..*start + 6).contains(&frame));
             let buttons = held().fold(PadState::empty(), |held, (_, buttons, _)| held | *buttons);
             let touch = held().find_map(|(.., touch)| *touch);
@@ -131,7 +136,7 @@ fn main() {
                 circle_y: axis(PadState::CIRCLE_UP, PadState::CIRCLE_DOWN),
                 ..InputState::default()
             });
-        } else if mash_buttons {
+        } else if mashing {
             let pressed = frame % 40 < 4;
             // some first-boot prompts (language/EULA screens) wait for a
             // touchscreen tap rather than a button, so tap the bottom screen's
