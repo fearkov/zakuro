@@ -248,8 +248,12 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // RegisterInterruptEvents(interrupt, channel, event handle)
         REGISTER_INTERRUPT_EVENTS => {
             let handle = buffer.get(&mut system.memory, 4);
+            // kept until the title is done, whatever it does with its handle
             if let Some(object) = system.kernel.resolve(handle) {
-                system.services.dsp.interrupt_events.push(object);
+                if !system.services.dsp.interrupt_events.contains(&object) {
+                    system.kernel.objects.add_ref(object);
+                    system.services.dsp.interrupt_events.push(object);
+                }
             }
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -261,6 +265,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 None => {
                     let (object, handle) =
                         system.kernel.create_event(ResetType::OneShot, "DSP:semaphore");
+                    system.kernel.objects.add_ref(object);
                     system.services.dsp.semaphore_event = Some(handle);
                     system.services.dsp.semaphore_event_object = Some(object);
                     handle

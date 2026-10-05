@@ -277,7 +277,14 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         REGISTER_INTERRUPT_RELAY_QUEUE => {
             let event = buffer.get(&mut system.memory, 3);
             system.services.gsp.interrupt_event = Some(event);
-            system.services.gsp.interrupt_event_object = system.kernel.resolve(event);
+            // kept while registered, whatever the title does with its handle
+            let object = system.kernel.resolve(event);
+            if let Some(object) = object {
+                system.kernel.objects.add_ref(object);
+            }
+            if let Some(old) = std::mem::replace(&mut system.services.gsp.interrupt_event_object, object) {
+                system.kernel.objects.release(old);
+            }
 
             let handle = ensure_shared_memory(system);
             let index = system.services.gsp.thread_index;
@@ -293,7 +300,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         UNREGISTER_INTERRUPT_RELAY_QUEUE => {
             system.services.gsp.interrupt_event = None;
-            system.services.gsp.interrupt_event_object = None;
+            if let Some(old) = system.services.gsp.interrupt_event_object.take() {
+                system.kernel.objects.release(old);
+            }
             buffer.reply(&mut system.memory, id, &[]);
             true
         }

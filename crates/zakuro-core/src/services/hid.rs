@@ -176,6 +176,9 @@ fn ensure_resources(system: &mut System) {
         "HID:DebugPad",
     ] {
         let (object, handle) = system.kernel.create_event(ResetType::OneShot, name);
+        // signalled every frame, so kept whatever the title does with its
+        // handle, a closed one can't hand the event's place to the next object
+        system.kernel.objects.add_ref(object);
         system.services.hid.events.push(handle);
         system.services.hid.event_objects.push(object);
     }

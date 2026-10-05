@@ -126,7 +126,8 @@ impl ObjectStore {
         }
     }
 
-    fn release(&mut self, id: ObjectId) {
+    /// counts one holder less, freeing the object with the last.
+    pub(crate) fn release(&mut self, id: ObjectId) {
         let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) else {
             return;
         };

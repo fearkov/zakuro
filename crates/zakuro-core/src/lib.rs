@@ -1255,6 +1255,41 @@ mod tests {
         assert_ne!(system.kernel.thread(id).status, ThreadStatus::WaitSync, "the waiter woke");
     }
 
+    /// a handle closed while a thread waits on its object neither wakes the
+    /// thread as if it was signalled nor gives the object's place to the
+    /// next one made, and the object goes once the wait is over.
+    #[test]
+    fn closing_what_a_thread_waits_on_keeps_it_waiting() {
+        let mut system = System::new(Config::default());
+        let id = one_spinning_thread(&mut system);
+        system.cpu.regs[1] = 0;
+        kernel::svc::dispatch(&mut system, 0x17);
+        let event = system.cpu.regs[1];
+        let object = system.kernel.resolve(event).unwrap();
+        // for a millisecond
+        system.cpu.regs[0] = event;
+        system.cpu.regs[2] = 1_000_000;
+        system.cpu.regs[3] = 0;
+        kernel::svc::dispatch(&mut system, 0x24);
+        let other = system.kernel.create_thread("other", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        system.map_tls_page(other);
+        system.kernel.current_thread = Some(other);
+        system.kernel.thread_mut(other).status = ThreadStatus::Running;
+        system.cpu.regs[0] = event;
+        kernel::svc::dispatch(&mut system, 0x23);
+        let tick = system.cpu.cycles;
+        system.kernel.schedule(&mut system.cpu, tick);
+        assert_eq!(system.kernel.thread(id).status, ThreadStatus::WaitSync, "not woken as if signalled");
+        system.cpu.regs[1] = 0;
+        kernel::svc::dispatch(&mut system, 0x17);
+        assert_ne!(system.kernel.resolve(system.cpu.regs[1]), Some(object));
+
+        let late = kernel::thread::nanos_to_ticks(1_000_000) + 1;
+        system.kernel.schedule(&mut system.cpu, late);
+        assert!(matches!(system.kernel.thread(id).wait_result, Some(kernel::thread::WaitResult::TimedOut)));
+        assert!(system.kernel.objects.get(object).is_none(), "gone after the wait");
+    }
+
     /// a pulse event wakes what waits on it when signalled and is gone
     /// after, the next wait on it waits.
     #[test]

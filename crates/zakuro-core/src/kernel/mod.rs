@@ -156,6 +156,8 @@ impl Kernel {
             return object;
         }
         let object = self.objects.insert(KObject::Thread(id));
+        // kept for every handle after, closed or not
+        self.objects.add_ref(object);
         self.thread_objects.insert(id, object);
         object
     }
@@ -165,6 +167,7 @@ impl Kernel {
             return object;
         }
         let object = self.objects.insert(KObject::Process);
+        self.objects.add_ref(object);
         self.process_object = Some(object);
         object
     }
@@ -382,9 +385,8 @@ impl Kernel {
         match thread.status {
             ThreadStatus::Sleeping => {
                 if timed_out {
-                    let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
-                    thread.status = ThreadStatus::Ready;
+                    self.end_wait(id);
+                    self.threads[id as usize].status = ThreadStatus::Ready;
                     return true;
                 }
             }
@@ -414,16 +416,16 @@ impl Kernel {
                         self.acquire(objects[index], id);
                         index
                     };
+                    self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
                     thread.wait_result = Some(WaitResult::Signaled(index));
                     thread.status = ThreadStatus::Ready;
                     return true;
                 }
 
                 if timed_out {
+                    self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
                     thread.wait_result = Some(WaitResult::TimedOut);
                     thread.status = ThreadStatus::Ready;
                     return true;
@@ -433,8 +435,8 @@ impl Kernel {
                 // arbiter waits are released explicitly by a signalling
                 // thread, only the timeout is handled here.
                 if timed_out => {
+                    self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
                     thread.wait_result = Some(WaitResult::TimedOut);
                     thread.status = ThreadStatus::Ready;
                     return true;
@@ -496,6 +498,11 @@ impl Kernel {
         tick: u64,
     ) {
         let Some(id) = self.current_thread else { return };
+        // what a thread waits on stays while it does, a handle to it closed
+        // meanwhile can't free it and hand its place to the next object
+        for &object in &objects {
+            self.objects.add_ref(object);
+        }
         let thread = &mut self.threads[id as usize];
         thread.wait_objects = objects;
         thread.wait_all = wait_all;
@@ -503,6 +510,15 @@ impl Kernel {
         thread.wait_result = None;
         thread.status = ThreadStatus::WaitSync;
         self.reschedule_pending = true;
+    }
+
+    /// ends a thread's wait, letting go of the objects it kept while it
+    /// waited.
+    fn end_wait(&mut self, id: ThreadId) {
+        for object in std::mem::take(&mut self.threads[id as usize].wait_objects) {
+            self.objects.release(object);
+        }
+        self.threads[id as usize].clear_wait();
     }
 
     /// whether a thread besides the current one could run.
@@ -526,9 +542,9 @@ impl Kernel {
     /// down, the way the console's kernel does. one held by a dead thread
     /// would block whoever waits on it next forever.
     pub fn end_thread(&mut self, id: ThreadId) {
+        self.end_wait(id);
         let thread = &mut self.threads[id as usize];
         thread.status = ThreadStatus::Dead;
-        thread.clear_wait();
         thread.wait_result = None;
         thread.wait_syscall = None;
         let held: Vec<ObjectId> = self
@@ -662,6 +678,10 @@ mod tests {
         mutex.owner = Some(holder);
         mutex.lock_count = 2;
         let object = kernel.objects.insert(KObject::Mutex(mutex));
+        // a handle the title holds, and the wait's own hold, as begin_wait
+        // takes it
+        kernel.objects.add_ref(object);
+        kernel.objects.add_ref(object);
         let thread = &mut kernel.threads[waiter as usize];
         thread.wait_objects = vec![object];
         thread.status = ThreadStatus::WaitSync;
