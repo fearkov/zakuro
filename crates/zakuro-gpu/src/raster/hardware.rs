@@ -1071,6 +1071,8 @@ pub struct Hardware {
     shades: bool,
     /// whether programs are translated rather than interpreted.
     translates: bool,
+    /// what a surface's memory was read into last, the next read's buffer.
+    scratch: Vec<u8>,
     /// the programs seen and how far their translation got.
     translated: HashMap<ProgramKey, Translation>,
     /// the modules made, by their source, which programs differing only in
@@ -1274,6 +1276,7 @@ impl Hardware {
                 },
                 // interpreting them all instead, to tell the two apart
                 translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
+                scratch: Vec::new(),
                 translated: HashMap::new(),
                 modules: HashMap::new(),
                 // to draw through the pipeline made for each draw from the
@@ -1856,7 +1859,10 @@ impl Hardware {
             self.write_back(memory, others)?;
             self.begin()?;
         }
-        let mut bytes = vec![0; size as usize];
+        // into the last lookup's buffer, a surface's worth of bytes allocated
+        // for each costs more than reading them
+        let mut bytes = std::mem::take(&mut self.scratch);
+        bytes.resize(size as usize, 0);
         memory.read(addr, &mut bytes);
         if bytes != self.surfaces[index].shadow {
             if self.surfaces[index].dirty.is_some() {
@@ -1868,8 +1874,12 @@ impl Hardware {
                 memory.read(addr, &mut bytes);
             }
             self.upload(index, &bytes)?;
-            self.surfaces[index].shadow = bytes;
+            // copied, so each shadow keeps a size of its own
+            let shadow = &mut self.surfaces[index].shadow;
+            shadow.clear();
+            shadow.extend_from_slice(&bytes);
         }
+        self.scratch = bytes;
         self.surfaces[index].checked = true;
         Ok(index)
     }

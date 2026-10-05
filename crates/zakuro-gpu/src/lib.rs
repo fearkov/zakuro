@@ -306,7 +306,14 @@ impl Gpu {
             _ => value.to_le_bytes().to_vec(),
         };
 
-        let mut buffer = pattern.repeat(length.div_ceil(pattern.len()));
+        // the pattern over the range in the last fill's buffer, doubling, a
+        // fill a frame over a large buffer would have a new block each time
+        let mut buffer = std::mem::take(&mut self.resources.fill);
+        buffer.clear();
+        buffer.extend_from_slice(&pattern);
+        while buffer.len() < length {
+            buffer.extend_from_within(..buffer.len().min(length - buffer.len()));
+        }
         buffer.truncate(length);
         log::debug!(
             "memory fill: 0x{start:08X}..0x{end:08X} with 0x{value:08X} ({width}-byte pattern)"
@@ -319,6 +326,7 @@ impl Gpu {
                 log::error!("the GPU could not clear a buffer, {error}");
             }
         }
+        self.resources.fill = buffer;
     }
 
     /// DisplayTransfer, copies a rectangle between buffers, converting format
@@ -676,7 +684,10 @@ impl Gpu {
         paddr: u32,
         size: u32,
     ) {
-        let mut words = read_command_buffer(memory, paddr, size);
+        // into the last list's buffer, a list a few times a frame, large
+        // when draws upload their uniforms, would have a new block each time
+        let mut words = std::mem::take(&mut self.resources.words);
+        read_command_buffer(memory, paddr, size, &mut words);
         // buffers jump into each other, and a buffer jumping to itself
         // would never end, real lists stay far below this.
         let mut jumps = 0u32;
@@ -732,10 +743,11 @@ impl Gpu {
                     log::warn!("command list jumps more than {jumps} times; stopping");
                     break;
                 }
-                words = read_command_buffer(memory, address, size);
+                read_command_buffer(memory, address, size, &mut words);
                 index = 0;
             }
         }
+        self.resources.words = words;
 
         self.flush_immediate(memory);
         self.command_lists += 1;
@@ -911,16 +923,18 @@ impl Gpu {
     }
 }
 
-/// reads a command buffer as words.
-fn read_command_buffer<M: GpuMemory>(memory: &mut M, paddr: u32, size: u32) -> Vec<u32> {
-    let mut buffer = vec![0u8; size as usize];
-    memory.read(memory.translate(paddr), &mut buffer);
-    buffer
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect()
+/// reads a command buffer as words, into words.
+fn read_command_buffer<M: GpuMemory>(memory: &mut M, paddr: u32, size: u32, words: &mut Vec<u32>) {
+    let addr = memory.translate(paddr);
+    words.clear();
+    match memory.slice(addr, size as usize) {
+        Some(bytes) => words.extend(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c))),
+        None => {
+            let mut bytes = vec![0u8; size as usize];
+            memory.read(addr, &mut bytes);
+            words.extend(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
+        }
+    }
 }
 
 const REG_GS_BLOCK_END: usize = REG_GS_BLOCK + SHADER_BLOCK_SIZE - 1;

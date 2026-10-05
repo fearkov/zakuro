@@ -716,9 +716,65 @@ pub struct Resources {
     pub light_tables: Tables,
     pub proctex_tables: crate::proctex::Tables,
     pub fog_table: crate::fog::Table,
+    scratch: Scratch,
+    /// the bytes of the last memory fill, the next one's buffer.
+    pub(crate) fill: Vec<u8>,
+    /// the words of the last command list, the next one's buffer.
+    pub(crate) words: Vec<u32>,
+    /// the last draw's triangles as the GPU takes them, the next one's
+    /// buffer.
+    triangles: Vec<u32>,
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
+}
+
+/// the buffers a draw fills, kept from one draw to the next. allocating
+/// them for each draw costs more than filling them, far more on Windows,
+/// which hands a large block out fresh from the system every time, its
+/// pages faulting in again as they are first written.
+#[derive(Default)]
+struct Scratch {
+    bytes: Vec<u8>,
+    indices: Vec<u32>,
+    /// for each vertex index, the stamp of the last draw that named it and
+    /// its place among that draw's vertices. a draw stamps the entries it
+    /// uses instead of clearing a table as long as its largest index.
+    stamps: Vec<u32>,
+    places: Vec<u32>,
+    stamp: u32,
+    unique: Vec<u32>,
+    order: Vec<usize>,
+    inputs: Vec<[Vec4; shader::INPUT_REGISTERS]>,
+}
+
+impl Scratch {
+    /// the vertices the indices name, each once, in the order they first
+    /// come, and each index's place among them.
+    fn unique(&mut self) {
+        let last = self.indices.iter().copied().max().unwrap_or(0) as usize;
+        if self.stamps.len() <= last {
+            self.stamps.resize(last + 1, 0);
+            self.places.resize(last + 1, 0);
+        }
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            // the stamps came around, none of the old ones may match
+            self.stamps.fill(0);
+            self.stamp = 1;
+        }
+        self.unique.clear();
+        self.order.clear();
+        for &index in &self.indices {
+            let i = index as usize;
+            if self.stamps[i] != self.stamp {
+                self.stamps[i] = self.stamp;
+                self.places[i] = self.unique.len() as u32;
+                self.unique.push(index);
+            }
+            self.order.push(self.places[i] as usize);
+        }
+    }
 }
 
 /// textures decoded to RGBA, kept across draws for as long as the bytes
@@ -1773,48 +1829,35 @@ pub fn draw<M: GpuMemory>(
     );
     // an index buffer names most vertices several times, fetch and shade
     // each of them once.
-    let indices: Vec<u32> = if indexed {
+    let mut scratch = std::mem::take(&mut resources.scratch);
+    if indexed {
         // the whole index buffer at once, a read per index costs far more
         let size = if index_short { 2 } else { 1 };
         let len = (vertex_count * size) as usize;
-        let mut bytes = vec![0u8; len];
+        let bytes = &mut scratch.bytes;
+        bytes.resize(len, 0);
         match memory.slice(index_base, len) {
             Some(slice) => bytes.copy_from_slice(slice),
-            None => memory.read(index_base, &mut bytes),
+            None => memory.read(index_base, bytes),
         }
+        scratch.indices.clear();
         if index_short {
-            bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32).collect()
+            scratch.indices.extend(scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32));
         } else {
-            bytes.iter().map(|&b| b as u32).collect()
+            scratch.indices.extend(scratch.bytes.iter().map(|&b| b as u32));
         }
+        scratch.unique();
     } else {
-        (0..vertex_count).map(|i| first_vertex + i).collect()
-    };
-    let (unique, order) = if indexed {
-        // each vertex's place among the unique ones, by a table as long as
-        // the indices go, they are 16 bits at most
-        let last = indices.iter().copied().max().unwrap_or(0) as usize;
-        let mut places = vec![u32::MAX; last + 1];
-        let mut unique = Vec::new();
-        let order: Vec<usize> = indices
-            .iter()
-            .map(|&index| {
-                let place = &mut places[index as usize];
-                if *place == u32::MAX {
-                    *place = unique.len() as u32;
-                    unique.push(index);
-                }
-                *place as usize
-            })
-            .collect();
-        (unique, Some(order))
-    } else {
-        (indices, None)
-    };
+        scratch.unique.clear();
+        scratch.unique.extend((0..vertex_count).map(|i| first_vertex + i));
+    }
     let plan = InputPlan::new(registers, &layout, fixed_attributes);
-    let inputs: Vec<_> = unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)).collect();
-    let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: order.as_deref() };
+    scratch.inputs.clear();
+    scratch.inputs.extend(scratch.unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)));
+    let order = indexed.then_some(&scratch.order[..]);
+    let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
     rasterize(registers, memory, resources, vertices);
+    resources.scratch = scratch;
     vertex_count
 }
 
@@ -1837,6 +1880,17 @@ pub fn draw_immediate<M: GpuMemory>(
         .collect();
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: None };
     rasterize(registers, memory, resources, vertices)
+}
+
+/// the vertices of each triangle out of count of them, as assemble puts
+/// them, each the vertex it names, into indices.
+fn assemble_into(topology: u32, count: usize, vertex: impl Fn(usize) -> u32, indices: &mut Vec<u32>) {
+    indices.clear();
+    match topology {
+        1 => indices.extend((2..count).flat_map(|i| if i % 2 == 0 { [i - 2, i - 1, i] } else { [i - 1, i - 2, i] }).map(vertex)),
+        2 => indices.extend((2..count).flat_map(|i| [0, i - 1, i]).map(vertex)),
+        _ => indices.extend((0..count / 3 * 3).map(vertex)),
+    }
 }
 
 /// the vertices of each triangle out of count of them, for a list, a strip
@@ -1978,8 +2032,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         let whole = target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8);
         if hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
             let vertex = |i: usize| order.map_or(i, |order| order[i]) as u32;
-            let indices: Vec<u32> =
-                assemble(topology, vertex_count).into_iter().flat_map(|(a, b, c)| [vertex(a), vertex(b), vertex(c)]).collect();
+            let mut indices = std::mem::take(&mut resources.triangles);
+            assemble_into(topology, vertex_count, vertex, &mut indices);
             let shading = hardware::Shading {
                 unit: vertex_shader,
                 inputs,
@@ -1988,8 +2042,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 viewport,
                 cull: cull_mode,
             };
-            match hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading))) {
-                Ok(()) => return (indices.len() / 3) as u32,
+            let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
+            let triangles = (indices.len() / 3) as u32;
+            resources.triangles = indices;
+            match drawn {
+                Ok(()) => return triangles,
                 Err(error) => log::error!("the GPU could not shade, {error}, shading on the CPU"),
             }
         }
@@ -3757,6 +3814,21 @@ mod tests {
                     let colors: std::collections::HashSet<&[u8]> = a.chunks(output_format.bytes_per_pixel()).collect();
                     assert!(colors.len() > 8);
                 }
+            }
+        }
+    }
+
+    /// the triangles assemble_into puts down are assemble's, for a list,
+    /// a strip and a fan of any length, each through the vertex it names.
+    #[test]
+    fn both_assemblers_make_the_same_triangles() {
+        for topology in 0..4 {
+            for count in 0..12 {
+                let mut indices = vec![99];
+                assemble_into(topology, count, |i| 100 + i as u32, &mut indices);
+                let triangles: Vec<u32> =
+                    assemble(topology, count).into_iter().flat_map(|(a, b, c)| [a, b, c].map(|i| 100 + i as u32)).collect();
+                assert_eq!(indices, triangles, "topology {topology}, {count} vertices");
             }
         }
     }
