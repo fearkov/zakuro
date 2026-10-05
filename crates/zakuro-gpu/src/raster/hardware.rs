@@ -207,6 +207,9 @@ struct Surface {
     guarded: Option<(u32, u32)>,
     /// and those its writes have to wait for, see guard_writes.
     write_guarded: Option<(u32, u32)>,
+    /// rows a fill cleared while others it drew had not come down, which
+    /// another surface over the same memory may have drawn over since.
+    cleared: Option<(u32, u32)>,
     capture: Option<Capture>,
     /// when drawing scaled, an image at the console's resolution the
     /// surface goes through on its way to and from guest memory, and a
@@ -348,11 +351,12 @@ fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache) {
 /// run that does not end well losing no more than that.
 const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// how much a surface holds the latest of its memory, of those over the
-/// same rows, what the GPU drew and guest memory lacks first, then the
-/// taller, which titles draw a shorter buffer into the start of.
-fn newest(surface: &Surface) -> (bool, u32) {
-    (surface.dirty.is_some(), surface.height)
+/// how much a surface holds the latest of some of its rows of memory, of
+/// those over the same rows, what the GPU drew there and guest memory lacks
+/// first, then the taller, which titles draw a shorter buffer into the start
+/// of. drawn in other rows, it may have older ones there.
+fn newest(surface: &Surface, (start, end): (u32, u32)) -> (bool, u32) {
+    (surface.dirty.is_some_and(|(from, to)| from < end && start < to), surface.height)
 }
 
 /// the rows of memory of a tiled surface a fill covers, when it covers some
@@ -365,6 +369,20 @@ fn rows_filled(surface: &Surface, addr: u32, len: u32) -> Option<(u32, u32)> {
     let whole = |offset: u64| offset.is_multiple_of(row * 8);
     let partial = start > 0 || end < surface.size() as u64;
     (surface.tiled && end > start && partial && whole(start) && whole(end)).then(|| ((start / row) as u32, (end / row) as u32))
+}
+
+/// the rows of a span left once other rows are taken out of it, which can
+/// only shorten it at either end, rows in its middle leave all of it.
+fn without((start, end): (u32, u32), (from, to): (u32, u32)) -> Option<(u32, u32)> {
+    if from <= start && end <= to {
+        None
+    } else if from <= start && start < to {
+        Some((to, end))
+    } else if from < end && end <= to {
+        Some((start, from))
+    } else {
+        Some((start, end))
+    }
 }
 
 /// where a pixel's bytes are in a buffer of guest memory, from its start.
@@ -1807,6 +1825,7 @@ impl Hardware {
                     dirty: None,
                     guarded: None,
                     write_guarded: None,
+                    cleared: None,
                     capture: None,
                     native,
                     screen: None,
@@ -1834,11 +1853,36 @@ impl Hardware {
         let mut bytes = vec![0; size as usize];
         memory.read(addr, &mut bytes);
         if bytes != self.surfaces[index].shadow {
+            if self.surfaces[index].dirty.is_some() {
+                // memory changed beside rows the GPU drew and it lacks, which
+                // an upload alone would lose. they come down first, along
+                // with what changed
+                self.write_back(memory, vec![index])?;
+                self.begin()?;
+                memory.read(addr, &mut bytes);
+            }
             self.upload(index, &bytes)?;
             self.surfaces[index].shadow = bytes;
         }
         self.surfaces[index].checked = true;
         Ok(index)
+    }
+
+    /// the GPU drew rows of a surface, which other surfaces over the same
+    /// memory hold older, the next use of one looks at memory again, after
+    /// what this one drew is written back. the other buffer of the same draw
+    /// is left alone, titles pack color and depth next to each other.
+    fn overdrawn(&mut self, index: usize, (start, end): (u32, u32), pair: Option<usize>) {
+        let s = &self.surfaces[index];
+        let row = s.row_bytes();
+        // whole rows of tiles, as a draw changes tiled memory
+        let (start, end) = (start / 8 * 8, end.div_ceil(8).saturating_mul(8).min(s.height));
+        let (addr, len) = (s.addr + start * row, end.saturating_sub(start) * row);
+        for i in 0..self.surfaces.len() {
+            if i != index && Some(i) != pair && self.surfaces[i].overlaps(addr, len) {
+                self.surfaces[i].checked = false;
+            }
+        }
     }
 
     /// copies a guest buffer's bytes into its surface.
@@ -2170,6 +2214,21 @@ impl Hardware {
                     if let Some(shadow) = surface.shadow.get_mut(range) {
                         shadow.copy_from_slice(filled);
                     }
+                    // memory holds those rows as the image does now, what
+                    // the GPU drew that has not come down is the rest. a
+                    // buffer of another shape drawn over the filled rows
+                    // does not have this one written back first, Inazuma
+                    // Eleven GO draws both screens through one every frame
+                    let left = surface.dirty.and_then(|dirty| without(dirty, rows));
+                    if left != surface.dirty {
+                        surface.dirty = left;
+                        // the next draw guards what it draws again
+                        surface.guarded = None;
+                        surface.write_guarded = None;
+                    }
+                    if left.is_some() {
+                        surface.cleared = Some(surface.cleared.map_or(rows, |(from, to)| (from.min(rows.0), to.max(rows.1))));
+                    }
                     surface.replaced();
                 } else {
                     self.surfaces[index].checked = false;
@@ -2190,6 +2249,7 @@ impl Hardware {
                 surface.dirty = None;
                 surface.guarded = None;
                 surface.write_guarded = None;
+                surface.cleared = None;
                 surface.checked = false;
                 continue;
             }
@@ -2240,6 +2300,7 @@ impl Hardware {
             surface.dirty = None;
             surface.guarded = None;
             surface.write_guarded = None;
+            surface.cleared = None;
             surface.checked = false;
             surface.replaced();
         }
@@ -2724,10 +2785,12 @@ impl Hardware {
         if color_mask != 0 {
             self.surfaces[color].drew(rows);
             self.surfaces[color].guard_writes(memory);
+            self.overdrawn(color, rows, depth);
         }
         if let Some(depth) = depth {
             if depth_write || (stencil_test && writable) {
                 self.surfaces[depth].drew(rows);
+                self.overdrawn(depth, rows, Some(color));
                 // only depth, which titles read to tell what is in view.
                 // Super Mario 3D Land reads small color buffers back on
                 // loading a course and stalls on what the GPU drew there,
@@ -2963,7 +3026,7 @@ impl Hardware {
             .iter()
             .filter(|s| s.kind == input_kind && s.tiled && s.width == t.input_width)
             .filter_map(|s| Some((s, row_in(s)?)))
-            .max_by_key(|(s, _)| newest(s))
+            .max_by_key(|&(s, row)| newest(s, (row + first, row + first + rows)))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
         else {
             return Ok(false);
@@ -2976,7 +3039,8 @@ impl Hardware {
         self.begin()?;
         // a flush looking one of them up drops what the other had checked
         let (source, target) = loop {
-            let source = self.surface(memory, addr, input_size, input_kind, true)?;
+            // the rows it reads, what is drawn over the rest stays on the GPU
+            let source = self.surface_rows(memory, addr, input_size, input_kind, true, Some((row + first, row + first + rows)))?;
             let target = self.surface(memory, t.output, output_size, output_kind, t.output_tiled)?;
             if self.surfaces[source].checked && self.surfaces[target].checked {
                 break (source, target);
@@ -3002,6 +3066,7 @@ impl Hardware {
         self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
         self.surfaces[target].changed();
         self.surfaces[target].guard_writes(memory);
+        self.overdrawn(target, (0, self.surfaces[target].height), None);
         self.capture(target)?;
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer
@@ -3055,21 +3120,33 @@ impl Hardware {
         let kinds = [Some(Kind::Color(texture.format)), depth];
         let tile_rows = 8 * texture.width * Kind::Color(texture.format).bytes();
         (0..self.surfaces.len())
-            .filter(|&i| {
+            .filter_map(|i| {
                 let s = &self.surfaces[i];
-                kinds.contains(&Some(s.kind)) && s.tiled && s.width == texture.width && {
-                    let offset = texture.addr.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0);
-                    offset.is_some_and(|offset| offset / tile_rows * 8 + texture.height <= s.height)
+                if !(kinds.contains(&Some(s.kind)) && s.tiled && s.width == texture.width) {
+                    return None;
                 }
+                let row = texture.addr.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * 8;
+                (row + texture.height <= s.height).then_some((i, row))
             })
-            .max_by_key(|&i| newest(&self.surfaces[i]))
-            .map(|index| (index, (texture.addr - self.surfaces[index].addr) / tile_rows * 8))
+            .max_by_key(|&(i, row)| newest(&self.surfaces[i], (row, row + texture.height)))
     }
 
     /// whether a texture is rows of a surface the GPU drew and guest memory
-    /// has not got back, which draw then copies on the GPU.
+    /// has not got back, which draw then copies on the GPU. rows a fill
+    /// cleared of it hold what memory held then, when memory may have
+    /// changed there since, or another surface drew over them, the texture
+    /// comes from memory once what was drawn is written back.
     pub(crate) fn holds(&self, texture: &DrawnTexture) -> bool {
-        self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].dirty.is_some())
+        let Some((index, row)) = self.texture_source(texture) else { return false };
+        let surface = &self.surfaces[index];
+        let changed = surface.cleared.is_some_and(|(from, to)| {
+            let (from, to) = (from.max(row), to.min(row + texture.height));
+            let at = surface.addr + from * surface.row_bytes();
+            from < to
+                && (!surface.checked
+                    || (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(at, (to - from) * surface.row_bytes())))
+        });
+        surface.dirty.is_some() && !changed
     }
 
     /// the image of a texture copied from the surface it is part of, copied
@@ -3901,6 +3978,7 @@ impl Hardware {
         let row = s.row_bytes() as usize;
         let addr = s.addr;
         let rows = first as usize * row..last as usize * row;
+        let drawn = bytes[rows.clone()].to_vec();
         // what was written over the buffer since the image last matched it
         // came after the drawing and stays, the console's GPU had put its
         // pixels in memory first. the CPU's writes and the files services
@@ -3915,14 +3993,22 @@ impl Hardware {
                 }
             }
         }
-        memory.write(addr + rows.start as u32, &bytes[rows]);
-        // what memory holds now, the rows drawn and the others as they were
-        memory.read(addr, &mut bytes);
+        memory.write(addr + rows.start as u32, &bytes[rows.clone()]);
         let surface = &mut self.surfaces[index];
-        surface.shadow = bytes;
+        if surface.shadow.len() == bytes.len() {
+            // the image still matches what memory held where it did before,
+            // and the rows written hold what it drew, what memory kept
+            // instead shows as a change the next time it is looked up
+            surface.shadow[rows].copy_from_slice(&drawn);
+        } else {
+            // what memory holds now, the rows drawn and the others as they were
+            memory.read(addr, &mut bytes);
+            surface.shadow = bytes;
+        }
         surface.dirty = None;
         surface.guarded = None;
         surface.write_guarded = None;
+        surface.cleared = None;
     }
 }
 

@@ -2677,6 +2677,218 @@ mod tests {
         assert!(depth.as_chunks::<4>().0.iter().all(|sample| sample[..3] != [0xFF; 3]), "the depth drawn came back");
     }
 
+    /// the target at another size, the viewport over all of it.
+    fn sized(registers: &mut [u32], width: u32, height: u32) {
+        registers[REG_VIEWPORT_WIDTH] = float24(width as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(height as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = width | ((height - 1) << 12);
+    }
+
+    /// a fill over every row the GPU drew leaves the buffer as memory holds
+    /// it, and the next draw there has the CPU's writes ask first again.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_fill_over_all_that_was_drawn_guards_the_next_draw_again() {
+        struct Guarded<'a>(&'a mut ConsoleMemory, Vec<(u32, u32)>);
+        impl GpuMemory for Guarded<'_> {
+            fn read(&mut self, addr: u32, out: &mut [u8]) {
+                self.0.read(addr, out)
+            }
+            fn write(&mut self, addr: u32, data: &[u8]) {
+                self.0.write(addr, data)
+            }
+            fn guard_writes(&mut self, addr: u32, len: u32) {
+                self.1.push((addr, len))
+            }
+        }
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut registers = target_registers();
+        sized(&mut registers, 8, 16);
+        // the window's top half, the first rows of memory
+        registers[REG_VIEWPORT_XY] = 8 << 16;
+        registers[REG_VIEWPORT_HEIGHT] = float24(4.0);
+        let mut memory = ConsoleMemory::default();
+        let mut guarded = Guarded(&mut memory, Vec::new());
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, RED));
+        assert_eq!(guarded.1, [(COLOR, 256)]);
+        let fill = [0u8; 256];
+        guarded.0.write(COLOR, &fill);
+        resources.hardware.as_mut().unwrap().filled(COLOR, &fill).unwrap();
+        rasterize_shaded(&registers, &mut guarded, &mut resources, &cover(-0.5, GREEN));
+        assert_eq!(guarded.1, [(COLOR, 256), (COLOR, 256)]);
+    }
+
+    /// a buffer drawn over rows a fill left of a taller one, which still has
+    /// other rows drawn, is the one a transfer of those rows reads.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn rows_drawn_after_a_fill_come_from_the_buffer_that_drew_them() {
+        const OUTPUT: u32 = 0x10_0000;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut tall = target_registers();
+        sized(&mut tall, 8, 16);
+        tall[REG_DEPTH_COLOR_MASK] |= 1 << 12;
+        let mut short = target_registers();
+        // a depth buffer of its own keeps it apart from the taller one
+        short[REG_DEPTH_COLOR_MASK] |= 1 << 12;
+        short[REG_DEPTH_BUFFER_ADDRESS] = 0x5000 >> 3;
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&tall, &mut memory, &mut resources, &cover(-0.5, RED));
+        let fill = [0u8; 256];
+        memory.write(COLOR, &fill);
+        resources.hardware.as_mut().unwrap().filled(COLOR, &fill).unwrap();
+        rasterize_shaded(&short, &mut memory, &mut resources, &cover(-0.5, GREEN));
+        let hardware = resources.hardware.as_mut().unwrap();
+        // a texture of those rows is copied from the shorter buffer on the
+        // GPU, one over both comes from memory
+        let texture = |height| DrawnTexture { addr: COLOR, width: 8, height, format: ColorFormat::Rgba8 };
+        assert!(hardware.holds(&texture(8)));
+        assert!(!hardware.holds(&texture(16)));
+        let transfer = hardware::Transfer {
+            input: COLOR,
+            output: OUTPUT,
+            input_width: 8,
+            input_height: 8,
+            output_width: 8,
+            output_height: 8,
+            copy: (8, 8),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: ColorFormat::Rgba8,
+            output_format: ColorFormat::Rgba8,
+        };
+        assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+        hardware.flush(&mut memory).unwrap();
+        let mut out = [0u8; 256];
+        memory.read(OUTPUT, &mut out);
+        assert!(out.as_chunks::<4>().0.iter().all(|p| ColorFormat::Rgba8.decode(p) == [0, 255, 0, 255]));
+    }
+
+    /// memory written over rows a fill cleared of a buffer still drawn
+    /// elsewhere, a DMA after the GPU was synced, is what a texture of those
+    /// rows shows, and what the buffer holds once used again.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn rows_written_after_a_fill_reach_textures_and_the_buffer() {
+        const OUTPUT: u32 = 0x10_0000;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut registers = target_registers();
+        sized(&mut registers, 8, 16);
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        let fill = [0u8; 256];
+        memory.write(COLOR, &fill);
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.filled(COLOR, &fill).unwrap();
+        hardware.sync(&mut memory, COLOR, 256).unwrap();
+        let mut green = [0u8; 4];
+        ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+        memory.write(COLOR, &green.repeat(64));
+        let texture = DrawnTexture { addr: COLOR, width: 8, height: 8, format: ColorFormat::Rgba8 };
+        assert!(!hardware.holds(&texture), "the texture comes from memory");
+        // the rest of the drawing comes down, and the buffer is used again
+        hardware.sync(&mut memory, COLOR + 256, 256).unwrap();
+        let transfer = hardware::Transfer {
+            input: COLOR,
+            output: OUTPUT,
+            input_width: 8,
+            input_height: 16,
+            output_width: 8,
+            output_height: 16,
+            copy: (8, 16),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: ColorFormat::Rgba8,
+            output_format: ColorFormat::Rgba8,
+        };
+        assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+        hardware.flush(&mut memory).unwrap();
+        let mut out = [0u8; 512];
+        memory.read(OUTPUT, &mut out);
+        let pixels: Vec<[u8; 4]> = out.as_chunks::<4>().0.iter().map(|p| ColorFormat::Rgba8.decode(p)).collect();
+        assert_eq!(pixels.iter().filter(|&&p| p == [0, 255, 0, 255]).count(), 64, "the rows written are green");
+        assert_eq!(pixels.iter().filter(|&&p| p == [255, 0, 0, 255]).count(), 64, "the rows drawn stay red");
+    }
+
+    /// a narrower buffer drawn over rows a fill left of a wider one does not
+    /// cost the wider one the rows it drew elsewhere, which memory lacks,
+    /// when it is used again.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_buffer_used_again_keeps_the_rows_it_drew() {
+        const OUTPUT: u32 = 0x10_0000;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut wide = target_registers();
+        sized(&mut wide, 16, 16);
+        let narrow = target_registers();
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&wide, &mut memory, &mut resources, &cover(-0.5, RED));
+        // its first row of tiles, 8 rows of 16 pixels
+        let fill = [0u8; 512];
+        memory.write(COLOR, &fill);
+        resources.hardware.as_mut().unwrap().filled(COLOR, &fill).unwrap();
+        rasterize_shaded(&narrow, &mut memory, &mut resources, &cover(-0.5, GREEN));
+        let hardware = resources.hardware.as_mut().unwrap();
+        let transfer = hardware::Transfer {
+            input: COLOR,
+            output: OUTPUT,
+            input_width: 16,
+            input_height: 16,
+            output_width: 16,
+            output_height: 16,
+            copy: (16, 16),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: ColorFormat::Rgba8,
+            output_format: ColorFormat::Rgba8,
+        };
+        assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+        hardware.sync(&mut memory, COLOR + 512, 512).unwrap();
+        let mut rest = [0u8; 512];
+        memory.read(COLOR + 512, &mut rest);
+        assert!(rest.as_chunks::<4>().0.iter().all(|p| ColorFormat::Rgba8.decode(p) == [255, 0, 0, 255]), "the rows it drew stay red");
+    }
+
+    /// a fill over the first rows of a buffer the GPU drew leaves only the
+    /// rest of the drawing to come down, so a buffer of another shape over
+    /// the filled rows does not have it written back first.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_fill_leaves_only_the_rest_of_the_drawing() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut registers = target_registers();
+        // eight by sixteen, two rows of tiles
+        registers[REG_VIEWPORT_HEIGHT] = float24(8.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12);
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        let fill = [0x11u8, 0x22, 0x33, 0x44].repeat(64);
+        memory.write(COLOR, &fill);
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.filled(COLOR, &fill).unwrap();
+        let mut rest = [0u8; 256];
+        hardware.sync(&mut memory, COLOR, 256).unwrap();
+        memory.read(COLOR + 256, &mut rest);
+        assert_eq!(rest, [0; 256], "nothing over the filled rows had to come down");
+        hardware.sync(&mut memory, COLOR + 256, 256).unwrap();
+        memory.read(COLOR + 256, &mut rest);
+        assert!(rest.as_chunks::<4>().0.iter().all(|p| ColorFormat::Rgba8.decode(p) == [255, 0, 0, 255]), "the rest of the drawing does");
+        let mut first = [0u8; 256];
+        memory.read(COLOR, &mut first);
+        assert_eq!(first[..], fill[..], "and the fill stays");
+    }
+
     /// memory written after the GPU drew over it by something that does not
     /// wait for the drawing stays when the drawing is written back.
     #[cfg(feature = "vulkan")]
