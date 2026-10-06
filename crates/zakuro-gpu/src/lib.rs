@@ -33,6 +33,11 @@ pub trait GpuMemory {
         None
     }
 
+    /// the same bytes to write in place, where slice finds them.
+    fn slice_mut(&mut self, _addr: u32, _len: usize) -> Option<&mut [u8]> {
+        None
+    }
+
     fn read_u32(&mut self, addr: u32) -> u32 {
         let mut buf = [0u8; 4];
         self.read(addr, &mut buf);
@@ -300,29 +305,30 @@ impl Gpu {
             }
         }
 
-        let pattern: Vec<u8> = match width {
-            2 => value.to_le_bytes()[..2].to_vec(),
-            3 => value.to_le_bytes()[..3].to_vec(),
-            _ => value.to_le_bytes().to_vec(),
-        };
-
-        // the pattern over the range in the last fill's buffer, doubling, a
-        // fill a frame over a large buffer would have a new block each time
-        let mut buffer = std::mem::take(&mut self.resources.fill);
-        buffer.clear();
-        buffer.extend_from_slice(&pattern);
-        while buffer.len() < length {
-            buffer.extend_from_within(..buffer.len().min(length - buffer.len()));
-        }
-        buffer.truncate(length);
+        let bytes = value.to_le_bytes();
+        let pattern = &bytes[..if matches!(width, 2 | 3) { width as usize } else { 4 }];
         log::debug!(
             "memory fill: 0x{start:08X}..0x{end:08X} with 0x{value:08X} ({width}-byte pattern)"
         );
-        memory.write(address, &buffer);
+        // in place where memory is in one piece, a frame's fills are
+        // megabytes, else over the range in the last fill's buffer
+        let mut buffer = std::mem::take(&mut self.resources.fill);
+        match memory.slice_mut(address, length) {
+            Some(range) => repeat(pattern, range),
+            None => {
+                buffer.resize(length, 0);
+                repeat(pattern, &mut buffer);
+                memory.write(address, &buffer);
+            }
+        }
         self.fills += 1;
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
-            if let Err(error) = hardware.filled(address, &buffer) {
+            let filled = match memory.slice(address, length) {
+                Some(range) => range,
+                None => &buffer[..],
+            };
+            if let Err(error) = hardware.filled(address, filled) {
                 log::error!("the GPU could not clear a buffer, {error}");
             }
         }
@@ -955,6 +961,19 @@ impl Gpu {
     }
 }
 
+/// pattern over bytes, from the start again each time it ends, the copies
+/// doubling.
+fn repeat(pattern: &[u8], bytes: &mut [u8]) {
+    let first = pattern.len().min(bytes.len());
+    bytes[..first].copy_from_slice(&pattern[..first]);
+    let mut done = first;
+    while done < bytes.len() {
+        let more = done.min(bytes.len() - done);
+        bytes.copy_within(..more, done);
+        done += more;
+    }
+}
+
 /// reads a command buffer as words, into words.
 fn read_command_buffer<M: GpuMemory>(memory: &mut M, paddr: u32, size: u32, words: &mut Vec<u32>) {
     let addr = memory.translate(paddr);
@@ -1289,6 +1308,47 @@ mod tests {
         assert_eq!(gpu.internal[0x0100], 0x1111, "the sub-buffer ran");
         assert_eq!(gpu.internal[0x0102], 0x2222, "the jump back ran");
         assert_eq!(gpu.internal[0x0101], 0, "a jump does not return");
+    }
+
+    /// flat memory that hands its bytes out in one piece, and nothing
+    /// else, to see a fill go in place.
+    struct WholeMemory(Vec<u8>);
+
+    impl GpuMemory for WholeMemory {
+        fn read(&mut self, _addr: u32, _out: &mut [u8]) {
+            unreachable!("read in one piece")
+        }
+
+        fn write(&mut self, _addr: u32, _data: &[u8]) {
+            unreachable!("written in one piece")
+        }
+
+        fn slice_mut(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+            self.0.get_mut(addr as usize..addr as usize + len)
+        }
+
+        fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+            self.0.get(addr as usize..addr as usize + len)
+        }
+    }
+
+    /// a fill repeats its pattern over the range, two and three byte ones
+    /// too, in place where memory is in one piece and through a copy where
+    /// it is not, and leaves the rest alone.
+    #[test]
+    fn fills_repeat_their_pattern() {
+        for (width, pattern) in [(2, &[0x11u8, 0x22][..]), (3, &[0x11, 0x22, 0x33]), (4, &[0x11, 0x22, 0x33, 0x44])] {
+            let mut expected = vec![0xEE; 0x200];
+            for (byte, &value) in expected[0x100..0x100 + 101].iter_mut().zip(pattern.iter().cycle()) {
+                *byte = value;
+            }
+            let mut flat = FlatMemory(vec![0xEE; 0x200]);
+            Gpu::new().memory_fill(&mut flat, 0x100, 0x100 + 101, 0x4433_2211, width);
+            assert_eq!(flat.0, expected, "{width} bytes through a copy");
+            let mut whole = WholeMemory(vec![0xEE; 0x200]);
+            Gpu::new().memory_fill(&mut whole, 0x100, 0x100 + 101, 0x4433_2211, width);
+            assert_eq!(whole.0, expected, "{width} bytes in place");
+        }
     }
 
     /// float uniforms sent in a burst, to one data register or along all

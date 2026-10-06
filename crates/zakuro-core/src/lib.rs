@@ -933,6 +933,10 @@ impl GpuMemory for GuestMemory<'_> {
     }
 
     fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+        self.slice_mut(addr, len).map(|slice| &*slice)
+    }
+
+    fn slice_mut(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
         // the linear heap and VRAM are physical memory in order, so what
         // translate made of a physical address leads back to it. VRAM first,
         // from the old linear heap's base a New 3DS's heap size reaches it
@@ -943,7 +947,7 @@ impl GpuMemory for GuestMemory<'_> {
         } else {
             return None;
         };
-        self.memory.phys.host_slice_mut(physical, u32::try_from(len).ok()?).map(|slice| &*slice)
+        self.memory.phys.host_slice_mut(physical, u32::try_from(len).ok()?)
     }
 
     fn translate(&self, paddr: u32) -> u32 {

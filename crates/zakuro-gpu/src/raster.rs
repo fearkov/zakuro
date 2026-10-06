@@ -2413,21 +2413,59 @@ mod tests {
     use std::collections::HashMap;
 
     /// guest memory seen the way the GPU sees it, physical VRAM and FCRAM
-    /// translate to different virtual windows.
-    #[derive(Default, Clone)]
-    struct ConsoleMemory(HashMap<u32, u8>);
+    /// translate to different virtual windows. its first megabytes lie in
+    /// one piece, as the linear heap and VRAM do, unless it is scattered.
+    #[derive(Clone)]
+    struct ConsoleMemory {
+        flat: Vec<u8>,
+        rest: HashMap<u32, u8>,
+        /// whether slice hands out the flat bytes.
+        whole: bool,
+    }
+
+    impl Default for ConsoleMemory {
+        fn default() -> ConsoleMemory {
+            ConsoleMemory { flat: vec![0; 4 << 20], rest: HashMap::new(), whole: true }
+        }
+    }
+
+    impl ConsoleMemory {
+        /// memory nothing is in one piece of, for the paths that copy.
+        fn scattered() -> ConsoleMemory {
+            ConsoleMemory { whole: false, ..ConsoleMemory::default() }
+        }
+    }
 
     impl GpuMemory for ConsoleMemory {
         fn read(&mut self, addr: u32, out: &mut [u8]) {
             for (i, byte) in out.iter_mut().enumerate() {
-                *byte = self.0.get(&(addr + i as u32)).copied().unwrap_or(0);
+                let at = addr + i as u32;
+                *byte = self.flat.get(at as usize).copied().unwrap_or_else(|| self.rest.get(&at).copied().unwrap_or(0));
             }
         }
 
         fn write(&mut self, addr: u32, data: &[u8]) {
-            for (i, byte) in data.iter().enumerate() {
-                self.0.insert(addr + i as u32, *byte);
+            for (i, &byte) in data.iter().enumerate() {
+                let at = addr + i as u32;
+                match self.flat.get_mut(at as usize) {
+                    Some(flat) => *flat = byte,
+                    None => {
+                        self.rest.insert(at, byte);
+                    }
+                }
             }
+        }
+
+        fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+            self.slice_mut(addr, len).map(|slice| &*slice)
+        }
+
+        fn slice_mut(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+            let at = addr as usize;
+            if !self.whole || at + len > self.flat.len() {
+                return None;
+            }
+            Some(&mut self.flat[at..at + len])
         }
 
         fn translate(&self, paddr: u32) -> u32 {
@@ -3110,46 +3148,47 @@ mod tests {
     #[test]
     fn rows_written_after_a_fill_reach_textures_and_the_buffer() {
         const OUTPUT: u32 = 0x10_0000;
-        let Ok(hardware) = hardware::Hardware::new() else { return };
-        let mut registers = target_registers();
-        sized(&mut registers, 8, 16);
-        let mut memory = ConsoleMemory::default();
-        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
-        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
-        let fill = [0u8; 256];
-        memory.write(COLOR, &fill);
-        let hardware = resources.hardware.as_mut().unwrap();
-        hardware.filled(COLOR, &fill).unwrap();
-        hardware.sync(&mut memory, COLOR, 256).unwrap();
-        let mut green = [0u8; 4];
-        ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
-        memory.write(COLOR, &green.repeat(64));
-        let texture = DrawnTexture { addr: COLOR, width: 8, height: 8, format: ColorFormat::Rgba8 };
-        assert!(!hardware.holds(&texture), "the texture comes from memory");
-        // the rest of the drawing comes down, and the buffer is used again
-        hardware.sync(&mut memory, COLOR + 256, 256).unwrap();
-        let transfer = hardware::Transfer {
-            input: COLOR,
-            output: OUTPUT,
-            input_width: 8,
-            input_height: 16,
-            output_width: 8,
-            output_height: 16,
-            copy: (8, 16),
-            scale: (1, 1),
-            flip: false,
-            input_linear: false,
-            output_tiled: false,
-            input_format: ColorFormat::Rgba8,
-            output_format: ColorFormat::Rgba8,
-        };
-        assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
-        hardware.flush(&mut memory).unwrap();
-        let mut out = [0u8; 512];
-        memory.read(OUTPUT, &mut out);
-        let pixels: Vec<[u8; 4]> = out.as_chunks::<4>().0.iter().map(|p| ColorFormat::Rgba8.decode(p)).collect();
-        assert_eq!(pixels.iter().filter(|&&p| p == [0, 255, 0, 255]).count(), 64, "the rows written are green");
-        assert_eq!(pixels.iter().filter(|&&p| p == [255, 0, 0, 255]).count(), 64, "the rows drawn stay red");
+        for mut memory in [ConsoleMemory::default(), ConsoleMemory::scattered()] {
+            let Ok(hardware) = hardware::Hardware::new() else { return };
+            let mut registers = target_registers();
+            sized(&mut registers, 8, 16);
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+            let fill = [0u8; 256];
+            memory.write(COLOR, &fill);
+            let hardware = resources.hardware.as_mut().unwrap();
+            hardware.filled(COLOR, &fill).unwrap();
+            hardware.sync(&mut memory, COLOR, 256).unwrap();
+            let mut green = [0u8; 4];
+            ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+            memory.write(COLOR, &green.repeat(64));
+            let texture = DrawnTexture { addr: COLOR, width: 8, height: 8, format: ColorFormat::Rgba8 };
+            assert!(!hardware.holds(&texture), "the texture comes from memory");
+            // the rest of the drawing comes down, and the buffer is used again
+            hardware.sync(&mut memory, COLOR + 256, 256).unwrap();
+            let transfer = hardware::Transfer {
+                input: COLOR,
+                output: OUTPUT,
+                input_width: 8,
+                input_height: 16,
+                output_width: 8,
+                output_height: 16,
+                copy: (8, 16),
+                scale: (1, 1),
+                flip: false,
+                input_linear: false,
+                output_tiled: false,
+                input_format: ColorFormat::Rgba8,
+                output_format: ColorFormat::Rgba8,
+            };
+            assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+            hardware.flush(&mut memory).unwrap();
+            let mut out = [0u8; 512];
+            memory.read(OUTPUT, &mut out);
+            let pixels: Vec<[u8; 4]> = out.as_chunks::<4>().0.iter().map(|p| ColorFormat::Rgba8.decode(p)).collect();
+            assert_eq!(pixels.iter().filter(|&&p| p == [0, 255, 0, 255]).count(), 64, "the rows written are green");
+            assert_eq!(pixels.iter().filter(|&&p| p == [255, 0, 0, 255]).count(), 64, "the rows drawn stay red");
+        }
     }
 
     /// a narrower buffer drawn over rows a fill left of a wider one does not
@@ -3229,17 +3268,18 @@ mod tests {
     #[cfg(feature = "vulkan")]
     #[test]
     fn writes_after_drawing_survive_the_write_back() {
-        let Ok(hardware) = hardware::Hardware::new() else { return };
-        let registers = target_registers();
-        let mut memory = ConsoleMemory::default();
-        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
-        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
-        memory.write(COLOR, &[0x5A; 16]);
-        resources.hardware.as_mut().unwrap().sync(&mut memory, COLOR, 8 * 8 * 4).unwrap();
-        let mut start = [0u8; 16];
-        memory.read(COLOR, &mut start);
-        assert_eq!(start, [0x5A; 16], "what was written after the drawing stays");
-        assert!(pixels(&mut memory)[4..].iter().all(|&p| p == [255, 0, 0, 255]), "and the drawing is the rest");
+        for mut memory in [ConsoleMemory::default(), ConsoleMemory::scattered()] {
+            let Ok(hardware) = hardware::Hardware::new() else { return };
+            let registers = target_registers();
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+            memory.write(COLOR, &[0x5A; 16]);
+            resources.hardware.as_mut().unwrap().sync(&mut memory, COLOR, 8 * 8 * 4).unwrap();
+            let mut start = [0u8; 16];
+            memory.read(COLOR, &mut start);
+            assert_eq!(start, [0x5A; 16], "what was written after the drawing stays");
+            assert!(pixels(&mut memory)[4..].iter().all(|&p| p == [255, 0, 0, 255]), "and the drawing is the rest");
+        }
     }
 
     /// a service that has the drawing written back before it writes, as a
@@ -3439,7 +3479,11 @@ mod tests {
                 let addr = addr + i as u32;
                 *byte = match self.at(addr) {
                     Some(at) => self.arrays[at],
-                    None => self.rest.0.get(&addr).copied().unwrap_or(0),
+                    None => {
+                        let mut byte = [0];
+                        self.rest.read(addr, &mut byte);
+                        byte[0]
+                    }
                 };
             }
         }
@@ -3449,9 +3493,7 @@ mod tests {
                 let addr = addr + i as u32;
                 match self.at(addr) {
                     Some(at) => self.arrays[at] = byte,
-                    None => {
-                        self.rest.0.insert(addr, byte);
-                    }
+                    None => self.rest.write(addr, &[byte]),
                 }
             }
         }

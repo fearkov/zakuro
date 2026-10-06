@@ -1897,11 +1897,15 @@ impl Hardware {
             self.begin()?;
         }
         // into the last lookup's buffer, a surface's worth of bytes allocated
-        // for each costs more than reading them
+        // for each costs more than reading them. compared in place where
+        // memory is in one piece, most lookups find nothing changed
         let mut bytes = std::mem::take(&mut self.scratch);
-        bytes.resize(size as usize, 0);
-        memory.read(addr, &mut bytes);
-        if bytes != self.surfaces[index].shadow {
+        let same = memory.slice(addr, size as usize).is_some_and(|now| now == self.surfaces[index].shadow);
+        if !same {
+            bytes.resize(size as usize, 0);
+            memory.read(addr, &mut bytes);
+        }
+        if !same && bytes != self.surfaces[index].shadow {
             if self.surfaces[index].dirty.is_some() {
                 // memory changed beside rows the GPU drew and it lacks, which
                 // an upload alone would lose. they come down first, along
