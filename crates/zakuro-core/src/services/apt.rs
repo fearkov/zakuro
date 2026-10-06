@@ -91,7 +91,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
             // a title does not just use the font, it parses it, an empty block
             // fails that parse and the title never gets going. it is built
             // again for its address once there is one.
-            log::info!("no shared font file found; using the generated ASCII font");
+            log::info!("no shared font file found; using the generated stand-in");
             Vec::new()
         }
     };

@@ -3724,10 +3724,12 @@ dependencies = [
 name = "zakuro-core"
 version = "0.2.18"
 dependencies = [
+ "ab_glyph",
  "bitflags 2.13.2",
  "chrono",
  "env_logger",
  "log",
+ "rayon",
  "recomp-abi",
  "symphonia-codec-aac",
  "symphonia-core",
