@@ -186,6 +186,32 @@ struct Shadow {
     alpha: bool,
 }
 
+/// the registers Lighting::read can take, the enable bit, the lights up to
+/// the configuration, the disable bit, how the tables are read and which
+/// light each slot holds.
+const REGISTERS_READ: usize = 1 + (REG_CONFIG1 + 1 - REG_LIGHTS) + 1 + 3 + 1;
+
+/// the lighting the last draw decoded, and the registers it came from,
+/// which draws mostly keep, and comparing those costs less than decoding
+/// the lights again.
+#[derive(Default)]
+pub(crate) struct LastLighting {
+    read: Option<[u32; REGISTERS_READ]>,
+    lighting: Option<Lighting>,
+}
+
+impl LastLighting {
+    /// the lighting set up in the registers, or None when it is off.
+    pub(crate) fn read(&mut self, registers: &[u32]) -> Option<Lighting> {
+        let read = Lighting::registers_read(registers);
+        if self.read != Some(read) {
+            self.lighting = Lighting::read(registers);
+            self.read = Some(read);
+        }
+        self.lighting.clone()
+    }
+}
+
 /// the lighting of a draw, decoded from the registers once.
 #[derive(Debug, Clone)]
 pub struct Lighting {
@@ -326,6 +352,19 @@ impl Lighting {
             bump,
             shadow,
         })
+    }
+
+    /// the registers read takes, of all the lights whichever it decodes,
+    /// in their order.
+    fn registers_read(registers: &[u32]) -> [u32; REGISTERS_READ] {
+        const LIGHTS: usize = REG_CONFIG1 + 1 - REG_LIGHTS;
+        let mut read = [0; REGISTERS_READ];
+        read[0] = registers[REG_ENABLE];
+        read[1..=LIGHTS].copy_from_slice(&registers[REG_LIGHTS..=REG_CONFIG1]);
+        read[LIGHTS + 1] = registers[REG_DISABLE];
+        read[LIGHTS + 2..LIGHTS + 5].copy_from_slice(&registers[REG_TABLE_ABSOLUTE..=REG_TABLE_SCALE]);
+        read[LIGHTS + 5] = registers[REG_LIGHT_SLOTS];
+        read
     }
 
     /// the lighting as the words of the hardware renderer's uniform block,
@@ -567,6 +606,44 @@ mod tests {
         registers[REG_TABLE_INDEX] = (5 << 8) | 1;
         tables.write(&mut registers, 2048);
         assert_ne!(tables.generation(), sent);
+    }
+
+    /// the lighting kept from the last draw is the one the registers set
+    /// up, through changes to any register it can be decoded from and to
+    /// ones it is not.
+    #[test]
+    fn kept_lighting_follows_the_registers() {
+        let mut seed = 3u32;
+        // the high bits, the low ones of the sequence repeat soon
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut registers = vec![0u32; 0x200];
+        registers[REG_ENABLE] = 1;
+        // all eight lights on, each slot a different one
+        registers[REG_LIGHT_COUNT] = 7;
+        registers[REG_LIGHT_SLOTS] = 0x7654_3210;
+        let read: Vec<usize> = [REG_ENABLE, REG_DISABLE, REG_LIGHT_SLOTS]
+            .into_iter()
+            .chain(REG_LIGHTS..=REG_CONFIG1)
+            .chain(REG_TABLE_ABSOLUTE..=REG_TABLE_SCALE)
+            .collect();
+        let mut kept = LastLighting::default();
+        let mut lit = 0;
+        for step in 0..4000 {
+            let register = match random() % 8 {
+                0 => (random() % 0x200) as usize,
+                // the switches and the slots often, they decide the rest
+                1 => [REG_ENABLE, REG_DISABLE, REG_LIGHT_COUNT, REG_LIGHT_SLOTS][(random() % 4) as usize],
+                _ => read[(random() as usize) % read.len()],
+            };
+            registers[register] ^= 1 << (random() % 32);
+            let fresh = Lighting::read(&registers);
+            lit += fresh.is_some() as u32;
+            assert_eq!(format!("{:?}", kept.read(&registers)), format!("{fresh:?}"), "step {step}, register {register:#X}");
+        }
+        assert!(lit > 400, "lit {lit} times");
     }
 
     #[test]

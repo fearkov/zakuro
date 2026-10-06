@@ -15,7 +15,7 @@
 //! buffer meanwhile, so the CPU rarely waits for the GPU.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
@@ -34,6 +34,9 @@ use crate::device::SharedDevice;
 use crate::shader::glsl::{self, SEMANTICS};
 use crate::shader::{Program, ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
+use hasher::{QuickMap, QuickSet};
+
+mod hasher;
 
 const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
@@ -188,6 +191,31 @@ pub(super) struct RawField {
     /// signed byte, byte, signed short or float, and how many components.
     pub(super) ty: u32,
     pub(super) count: u32,
+}
+
+/// a block of words a draw stages, the uniforms or what else the vertex
+/// shader reads, and the last one of its kind the batch holds.
+#[derive(Default)]
+struct Block {
+    /// the words being gathered.
+    words: Vec<u32>,
+    /// the words staged last, and where, until the batch is handed over.
+    last: Vec<u32>,
+    at: Option<u64>,
+}
+
+impl Block {
+    /// where the batch holds the words gathered, when they are the words
+    /// the last block of the kind staged.
+    fn staged(&self) -> Option<u64> {
+        self.at.filter(|_| self.words == self.last)
+    }
+
+    /// the words gathered went into the batch at offset.
+    fn staged_at(&mut self, offset: u64) {
+        std::mem::swap(&mut self.words, &mut self.last);
+        self.at = Some(offset);
+    }
 }
 
 fn vk_error(what: &'static str) -> impl Fn(vk::Result) -> String {
@@ -823,7 +851,7 @@ struct Compiler {
     /// the jobs queued and not made yet.
     outstanding: usize,
     /// the pipelines asked for, each only once.
-    asked: HashSet<PipelineKey>,
+    asked: QuickSet<PipelineKey>,
     threads: Vec<thread::JoinHandle<()>>,
 }
 
@@ -860,7 +888,7 @@ impl Compiler {
                     .ok()
             })
             .collect();
-        Compiler { queue, made, outstanding: 0, asked: HashSet::new(), threads }
+        Compiler { queue, made, outstanding: 0, asked: QuickSet::default(), threads }
     }
 
     /// queues a generic pipeline ahead of the pipelines asked for, unless
@@ -1170,7 +1198,10 @@ pub struct Hardware {
     /// what a surface's memory was read into last, the next read's buffer.
     scratch: Vec<u8>,
     /// the programs seen and how far their translation got.
-    translated: HashMap<ProgramKey, Translation>,
+    translated: QuickMap<ProgramKey, Translation>,
+    /// the last draw's program and how far its translation got, which the
+    /// next draw mostly shares, until the compiler brings anything in.
+    last_translation: Option<(ProgramKey, Translation)>,
     /// the modules made, by their source, which programs differing only in
     /// words they never run share, and so their pipelines.
     modules: HashMap<String, vk::ShaderModule>,
@@ -1188,10 +1219,15 @@ pub struct Hardware {
     blend_state: Option<ash::ext::extended_dynamic_state3::Device>,
     logic_op_state: Option<ash::ext::extended_dynamic_state2::Device>,
     /// where the batch copied programs, by their fingerprints.
-    programs: HashMap<u64, u64>,
-    /// the words a draw stages, kept for the next draw's.
-    words: Vec<u32>,
-    pipelines: HashMap<PipelineKey, vk::Pipeline>,
+    programs: QuickMap<u64, u64>,
+    /// the blocks the last draw staged, its uniforms and what else its
+    /// vertex shader read.
+    uniforms: Block,
+    shading: Block,
+    pipelines: QuickMap<PipelineKey, vk::Pipeline>,
+    /// the last pipeline a draw found made for its own key, which the next
+    /// draw mostly shares. a pipeline stays in the map for good.
+    last_pipeline: Option<(PipelineKey, vk::Pipeline)>,
     /// made the first time a display transfer runs here.
     transfer: Option<Compute>,
     /// made the first time a texture is read out of a depth buffer, with
@@ -1202,7 +1238,7 @@ pub struct Hardware {
     /// the same writing an image, made the first time it is needed.
     upright_image: Option<Compute>,
     samples: Option<Local>,
-    samplers: HashMap<(bool, Wrap, Wrap), vk::Sampler>,
+    samplers: QuickMap<(bool, Wrap, Wrap), vk::Sampler>,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -1375,7 +1411,8 @@ impl Hardware {
                 // interpreting them all instead, to tell the two apart
                 translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
                 scratch: Vec::new(),
-                translated: HashMap::new(),
+                translated: QuickMap::default(),
+                last_translation: None,
                 modules: HashMap::new(),
                 // to draw through the pipeline made for each draw from the
                 // first on, as the tests do
@@ -1386,15 +1423,17 @@ impl Hardware {
                 dynamic,
                 blend_state,
                 logic_op_state,
-                programs: HashMap::new(),
-                words: Vec::new(),
-                pipelines: HashMap::new(),
+                programs: QuickMap::default(),
+                uniforms: Block::default(),
+                shading: Block::default(),
+                pipelines: QuickMap::default(),
+                last_pipeline: None,
                 transfer: None,
                 depth: None,
                 upright: None,
                 upright_image: None,
                 samples: None,
-                samplers: HashMap::new(),
+                samplers: QuickMap::default(),
                 used: 0,
                 readback: None,
                 surfaces: Vec::new(),
@@ -1790,6 +1829,25 @@ impl Hardware {
             return Err(format!("a draw needs {size} more bytes than a batch has"));
         }
         self.used = offset + size;
+        Ok(offset)
+    }
+
+    /// where the batch holds a block's words, staged here unless they are
+    /// the words of the last block of its kind, which draws in a row mostly
+    /// share, the GPU reading those again. the ring is memory the CPU
+    /// writes past its caches, slower than gathering the words and
+    /// comparing them, and it takes a run of whole lines best, so the words
+    /// go in at once.
+    fn stage_block(&mut self, block: &mut Block, size: u64, align: u64) -> Result<u64, String> {
+        debug_assert_eq!(block.words.len() as u64 * 4, size);
+        if let Some(at) = block.staged() {
+            return Ok(at);
+        }
+        let offset = self.stage(size, align)?;
+        for (out, word) in self.ring(offset, size).as_chunks_mut::<4>().0.iter_mut().zip(&block.words) {
+            *out = word.to_le_bytes();
+        }
+        block.staged_at(offset);
         Ok(offset)
     }
 
@@ -2273,7 +2331,13 @@ impl Hardware {
         if self.generic {
             return self.pipeline(generic);
         }
+        if let Some((last, pipeline)) = self.last_pipeline {
+            if last == key {
+                return Ok(pipeline);
+            }
+        }
         if let Some(&pipeline) = self.pipelines.get(&key) {
+            self.last_pipeline = Some((key, pipeline));
             return Ok(pipeline);
         }
         if !translating && self.compiler.asked.insert(key) {
@@ -2552,28 +2616,40 @@ impl Hardware {
         }
         let unit = shading.unit;
         let key = (unit.fingerprint(), unit.entry_point, shading.semantics);
-        if let Entry::Vacant(entry) = self.translated.entry(key) {
-            match unit.prepared() {
-                Some(program) => {
-                    entry.insert(Translation::Pending);
-                    self.hand(Job::Translate(key, program));
-                }
-                None => {
-                    entry.insert(Translation::Failed);
-                    log::debug!(
-                        target: "zakuro_gpu::programs",
-                        "program {:016X} from {} stays interpreted, it was not prepared",
-                        key.0,
-                        key.1
-                    );
-                }
-            }
-        }
-        match self.translated[&key] {
+        let translation = match self.last_translation {
+            Some((last, translation)) if last == key => translation,
+            _ => self.translation(unit, key),
+        };
+        self.last_translation = Some((key, translation));
+        match translation {
             Translation::Pending => (VertexStage::Interpreted, true),
             Translation::Failed => (VertexStage::Interpreted, false),
             Translation::Done(module) => (VertexStage::Translated(module), false),
         }
+    }
+
+    /// how far a program's translation got, the compiler starting on it the
+    /// first time the program is seen.
+    fn translation(&mut self, unit: &ShaderUnit, key: ProgramKey) -> Translation {
+        if let Some(&translation) = self.translated.get(&key) {
+            return translation;
+        }
+        match unit.prepared() {
+            Some(program) => {
+                self.translated.insert(key, Translation::Pending);
+                self.hand(Job::Translate(key, program));
+            }
+            None => {
+                self.translated.insert(key, Translation::Failed);
+                log::debug!(
+                    target: "zakuro_gpu::programs",
+                    "program {:016X} from {} stays interpreted, it was not prepared",
+                    key.0,
+                    key.1
+                );
+            }
+        }
+        self.translated[&key]
     }
 
     /// has the compiler do a job, or does it here, when waiting for it or
@@ -2602,6 +2678,8 @@ impl Hardware {
     }
 
     fn take(&mut self, made: Made) {
+        // a translation may have come in or gone back to the interpreter
+        self.last_translation = None;
         match made {
             Made::Translated(key, Ok((words, source))) => {
                 let module = match self.modules.get(&source) {
@@ -2663,8 +2741,13 @@ impl Hardware {
             Some(&offset) => offset,
             None => {
                 let offset = self.stage(PROGRAM_BYTES, self.storage_alignment)?;
-                let words = unit.program.iter().chain(unit.descriptors.iter());
-                for (out, word) in self.ring(offset, PROGRAM_BYTES).as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                // the program, then its descriptors, each a run as fast as
+                // copying, a chain of the two goes a word at a time
+                let (program, descriptors) = self.ring(offset, PROGRAM_BYTES).as_chunks_mut::<4>().0.split_at_mut(unit.program.len());
+                for (out, word) in program.iter_mut().zip(unit.program.iter()) {
+                    *out = word.to_le_bytes();
+                }
+                for (out, word) in descriptors.iter_mut().zip(unit.descriptors.iter()) {
                     *out = word.to_le_bytes();
                 }
                 self.programs.insert(fingerprint, offset);
@@ -2714,9 +2797,12 @@ impl Hardware {
                 total as u64 + 4
             }
         };
-        let mut words = std::mem::take(&mut self.words);
+        // the arrays go in as slices, a flattened iterator has no length to
+        // reserve by and pushes a word at a time
+        let mut block = std::mem::take(&mut self.shading);
+        let words = &mut block.words;
         words.clear();
-        words.extend(unit.float_uniforms.iter().flatten().map(|value| value.to_bits()));
+        words.extend(unit.float_uniforms.as_flattened().iter().map(|value| value.to_bits()));
         for [count, start, step, _] in unit.int_uniforms {
             words.extend([count as u32, start as u32, step as i8 as u32, 0]);
         }
@@ -2725,16 +2811,10 @@ impl Hardware {
         words.extend([depth_map.scale.to_bits(), depth_map.offset.to_bits(), 0, 0]);
         let (x, y, width, height) = shading.viewport;
         words.extend([x, y, width, height].map(f32::to_bits));
-        words.extend(attributes.iter().flatten());
-        words.extend(defaults.iter().flatten().map(|value| value.to_bits()));
-        debug_assert_eq!(words.len(), SHADING_WORDS);
-        let uniforms = self.stage(SHADING_SIZE, self.storage_alignment);
-        if let Ok(uniforms) = uniforms {
-            for (out, word) in self.ring(uniforms, SHADING_SIZE).as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-                *out = word.to_le_bytes();
-            }
-        }
-        self.words = words;
+        words.extend_from_slice(attributes.as_flattened());
+        words.extend(defaults.as_flattened().iter().map(|value| value.to_bits()));
+        let uniforms = self.stage_block(&mut block, SHADING_SIZE, self.storage_alignment);
+        self.shading = block;
         let uniforms = uniforms?;
 
         let inputs = self.stage(input_bytes, self.storage_alignment)?;
@@ -2779,6 +2859,9 @@ impl Hardware {
         if empty || right <= left || top <= bottom {
             return Ok(());
         }
+        // blocks used again add nothing to the ring, so a batch can run on
+        // past where it used to be handed over, which moves when that
+        // happens but not what is drawn
         if self.used > RING_FLUSH {
             self.submit()?;
         }
@@ -2848,7 +2931,8 @@ impl Hardware {
 
 
         let r = draw.registers;
-        let mut words = std::mem::take(&mut self.words);
+        let mut block = std::mem::take(&mut self.uniforms);
+        let words = &mut block.words;
         words.clear();
         for base in STAGE_REGISTERS {
             words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], 0, 0, 0]);
@@ -2873,7 +2957,7 @@ impl Hardware {
         };
         words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
         match draw.lighting {
-            Some(lighting) => lighting.pack(&mut words),
+            Some(lighting) => lighting.pack(words),
             None => words.resize(UNIFORM_WORDS - PROCTEX_WORDS - FOG_WORDS, 0),
         }
         let procedural = [
@@ -2887,15 +2971,8 @@ impl Hardware {
         words.extend(procedural.map(|register| r[register]));
         words.extend([0, 0]);
         words.extend([r[fog::REG_COLOR], 0, 0, 0]);
-        debug_assert_eq!(words.len(), UNIFORM_WORDS);
-        let uniform_offset = self.stage(UNIFORM_SIZE, self.uniform_alignment);
-        if let Ok(uniform_offset) = uniform_offset {
-            let staging = self.ring(uniform_offset, UNIFORM_SIZE);
-            for (out, word) in staging.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-                *out = word.to_le_bytes();
-            }
-        }
-        self.words = words;
+        let uniform_offset = self.stage_block(&mut block, UNIFORM_SIZE, self.uniform_alignment);
+        self.uniforms = block;
         let uniform_offset = uniform_offset?;
 
         // what the draw may change
@@ -3910,6 +3987,8 @@ impl Hardware {
         self.used = 0;
         self.tables = None;
         self.programs.clear();
+        self.uniforms.at = None;
+        self.shading.at = None;
         self.batch += 1;
 
         // textures nobody drew with for a while go, long after the GPU
@@ -4510,6 +4589,33 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
 mod tests {
     use super::*;
 
+    /// a block gathered with the words of the last one staged is read from
+    /// where that went, any other is staged anew, and nothing is read from
+    /// a batch handed over.
+    #[test]
+    fn a_block_is_staged_again_only_when_its_words_change() {
+        let mut block = Block::default();
+        let gather = |block: &mut Block, words: &[u32]| {
+            block.words.clear();
+            block.words.extend_from_slice(words);
+        };
+        gather(&mut block, &[1, 2, 3]);
+        assert_eq!(block.staged(), None, "nothing staged yet");
+        block.staged_at(64);
+        gather(&mut block, &[1, 2, 3]);
+        assert_eq!(block.staged(), Some(64));
+        gather(&mut block, &[1, 2, 4]);
+        assert_eq!(block.staged(), None, "a word changed");
+        block.staged_at(128);
+        gather(&mut block, &[1, 2, 4]);
+        assert_eq!(block.staged(), Some(128));
+        gather(&mut block, &[1, 2, 3]);
+        assert_eq!(block.staged(), None, "only the last block is kept");
+        gather(&mut block, &[1, 2, 4]);
+        block.at = None;
+        assert_eq!(block.staged(), None, "the batch was handed over");
+    }
+
     /// what a surface keeps of guest memory, through a pixel standing in for
     /// its shadow or not, is what the plain bytes would be, after uploads of
     /// memory of one pixel or not, fills over all of it or rows of it, and
@@ -4612,7 +4718,7 @@ mod tests {
     /// for while the blend state is dynamic.
     #[test]
     fn the_generic_pipelines_made_at_the_start_are_all_a_draw_needs() {
-        let made: HashSet<PipelineKey> = generic_keys(true).into_iter().collect();
+        let made: QuickSet<PipelineKey> = generic_keys(true).into_iter().collect();
         let mut seed = 5u32;
         let mut random = move || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);

@@ -8,6 +8,9 @@ const STAGE_REGISTERS: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
 const REG_UPDATE_BUFFER: usize = 0x0E0;
 /// register holding the buffer's initial color.
 const REG_BUFFER_COLOR: usize = 0x0FD;
+/// the registers the environment is decoded from, each stage's five, then
+/// the buffer's update bits and its color.
+const REGISTERS_READ: usize = 6 * 5 + 2;
 
 /// where one of a stage's three inputs comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +83,7 @@ impl Operation {
 }
 
 /// one configured stage.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Stage {
     color_sources: [Source; 3],
     alpha_sources: [Source; 3],
@@ -95,7 +98,7 @@ struct Stage {
 
 /// the whole texture environment, decoded from the register file once per
 /// draw rather than per pixel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TexEnv {
     stages: [Stage; 6],
     /// stages that hand the previous stage's result on unchanged.
@@ -124,13 +127,24 @@ impl Stage {
 
 impl TexEnv {
     pub fn read(registers: &[u32]) -> TexEnv {
+        TexEnv::decode(&TexEnv::registers_read(registers))
+    }
+
+    /// the registers decode takes, in its order.
+    fn registers_read(registers: &[u32]) -> [u32; REGISTERS_READ] {
+        let mut read = [0; REGISTERS_READ];
+        for (stage, base) in STAGE_REGISTERS.into_iter().enumerate() {
+            read[stage * 5..stage * 5 + 5].copy_from_slice(&registers[base..base + 5]);
+        }
+        read[30] = registers[REG_UPDATE_BUFFER];
+        read[31] = registers[REG_BUFFER_COLOR];
+        read
+    }
+
+    fn decode(read: &[u32; REGISTERS_READ]) -> TexEnv {
+        let (stage_registers, _) = read.as_chunks::<5>();
         let stages: [Stage; 6] = std::array::from_fn(|i| {
-            let base = STAGE_REGISTERS[i];
-            let source = registers[base];
-            let operand = registers[base + 1];
-            let combiner = registers[base + 2];
-            let constant = registers[base + 3];
-            let scale = registers[base + 4];
+            let [source, operand, combiner, constant, scale] = stage_registers[i];
 
             Stage {
                 color_sources: [
@@ -159,13 +173,13 @@ impl TexEnv {
 
         // bits 8-11 say which of stages 0-3 write their color into the
         // buffer, bits 12-15 their alpha.
-        let update = registers[REG_UPDATE_BUFFER];
+        let update = read[30];
         TexEnv {
             stages,
             passthrough: stages.map(|stage| stage.is_passthrough()),
             update_color: std::array::from_fn(|i| update & (0x100 << i) != 0),
             update_alpha: std::array::from_fn(|i| update & (0x1000 << i) != 0),
-            buffer_color: unpack(registers[REG_BUFFER_COLOR]),
+            buffer_color: unpack(read[31]),
         }
     }
 
@@ -242,6 +256,30 @@ impl TexEnv {
         }
 
         previous
+    }
+}
+
+/// the texture environment the last draw decoded, and the registers it came
+/// from. most draws keep the combiners of the one before, and comparing the
+/// registers costs far less than decoding them again.
+#[derive(Default)]
+pub(crate) struct LastTexEnv {
+    read: [u32; REGISTERS_READ],
+    tex_env: Option<TexEnv>,
+}
+
+impl LastTexEnv {
+    /// the texture environment the registers set up.
+    pub(crate) fn read(&mut self, registers: &[u32]) -> TexEnv {
+        let read = TexEnv::registers_read(registers);
+        match self.tex_env {
+            Some(tex_env) if self.read == read => tex_env,
+            _ => {
+                let tex_env = TexEnv::decode(&read);
+                *self = LastTexEnv { read, tex_env: Some(tex_env) };
+                tex_env
+            }
+        }
     }
 }
 
@@ -442,6 +480,98 @@ mod tests {
         registers[stage2] = 0x000D_000D;
         let env = TexEnv::read(&registers);
         assert_eq!(env.apply([0.0; 4], [[0.0; 4]; 4], None), red);
+    }
+
+    /// TexEnv::read through registers_read and decode, and the kept one,
+    /// decode what reading the registers straight did before, over random
+    /// words in every register it reads and random registers elsewhere.
+    #[test]
+    fn reading_through_the_words_read_decodes_as_before() {
+        fn old_read(registers: &[u32]) -> TexEnv {
+            let stages: [Stage; 6] = std::array::from_fn(|i| {
+                let base = STAGE_REGISTERS[i];
+                let source = registers[base];
+                let operand = registers[base + 1];
+                let combiner = registers[base + 2];
+                let constant = registers[base + 3];
+                let scale = registers[base + 4];
+                Stage {
+                    color_sources: [Source::from_raw(source), Source::from_raw(source >> 4), Source::from_raw(source >> 8)],
+                    alpha_sources: [Source::from_raw(source >> 16), Source::from_raw(source >> 20), Source::from_raw(source >> 24)],
+                    color_operands: [operand & 0xF, (operand >> 4) & 0xF, (operand >> 8) & 0xF],
+                    alpha_operands: [(operand >> 12) & 0x7, (operand >> 16) & 0x7, (operand >> 20) & 0x7],
+                    color_op: Operation::from_raw(combiner),
+                    alpha_op: Operation::from_raw(combiner >> 16),
+                    constant: unpack(constant),
+                    color_scale: scale_factor(scale),
+                    alpha_scale: scale_factor(scale >> 16),
+                }
+            });
+            let update = registers[REG_UPDATE_BUFFER];
+            TexEnv {
+                stages,
+                passthrough: stages.map(|stage| stage.is_passthrough()),
+                update_color: std::array::from_fn(|i| update & (0x100 << i) != 0),
+                update_alpha: std::array::from_fn(|i| update & (0x1000 << i) != 0),
+                buffer_color: unpack(registers[REG_BUFFER_COLOR]),
+            }
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 16) as u32
+        };
+        let read: Vec<usize> = STAGE_REGISTERS.iter().flat_map(|&base| base..base + 5).chain([REG_UPDATE_BUFFER, REG_BUFFER_COLOR]).collect();
+        let mut registers = vec![0u32; 0x300];
+        let mut kept = LastTexEnv::default();
+        for step in 0..50_000 {
+            if step % 500 == 0 {
+                registers.iter_mut().for_each(|r| *r = random());
+            }
+            for _ in 0..1 + random() % 3 {
+                let register = match random() % 4 {
+                    0 => (random() % 0x300) as usize,
+                    _ => read[(random() as usize) % read.len()],
+                };
+                // small values now and then, the fields are a few bits each
+                registers[register] = if random() % 2 == 0 { random() } else { random() & 0x00FF_00FF };
+            }
+            let old = old_read(&registers);
+            assert_eq!(TexEnv::read(&registers), old, "step {step}");
+            assert_eq!(kept.read(&registers), old, "step {step}, kept");
+            assert_eq!(kept.read(&registers).reads_lighting(), old.reads_lighting(), "step {step}");
+        }
+    }
+
+    /// the environment kept from the last draw is the one the registers
+    /// set up, through changes to any register it is decoded from and to
+    /// ones it is not.
+    #[test]
+    fn a_kept_environment_follows_the_registers() {
+        let mut seed = 7u32;
+        // the high bits, the low ones of the sequence repeat soon
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut registers = vec![0u32; 0x300];
+        let mut kept = LastTexEnv::default();
+        let read: Vec<usize> = STAGE_REGISTERS.iter().flat_map(|&base| base..base + 5).chain([REG_UPDATE_BUFFER, REG_BUFFER_COLOR]).collect();
+        for step in 0..2000 {
+            // mostly a register the environment reads, a bit at a time as
+            // titles change them, or now and then one it does not
+            let register = match random() % 8 {
+                0 => (random() % 0x300) as usize,
+                _ => read[(random() as usize) % read.len()],
+            };
+            registers[register] ^= 1 << (random() % 32);
+            assert_eq!(kept.read(&registers), TexEnv::read(&registers), "step {step}, register {register:#X}");
+            if step % 3 == 0 {
+                assert_eq!(kept.read(&registers), TexEnv::read(&registers), "step {step} again");
+            }
+        }
     }
 
     /// color and alpha have separate update bits.
