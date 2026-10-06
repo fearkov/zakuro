@@ -76,11 +76,33 @@ fn scan(folder: &Path) -> Vec<Game> {
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| GAME_FILES.contains(&extension.to_ascii_lowercase().as_str()))
         })
-        .map(|path| read_game(&path))
+        .map(|path| read_or_list_unreadable(&path))
         .collect();
     // the ones that can't be played go last
     games.sort_by_key(|game| (game.problem.is_some(), game.name.to_lowercase()));
     games
+}
+
+/// a game read, or one that made reading it fail on a bug listed as
+/// unreadable, rather than taking the whole library with it.
+fn read_or_list_unreadable(path: &Path) -> Game {
+    std::panic::catch_unwind(|| read_game(path)).unwrap_or_else(|_| {
+        log::error!("reading {} failed", path.display());
+        unplayable(path, "Zakuro couldn't read it, please report it".to_owned())
+    })
+}
+
+/// a file in the library that can't be played, and why.
+fn unplayable(path: &Path, problem: String) -> Game {
+    Game {
+        path: path.to_owned(),
+        name: path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default(),
+        publisher: String::new(),
+        program_id: 0,
+        icon: None,
+        recompiled: false,
+        problem: Some(problem),
+    }
 }
 
 fn read_game(path: &Path) -> Game {
@@ -95,15 +117,7 @@ fn read_game(path: &Path) -> Game {
                 Some(error) => problem(&error),
                 None => "Empty, its download may not have finished".to_owned(),
             };
-            return Game {
-                path: path.to_owned(),
-                name: file_name,
-                publisher: String::new(),
-                program_id: 0,
-                icon: None,
-                recompiled: false,
-                problem: Some(problem),
-            };
+            return unplayable(path, problem);
         }
     };
     let program_id = title.program_id();
