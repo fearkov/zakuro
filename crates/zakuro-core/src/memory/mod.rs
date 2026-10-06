@@ -316,6 +316,14 @@ impl Memory {
         })
     }
 
+    /// true when every page in the range is mapped and writable.
+    pub fn is_writable(&self, vaddr: VAddr, size: u32) -> bool {
+        (0..size.div_ceil(PAGE_SIZE)).all(|page| {
+            let index = ((vaddr.wrapping_add(page * PAGE_SIZE)) >> PAGE_BITS) as usize;
+            !self.write_table[index].is_null()
+        })
+    }
+
     // -- bulk access --------------------------------------------------------
 
     /// copies a block of guest memory out, page by page so it can straddle

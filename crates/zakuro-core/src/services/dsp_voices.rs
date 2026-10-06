@@ -18,8 +18,24 @@ pub const REGION_STRIDE: u32 = 0x2_0000;
 
 /// one frame of stereo samples.
 pub type Frame = [[i16; 2]; FRAME_SAMPLES];
-/// one frame of an intermediate mix, two left and two right channels.
-pub type QuadFrame = [[i32; 4]; FRAME_SAMPLES];
+/// one frame of an intermediate mix, two left and two right channels, one
+/// channel after the other as the title sees it.
+pub type QuadFrame = [[i32; FRAME_SAMPLES]; 4];
+
+/// the loudest gain mixed the quick way. a sample times three of them, as a
+/// fade between two can reach on the way, is still well within i32.
+const QUICK_GAIN: f32 = 16384.0;
+
+/// how far through a frame each of its samples is, for gains fading over it.
+const PROGRESS: [f32; FRAME_SAMPLES] = {
+    let mut progress = [0.0; FRAME_SAMPLES];
+    let mut i = 0;
+    while i < FRAME_SAMPLES {
+        progress[i] = i as f32 / (FRAME_SAMPLES - 1) as f32;
+        i += 1;
+    }
+    progress
+};
 
 /// bits of a configuration's dirty word, which fields the title changed.
 mod dirty {
@@ -146,6 +162,17 @@ impl Default for BiquadFilter {
     }
 }
 
+/// what an ADPCM buffer was decoded from, its bytes and the coefficients
+/// and history the decoding started with, and the history it left.
+#[derive(Debug, Clone)]
+struct AdpcmSource {
+    data: Vec<u8>,
+    count: usize,
+    coefficients: [i16; 16],
+    start: [i16; 2],
+    end: [i16; 2],
+}
+
 #[derive(Debug, Clone, Default)]
 struct Filters {
     simple: Option<SimpleFilter>,
@@ -200,6 +227,9 @@ struct Voice {
     playing: Option<Buffer>,
     /// an ADPCM buffer, decoded when it started.
     decoded: Vec<i16>,
+    /// what decoded came from. a looping buffer comes around the same
+    /// again and again, and is not decoded again.
+    decoded_from: Option<AdpcmSource>,
     /// samples left in the buffer being played, and how long it is.
     remaining: u32,
     length: u32,
@@ -236,6 +266,7 @@ impl Default for Voice {
             queue: Vec::new(),
             playing: None,
             decoded: Vec::new(),
+            decoded_from: None,
             remaining: 0,
             length: 0,
             fraction: 0.0,
@@ -275,54 +306,47 @@ impl Voice {
         if let Some(history) = buffer.adpcm {
             self.history = history;
         }
-        self.decoded.clear();
         if buffer.format == Format::Adpcm {
             let bytes = buffer.length.div_ceil(14) * 8;
             match memory.physical(buffer.address & !3, bytes) {
-                Some(data) => self.decoded = decode_adpcm(data, buffer.length as usize, &self.coefficients, &mut self.history),
-                None => log::debug!("dsp: an ADPCM buffer at 0x{:08X} is not in memory", buffer.address),
+                Some(data) => self.decode(data, buffer.length as usize),
+                None => {
+                    self.forget_decoded();
+                    log::debug!("dsp: an ADPCM buffer at 0x{:08X} is not in memory", buffer.address);
+                }
             }
+        } else {
+            self.forget_decoded();
         }
         self.playing = Some(buffer);
         true
     }
 
-    /// input sample index of the buffer being played, both channels.
-    fn input(&self, memory: &mut impl SampleMemory, index: u32) -> [i16; 2] {
-        let Some(buffer) = &self.playing else { return [0; 2] };
-        let index = index.min(buffer.length.saturating_sub(1));
-        let channels = if buffer.stereo { 2 } else { 1 };
-        let at = buffer.address & !3;
-        let [left, right] = match buffer.format {
-            Format::Adpcm => {
-                let sample = self.decoded.get(index as usize).copied().unwrap_or(0);
-                [sample, sample]
+    /// decodes an ADPCM buffer on from the history, unless decoded holds it
+    /// already, which leaves the history where decoding it again would.
+    fn decode(&mut self, data: &[u8], count: usize) {
+        let start = self.history;
+        if let Some(source) = &self.decoded_from {
+            if source.count == count
+                && source.start == start
+                && source.coefficients == self.coefficients
+                && source.data == data
+            {
+                self.history = source.end;
+                return;
             }
-            Format::Pcm8 => match memory.physical(at + index * channels, channels) {
-                Some(data) => [data[0] as i8 as i16 * 256, data[data.len() - 1] as i8 as i16 * 256],
-                None => [0; 2],
-            },
-            Format::Pcm16 => match memory.physical(at + index * channels * 2, channels * 2) {
-                Some(data) => [
-                    i16::from_le_bytes([data[0], data[1]]),
-                    i16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]),
-                ],
-                None => [0; 2],
-            },
-        };
-        [left, right]
+        }
+        decode_adpcm(data, count, &self.coefficients, &mut self.history, &mut self.decoded);
+        let mut copy = self.decoded_from.take().map(|source| source.data).unwrap_or_default();
+        copy.clear();
+        copy.extend_from_slice(data);
+        self.decoded_from =
+            Some(AdpcmSource { data: copy, count, coefficients: self.coefficients, start, end: self.history });
     }
 
-    /// the output sample at the current position, between two inputs.
-    fn sample(&self, memory: &mut impl SampleMemory) -> [i16; 2] {
-        let at = self.length - self.remaining;
-        let x0 = self.input(memory, at);
-        if self.interpolation == Interpolation::None || self.fraction == 0.0 {
-            return x0;
-        }
-        let x1 = self.input(memory, at + 1);
-        let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * self.fraction) as i16;
-        [between(x0[0], x1[0]), between(x0[1], x1[1])]
+    fn forget_decoded(&mut self) {
+        self.decoded.clear();
+        self.decoded_from = None;
     }
 
     /// plays one audio frame's worth of input.
@@ -350,64 +374,271 @@ impl Voice {
             if self.remaining == 0 && !self.dequeue(memory) {
                 break;
             }
-            self.frame[output] = self.sample(memory);
-            output += 1;
-            // each output sample consumes rate input samples.
-            let input = self.fraction + self.rate;
-            let consumed = (input.floor() as u32).min(self.remaining);
-            self.fraction = (input - consumed as f64).max(0.0);
-            self.remaining -= consumed;
+            output = self.play_buffer(memory, output);
         }
         self.ran_out_at_frame_end = self.remaining == 0 && output == FRAME_SAMPLES;
         self.filters.process(&mut self.frame[..output]);
     }
 
-    /// adds what the voice played to one intermediate mix, fading from the
-    /// gains it had when they just changed.
-    fn mix_into(&mut self, mix: &mut QuadFrame, index: usize) {
-        let gains = self.gain[index];
-        let from = self.ramp[index].take();
+    /// plays the buffer at hand into the frame from output on, at least one
+    /// sample and on until the frame is full or the buffer ran out, and
+    /// returns where the frame got to. the samples come straight from the
+    /// buffer's memory when all of it is there.
+    fn play_buffer(&mut self, memory: &mut impl SampleMemory, output: usize) -> usize {
+        let Some(buffer) = self.playing else {
+            return self.play_from::<false>(output, 0, |_| [0; 2]);
+        };
+        let last = buffer.length.saturating_sub(1);
+        let size = match buffer.format {
+            Format::Adpcm => {
+                let decoded = std::mem::take(&mut self.decoded);
+                // the samples up to last, all there unless the title made
+                // the buffer longer, read with no check on each
+                let output = match decoded.get(..=last as usize) {
+                    Some(samples) => self.play_from::<false>(output, last, |index| [samples[index as usize]; 2]),
+                    None => self.play_from::<false>(output, last, |index| {
+                        [decoded.get(index as usize).copied().unwrap_or(0); 2]
+                    }),
+                };
+                self.decoded = decoded;
+                return output;
+            }
+            Format::Pcm8 => 1,
+            Format::Pcm16 => 2,
+        };
+        let channels = if buffer.stereo { 2 } else { 1 };
+        let bytes = buffer.length.checked_mul(size * channels).filter(|_| buffer.length != 0);
+        let data = bytes.and_then(|bytes| memory.physical(buffer.address & !3, bytes));
+        match (data, buffer.format, buffer.stereo) {
+            (Some(data), Format::Pcm8, false) => self.play_from::<false>(output, last, |index| {
+                [data[index as usize] as i8 as i16 * 256; 2]
+            }),
+            (Some(data), Format::Pcm8, true) => self.play_from::<true>(output, last, |index| {
+                let at = index as usize * 2;
+                [data[at] as i8 as i16 * 256, data[at + 1] as i8 as i16 * 256]
+            }),
+            (Some(data), Format::Pcm16, false) => self.play_from::<false>(output, last, |index| {
+                let at = index as usize * 2;
+                [i16::from_le_bytes([data[at], data[at + 1]]); 2]
+            }),
+            (Some(data), Format::Pcm16, true) => self.play_from::<true>(output, last, |index| {
+                let at = index as usize * 4;
+                [i16::from_le_bytes([data[at], data[at + 1]]), i16::from_le_bytes([data[at + 2], data[at + 3]])]
+            }),
+            // not all of it in memory, each sample read as it comes
+            _ => self.play_from::<true>(output, last, |index| read_pcm(memory, &buffer, index)),
+        }
+    }
+
+    /// plays input into the frame from output on, read giving the samples
+    /// of the buffer at hand by index, up to last, at least one sample and
+    /// on until the frame is full or the buffer ran out, and returns where
+    /// the frame got to. without STEREO the channels of each input sample
+    /// are the same, and only the first is worked out.
+    fn play_from<const STEREO: bool>(
+        &mut self,
+        mut output: usize,
+        last: u32,
+        mut read: impl FnMut(u32) -> [i16; 2],
+    ) -> usize {
+        let fits = self.rate < (1u32 << 31) as f64;
+        loop {
+            if fits && self.remaining > 0 && (0.0..1.0).contains(&self.fraction) {
+                // a whole rate from no fraction leaves none, nothing to
+                // interpolate
+                let whole = self.fraction == 0.0 && self.rate == (self.rate as u32) as f64;
+                return if self.interpolation == Interpolation::None || whole {
+                    self.play_steady::<STEREO, false>(output, last, read)
+                } else {
+                    self.play_steady::<STEREO, true>(output, last, read)
+                };
+            }
+            // a sample the long way, for a buffer that started spent, a
+            // fraction of one or more or a rate past what u32 counts
+            let at = self.length - self.remaining;
+            let x0 = read(at.min(last));
+            self.frame[output] = if self.interpolation == Interpolation::None || self.fraction == 0.0 {
+                x0
+            } else {
+                lerp::<STEREO>(x0, read((at + 1).min(last)), self.fraction)
+            };
+            output += 1;
+            // each output sample consumes rate input samples
+            let input = self.fraction + self.rate;
+            let consumed = (input as u32).min(self.remaining);
+            self.fraction = (input - consumed as f64).max(0.0);
+            self.remaining -= consumed;
+            if output == FRAME_SAMPLES || self.remaining == 0 {
+                return output;
+            }
+        }
+    }
+
+    /// plays on as play_from does, with the fraction below one, which makes
+    /// what each output sample consumes the whole of the rate or one more,
+    /// and leaves the fraction to a subtraction rather than a trip through
+    /// integers. LERP interpolates, which at no fraction gives the input
+    /// sample as it is.
+    fn play_steady<const STEREO: bool, const LERP: bool>(
+        &mut self,
+        mut output: usize,
+        last: u32,
+        mut read: impl FnMut(u32) -> [i16; 2],
+    ) -> usize {
+        let (length, rate) = (self.length, self.rate);
+        let (mut remaining, mut fraction) = (self.remaining, self.fraction);
+        let whole = rate as u32;
+        let (below, above) = (whole as f64, whole as f64 + 1.0);
+        loop {
+            let at = length - remaining;
+            let x0 = read(at.min(last));
+            self.frame[output] = if LERP { lerp::<STEREO>(x0, read((at + 1).min(last)), fraction) } else { x0 };
+            output += 1;
+            let input = fraction + rate;
+            let over = input >= above;
+            let consumed = whole + over as u32;
+            if consumed >= remaining {
+                // the buffer runs out with this sample
+                let consumed = (input as u32).min(remaining);
+                fraction = (input - consumed as f64).max(0.0);
+                remaining -= consumed;
+                break;
+            }
+            fraction = input - if over { above } else { below };
+            remaining -= consumed;
+            if output == FRAME_SAMPLES {
+                break;
+            }
+        }
+        self.remaining = remaining;
+        self.fraction = fraction;
+        output
+    }
+
+    /// adds what the voice played to the intermediate mixes, each fading
+    /// from the gains it had when they just changed.
+    fn mix_into(&mut self, mixes: &mut [QuadFrame; 3]) {
+        let ramps = std::mem::take(&mut self.ramp);
         if !self.enabled {
             return;
         }
-        for (i, (out, sample)) in mix.iter_mut().zip(&self.frame).enumerate() {
-            let progress = i as f32 / (FRAME_SAMPLES - 1) as f32;
-            let gain = |c: usize| from.map_or(gains[c], |from| from[c] + (gains[c] - from[c]) * progress);
-            out[0] += (gain(0) * sample[0] as f32) as i32;
-            out[1] += (gain(1) * sample[1] as f32) as i32;
-            out[2] += (gain(2) * sample[0] as f32) as i32;
-            out[3] += (gain(3) * sample[1] as f32) as i32;
+        let inputs = [self.frame.map(|[left, _]| left as f32), self.frame.map(|[_, right]| right as f32)];
+        for ((mix, gains), from) in mixes.iter_mut().zip(self.gain).zip(ramps) {
+            for (channel, out) in mix.iter_mut().enumerate() {
+                let (input, gain) = (&inputs[channel & 1], gains[channel]);
+                match from.map(|from| from[channel]) {
+                    // a gain fading to where it was stays put, the same to
+                    // the last bit but for the sign of a zero, which adds
+                    // nothing either way
+                    Some(from) if from != gain => fade(out, input, from, gain),
+                    _ if gain == 0.0 => {}
+                    _ => add(out, input, gain),
+                }
+            }
+        }
+    }
+}
+
+/// the sample a fraction of the way from one input to the next, both
+/// channels or, without STEREO, the first for both.
+fn lerp<const STEREO: bool>(x0: [i16; 2], x1: [i16; 2], fraction: f64) -> [i16; 2] {
+    let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * fraction) as i16;
+    let left = between(x0[0], x1[0]);
+    [left, if STEREO { between(x0[1], x1[1]) } else { left }]
+}
+
+/// one sample of a PCM buffer read from memory by itself, both channels.
+fn read_pcm(memory: &mut impl SampleMemory, buffer: &Buffer, index: u32) -> [i16; 2] {
+    let channels = if buffer.stereo { 2 } else { 1 };
+    let at = buffer.address & !3;
+    if buffer.format == Format::Pcm8 {
+        return match memory.physical(at + index * channels, channels) {
+            Some(data) => [data[0] as i8 as i16 * 256, data[data.len() - 1] as i8 as i16 * 256],
+            None => [0; 2],
+        };
+    }
+    match memory.physical(at + index * channels * 2, channels * 2) {
+        Some(data) => [
+            i16::from_le_bytes([data[0], data[1]]),
+            i16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]),
+        ],
+        None => [0; 2],
+    }
+}
+
+/// adds samples to a channel of a mix at a steady gain.
+fn add(out: &mut [i32; FRAME_SAMPLES], input: &[f32; FRAME_SAMPLES], gain: f32) {
+    if gain.abs() <= QUICK_GAIN {
+        for (out, sample) in out.iter_mut().zip(input) {
+            // SAFETY: a sample is 32768 at most either way, so the product
+            // is a number within 2^29, which truncates the same as the
+            // saturating cast does, only four at a time where that goes one
+            *out += unsafe { (gain * sample).to_int_unchecked::<i32>() };
+        }
+    } else {
+        for (out, sample) in out.iter_mut().zip(input) {
+            *out += (gain * sample) as i32;
+        }
+    }
+}
+
+/// adds samples to a channel of a mix at a gain going from one value to
+/// another over the frame.
+fn fade(out: &mut [i32; FRAME_SAMPLES], input: &[f32; FRAME_SAMPLES], from: f32, to: f32) {
+    let change = to - from;
+    if from.abs() <= QUICK_GAIN && to.abs() <= QUICK_GAIN {
+        for ((out, sample), progress) in out.iter_mut().zip(input).zip(PROGRESS) {
+            // SAFETY: the change is within two quick gains and the gain on
+            // the way within three, so as in add the product is a number
+            // well within i32
+            *out += unsafe { ((from + change * progress) * sample).to_int_unchecked::<i32>() };
+        }
+    } else {
+        for ((out, sample), progress) in out.iter_mut().zip(input).zip(PROGRESS) {
+            *out += ((from + change * progress) * sample) as i32;
         }
     }
 }
 
 /// GC ADPCM, frames of 8 bytes holding a header and 14 samples of 4 bits,
-/// each predicted from the two before it.
-fn decode_adpcm(data: &[u8], count: usize, coefficients: &[i16; 16], history: &mut [i16; 2]) -> Vec<i16> {
-    let mut samples = Vec::with_capacity(count);
+/// each predicted from the two before it, decoded into samples.
+fn decode_adpcm(data: &[u8], count: usize, coefficients: &[i16; 16], history: &mut [i16; 2], samples: &mut Vec<i16>) {
+    samples.clear();
+    samples.reserve(count);
     let [mut yn1, mut yn2] = history.map(|h| h as i32);
     for frame in data.chunks(8) {
         let header = frame[0];
         let scale = 1 << (header & 0xF);
         let predictor = ((header >> 4) & 7) as usize;
         let (c1, c2) = (coefficients[predictor * 2] as i32, coefficients[predictor * 2 + 1] as i32);
+        let mut decode = |nibble: u8| {
+            // the nibble is signed
+            let xn = (((nibble as i32) << 28) >> 28) * scale;
+            let value = (((xn << 11) + 0x400 + c1 * yn1 + c2 * yn2) >> 11).clamp(-32768, 32767);
+            yn2 = yn1;
+            yn1 = value;
+            value as i16
+        };
+        // a whole frame goes without counting each sample
+        if frame.len() == 8 && count - samples.len() >= 14 {
+            let mut decoded = [0; 14];
+            for (pair, &byte) in decoded.as_chunks_mut().0.iter_mut().zip(&frame[1..]) {
+                *pair = [decode(byte >> 4), decode(byte & 0xF)];
+            }
+            samples.extend_from_slice(&decoded);
+            continue;
+        }
         for &byte in &frame[1..] {
             for nibble in [byte >> 4, byte & 0xF] {
                 if samples.len() == count {
                     *history = [yn1 as i16, yn2 as i16];
-                    return samples;
+                    return;
                 }
-                // the nibble is signed
-                let xn = (((nibble as i32) << 28) >> 28) * scale;
-                let value = (((xn << 11) + 0x400 + c1 * yn1 + c2 * yn2) >> 11).clamp(-32768, 32767);
-                yn2 = yn1;
-                yn1 = value;
-                samples.push(value as i16);
+                samples.push(decode(nibble));
             }
         }
     }
     *history = [yn1 as i16, yn2 as i16];
-    samples
 }
 
 #[derive(Debug, Clone)]
@@ -440,7 +671,7 @@ impl Voices {
         let coefficients = layout.coefficients + read * REGION_STRIDE;
         let statuses = layout.statuses + write * REGION_STRIDE;
 
-        let mut mixes = [[[0; 4]; FRAME_SAMPLES]; 3];
+        let mut mixes = [[[0; FRAME_SAMPLES]; 4]; 3];
         for (index, voice) in self.voices.iter_mut().enumerate() {
             let base = configurations + index as u32 * CONFIG_SIZE;
             let was_enabled = voice.enabled;
@@ -465,9 +696,7 @@ impl Voices {
             if voice.enabled {
                 voice.play_frame(memory);
             }
-            for (mix, frame) in mixes.iter_mut().enumerate() {
-                voice.mix_into(frame, mix);
-            }
+            voice.mix_into(&mut mixes);
             write_status(voice, memory, statuses + index as u32 * STATUS_SIZE);
         }
         mixes
@@ -817,9 +1046,60 @@ mod tests {
         coefficients[2] = 1 << 11;
         let frame = [0x10, 0x12, 0x30, 0, 0, 0, 0, 0];
         let mut history = [100, 0];
-        let samples = decode_adpcm(&frame, 4, &coefficients, &mut history);
+        let mut samples = vec![7; 20];
+        decode_adpcm(&frame, 4, &coefficients, &mut history, &mut samples);
         assert_eq!(samples, [101, 103, 106, 106]);
         assert_eq!(history, [106, 106]);
+    }
+
+    /// an ADPCM buffer comes from the last decoding only when that started
+    /// from the same bytes, coefficients and history, and ran as long.
+    #[test]
+    fn adpcm_is_decoded_again_unless_nothing_changed() {
+        let mut data: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37)).collect();
+        // the first frame predicts from the history it starts with
+        data[0] = 0x12;
+        let mut voice = Voice::default();
+        voice.coefficients[2] = 1 << 11;
+        voice.coefficients[3] = -(1 << 9);
+        let steps: [(usize, [i16; 2], bool); 7] = [
+            (20, [0, 0], false),
+            (20, [0, 0], false),
+            (15, [0, 0], false),
+            (15, [5, -5], false),
+            (15, [5, -5], true),
+            (28, [5, -5], false),
+            (28, [5, -5], false),
+        ];
+        for (step, (count, history, coefficients_changed)) in steps.into_iter().enumerate() {
+            if coefficients_changed {
+                voice.coefficients[4] = 3000;
+            }
+            data[9] ^= (step == 6) as u8;
+            voice.history = history;
+            voice.decode(&data, count);
+            let (mut expected, mut end) = (Vec::new(), history);
+            decode_adpcm(&data, count, &voice.coefficients, &mut end, &mut expected);
+            assert_eq!((&voice.decoded, voice.history), (&expected, end), "step {step}");
+        }
+    }
+
+    /// ADPCM decodes to the bit as it did a sample at a time, frames whole
+    /// or cut short, however many samples are asked for.
+    #[test]
+    fn adpcm_decodes_as_the_sample_at_a_time_reference() {
+        let mut random = Random(0xD1B5_4A32_D192_ED03);
+        let mut samples = Vec::new();
+        for case in 0..3000 {
+            let data: Vec<u8> = (0..random.below(80)).map(|_| random.next() as u8).collect();
+            let count = random.below(150) as usize;
+            let coefficients: [i16; 16] = std::array::from_fn(|_| random.next() as i16 >> (3 + random.below(3)));
+            let start = [random.next() as i16, random.next() as i16];
+            let (mut history, mut expected_history) = (start, start);
+            decode_adpcm(&data, count, &coefficients, &mut history, &mut samples);
+            let expected = reference::decode_adpcm(&data, count, &coefficients, &mut expected_history);
+            assert_eq!((&samples, history), (&expected, expected_history), "case {case}");
+        }
     }
 
     /// an embedded buffer plays as long as it says, a sound of a second or
@@ -846,12 +1126,459 @@ mod tests {
         voice.frame = [[1000, 1000]; FRAME_SAMPLES];
         voice.ramp[0] = Some([0.0; 4]);
         voice.gain[0] = [1.0; 4];
-        let mut mix = [[0; 4]; FRAME_SAMPLES];
-        voice.mix_into(&mut mix, 0);
-        assert_eq!(mix[0], [0; 4]);
-        assert_eq!(mix[FRAME_SAMPLES - 1], [1000; 4]);
-        let mut again = [[0; 4]; FRAME_SAMPLES];
-        voice.mix_into(&mut again, 0);
-        assert_eq!(again[0], [1000; 4], "the fade happens once");
+        let mut mixes = [[[0; FRAME_SAMPLES]; 4]; 3];
+        voice.mix_into(&mut mixes);
+        let sample = |mix: &QuadFrame, at: usize| mix.iter().map(|channel| channel[at]).collect::<Vec<_>>();
+        assert_eq!(sample(&mixes[0], 0), [0; 4]);
+        assert_eq!(sample(&mixes[0], FRAME_SAMPLES - 1), [1000; 4]);
+        let mut again = [[[0; FRAME_SAMPLES]; 4]; 3];
+        voice.mix_into(&mut again);
+        assert_eq!(sample(&again[0], 0), [1000; 4], "the fade happens once");
+    }
+
+    /// the voices as they played and mixed a sample at a time, which the
+    /// faster ways have to match to the bit.
+    mod reference {
+        use super::super::*;
+
+        fn input(voice: &Voice, memory: &mut impl SampleMemory, index: u32) -> [i16; 2] {
+            let Some(buffer) = &voice.playing else { return [0; 2] };
+            let index = index.min(buffer.length.saturating_sub(1));
+            let channels = if buffer.stereo { 2 } else { 1 };
+            let at = buffer.address & !3;
+            let [left, right] = match buffer.format {
+                Format::Adpcm => {
+                    let sample = voice.decoded.get(index as usize).copied().unwrap_or(0);
+                    [sample, sample]
+                }
+                Format::Pcm8 => match memory.physical(at + index * channels, channels) {
+                    Some(data) => [data[0] as i8 as i16 * 256, data[data.len() - 1] as i8 as i16 * 256],
+                    None => [0; 2],
+                },
+                Format::Pcm16 => match memory.physical(at + index * channels * 2, channels * 2) {
+                    Some(data) => [
+                        i16::from_le_bytes([data[0], data[1]]),
+                        i16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]),
+                    ],
+                    None => [0; 2],
+                },
+            };
+            [left, right]
+        }
+
+        fn sample(voice: &Voice, memory: &mut impl SampleMemory) -> [i16; 2] {
+            let at = voice.length - voice.remaining;
+            let x0 = input(voice, memory, at);
+            if voice.interpolation == Interpolation::None || voice.fraction == 0.0 {
+                return x0;
+            }
+            let x1 = input(voice, memory, at + 1);
+            let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * voice.fraction) as i16;
+            [between(x0[0], x1[0]), between(x0[1], x1[1])]
+        }
+
+        pub fn decode_adpcm(data: &[u8], count: usize, coefficients: &[i16; 16], history: &mut [i16; 2]) -> Vec<i16> {
+            let mut samples = Vec::with_capacity(count);
+            let [mut yn1, mut yn2] = history.map(|h| h as i32);
+            for frame in data.chunks(8) {
+                let header = frame[0];
+                let scale = 1 << (header & 0xF);
+                let predictor = ((header >> 4) & 7) as usize;
+                let (c1, c2) = (coefficients[predictor * 2] as i32, coefficients[predictor * 2 + 1] as i32);
+                for &byte in &frame[1..] {
+                    for nibble in [byte >> 4, byte & 0xF] {
+                        if samples.len() == count {
+                            *history = [yn1 as i16, yn2 as i16];
+                            return samples;
+                        }
+                        let xn = (((nibble as i32) << 28) >> 28) * scale;
+                        let value = (((xn << 11) + 0x400 + c1 * yn1 + c2 * yn2) >> 11).clamp(-32768, 32767);
+                        yn2 = yn1;
+                        yn1 = value;
+                        samples.push(value as i16);
+                    }
+                }
+            }
+            *history = [yn1 as i16, yn2 as i16];
+            samples
+        }
+
+        fn dequeue(voice: &mut Voice, memory: &mut impl SampleMemory) -> bool {
+            let Some(index) = (0..voice.queue.len()).min_by_key(|&i| voice.queue[i].id) else {
+                return false;
+            };
+            let buffer = voice.queue[index];
+            if buffer.looping {
+                voice.queue[index].has_played = true;
+            } else {
+                voice.queue.remove(index);
+            }
+            let start = if buffer.has_played { 0 } else { buffer.play_position.min(buffer.length) };
+            voice.length = buffer.length;
+            voice.remaining = buffer.length - start;
+            voice.position = start;
+            voice.fraction = 0.0;
+            voice.current_buffer_id = buffer.id;
+            voice.last_buffer_id = 0;
+            voice.buffer_update = buffer.from_queue && !buffer.has_played;
+            if let Some(history) = buffer.adpcm {
+                voice.history = history;
+            }
+            voice.decoded.clear();
+            if buffer.format == Format::Adpcm {
+                let bytes = buffer.length.div_ceil(14) * 8;
+                if let Some(data) = memory.physical(buffer.address & !3, bytes) {
+                    voice.decoded = decode_adpcm(data, buffer.length as usize, &voice.coefficients, &mut voice.history);
+                }
+            }
+            voice.playing = Some(buffer);
+            true
+        }
+
+        pub fn play_frame(voice: &mut Voice, memory: &mut impl SampleMemory) {
+            voice.frame = [[0; 2]; FRAME_SAMPLES];
+            let follows_on = std::mem::take(&mut voice.ran_out_at_frame_end) && !voice.queue.is_empty();
+            if voice.remaining == 0 && !follows_on {
+                if dequeue(voice, memory) {
+                    return;
+                }
+                voice.enabled = false;
+                voice.buffer_update = true;
+                voice.last_buffer_id = voice.current_buffer_id;
+                voice.current_buffer_id = 0;
+                voice.position = 0;
+                return;
+            }
+
+            voice.position = voice.length - voice.remaining;
+            let mut output = 0;
+            while output < FRAME_SAMPLES {
+                if voice.remaining == 0 && !dequeue(voice, memory) {
+                    break;
+                }
+                voice.frame[output] = sample(voice, memory);
+                output += 1;
+                let input = voice.fraction + voice.rate;
+                let consumed = (input.floor() as u32).min(voice.remaining);
+                voice.fraction = (input - consumed as f64).max(0.0);
+                voice.remaining -= consumed;
+            }
+            voice.ran_out_at_frame_end = voice.remaining == 0 && output == FRAME_SAMPLES;
+            voice.filters.process(&mut voice.frame[..output]);
+        }
+
+        /// a mix with the channels of each sample together, as it was.
+        pub type Interleaved = [[i32; 4]; FRAME_SAMPLES];
+
+        pub fn interleave(mix: &QuadFrame) -> Interleaved {
+            std::array::from_fn(|sample| std::array::from_fn(|channel| mix[channel][sample]))
+        }
+
+        pub fn mix_into(voice: &mut Voice, mix: &mut Interleaved, index: usize) {
+            let gains = voice.gain[index];
+            let from = voice.ramp[index].take();
+            if !voice.enabled {
+                return;
+            }
+            for (i, (out, sample)) in mix.iter_mut().zip(&voice.frame).enumerate() {
+                let progress = i as f32 / (FRAME_SAMPLES - 1) as f32;
+                let gain = |c: usize| from.map_or(gains[c], |from| from[c] + (gains[c] - from[c]) * progress);
+                out[0] += (gain(0) * sample[0] as f32) as i32;
+                out[1] += (gain(1) * sample[1] as f32) as i32;
+                out[2] += (gain(2) * sample[0] as f32) as i32;
+                out[3] += (gain(3) * sample[1] as f32) as i32;
+            }
+        }
+    }
+
+    /// a small xorshift generator, the same numbers every run.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+
+        fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+            items[self.below(items.len() as u64) as usize]
+        }
+
+        /// somewhere in [0, 1).
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// bytes of memory the random buffers play from, at BASE.
+    const MEMORY_SIZE: u32 = 0x4000;
+
+    /// a buffer of any kind a title could queue, now and then not all of it
+    /// in memory or none of it.
+    fn random_buffer(random: &mut Random) -> Buffer {
+        let length = match random.below(6) {
+            0 => random.pick(&[0, 1, 2, 3]),
+            1 | 2 => random.below(60) as u32,
+            _ => random.below(3000) as u32,
+        };
+        let address = match random.below(10) {
+            0 => BASE - 0x100,
+            1 => BASE + MEMORY_SIZE - random.below(64) as u32,
+            _ => BASE + random.below(MEMORY_SIZE as u64 / 2) as u32,
+        };
+        Buffer {
+            address,
+            length,
+            format: random.pick(&[Format::Pcm8, Format::Pcm16, Format::Adpcm]),
+            stereo: random.chance(50),
+            looping: random.chance(25),
+            id: random.below(8) as u16,
+            adpcm: random.chance(50).then(|| [random.next() as i16, random.next() as i16]),
+            from_queue: random.chance(50),
+            play_position: if random.chance(70) { 0 } else { random.below(length as u64 + 20) as u32 },
+            has_played: false,
+        }
+    }
+
+    /// a voice set up the way a title could have it, part way through
+    /// whatever it plays.
+    fn random_voice(random: &mut Random) -> Voice {
+        let rates = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 32728.0 / 32000.0, 22050.0 / 32728.0, 1e-3, 7.75, 300.0, 3e9, 1e12];
+        let mut voice = Voice {
+            enabled: true,
+            rate: if random.chance(70) { random.pick(&rates) } else { random.unit() * 4.0 + 1e-9 },
+            interpolation: random.pick(&[Interpolation::Polyphase, Interpolation::Linear, Interpolation::None]),
+            fraction: match random.below(6) {
+                0 => 0.0,
+                1 => random.pick(&[1.0, 1.5, 3.25, 1.0 - f64::EPSILON / 2.0]),
+                _ => random.unit(),
+            },
+            ran_out_at_frame_end: random.chance(20),
+            ..Voice::default()
+        };
+        // as loud as a title's coefficients get, louder would overflow the
+        // decoder's sum in a test build
+        for coefficient in &mut voice.coefficients {
+            *coefficient = random.next() as i16 >> (3 + random.below(3));
+        }
+        voice.history = [random.next() as i16, random.next() as i16];
+        if random.chance(20) {
+            voice.filters.simple = Some(SimpleFilter { b0: (random.next() as i16) as i32, a1: (random.next() as i16 >> 2) as i32, y1: [0; 2] });
+        }
+        if random.chance(20) {
+            voice.filters.biquad = Some(BiquadFilter {
+                b: [random.next() as i16 as i32 >> 2, random.next() as i16 as i32 >> 3, random.next() as i16 as i32 >> 3],
+                a: [random.next() as i16 as i32 >> 3, random.next() as i16 as i32 >> 4],
+                ..BiquadFilter::default()
+            });
+        }
+        for _ in 0..random.below(5) {
+            voice.queue.push(random_buffer(random));
+        }
+        // a buffer lengthened before it started plays silence
+        if random.chance(5) {
+            voice.length = random.below(400) as u32;
+            voice.remaining = voice.length;
+        }
+        voice
+    }
+
+    /// asserts two voices are in the same state, to the bit.
+    fn assert_same(voice: &Voice, reference: &Voice, context: &str) {
+        assert_eq!(voice.frame, reference.frame, "{context}: samples");
+        assert_eq!(voice.fraction.to_bits(), reference.fraction.to_bits(), "{context}: fraction");
+        assert_eq!(
+            (voice.enabled, voice.remaining, voice.length, voice.position, voice.ran_out_at_frame_end, voice.history),
+            (
+                reference.enabled,
+                reference.remaining,
+                reference.length,
+                reference.position,
+                reference.ran_out_at_frame_end,
+                reference.history,
+            ),
+            "{context}"
+        );
+        assert_eq!(
+            (voice.current_buffer_id, voice.last_buffer_id, voice.buffer_update),
+            (reference.current_buffer_id, reference.last_buffer_id, reference.buffer_update),
+            "{context}: report"
+        );
+        assert_eq!(format!("{:?}", voice.playing), format!("{:?}", reference.playing), "{context}: playing");
+        assert_eq!(format!("{:?}", voice.queue), format!("{:?}", reference.queue), "{context}: queue");
+        assert_eq!(format!("{:?}", voice.filters), format!("{:?}", reference.filters), "{context}: filters");
+        assert_eq!(voice.decoded, reference.decoded, "{context}: decoded");
+    }
+
+    /// voices play to the bit what they did a sample at a time, whatever
+    /// the format, rate, interpolation and buffers, and the title changing
+    /// things between frames.
+    #[test]
+    fn playing_matches_the_sample_at_a_time_reference() {
+        let mut random = Random(0x9E37_79B9_7F4A_7C15);
+        for case in 0..3000 {
+            let mut memory = Samples((0..MEMORY_SIZE).map(|_| random.next() as u8).collect());
+            let mut voice = random_voice(&mut random);
+            let mut reference = voice.clone();
+            for frame in 0..10 {
+                if random.chance(20) {
+                    let buffer = random_buffer(&mut random);
+                    voice.queue.push(buffer);
+                    reference.queue.push(buffer);
+                }
+                // the title lengthening the buffer playing, as parse_config does
+                if random.chance(10) {
+                    let length = random.below(3000) as u32;
+                    for voice in [&mut voice, &mut reference] {
+                        let played = voice.length - voice.remaining;
+                        voice.length = length.max(played);
+                        voice.remaining = voice.length - played;
+                        if let Some(playing) = &mut voice.playing {
+                            playing.length = voice.length;
+                        }
+                    }
+                }
+                // a new rate part way through a buffer, whole ones too
+                if random.chance(10) {
+                    let rate = if random.chance(50) { random.pick(&[1.0, 2.0, 3.0]) } else { random.unit() * 3.0 + 0.01 };
+                    voice.rate = rate;
+                    reference.rate = rate;
+                }
+                // the title writing over the samples playing, or changing
+                // the coefficients
+                if let Some(playing) = voice.playing.filter(|_| random.chance(15)) {
+                    let at = (playing.address & !3).wrapping_sub(BASE) as u64 + random.below(playing.length as u64 / 2 + 1);
+                    if let Some(byte) = memory.0.get_mut(at as usize) {
+                        *byte = random.next() as u8;
+                    }
+                }
+                if random.chance(5) {
+                    let at = random.below(16) as usize;
+                    let coefficient = random.next() as i16 >> 4;
+                    voice.coefficients[at] = coefficient;
+                    reference.coefficients[at] = coefficient;
+                }
+                if !voice.enabled && random.chance(50) {
+                    voice.enabled = true;
+                    reference.enabled = true;
+                }
+                if voice.enabled {
+                    voice.play_frame(&mut memory);
+                    reference::play_frame(&mut reference, &mut memory);
+                }
+                assert_same(&voice, &reference, &format!("case {case}, frame {frame}"));
+            }
+        }
+    }
+
+    /// a buffer running off the end of the DSP's memory goes on into the
+    /// memory after it, read a sample at a time.
+    #[test]
+    fn a_buffer_across_two_memories_plays_from_both() {
+        use zakuro_common::memory_map::{DSP_RAM_PADDR, DSP_RAM_SIZE};
+        let mut memory = Memory::new(false, 64 << 20);
+        let end = DSP_RAM_PADDR + DSP_RAM_SIZE;
+        for (i, address) in (end - 64..end + 64).enumerate() {
+            memory.phys.host_slice_mut(address, 1).unwrap()[0] = i as u8 | 1;
+        }
+        let mut voice = voice_with(&[]);
+        voice.queue.push(Buffer { address: end - 32, stereo: true, ..buffer(1, 32) });
+        voice.rate = 0.75;
+        let mut reference = voice.clone();
+        for frame in 0..3 {
+            voice.play_frame(&mut memory);
+            reference::play_frame(&mut reference, &mut memory);
+            assert_same(&voice, &reference, &format!("frame {frame}"));
+            if frame == 1 {
+                assert_ne!(voice.frame[30], [0; 2], "the samples past the end are there");
+            }
+        }
+    }
+
+    /// what the voices add to the mixes is to the bit what they added a
+    /// sample at a time, steady, fading, fading back to where they were,
+    /// silent and at gains far too loud.
+    #[test]
+    fn mixing_matches_the_sample_at_a_time_reference() {
+        let mut random = Random(0x2545_F491_4F6C_DD1D);
+        let gains = [
+            0.0,
+            -0.0,
+            1.0,
+            0.5,
+            -0.75,
+            1e-40,
+            3.0,
+            QUICK_GAIN,
+            -QUICK_GAIN,
+            QUICK_GAIN + 0.002,
+            1e9,
+            3e38,
+            -3e38,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+        ];
+        for case in 0..4000 {
+            let loud = random.chance(30);
+            let gain = |random: &mut Random| {
+                if loud {
+                    random.pick(&gains)
+                } else {
+                    (random.unit() * 4.0 - 2.0) as f32
+                }
+            };
+            let mut voice = Voice { enabled: random.chance(90), ..Voice::default() };
+            let quiet = random.chance(10);
+            for sample in &mut voice.frame {
+                *sample = if quiet { [0; 2] } else { [random.next() as i16, random.next() as i16] };
+            }
+            for mix in 0..3 {
+                voice.gain[mix] = match random.below(4) {
+                    0 => [0.0; 4],
+                    1 => [gain(&mut random); 4],
+                    _ => std::array::from_fn(|_| gain(&mut random)),
+                };
+                voice.ramp[mix] = match random.below(5) {
+                    0 | 1 => None,
+                    2 => Some(voice.gain[mix]),
+                    // the same gains, a zero of the other sign
+                    3 => Some(voice.gain[mix].map(|g| if g == 0.0 { -g } else { g })),
+                    _ => Some(std::array::from_fn(|_| gain(&mut random))),
+                };
+            }
+            let mut reference = voice.clone();
+            // far too loud a voice is the only one, it would overflow the
+            // sum in a test build
+            let start = if loud { 0 } else { 1 << 28 };
+            let mut mixes = [[[0; FRAME_SAMPLES]; 4]; 3];
+            for value in mixes.iter_mut().flatten().flatten() {
+                *value = random.below(start as u64 * 2 + 1) as i32 - start;
+            }
+            let mut expected = mixes.map(|mix| reference::interleave(&mix));
+            voice.mix_into(&mut mixes);
+            for (mix, frame) in expected.iter_mut().enumerate() {
+                reference::mix_into(&mut reference, frame, mix);
+            }
+            assert_eq!(mixes.map(|mix| reference::interleave(&mix)), expected, "case {case}");
+            assert_eq!(voice.ramp, [None; 3], "case {case}: the fades are done");
+        }
+    }
+
+    #[test]
+    fn fades_go_through_a_frame_as_the_division_does() {
+        for (i, progress) in PROGRESS.iter().enumerate() {
+            let at = std::hint::black_box(i as f32) / std::hint::black_box((FRAME_SAMPLES - 1) as f32);
+            assert_eq!(progress.to_bits(), at.to_bits());
+        }
     }
 }
