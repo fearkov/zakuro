@@ -19,6 +19,8 @@ pub enum Action {
     Play(PathBuf),
     /// recompile the library's game at this index.
     Recompile(usize),
+    /// show the mods folder of the game with this program id.
+    Mods(u64),
     CancelRecompile(u64),
     ChooseFolder,
     ChooseBackground,
@@ -230,6 +232,9 @@ impl Menus {
                                     if game.recompiled {
                                         ui.label(RichText::new("recompiled").color(Color32::from_rgb(110, 200, 120)));
                                     }
+                                    if game.modded {
+                                        ui.label(RichText::new("mods").color(Color32::from_rgb(120, 170, 230)));
+                                    }
                                 });
                             });
                             if game.problem.is_some() {
@@ -255,6 +260,9 @@ impl Menus {
                                             ui.label(RichText::new(format!("failed, {error}")).color(Color32::LIGHT_RED));
                                         }
                                     }
+                                }
+                                if ui.button("Mods").on_hover_text("Open the game's mods folder. Files put in its romfs folder replace the game's, the way Luma3DS and Citra take mods.").clicked() {
+                                    actions.push(Action::Mods(game.program_id));
                                 }
                             });
                         });

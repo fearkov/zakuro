@@ -20,8 +20,9 @@ pub enum LoadError {
 const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 
 pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
-    let title = Title::load(path)?;
+    let mut title = Title::load(path)?;
     log::info!("loaded {}", title.describe());
+    crate::mods::lay(&mut title, config.data_dir.as_deref());
 
     let exheader = &title.exheader;
     let app_bytes = exheader.system_mode.application_memory();

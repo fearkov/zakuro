@@ -65,9 +65,9 @@ pub fn run(linked: Option<Linked>) {
         options,
         settings,
         linked,
+        library: Library::new(data_dir.clone()),
         data_dir,
         game: None,
-        library: Library::default(),
         menus: Menus::default(),
         jobs: Vec::new(),
         gui: None,
@@ -110,6 +110,22 @@ pub fn run(linked: Option<Linked>) {
     event_loop.set_control_flow(ControlFlow::Poll);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("zakuro: {error}");
+    }
+}
+
+/// opens a folder in the system's file manager.
+fn show_folder(folder: &Path) {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    match std::process::Command::new(program).arg(folder).spawn() {
+        // waited for so it leaves nothing behind when it closes
+        Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+        Err(error) => log::warn!("showing {}: {error}", folder.display()),
     }
 }
 
@@ -781,6 +797,15 @@ impl App {
                 }
             }
             Action::Recompile(index) => self.recompile(index),
+            Action::Mods(program_id) => {
+                if let Some(data_dir) = &self.data_dir {
+                    let folder = zakuro_core::mods::dir(data_dir, program_id);
+                    match std::fs::create_dir_all(folder.join("romfs")) {
+                        Ok(()) => show_folder(&folder),
+                        Err(error) => self.menus.message = Some(format!("The mods folder can't be made: {error}")),
+                    }
+                }
+            }
             Action::CancelRecompile(program_id) => {
                 for job in self.jobs.iter().filter(|job| job.program_id == program_id) {
                     job.cancel();

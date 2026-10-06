@@ -10,49 +10,58 @@ pub struct BuildFile {
 const INVALID: u32 = 0xFFFF_FFFF;
 
 /// one directory while the tree is being assembled.
-struct Dir {
-    name: String,
-    parent: usize,
-    children: Vec<usize>,
-    files: Vec<usize>,
+pub(crate) struct Dir {
+    pub(crate) name: String,
+    pub(crate) parent: usize,
+    pub(crate) children: Vec<usize>,
+    pub(crate) files: Vec<usize>,
     /// offset in the built metadata table, filled in during layout.
-    offset: u32,
+    pub(crate) offset: u32,
 }
 
 /// one file while the tree is being assembled.
-struct File {
-    name: String,
-    parent: usize,
-    data_offset: u64,
-    data_size: u64,
-    offset: u32,
+pub(crate) struct File {
+    pub(crate) name: String,
+    pub(crate) parent: usize,
+    /// offset from the start of the file data.
+    pub(crate) data_offset: u64,
+    pub(crate) data_size: u64,
+    pub(crate) offset: u32,
 }
 
-/// builds a level-3 RomFS image containing files.
+/// builds a level-3 RomFS image containing files, kept in a nameless
+/// directory under the root as the system's archives keep theirs.
 pub fn build(files: &[BuildFile]) -> Vec<u8> {
-    let mut dirs = vec![
-        Dir {
-            name: String::new(),
-            parent: 0,
-            children: vec![1],
-            files: Vec::new(),
-            offset: 0,
-        },
-        Dir {
+    assemble(files, true)
+}
+
+/// builds an image with files under a nameless directory, or at the root
+/// as a game's RomFS has them.
+pub(crate) fn assemble(files: &[BuildFile], nameless: bool) -> Vec<u8> {
+    let root = Dir {
+        name: String::new(),
+        parent: 0,
+        children: Vec::new(),
+        files: Vec::new(),
+        offset: 0,
+    };
+    let mut dirs = vec![root];
+    if nameless {
+        dirs[0].children.push(1);
+        dirs.push(Dir {
             name: String::new(),
             parent: 0,
             children: Vec::new(),
             files: Vec::new(),
             offset: 0,
-        },
-    ];
-    // everything below is placed under the nameless directory, not the root.
-    const CONTENT_ROOT: usize = 1;
+        });
+    }
+    let content_root = dirs.len() - 1;
     let mut entries: Vec<File> = Vec::new();
     let mut data = Vec::new();
 
     for file in files {
-        let mut parent = CONTENT_ROOT;
+        let mut parent = content_root;
         let mut components: Vec<&str> = file.path.split('/').filter(|c| !c.is_empty()).collect();
         let Some(name) = components.pop() else {
             continue;
@@ -100,6 +109,14 @@ pub fn build(files: &[BuildFile]) -> Vec<u8> {
         dirs[parent].files.push(index);
     }
 
+    let mut out = metadata(&mut dirs, &mut entries);
+    out.extend_from_slice(&data);
+    out
+}
+
+/// the header and the metadata tables for a tree whose root is dirs[0],
+/// padded up to where the file data starts.
+pub(crate) fn metadata(dirs: &mut [Dir], entries: &mut [File]) -> Vec<u8> {
     // lay the metadata tables out so every entry knows its own offset before
     // anything has to write a sibling or child pointer to it.
     let mut dir_meta_size = 0u32;
@@ -113,6 +130,19 @@ pub fn build(files: &[BuildFile]) -> Vec<u8> {
         file_meta_size += file_entry_size(&file.name);
     }
 
+    // every entry's next sibling, found in one pass, a directory in a game's
+    // RomFS can hold thousands of files.
+    let mut next_dir = vec![INVALID; dirs.len()];
+    let mut next_file = vec![INVALID; entries.len()];
+    for dir in dirs.iter() {
+        for pair in dir.children.windows(2) {
+            next_dir[pair[0]] = dirs[pair[1]].offset;
+        }
+        for pair in dir.files.windows(2) {
+            next_file[pair[0]] = entries[pair[1]].offset;
+        }
+    }
+
     let dir_buckets = bucket_count(dirs.len());
     let file_buckets = bucket_count(entries.len());
     let mut dir_hash = vec![INVALID; dir_buckets];
@@ -121,20 +151,15 @@ pub fn build(files: &[BuildFile]) -> Vec<u8> {
     let mut dir_meta = Vec::with_capacity(dir_meta_size as usize);
     for (index, dir) in dirs.iter().enumerate() {
         let parent = dirs[dir.parent].offset;
-        let next_sibling = sibling_of(&dirs, dir.parent, index, |d| &d.children)
-            .map_or(INVALID, |s| dirs[s].offset);
+        let next_sibling = next_dir[index];
         let first_child = dir.children.first().map_or(INVALID, |&c| dirs[c].offset);
         let first_file = dir.files.first().map_or(INVALID, |&f| entries[f].offset);
 
-        // the root is not in the hash table, nothing ever looks it up by name.
-        let next_hash = if index == 0 {
-            INVALID
-        } else {
-            let bucket = hash(parent, &dir.name) as usize % dir_buckets;
-            let previous = dir_hash[bucket];
-            dir_hash[bucket] = dir.offset;
-            previous
-        };
+        // the root is in the hash table too, a game's lookups start from the
+        // nameless directory under offset 0 and find the root itself.
+        let bucket = hash(parent, &dir.name) as usize % dir_buckets;
+        let next_hash = dir_hash[bucket];
+        dir_hash[bucket] = dir.offset;
 
         dir_meta.extend_from_slice(&parent.to_le_bytes());
         dir_meta.extend_from_slice(&next_sibling.to_le_bytes());
@@ -147,8 +172,7 @@ pub fn build(files: &[BuildFile]) -> Vec<u8> {
     let mut file_meta = Vec::with_capacity(file_meta_size as usize);
     for (index, file) in entries.iter().enumerate() {
         let parent = dirs[file.parent].offset;
-        let next_sibling = sibling_of(&dirs, file.parent, index, |d| &d.files)
-            .map_or(INVALID, |s| entries[s].offset);
+        let next_sibling = next_file[index];
 
         let bucket = hash(parent, &file.name) as usize % file_buckets;
         let next_hash = file_hash[bucket];
@@ -173,7 +197,7 @@ pub fn build(files: &[BuildFile]) -> Vec<u8> {
     let file_meta_offset = file_hash_offset + file_hash_size;
     let file_data_offset = align_up(file_meta_offset + file_meta_size, 16);
 
-    let mut out = Vec::with_capacity(file_data_offset as usize + data.len());
+    let mut out = Vec::with_capacity(file_data_offset as usize);
     for value in [
         HEADER_SIZE,
         dir_hash_offset,
@@ -197,20 +221,7 @@ pub fn build(files: &[BuildFile]) -> Vec<u8> {
     }
     out.extend_from_slice(&file_meta);
     out.resize(file_data_offset as usize, 0);
-    out.extend_from_slice(&data);
     out
-}
-
-/// the entry after index in its parent's list, if any.
-fn sibling_of(
-    dirs: &[Dir],
-    parent: usize,
-    index: usize,
-    list: impl Fn(&Dir) -> &Vec<usize>,
-) -> Option<usize> {
-    let siblings = list(&dirs[parent]);
-    let position = siblings.iter().position(|&s| s == index)?;
-    siblings.get(position + 1).copied()
 }
 
 fn dir_entry_size(name: &str) -> u32 {
@@ -389,6 +400,16 @@ mod tests {
         // a name that is not there must not resolve to a neighbour that
         // happens to share a bucket.
         assert!(hash_lookup(&image, us, "missing.bin", true).is_none());
+    }
+
+    /// a game's RomFS keeps its files at the root, and a game finds the
+    /// root itself as the nameless directory under offset 0.
+    #[test]
+    fn a_game_finds_the_root_through_the_hash_table() {
+        let image = assemble(&[BuildFile { path: "Data/file.bin".into(), data: vec![1] }], false);
+        assert_eq!(hash_lookup(&image, 0, "", false), Some(0));
+        let data = hash_lookup(&image, 0, "Data", false).expect("Data should hash-resolve");
+        hash_lookup(&image, data, "file.bin", true).expect("the file should hash-resolve");
     }
 
     #[test]

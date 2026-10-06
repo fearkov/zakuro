@@ -3753,6 +3753,7 @@ dependencies = [
 name = "zakuro-fs"
 version = "0.2.18"
 dependencies = [
+ "crc32fast",
  "log",
  "memmap2",
  "thiserror 2.0.20",

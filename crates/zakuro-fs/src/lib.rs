@@ -4,9 +4,11 @@
 
 pub mod cia;
 pub mod exefs;
+pub mod layered;
 pub mod lz77;
 pub mod ncch;
 pub mod ncsd;
+pub mod patch;
 mod reader;
 pub mod romfs;
 pub mod romfs_build;
@@ -68,6 +70,12 @@ pub enum FsError {
 
     #[error("path not found in RomFS: {0}")]
     PathNotFound(String),
+
+    #[error("malformed patch: {0}")]
+    BadPatch(&'static str),
+
+    #[error("the patch is for another version of the file")]
+    PatchMismatch,
 }
 
 /// a memory-mapped ROM file. Games are up to 4 GiB, so nothing is read eagerly.
@@ -113,6 +121,8 @@ pub struct Title {
     pub exefs: ExeFs,
     exefs_offset: u64,
     pub romfs: Option<RomFs>,
+    /// the RomFS with mods over it, when there are any.
+    pub layered: Option<std::sync::Arc<layered::Layered>>,
 }
 
 impl Title {
@@ -169,7 +179,20 @@ impl Title {
             exefs,
             exefs_offset,
             romfs,
+            layered: None,
         })
+    }
+
+    /// lays the mod in dir over the RomFS. what it changed, when it changed
+    /// anything.
+    pub fn lay_mods(&mut self, dir: &Path) -> Result<Option<layered::Changes>, FsError> {
+        let Some(romfs) = &self.romfs else {
+            return Ok(None);
+        };
+        let layered = layered::Layered::new(romfs, self.image.data(), dir)?;
+        let changes = layered.as_ref().map(|layered| layered.changes);
+        self.layered = layered.map(std::sync::Arc::new);
+        Ok(changes)
     }
 
     pub fn image(&self) -> &RomImage {

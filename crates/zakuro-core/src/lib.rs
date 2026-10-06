@@ -6,6 +6,7 @@ pub mod hints;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
+pub mod mods;
 pub mod replay;
 pub mod recompiled;
 pub mod services;

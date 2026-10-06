@@ -107,6 +107,8 @@ pub enum FileBacking {
     Host(PathBuf),
     /// read-only bytes generated in memory.
     Memory(Vec<u8>),
+    /// the title's RomFS with mods over it.
+    Layered(std::sync::Arc<zakuro_fs::layered::Layered>),
 }
 
 impl FileBacking {
@@ -115,6 +117,7 @@ impl FileBacking {
             FileBacking::RomImage { size, .. } => *size,
             FileBacking::Host(path) => host_archive::size_of(path),
             FileBacking::Memory(data) => data.len() as u64,
+            FileBacking::Layered(layered) => layered.len(),
         }
     }
 }
@@ -1036,6 +1039,13 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     match kind {
         SELF_NCCH_ROMFS | SELF_NCCH_UPDATE_ROMFS => {
+            if let Some(layered) = title.layered.clone() {
+                log::debug!("fs: opened SelfNCCH RomFS with mods over it, {} MiB", layered.len() / (1024 * 1024));
+                return Some(system.services.fs.add_file(OpenFile {
+                    path: "romfs:/".into(),
+                    backing: FileBacking::Layered(layered),
+                }));
+            }
             let romfs = title.romfs.as_ref()?;
             let size = title.ncch.romfs_size.saturating_sub(0x1000);
             let backing = FileBacking::RomImage {
@@ -1116,6 +1126,15 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             let start = offset as usize;
             let count = (size as usize).min(data.len() - start);
             system.write_from_service(dest, &data[start..start + count]);
+            count as u32
+        }
+        FileBacking::Layered(layered) => {
+            let Some(title) = system.title.as_ref() else {
+                return 0;
+            };
+            let mut data = vec![0u8; (size as u64).min(layered.len().saturating_sub(offset)) as usize];
+            let count = layered.read(title.image().data(), offset, &mut data);
+            system.write_from_service(dest, &data[..count]);
             count as u32
         }
     }

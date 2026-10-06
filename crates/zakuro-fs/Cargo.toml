@@ -9,3 +9,4 @@ zakuro-common.workspace = true
 log.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+crc32fast = "1"

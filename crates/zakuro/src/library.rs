@@ -17,6 +17,8 @@ pub struct Game {
     pub icon: Option<Vec<u8>>,
     /// 3dsrecomp installed code for it.
     pub recompiled: bool,
+    /// its mods folder has something in it.
+    pub modded: bool,
     /// why it can't be played, when it can't, an encrypted dump say.
     pub problem: Option<String>,
 }
@@ -28,15 +30,23 @@ pub struct Library {
     scanning: Option<Receiver<Vec<Game>>>,
     /// set when the games changed and their icons need uploading.
     pub changed: bool,
+    /// where the games' mods folders are.
+    data_dir: Option<PathBuf>,
 }
 
 impl Library {
+    /// a library whose games keep their mods under data_dir.
+    pub fn new(data_dir: Option<PathBuf>) -> Library {
+        Library { data_dir, ..Library::default() }
+    }
+
     /// starts looking through folder again.
     pub fn scan(&mut self, folder: &Path) {
         let (send, receive) = channel();
         let folder = folder.to_owned();
+        let data_dir = self.data_dir.clone();
         std::thread::spawn(move || {
-            let _ = send.send(scan(&folder));
+            let _ = send.send(scan(&folder, data_dir.as_deref()));
         });
         self.scanning = Some(receive);
     }
@@ -67,7 +77,7 @@ impl Library {
     }
 }
 
-fn scan(folder: &Path) -> Vec<Game> {
+fn scan(folder: &Path, data_dir: Option<&Path>) -> Vec<Game> {
     let Ok(entries) = std::fs::read_dir(folder) else { return Vec::new() };
     let mut games: Vec<Game> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -76,7 +86,7 @@ fn scan(folder: &Path) -> Vec<Game> {
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| GAME_FILES.contains(&extension.to_ascii_lowercase().as_str()))
         })
-        .map(|path| read_or_list_unreadable(&path))
+        .map(|path| read_or_list_unreadable(&path, data_dir))
         .collect();
     // the ones that can't be played go last
     games.sort_by_key(|game| (game.problem.is_some(), game.name.to_lowercase()));
@@ -85,8 +95,8 @@ fn scan(folder: &Path) -> Vec<Game> {
 
 /// a game read, or one that made reading it fail on a bug listed as
 /// unreadable, rather than taking the whole library with it.
-fn read_or_list_unreadable(path: &Path) -> Game {
-    std::panic::catch_unwind(|| read_game(path)).unwrap_or_else(|_| {
+fn read_or_list_unreadable(path: &Path, data_dir: Option<&Path>) -> Game {
+    std::panic::catch_unwind(|| read_game(path, data_dir)).unwrap_or_else(|_| {
         log::error!("reading {} failed", path.display());
         unplayable(path, "Zakuro couldn't read it, please report it".to_owned())
     })
@@ -101,11 +111,12 @@ fn unplayable(path: &Path, problem: String) -> Game {
         program_id: 0,
         icon: None,
         recompiled: false,
+        modded: false,
         problem: Some(problem),
     }
 }
 
-fn read_game(path: &Path) -> Game {
+fn read_game(path: &Path, data_dir: Option<&Path>) -> Game {
     let file_name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     let empty = std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0);
     let loaded = if empty { Err(None) } else { zakuro_fs::Title::load(path).map_err(Some) };
@@ -129,6 +140,7 @@ fn read_game(path: &Path) -> Game {
         program_id,
         icon: smdh.map(|s| s.icon),
         recompiled: zakuro_core::recompiled::installed(program_id).is_some(),
+        modded: data_dir.is_some_and(|data_dir| zakuro_core::mods::present(data_dir, program_id)),
         problem: None,
     }
 }
