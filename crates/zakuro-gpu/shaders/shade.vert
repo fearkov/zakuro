@@ -423,6 +423,14 @@ void main() {
         window = roundEven(window * 16.0) / 16.0;
         position.xy = ((window - viewport.xy) / viewport.zw * 2.0 - 1.0) * position.w;
     }
+    // z on an end of the range the PICA draws when it misses one only by
+    // rounding, as clip_triangle has it
+    float z_over_w = position.z / position.w;
+    if (z_over_w > 0.0 && z_over_w < 1e-8) {
+        position.z = 0.0;
+    } else if (z_over_w < -1.0 && z_over_w > -1.00001) {
+        position.z = -position.w;
+    }
     gl_Position = vec4(position.xy, -position.z, position.w);
     // no color is white, an untextured draw comes out lit
     out_color = vec4(semantic(4u, 1.0), semantic(5u, 1.0), semantic(6u, 1.0), semantic(7u, 1.0));

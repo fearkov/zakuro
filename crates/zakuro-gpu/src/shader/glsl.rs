@@ -852,6 +852,14 @@ const EPILOGUE: &str = r#"    if (position.w > 1e-5) {
         vec2 placed = ((window - viewport.xy) / viewport.zw * 2.0 - 1.0) * position.w;
         position = vec4(placed, position.z, position.w);
     }
+    // z on an end of the range the PICA draws when it misses one only by
+    // rounding, as clip_triangle has it
+    float z_over_w = position.z / position.w;
+    if (z_over_w > 0.0 && z_over_w < 1e-8) {
+        position.z = 0.0;
+    } else if (z_over_w < -1.0 && z_over_w > -1.00001) {
+        position.z = -position.w;
+    }
     gl_Position = vec4(position.xy, -position.z, position.w);
 "#;
 

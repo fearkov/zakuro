@@ -799,8 +799,24 @@ fn inside(vertex: &Vertex) -> bool {
     CLIP_PLANES.iter().all(|plane| plane(vertex) >= 0.0)
 }
 
+/// a vertex with z on an end of the range the PICA draws when it misses
+/// one only by rounding. the PICA works positions out in 24-bit floats,
+/// which land on 0 and -w, singles can miss them by a little, and 2D drawn
+/// on the near or far plane, a title's video say, lost triangles to it.
+fn held_in_range(mut vertex: Vertex) -> Vertex {
+    let [_, _, z, w] = vertex.clip;
+    let z_over_w = z / w;
+    if z_over_w > 0.0 && z_over_w < 1e-8 {
+        vertex.clip[2] = 0.0;
+    } else if z_over_w < -1.0 && z_over_w > -1.00001 {
+        vertex.clip[2] = -w;
+    }
+    vertex
+}
+
 /// clips a triangle to the volume the PICA draws.
 fn clip_triangle(triangle: [Vertex; 3]) -> Vec<Vertex> {
+    let triangle = triangle.map(held_in_range);
     let planes = CLIP_PLANES;
     if triangle.iter().all(inside) {
         return triangle.to_vec();
@@ -4183,6 +4199,55 @@ mod tests {
         assert!(drawn as u32 > cases * 40, "only {drawn} pixels drawn");
         assert!(translations as u32 >= least, "only {translations} of {cases} programs translated");
         assert_eq!(interpreters.hardware.as_ref().unwrap().translations(), 0);
+    }
+
+    /// 2D drawn on the near or far plane is drawn when z misses the plane
+    /// only by rounding, as it would on the console, and clipped when it is
+    /// really outside, the same on the CPU, on the GPU interpreting the
+    /// program and with it translated.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn geometry_on_the_ends_of_the_z_range_is_drawn() {
+        let mut registers = translation_registers();
+        // color only, nothing but the clipping keeps a pixel out
+        registers[REG_DEPTH_COLOR_MASK] = 0xF << 8;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut unit = ShaderUnit::new();
+        unit.descriptors[0] = 0xF | IDENTITY;
+        let mov = |destination: u32, source: u32| 0x13 << 26 | destination << 21 | source << 12;
+        unit.program[..3].copy_from_slice(&[mov(0, 0), mov(2, 1), 0x22 << 26]);
+        unit.prepare();
+        let hardware = |translates: bool| {
+            hardware::Hardware::new().ok().map(|mut hardware| {
+                hardware.set_translates(translates, true);
+                Resources { hardware: Some(hardware), ..Default::default() }
+            })
+        };
+        let (mut interpreting, mut translating) = (hardware(false), hardware(true));
+        let bytes = (TRANSLATION_SIZE * TRANSLATION_SIZE * 4) as usize;
+        for (z, drawn) in [(-0.5, true), (-1.000005, true), (5e-9, true), (-1.001, false), (1e-6, false)] {
+            let inputs: Vec<[shader::Vec4; shader::INPUT_REGISTERS]> = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
+                .into_iter()
+                .map(|[x, y]| {
+                    let mut input = [shader::ZERO; shader::INPUT_REGISTERS];
+                    input[0] = [x, y, z, 1.0];
+                    input[1] = [1.0, 0.0, 0.0, 1.0];
+                    input
+                })
+                .collect();
+            let mut memory = ConsoleMemory::default();
+            memory.write(COLOR, &vec![0u8; bytes]);
+            let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &unit, inputs: &inputs, order: None };
+            rasterize(&registers, &mut memory, &mut Resources::default(), vertices);
+            let mut software = vec![0u8; bytes];
+            memory.read(COLOR, &mut software);
+            let red = software.chunks(4).filter(|pixel| ColorFormat::Rgba8.decode(pixel) == [255, 0, 0, 255]).count();
+            assert_eq!(red > 0, drawn, "z {z} on the CPU, {red} pixels");
+            for resources in [&mut interpreting, &mut translating].into_iter().flatten() {
+                let gpu = draw_on_gpu(&registers, resources, &unit, &inputs);
+                assert!(gpu[..bytes] == software[..], "z {z} on the GPU draws what the CPU does");
+            }
+        }
     }
 
     /// a program is interpreted while the compiler thread translates it and
