@@ -91,6 +91,8 @@ pub struct VulkanPresenter {
     /// the device and instance, when the renderer draws on them too, which
     /// go with the last of the two rather than with this.
     shared: Option<Arc<SharedDevice>>,
+    /// whether a present waits for the display, as FIFO does.
+    waits: bool,
 
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -348,6 +350,7 @@ impl VulkanPresenter {
             sampler,
             gpu_sets,
             shared: ManuallyDrop::into_inner(shared),
+            waits: true,
             command_pool,
             command_buffers,
             image_available,
@@ -417,6 +420,7 @@ impl VulkanPresenter {
             _ => vec![vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO],
         };
         let present_mode = wanted.into_iter().find(|mode| present_modes.contains(mode)).unwrap_or(vk::PresentModeKHR::FIFO);
+        self.waits = present_mode == vk::PresentModeKHR::FIFO;
         if self.swapchain == vk::SwapchainKHR::null() {
             let name = |mode: vk::PresentModeKHR| match mode {
                 vk::PresentModeKHR::FIFO => "fifo".to_owned(),
@@ -548,6 +552,12 @@ impl VulkanPresenter {
     /// the device, for the renderer to draw on, when it can share it.
     pub fn shared_device(&self) -> Option<Arc<SharedDevice>> {
         self.shared.clone()
+    }
+
+    /// whether a present waits for the display, rather than handing the
+    /// frame over and going on.
+    pub fn waits_for_display(&self) -> bool {
+        self.waits
     }
 
     /// what a screen is drawn from this frame, pixels uploaded to its own

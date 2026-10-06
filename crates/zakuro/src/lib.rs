@@ -372,6 +372,13 @@ const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);
 /// frames that may go unshown in a row while catching up.
 const MAX_SKIPPED: u32 = 4;
 
+/// whether a frame goes unshown, the game running behind the schedule with
+/// a presenter that waits for the display, and fewer than MAX_SKIPPED
+/// unshown before it.
+fn skips_showing(playing: bool, behind: bool, waits: bool, skipped: u32) -> bool {
+    playing && behind && waits && skipped < MAX_SKIPPED
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -851,9 +858,12 @@ impl App {
 
         self.next_frame += FRAME_TIME;
         // behind the schedule, showing the frame would wait on the display,
-        // so it goes unshown, a few at most
+        // so it goes unshown, a few at most. a presenter that does not wait,
+        // in mailbox mode, shows them all, a game that could not keep up
+        // showed a fifth of its frames
         let behind = Instant::now() > self.next_frame;
-        if playing && behind && self.skipped < MAX_SKIPPED {
+        let waits = self.backend.as_ref().is_some_and(Backend::waits_for_display);
+        if skips_showing(playing, behind, waits, self.skipped) {
             self.skipped += 1;
         } else {
             self.skipped = 0;
@@ -997,3 +1007,20 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<Gp
 
 /// keeps the renderer kind referenced even when a backend feature is off.
 const _: RendererKind = RendererKind::Software;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a frame goes unshown only while the game runs behind with a
+    /// presenter that waits for the display, a few in a row at most.
+    #[test]
+    fn frames_go_unshown_only_when_showing_would_wait() {
+        assert!(skips_showing(true, true, true, 0));
+        assert!(skips_showing(true, true, true, MAX_SKIPPED - 1));
+        assert!(!skips_showing(true, true, true, MAX_SKIPPED), "a few in a row at most");
+        assert!(!skips_showing(true, true, false, 0), "mailbox shows every frame");
+        assert!(!skips_showing(true, false, true, 0), "on time");
+        assert!(!skips_showing(false, true, true, 0), "paused");
+    }
+}
