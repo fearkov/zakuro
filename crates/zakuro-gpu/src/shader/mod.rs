@@ -168,11 +168,53 @@ impl ShaderUnit {
         if self.float_uniform_component < needed {
             return;
         }
-
-        let staged = self.float_uniform_staging;
         self.float_uniform_component = 0;
+        self.set_float_uniform(self.float_uniform_staging, self.float_uniform_wide);
+    }
 
-        let value = if self.float_uniform_wide {
+    /// float uniform words in a row, as upload_float_uniform takes them,
+    /// a whole vector at a time once a vector starts. a draw's matrices
+    /// come this way, most of the words in a command list.
+    pub fn upload_float_uniforms(&mut self, mut words: &[u32]) {
+        // the rest of a vector the words before left unfinished
+        while self.float_uniform_component != 0 {
+            let [word, rest @ ..] = words else {
+                return;
+            };
+            self.upload_float_uniform(*word);
+            words = rest;
+        }
+        let rest = if self.float_uniform_wide {
+            self.upload_vectors::<4>(words)
+        } else {
+            self.upload_vectors::<3>(words)
+        };
+        for &word in rest {
+            self.upload_float_uniform(word);
+        }
+    }
+
+    /// uploads the whole vectors of n words at the start of words, and
+    /// gives back the words after them.
+    #[inline]
+    fn upload_vectors<'a, const N: usize>(&mut self, words: &'a [u32]) -> &'a [u32] {
+        let (vectors, rest) = words.as_chunks::<N>();
+        // staged as a word at a time stages them, the last vector's words
+        // stay there
+        let mut staged = self.float_uniform_staging;
+        for vector in vectors {
+            staged[..N].copy_from_slice(vector);
+            self.set_float_uniform(staged, N == 4);
+        }
+        self.float_uniform_staging = staged;
+        rest
+    }
+
+    /// decodes a vector's staged words into the uniform the index names,
+    /// and moves the index on.
+    #[inline(always)]
+    fn set_float_uniform(&mut self, staged: [u32; 4], wide: bool) {
+        let value = if wide {
             [
                 f32::from_bits(staged[3]),
                 f32::from_bits(staged[2]),
@@ -196,7 +238,7 @@ impl ShaderUnit {
                 "uniform c{} set to NaN {value:?} from {:08X?} ({} bit)",
                 self.float_uniform_index,
                 staged,
-                if self.float_uniform_wide { 32 } else { 24 },
+                if wide { 32 } else { 24 },
             );
         }
         if self.float_uniform_index < FLOAT_UNIFORMS {
@@ -205,11 +247,20 @@ impl ShaderUnit {
         self.float_uniform_index += 1;
     }
 
-    /// float uniform words in a row, as upload_float_uniform takes them.
-    pub fn upload_float_uniforms(&mut self, words: &[u32]) {
-        for &word in words {
-            self.upload_float_uniform(word);
-        }
+    /// the upload cursors, the staged words and the programs decoded, to
+    /// tell two units apart in tests.
+    #[cfg(test)]
+    pub(crate) fn cursors(&self) -> (usize, usize, bool, [u32; 4], Option<u64>, Vec<u64>) {
+        let mut decoded_before: Vec<u64> = self.decoded_before.keys().copied().collect();
+        decoded_before.sort_unstable();
+        (
+            self.float_uniform_index,
+            self.float_uniform_component,
+            self.float_uniform_wide,
+            self.float_uniform_staging,
+            self.decoded.as_ref().map(|program| program.fingerprint),
+            decoded_before,
+        )
     }
 }
 
@@ -1312,6 +1363,38 @@ mod tests {
         unit.prepare();
         run(&unit, &mut state);
         assert_eq!(state.output[0], [11.0, 22.0, 33.0, 44.0]);
+    }
+
+    /// float uniforms sent as a run land as they do a word at a time,
+    /// packed and wide, starting part way through a vector or not, ending
+    /// part way through one or not, past the last uniform too.
+    #[test]
+    fn uniforms_sent_as_a_run_land_as_one_word_at_a_time() {
+        let mut random = Random(7);
+        for case in 0..2000 {
+            let mut runs = ShaderUnit::new();
+            // a wide upload before leaves a fourth staged word behind
+            runs.set_float_uniform_index(0x8000_0000);
+            for _ in 0..random.below(5) {
+                runs.upload_float_uniform(random.next());
+            }
+            let wide = if random.below(2) == 0 { 0x8000_0000 } else { 0 };
+            runs.set_float_uniform_index(random.below(0x80) | wide);
+            for _ in 0..random.below(4) {
+                runs.upload_float_uniform(random.next());
+            }
+            let mut words = runs.clone();
+            let run: Vec<u32> = (0..random.below(60))
+                .map(|_| if random.below(4) == 0 { random.float().to_bits() } else { random.next() })
+                .collect();
+            runs.upload_float_uniforms(&run);
+            for &word in &run {
+                words.upload_float_uniform(word);
+            }
+            assert_eq!(runs.cursors(), words.cursors(), "case {case}");
+            let bits = |unit: &ShaderUnit| unit.float_uniforms.as_flattened().iter().map(|c| c.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&runs), bits(&words), "case {case}");
+        }
     }
 
     #[test]
