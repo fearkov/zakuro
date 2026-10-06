@@ -1,4 +1,7 @@
-//! cargo run -p zakuro-fs --example romdump -- <rom>
+//! cargo run -p zakuro-fs --example romdump -- <rom> [files]
+//!
+//! files lists every file in the RomFS with its size and where it is in the
+//! ROM, by the paths a mod's romfs folder takes.
 
 use zakuro_fs::Title;
 
@@ -71,5 +74,16 @@ fn main() {
         println!("  root files: {}", fs.files(&root).iter().map(|(_, f)| f.name.clone()).collect::<Vec<_>>().join(" "));
         let (dirs, files) = fs.count_entries();
         println!("  {dirs} directories, {files} files");
+        if std::env::args().nth(2).as_deref() == Some("files") {
+            let mut pending = vec![(String::new(), root)];
+            while let Some((path, dir)) = pending.pop() {
+                for (_, file) in fs.files(&dir) {
+                    println!("  {path}{}  {}  @0x{:X}", file.name, file.data_size, fs.file_data_offset(&file));
+                }
+                for (_, child) in fs.subdirs(&dir).into_iter().rev() {
+                    pending.push((format!("{path}{}/", child.name), child));
+                }
+            }
+        }
     }
 }
