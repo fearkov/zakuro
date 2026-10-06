@@ -523,6 +523,7 @@ impl App {
             None => None,
         };
         let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
+        let outdated = system.recompiled.as_ref().is_some_and(|code| code.outdated());
         let name = self
             .library
             .games
@@ -541,6 +542,12 @@ impl App {
                 }
                 Err(error) => log::warn!("could not record to {}, {error}", record.display()),
             }
+        }
+        if outdated {
+            self.menus.message = Some(format!(
+                "{} was recompiled by an older version of Zakuro. Recompile it again from the library and it runs faster.",
+                game.name
+            ));
         }
         self.game = Some(game);
         self.menus.menu_open = false;

@@ -167,6 +167,12 @@ impl Library {
         (0..FOUND).map(|_| Cell::new((u32::MAX, None))).collect()
     }
 
+    /// whether the code came from an older 3dsrecomp than the one this
+    /// build has, so that recompiling the game again makes it run faster.
+    pub fn outdated(&self) -> bool {
+        self.code.generation() < recomp_abi::GENERATION
+    }
+
     /// how many instructions the code has handed to the interpreter.
     pub fn fallbacks(&self) -> u64 {
         self.fallbacks.get()

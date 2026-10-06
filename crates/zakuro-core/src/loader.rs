@@ -91,6 +91,9 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         match crate::recompiled::Library::open(&path) {
             Ok(library) => {
                 log::info!("running recompiled code from {}, {}", path.display(), library.describe());
+                if library.outdated() {
+                    log::warn!("an older 3dsrecomp made {}, recompiling the game again makes it faster", path.display());
+                }
                 system.recompiled = Some(library);
                 let text = exheader_text(&title);
                 system.hints = Some(crate::hints::Hints::new(&path, text));
