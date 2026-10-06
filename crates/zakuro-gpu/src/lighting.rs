@@ -146,7 +146,7 @@ struct Lookup {
     scale: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Light {
     specular0: [f32; 3],
     specular1: [f32; 3],
@@ -189,7 +189,9 @@ struct Shadow {
 /// the lighting of a draw, decoded from the registers once.
 #[derive(Debug, Clone)]
 pub struct Lighting {
-    lights: Vec<Light>,
+    /// the lights on, the first light_count of them.
+    lights: [Light; 8],
+    light_count: usize,
     global_ambient: [f32; 3],
     config: u32,
     distribution0: Option<Lookup>,
@@ -210,6 +212,10 @@ pub struct Lighting {
 }
 
 impl Lighting {
+    fn lights(&self) -> &[Light] {
+        &self.lights[..self.light_count]
+    }
+
     /// the lighting set up in the registers, or None when it is off.
     pub fn read(registers: &[u32]) -> Option<Lighting> {
         if registers[REG_ENABLE] & 1 == 0 || registers[REG_DISABLE] & 1 != 0 {
@@ -240,33 +246,33 @@ impl Lighting {
             (config1 & (1 << disabled) == 0 && supported(config, table)).then(|| lookup(field))
         };
 
-        let count = (registers[REG_LIGHT_COUNT] & 7) + 1;
-        let lights: Vec<Light> = (0..count)
-            .map(|slot| {
-                let number = ((registers[REG_LIGHT_SLOTS] >> (slot * 4)) & 7) as usize;
-                let block = &registers[REG_LIGHTS + number * 0x10..REG_LIGHTS + number * 0x10 + 0x10];
-                let half = |value: u32| pica_float(value & 0xFFFF, 10, 5);
-                let position = [half(block[4]), half(block[4] >> 16), half(block[5])];
-                Light {
-                    specular0: color(block[0]),
-                    specular1: color(block[1]),
-                    diffuse: color(block[2]),
-                    ambient: color(block[3]),
-                    position,
-                    direction: normalized(position),
-                    spot: [fixed(block[6]), fixed(block[6] >> 16), fixed(block[7])],
-                    directional: block[9] & 1 != 0,
-                    two_sided: block[9] & 2 != 0,
-                    geometric0: block[9] & 4 != 0,
-                    geometric1: block[9] & 8 != 0,
-                    distance: (config1 & (1 << (24 + number)) == 0)
-                        .then(|| (pica_float(block[10] & 0xF_FFFF, 12, 7), pica_float(block[11] & 0xF_FFFF, 12, 7))),
-                    spotlight: config1 & (1 << (8 + number)) == 0 && supported(config, SPOTLIGHT),
-                    shadowed: config1 & (1 << number) == 0,
-                    number,
-                }
-            })
-            .collect();
+        let light_count = ((registers[REG_LIGHT_COUNT] & 7) + 1) as usize;
+        let mut lights = [Light::default(); 8];
+        for (slot, light) in lights.iter_mut().enumerate().take(light_count) {
+            let number = ((registers[REG_LIGHT_SLOTS] >> (slot * 4)) & 7) as usize;
+            let block = &registers[REG_LIGHTS + number * 0x10..REG_LIGHTS + number * 0x10 + 0x10];
+            let half = |value: u32| pica_float(value & 0xFFFF, 10, 5);
+            let position = [half(block[4]), half(block[4] >> 16), half(block[5])];
+            *light = Light {
+                specular0: color(block[0]),
+                specular1: color(block[1]),
+                diffuse: color(block[2]),
+                ambient: color(block[3]),
+                position,
+                direction: normalized(position),
+                spot: [fixed(block[6]), fixed(block[6] >> 16), fixed(block[7])],
+                directional: block[9] & 1 != 0,
+                two_sided: block[9] & 2 != 0,
+                geometric0: block[9] & 4 != 0,
+                geometric1: block[9] & 8 != 0,
+                distance: (config1 & (1 << (24 + number)) == 0)
+                    .then(|| (pica_float(block[10] & 0xF_FFFF, 12, 7), pica_float(block[11] & 0xF_FFFF, 12, 7))),
+                spotlight: config1 & (1 << (8 + number)) == 0 && supported(config, SPOTLIGHT),
+                shadowed: config1 & (1 << number) == 0,
+                number,
+            };
+        }
+        let on = &lights[..light_count];
 
         let bump = match (config0 >> 28) & 3 {
             1 => Bump::Normal(((config0 >> 22) & 3) as usize, config0 & (1 << 30) == 0),
@@ -288,19 +294,23 @@ impl Lighting {
         let spotlight = lookup(2);
 
         // the dot products the tables that get read take
-        let inputs: Vec<u32> = [distribution0, distribution1, fresnel]
+        let (mut half_input, mut view_input) = (false, false);
+        for input in [distribution0, distribution1, fresnel]
             .into_iter()
             .chain(reflect)
             .flatten()
-            .chain(lights.iter().any(|light| light.spotlight).then_some(spotlight))
+            .chain(on.iter().any(|light| light.spotlight).then_some(spotlight))
             .map(|lookup| lookup.input)
-            .collect();
-        let needs_half = lights.iter().any(|light| light.geometric0 || light.geometric1)
-            || inputs.iter().any(|&input| input == 0 || input == 1 || (input == 5 && config == 8));
-        let needs_view = needs_half || inputs.iter().any(|&input| input == 1 || input == 2);
+        {
+            half_input |= input == 0 || input == 1 || (input == 5 && config == 8);
+            view_input |= input == 1 || input == 2;
+        }
+        let needs_half = on.iter().any(|light| light.geometric0 || light.geometric1) || half_input;
+        let needs_view = needs_half || view_input;
 
         Some(Lighting {
             lights,
+            light_count,
             global_ambient: color(registers[REG_GLOBAL_AMBIENT]),
             config,
             distribution0,
@@ -333,7 +343,7 @@ impl Lighting {
                 | (shadow.secondary as u32) << 10
                 | (shadow.alpha as u32) << 11
         });
-        words.extend([self.config, self.lights.len() as u32, bump, shadow]);
+        words.extend([self.config, self.light_count as u32, bump, shadow]);
         words.extend([
             self.fresnel_primary as u32,
             self.fresnel_secondary as u32,
@@ -353,7 +363,7 @@ impl Lighting {
         let vector = |v: [f32; 3]| [v[0].to_bits(), v[1].to_bits(), v[2].to_bits(), 0];
         words.extend(vector(self.global_ambient));
         for slot in 0..8 {
-            let Some(light) = self.lights.get(slot) else {
+            let Some(light) = self.lights().get(slot) else {
                 words.extend([0; 36]);
                 continue;
             };
@@ -403,7 +413,7 @@ impl Lighting {
 
         let mut diffuse_sum = [0.0, 0.0, 0.0, 1.0];
         let mut specular_sum = [0.0, 0.0, 0.0, 1.0];
-        for (slot, light) in self.lights.iter().enumerate() {
+        for (slot, light) in self.lights().iter().enumerate() {
             let light_vector = if light.directional {
                 light.direction
             } else {
@@ -461,7 +471,7 @@ impl Lighting {
             let mut specular1: [f32; 3] = std::array::from_fn(|i| distribution1 * reflect[i] * light.specular1[i]);
 
             // only the last light applies fresnel
-            if slot == self.lights.len() - 1 {
+            if slot == self.light_count - 1 {
                 if let Some(lookup) = self.fresnel {
                     let fresnel = value(lookup, FRESNEL);
                     if self.fresnel_primary {

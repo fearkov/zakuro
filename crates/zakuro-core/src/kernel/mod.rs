@@ -391,31 +391,24 @@ impl Kernel {
                 }
             }
             ThreadStatus::WaitSync => {
-                let objects = thread.wait_objects.clone();
                 let wait_all = thread.wait_all;
+                // every object looked at before any is acquired, the way
+                // the kernel checks them, without copying the list for each
+                // blocked thread on every schedule
+                let count = thread.wait_objects.len();
+                let signaled = |k: usize| self.is_signaled(self.threads[id as usize].wait_objects[k], id);
+                let satisfied = if wait_all { (0..count).all(signaled).then_some(0) } else { (0..count).position(signaled) };
 
-                let states: Vec<bool> = objects
-                    .iter()
-                    .map(|&object| self.is_signaled(object, id))
-                    .collect();
-
-                let satisfied = if wait_all {
-                    states.iter().all(|&s| s)
-                } else {
-                    states.iter().any(|&s| s)
-                };
-
-                if satisfied {
-                    let index = if wait_all {
-                        for &object in &objects {
+                if let Some(index) = satisfied {
+                    if wait_all {
+                        for k in 0..count {
+                            let object = self.threads[id as usize].wait_objects[k];
                             self.acquire(object, id);
                         }
-                        0
                     } else {
-                        let index = states.iter().position(|&s| s).unwrap();
-                        self.acquire(objects[index], id);
-                        index
-                    };
+                        let object = self.threads[id as usize].wait_objects[index];
+                        self.acquire(object, id);
+                    }
                     self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
                     thread.wait_result = Some(WaitResult::Signaled(index));

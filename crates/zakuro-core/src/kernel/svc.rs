@@ -826,27 +826,18 @@ fn wait_synchronization_n(system: &mut System) {
         return;
     };
 
-    let states: Vec<bool> = objects
-        .iter()
-        .map(|&object| system.kernel.is_signaled(object, thread_id))
-        .collect();
-    let satisfied = if wait_all {
-        states.iter().all(|&s| s)
-    } else {
-        states.iter().any(|&s| s)
-    };
+    let kernel = &system.kernel;
+    let signaled = |&object: &ObjectId| kernel.is_signaled(object, thread_id);
+    let satisfied = if wait_all { objects.iter().all(signaled).then_some(0) } else { objects.iter().position(signaled) };
 
-    if satisfied {
-        let index = if wait_all {
+    if let Some(index) = satisfied {
+        if wait_all {
             for &object in &objects {
                 system.kernel.acquire_public(object, thread_id);
             }
-            0
         } else {
-            let index = states.iter().position(|&s| s).unwrap();
             system.kernel.acquire_public(objects[index], thread_id);
-            index
-        };
+        }
         system.cpu.regs[0] = 0;
         system.cpu.regs[1] = index as u32;
         return;

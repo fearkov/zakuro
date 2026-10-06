@@ -90,6 +90,8 @@ struct Field {
 
 /// one attribute array, as a vertex of it is laid out.
 struct LoaderLayout {
+    /// the loader, 0 to 11.
+    index: usize,
     offset: u32,
     stride: u32,
     /// the bytes of a vertex the fields take.
@@ -107,8 +109,9 @@ impl VertexLayout {
     fn read(registers: &[u32]) -> VertexLayout {
         let loaders = read_loaders(registers)
             .iter()
-            .filter(|loader| loader.component_count > 0)
-            .map(|loader| {
+            .enumerate()
+            .filter(|(_, loader)| loader.component_count > 0)
+            .map(|(index, loader)| {
                 let mut offset = 0u32;
                 let mut fields = Vec::new();
                 for slot in 0..loader.component_count.min(12) {
@@ -125,7 +128,7 @@ impl VertexLayout {
                     fields.push(Field { id, offset, ty, count });
                     offset += size * count;
                 }
-                LoaderLayout { offset: loader.offset, stride: loader.stride, size: offset, fields }
+                LoaderLayout { index, offset: loader.offset, stride: loader.stride, size: offset, fields }
             })
             .collect();
         VertexLayout { loaders }
@@ -137,11 +140,15 @@ impl VertexLayout {
 /// fields the arrays do give, each going straight to its register.
 struct InputPlan {
     template: [Vec4; shader::INPUT_REGISTERS],
+    /// for each input register, the fixed attribute it takes, if one does.
+    fixed: [Option<usize>; shader::INPUT_REGISTERS],
     loaders: Vec<LoaderPlan>,
 }
 
 /// the fields one array gives, and where a vertex of it is.
 struct LoaderPlan {
+    /// the loader, 0 to 11, whose register holds the array's offset.
+    index: usize,
     offset: u32,
     stride: u32,
     size: u32,
@@ -179,10 +186,17 @@ impl InputPlan {
         }
         let fixed_mask = (registers[REG_ATTRIBUTE_FORMAT_HIGH] >> 16) & 0xFFF;
         let mut template = [shader::ZERO; shader::INPUT_REGISTERS];
+        let mut fixed_registers = [None; shader::INPUT_REGISTERS];
         let mut loaders: Vec<LoaderPlan> = layout
             .loaders
             .iter()
-            .map(|loader| LoaderPlan { offset: loader.offset, stride: loader.stride, size: loader.size, fields: Vec::new() })
+            .map(|loader| LoaderPlan {
+                index: loader.index,
+                offset: loader.offset,
+                stride: loader.stride,
+                size: loader.size,
+                fields: Vec::new(),
+            })
             .collect();
         for (register, id) in owner.iter().enumerate() {
             let Some(id) = *id else { continue };
@@ -191,12 +205,27 @@ impl InputPlan {
                     let field = &layout.loaders[l].fields[f];
                     loaders[l].fields.push(PlacedField { offset: field.offset, ty: field.ty, count: field.count, register });
                 }
-                None if fixed_mask & (1 << id) != 0 => template[register] = fixed[id],
+                None if fixed_mask & (1 << id) != 0 => fixed_registers[register] = Some(id),
                 None => template[register] = [0.0, 0.0, 0.0, 1.0],
             }
         }
         loaders.retain(|loader| !loader.fields.is_empty());
-        InputPlan { template, loaders }
+        let mut plan = InputPlan { template, fixed: fixed_registers, loaders };
+        plan.refresh(registers, fixed);
+        plan
+    }
+
+    /// what a draw changes without changing how its vertices are laid
+    /// out, where its arrays start and the values of its fixed attributes.
+    fn refresh(&mut self, registers: &[u32], fixed: &[Vec4; 16]) {
+        for loader in &mut self.loaders {
+            loader.offset = registers[REG_ATTRIBUTE_LOADER + loader.index * REG_ATTRIBUTE_LOADER_STRIDE] & 0x0FFF_FFFF;
+        }
+        for (register, id) in self.fixed.iter().enumerate() {
+            if let Some(id) = *id {
+                self.template[register] = fixed[id];
+            }
+        }
     }
 
     /// one vertex's input registers.
@@ -236,6 +265,73 @@ impl LoaderPlan {
             }
             input[field.register] = value;
         }
+    }
+}
+
+/// the words a draw's vertex layout comes from: the attribute formats,
+/// each loader's components, stride and count, and how the vertex shader
+/// takes its inputs. the loaders' offsets are not among them, titles go
+/// from one mesh to the next by changing those alone.
+const PLAN_KEY: usize = 2 + REG_ATTRIBUTE_LOADER_COUNT * 2 + 3;
+/// the vertex layouts kept, more than a busy frame draws with.
+const PLANS: usize = 32;
+
+/// the input plans of the vertex layouts draws used last. working one out
+/// takes longer than the rest of a small draw.
+#[derive(Default)]
+struct Plans {
+    keys: Vec<[u32; PLAN_KEY]>,
+    plans: Vec<InputPlan>,
+    /// the plan the last draw used, and the one a new layout replaces next.
+    current: usize,
+    next: usize,
+}
+
+impl Plans {
+    /// the plan for the layout the registers set, brought up to the draw.
+    fn update(&mut self, registers: &[u32], fixed: &[Vec4; 16]) -> &InputPlan {
+        let mut key = [0; PLAN_KEY];
+        key[0] = registers[REG_ATTRIBUTE_FORMAT_LOW];
+        key[1] = registers[REG_ATTRIBUTE_FORMAT_HIGH];
+        for i in 0..REG_ATTRIBUTE_LOADER_COUNT {
+            let base = REG_ATTRIBUTE_LOADER + i * REG_ATTRIBUTE_LOADER_STRIDE;
+            key[2 + i * 2] = registers[base + 1];
+            key[3 + i * 2] = registers[base + 2];
+        }
+        key[PLAN_KEY - 3] = registers[REG_VS_NUM_INPUT_ATTRIBUTES];
+        key[PLAN_KEY - 2] = registers[REG_VS_BLOCK + SHADER_INPUT_MAP_LOW];
+        key[PLAN_KEY - 1] = registers[REG_VS_BLOCK + SHADER_INPUT_MAP_HIGH];
+        let found = if self.keys.get(self.current) == Some(&key) {
+            Some(self.current)
+        } else {
+            self.keys.iter().position(|kept| *kept == key)
+        };
+        self.current = match found {
+            Some(i) => {
+                self.plans[i].refresh(registers, fixed);
+                i
+            }
+            None => {
+                let plan = InputPlan::new(registers, &VertexLayout::read(registers), fixed);
+                if self.keys.len() < PLANS {
+                    self.keys.push(key);
+                    self.plans.push(plan);
+                    self.keys.len() - 1
+                } else {
+                    let i = self.next;
+                    self.next = (i + 1) % PLANS;
+                    self.keys[i] = key;
+                    self.plans[i] = plan;
+                    i
+                }
+            }
+        };
+        &self.plans[self.current]
+    }
+
+    /// the plan update last gave.
+    fn current(&self) -> &InputPlan {
+        &self.plans[self.current]
     }
 }
 
@@ -500,7 +596,13 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
     let map = read_output_map(registers);
     let mask = registers[REG_VS_OUTPUT_MASK] & 0xFFFF;
     // the output register behind each attribute, as pack_outputs packs them
-    let enabled: Vec<usize> = (0..shader::OUTPUT_REGISTERS).filter(|r| mask == 0 || mask & (1 << r) != 0).collect();
+    let mut enabled = [0; shader::OUTPUT_REGISTERS];
+    let mut count = 0;
+    for register in (0..shader::OUTPUT_REGISTERS).filter(|r| mask == 0 || mask & (1 << r) != 0) {
+        enabled[count] = register;
+        count += 1;
+    }
+    let enabled = &enabled[..count];
     let slot = |slot: Option<(usize, usize)>| match slot {
         None => hardware::MISSING,
         Some((attribute, component)) => {
@@ -760,6 +862,10 @@ struct Scratch {
     inputs: Vec<[Vec4; shader::INPUT_REGISTERS]>,
     /// each vertex of a draw counted from the first one it uses.
     relative: Vec<u32>,
+    plans: Plans,
+    /// the arrays a draw hands the GPU to decode.
+    #[cfg(feature = "vulkan")]
+    raw: hardware::RawInputs,
 }
 
 impl Scratch {
@@ -1038,7 +1144,7 @@ fn bind_texture<M: GpuMemory>(
 
     let key = (addr, format, width, height);
     let texels = match (drawn, cache.checked(key, size as u32)) {
-        (Some(_), _) => Arc::from([]),
+        (Some(_), _) => Arc::default(),
         (None, Some(texels)) => texels,
         (None, None) => match memory.slice(addr, size) {
             Some(data) => cache.decoded(key, data),
@@ -1823,7 +1929,6 @@ pub fn draw<M: GpuMemory>(
     }
 
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
-    let layout = VertexLayout::read(registers);
 
     // resolve each of the vertex_count draw indices to an actual vertex
     // array index, sequential for DrawArrays, looked up in the index buffer
@@ -1833,14 +1938,6 @@ pub fn draw<M: GpuMemory>(
     let index_base = memory.translate(attribute_base + (index_config & 0x0FFF_FFFF));
 
 
-    // shade every vertex once.
-    log::trace!(
-        "array draw: {vertex_count} vertices from 0x{attribute_base:08X}, indexed {indexed}, formats \
-         0x{:08X}{:08X}, loaders {:?}",
-        registers[REG_ATTRIBUTE_FORMAT_HIGH],
-        registers[REG_ATTRIBUTE_FORMAT_LOW],
-        layout.loaders.iter().map(|l| (l.offset, l.stride, l.size)).collect::<Vec<_>>(),
-    );
     // an index buffer names most vertices several times, fetch and shade
     // each of them once.
     let mut scratch = std::mem::take(&mut resources.scratch);
@@ -1861,7 +1958,14 @@ pub fn draw<M: GpuMemory>(
             scratch.indices.extend(scratch.bytes.iter().map(|&b| b as u32));
         }
     }
-    let plan = InputPlan::new(registers, &layout, fixed_attributes);
+    let plan = scratch.plans.update(registers, fixed_attributes);
+    log::trace!(
+        "array draw: {vertex_count} vertices from 0x{attribute_base:08X}, indexed {indexed}, formats \
+         0x{:08X}{:08X}, arrays {:?}",
+        registers[REG_ATTRIBUTE_FORMAT_HIGH],
+        registers[REG_ATTRIBUTE_FORMAT_LOW],
+        plan.loaders.iter().map(|l| (l.offset, l.stride, l.size)).collect::<Vec<_>>(),
+    );
     // the GPU decodes the arrays itself when it shades the draw, from the
     // first vertex the draw uses to the last
     #[cfg(feature = "vulkan")]
@@ -1872,14 +1976,14 @@ pub fn draw<M: GpuMemory>(
         } else {
             (first_vertex, vertex_count)
         };
-        if let Some(raw) = raw_inputs(&plan, memory, attribute_base, first, span) {
+        if raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
             scratch.relative.clear();
             if indexed {
                 scratch.relative.extend(scratch.indices.iter().map(|&index| index - first));
             } else {
                 scratch.relative.extend(0..vertex_count);
             }
-            let vertices = Vertices::Raw { vertex_shader, raw: &raw, vertices: &scratch.relative };
+            let vertices = Vertices::Raw { vertex_shader, raw: &scratch.raw, vertices: &scratch.relative };
             if rasterize(registers, memory, resources, vertices).is_some() {
                 resources.scratch = scratch;
                 return vertex_count;
@@ -1892,6 +1996,7 @@ pub fn draw<M: GpuMemory>(
         scratch.unique.clear();
         scratch.unique.extend((0..vertex_count).map(|i| first_vertex + i));
     }
+    let plan = scratch.plans.current();
     scratch.inputs.clear();
     scratch.inputs.extend(scratch.unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)));
     let order = indexed.then_some(&scratch.order[..]);
@@ -1922,26 +2027,37 @@ pub fn draw_immediate<M: GpuMemory>(
     rasterize(registers, memory, resources, vertices).unwrap_or(0)
 }
 
-/// a draw's arrays for the GPU to decode, from the first vertex the draw
-/// uses on, none when they cost more to hand over than to decode on the
-/// CPU or do not lie in one piece of memory.
+/// puts a draw's arrays for the GPU to decode in raw, from the first
+/// vertex the draw uses on. false when they cost more to hand over than to
+/// decode on the CPU or do not lie in one piece of memory.
 #[cfg(feature = "vulkan")]
-fn raw_inputs<M: GpuMemory>(plan: &InputPlan, memory: &mut M, base: u32, first: u32, span: u32) -> Option<hardware::RawInputs> {
+fn raw_inputs<M: GpuMemory>(
+    plan: &InputPlan,
+    memory: &mut M,
+    base: u32,
+    first: u32,
+    span: u32,
+    raw: &mut hardware::RawInputs,
+) -> bool {
     // past this the vertices between the ones a draw uses cost too much
     const LIMIT: u64 = 4 << 20;
-    let mut raw = hardware::RawInputs { arrays: Vec::new(), fields: [None; shader::INPUT_REGISTERS], defaults: plan.template };
+    raw.arrays.clear();
+    raw.fields = [None; shader::INPUT_REGISTERS];
+    raw.defaults = plan.template;
     let mut total = 0u64;
     for loader in &plan.loaders {
         let start = base.wrapping_add(loader.offset).wrapping_add(first.wrapping_mul(loader.stride));
         let len = (span - 1) * loader.stride + loader.size;
         total += len as u64;
         if total > LIMIT {
-            return None;
+            return false;
         }
         // a vertex's address is translated on its own on the CPU, which
         // comes to the same where the array is in one piece
         let addr = memory.translate(start);
-        memory.slice(addr, len as usize)?;
+        if memory.slice(addr, len as usize).is_none() {
+            return false;
+        }
         for field in &loader.fields {
             // a field fills its components over (0, 0, 0, 1)
             raw.defaults[field.register] = [0.0, 0.0, 0.0, 1.0];
@@ -1955,7 +2071,7 @@ fn raw_inputs<M: GpuMemory>(plan: &InputPlan, memory: &mut M, base: u32, first: 
         }
         raw.arrays.push((addr, len));
     }
-    Some(raw)
+    true
 }
 
 /// the vertices of each triangle out of count of them, as assemble puts
@@ -2341,6 +2457,41 @@ mod tests {
 
         let input = fetch_vertex(&registers, &mut memory, 0x1800_0000, &layout, &[shader::ZERO; 16], 0);
         assert_eq!(input[0], [1.5, -2.0, 0.25, 1.0]);
+    }
+
+    /// a draw that keeps the last one's layout but moves its array or
+    /// changes a fixed attribute reads its own vertices and values.
+    #[test]
+    fn a_kept_input_plan_follows_the_draw() {
+        let mut memory = ConsoleMemory::default();
+        for (i, value) in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].iter().enumerate() {
+            memory.write(0x1400_0100 + i as u32 * 4, &value.to_le_bytes());
+        }
+        let mut registers = vec![0u32; 0x300];
+        registers[REG_ATTRIBUTE_FORMAT_LOW] = 0xF; // attribute 0, four floats
+        registers[REG_ATTRIBUTE_FORMAT_HIGH] = 1 << 17; // attribute 1 fixed
+        registers[REG_ATTRIBUTE_LOADER] = 0x100;
+        registers[REG_ATTRIBUTE_LOADER + 2] = (1 << 28) | (16 << 16);
+        registers[REG_VS_NUM_INPUT_ATTRIBUTES] = 1;
+        registers[REG_VS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x10; // attribute 1 in v1
+        let mut fixed = [shader::ZERO; 16];
+        fixed[1] = [0.5; 4];
+
+        let mut plans = Plans::default();
+        let plan = plans.update(&registers, &fixed);
+        assert_eq!(plan.fetch(&mut memory, 0x2000_0000, 0)[..2], [[1.0, 2.0, 3.0, 4.0], [0.5; 4]]);
+
+        registers[REG_ATTRIBUTE_LOADER] = 0x110;
+        fixed[1] = [0.25; 4];
+        let plan = plans.update(&registers, &fixed);
+        assert_eq!(plan.fetch(&mut memory, 0x2000_0000, 0)[..2], [[5.0, 6.0, 7.0, 8.0], [0.25; 4]]);
+        assert_eq!(plans.keys.len(), 1);
+
+        // two floats a vertex is another layout
+        registers[REG_ATTRIBUTE_FORMAT_LOW] = 0x7;
+        let plan = plans.update(&registers, &fixed);
+        assert_eq!(plan.fetch(&mut memory, 0x2000_0000, 0)[0], [5.0, 6.0, 0.0, 1.0]);
+        assert_eq!(plans.keys.len(), 2);
     }
 
     const COLOR: u32 = 0x1000;

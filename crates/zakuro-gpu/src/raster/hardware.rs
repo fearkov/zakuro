@@ -167,6 +167,7 @@ pub(super) enum Inputs<'a> {
 }
 
 /// a draw's vertex arrays for the GPU to decode.
+#[derive(Default)]
 pub(super) struct RawInputs {
     /// each array's bytes from the first vertex the draw uses to the last,
     /// as an address and a length in one piece of host memory.
@@ -1126,6 +1127,8 @@ pub struct Hardware {
     logic_op_state: Option<ash::ext::extended_dynamic_state2::Device>,
     /// where the batch copied programs, by their fingerprints.
     programs: HashMap<u64, u64>,
+    /// the words a draw stages, kept for the next draw's.
+    words: Vec<u32>,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     /// made the first time a display transfer runs here.
     transfer: Option<Compute>,
@@ -1322,6 +1325,7 @@ impl Hardware {
                 blend_state,
                 logic_op_state,
                 programs: HashMap::new(),
+                words: Vec::new(),
                 pipelines: HashMap::new(),
                 transfer: None,
                 depth: None,
@@ -2611,10 +2615,16 @@ impl Hardware {
         // the first vertex, the bytes from one vertex to the next, and
         // offset | type << 8 | count << 16, no count reading the default
         let read = unit.inputs_read();
-        let registers: Vec<usize> = (0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0).collect();
+        let mut reads = [0usize; INPUT_REGISTERS];
+        let mut count = 0;
+        for register in (0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0) {
+            reads[count] = register;
+            count += 1;
+        }
+        let registers = &reads[..count];
         let mut attributes = [[0u32; 4]; INPUT_REGISTERS];
         let mut defaults = [crate::shader::ZERO; INPUT_REGISTERS];
-        let mut starts = Vec::new();
+        let mut starts = [0u32; 12];
         let input_bytes = match shading.inputs {
             Inputs::Decoded(decoded) => {
                 // the registers a vertex reads in turn, four floats each
@@ -2628,11 +2638,11 @@ impl Hardware {
                 // each array from a word on, and a word after the last, a
                 // value can run into the word after its own
                 let mut total = 0;
-                for &(_, len) in &raw.arrays {
-                    starts.push(total);
+                for (start, &(_, len)) in starts.iter_mut().zip(&raw.arrays) {
+                    *start = total;
                     total += len.div_ceil(4) * 4;
                 }
-                for &register in &registers {
+                for &register in registers {
                     defaults[register] = raw.defaults[register];
                     if let Some(field) = raw.fields[register] {
                         let format = field.offset | field.ty << 8 | field.count << 16;
@@ -2642,7 +2652,8 @@ impl Hardware {
                 total as u64 + 4
             }
         };
-        let mut words = Vec::with_capacity(SHADING_WORDS);
+        let mut words = std::mem::take(&mut self.words);
+        words.clear();
         words.extend(unit.float_uniforms.iter().flatten().map(|value| value.to_bits()));
         for [count, start, step, _] in unit.int_uniforms {
             words.extend([count as u32, start as u32, step as i8 as u32, 0]);
@@ -2655,10 +2666,14 @@ impl Hardware {
         words.extend(attributes.iter().flatten());
         words.extend(defaults.iter().flatten().map(|value| value.to_bits()));
         debug_assert_eq!(words.len(), SHADING_WORDS);
-        let uniforms = self.stage(SHADING_SIZE, self.storage_alignment)?;
-        for (out, word) in self.ring(uniforms, SHADING_SIZE).as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-            *out = word.to_le_bytes();
+        let uniforms = self.stage(SHADING_SIZE, self.storage_alignment);
+        if let Ok(uniforms) = uniforms {
+            for (out, word) in self.ring(uniforms, SHADING_SIZE).as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+                *out = word.to_le_bytes();
+            }
         }
+        self.words = words;
+        let uniforms = uniforms?;
 
         let inputs = self.stage(input_bytes, self.storage_alignment)?;
         match shading.inputs {
@@ -2668,7 +2683,7 @@ impl Hardware {
                 // run at memory speed, a vertex can have thousands of them
                 let mut out = staging.as_chunks_mut::<16>().0.iter_mut();
                 for input in decoded {
-                    for &register in &registers {
+                    for &register in registers {
                         let Some(slot) = out.next() else { break };
                         let [x, y, z, w] = input[register].map(f32::to_le_bytes);
                         *slot = [x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], w[0], w[1], w[2], w[3]];
@@ -2771,7 +2786,8 @@ impl Hardware {
 
 
         let r = draw.registers;
-        let mut words = Vec::with_capacity(UNIFORM_WORDS);
+        let mut words = std::mem::take(&mut self.words);
+        words.clear();
         for base in STAGE_REGISTERS {
             words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], 0, 0, 0]);
         }
@@ -2810,11 +2826,15 @@ impl Hardware {
         words.extend([0, 0]);
         words.extend([r[fog::REG_COLOR], 0, 0, 0]);
         debug_assert_eq!(words.len(), UNIFORM_WORDS);
-        let uniform_offset = self.stage(UNIFORM_SIZE, self.uniform_alignment)?;
-        let staging = self.ring(uniform_offset, UNIFORM_SIZE);
-        for (out, word) in staging.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-            *out = word.to_le_bytes();
+        let uniform_offset = self.stage(UNIFORM_SIZE, self.uniform_alignment);
+        if let Ok(uniform_offset) = uniform_offset {
+            let staging = self.ring(uniform_offset, UNIFORM_SIZE);
+            for (out, word) in staging.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+                *out = word.to_le_bytes();
+            }
         }
+        self.words = words;
+        let uniform_offset = uniform_offset?;
 
         // what the draw may change
         let color_mask = if r[REG_COLOR_BUFFER_WRITE] != 0 { (r[REG_DEPTH_COLOR_MASK] >> 8) & 0xF } else { 0 };
@@ -2904,7 +2924,8 @@ impl Hardware {
         let vertex_infos = shaded.map(|staged| {
             staged.map(|(offset, range)| [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(offset).range(range)])
         });
-        let mut writes = vec![
+        let mut writes = [vk::WriteDescriptorSet::default(); 8];
+        let fixed = [
             vk::WriteDescriptorSet::default()
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -2926,16 +2947,18 @@ impl Hardware {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&tables_info),
         ];
+        writes[..fixed.len()].copy_from_slice(&fixed);
+        let mut count = fixed.len();
         if let Some(infos) = &vertex_infos {
             for (binding, info) in (5..).zip(&infos[..3]) {
-                writes.push(
-                    vk::WriteDescriptorSet::default()
-                        .dst_binding(binding)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(info),
-                );
+                writes[count] = vk::WriteDescriptorSet::default()
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info);
+                count += 1;
             }
         }
+        let writes = &writes[..count];
         // where the PICA's viewport puts clip space, for what the GPU
         // shades, the whole target for what the CPU placed on it
         let (x, y, viewport_width, viewport_height) = match draw.geometry {
@@ -3009,7 +3032,7 @@ impl Hardware {
                     ops.cmd_set_logic_op(commands, logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
                 }
             }
-            self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &writes);
+            self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
             self.draws += 1;
             match vertex_infos {
                 Some(infos) => {
@@ -3193,7 +3216,10 @@ impl Hardware {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&infos[1]),
         ];
-        let bytes: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let mut bytes = [0u8; 44];
+        for (bytes, constant) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(constants) {
+            *bytes = constant.to_le_bytes();
+        }
         // SAFETY: recording, outside rendering, on images in the general
         // layout made for storage
         unsafe {
