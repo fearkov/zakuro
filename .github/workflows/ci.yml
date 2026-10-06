@@ -17,6 +17,9 @@ jobs:
       - name: Sound library headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - name: Fonts for Japanese, so the font tests draw with one
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y fonts-noto-cjk
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
       - run: cargo test --release --workspace
