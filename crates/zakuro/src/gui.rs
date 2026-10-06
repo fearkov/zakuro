@@ -16,6 +16,7 @@ pub struct Gui {
 impl Gui {
     pub fn new(window: &Window) -> Gui {
         let ctx = egui::Context::default();
+        ctx.set_fonts(fonts(system_fonts()));
         let state = egui_winit::State::new(
             ctx.clone(),
             ViewportId::ROOT,
@@ -104,5 +105,97 @@ fn texture(id: TextureId) -> u64 {
     match id {
         TextureId::Managed(n) => n * 2,
         TextureId::User(n) => n * 2 + 1,
+    }
+}
+
+/// egui's own fonts, then extra ones to fall back on for what they lack.
+/// game names come in Japanese, Korean and Chinese, whose characters
+/// egui's fonts have none of and drew as boxes.
+fn fonts(extra: Vec<Vec<u8>>) -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    for (i, font) in extra.into_iter().enumerate() {
+        let name = format!("system {i}");
+        fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(font)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.clone());
+        }
+    }
+    fonts
+}
+
+/// the system's fonts for Japanese, Korean and Chinese, the first one
+/// there of each kind.
+fn system_fonts() -> Vec<Vec<u8>> {
+    font_candidates().iter().filter_map(|paths| paths.iter().find_map(|path| std::fs::read(path).ok())).collect()
+}
+
+/// where Windows keeps fonts for Japanese, Korean and Chinese, each kind
+/// the ones to try in turn.
+#[cfg(windows)]
+fn font_candidates() -> Vec<Vec<std::path::PathBuf>> {
+    let folder = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
+    let kinds: [&[&str]; 3] = [&["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"], &["malgun.ttf"], &["msyh.ttc", "simsun.ttc"]];
+    kinds.iter().map(|names| names.iter().map(|name| folder.join(name)).collect()).collect()
+}
+
+/// where macOS keeps fonts for Japanese, Korean and Chinese.
+#[cfg(target_os = "macos")]
+fn font_candidates() -> Vec<Vec<std::path::PathBuf>> {
+    let kinds: [&[&str]; 3] = [
+        &["/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc"],
+        &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
+        &["/System/Library/Fonts/PingFang.ttc"],
+    ];
+    kinds.iter().map(|paths| paths.iter().map(std::path::PathBuf::from).collect()).collect()
+}
+
+/// where Linux distributions put Noto's collection, which has Japanese,
+/// Korean and Chinese all in one, or else the font fontconfig picks for
+/// Japanese.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn font_candidates() -> Vec<Vec<std::path::PathBuf>> {
+    let mut paths: Vec<std::path::PathBuf> = [
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    if !paths.iter().any(|path| path.exists()) {
+        let matched = std::process::Command::new("fc-match").args(["--format=%{file}", ":lang=ja"]).output();
+        if let Some(output) = matched.ok().filter(|output| output.status.success()) {
+            paths.push(String::from_utf8_lossy(&output.stdout).into_owned().into());
+        }
+    }
+    vec![paths]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::epaint::text::{Fonts, TextOptions};
+
+    /// Japanese names have every character to draw with the system's
+    /// fonts, where the system has them, and none with egui's alone. only
+    /// their Japanese characters are asked about, epaint says no for any
+    /// character the font with its replacement glyph has, Hack's letters
+    /// for monospace among them.
+    #[test]
+    fn japanese_names_are_drawn_with_the_system_fonts() {
+        let name = "イナズマイレブン・クロノストーン";
+        let mut plain = Fonts::new(TextOptions::default(), fonts(Vec::new()));
+        assert!(!plain.has_glyphs(&egui::FontId::proportional(14.0), name), "egui's own fonts have no Japanese");
+        let found = system_fonts();
+        if found.is_empty() {
+            eprintln!("no font for Japanese on this system");
+            return;
+        }
+        let mut with = Fonts::new(TextOptions::default(), fonts(found));
+        for font in [egui::FontId::proportional(14.0), egui::FontId::monospace(14.0)] {
+            assert!(with.has_glyphs(&font, name), "{font:?}");
+        }
     }
 }
