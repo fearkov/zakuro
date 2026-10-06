@@ -718,14 +718,19 @@ impl Gpu {
 
             self.write_internal(memory, renderer, register, data, mask);
 
-            for i in 0..extra {
-                if index >= words.len() {
-                    break;
+            let burst = &words[index..(index + extra).min(words.len())];
+            if mask == 0xF && self.upload_uniforms(register, consecutive, burst) {
+                index += burst.len();
+            } else {
+                for i in 0..extra {
+                    if index >= words.len() {
+                        break;
+                    }
+                    let value = words[index];
+                    index += 1;
+                    let target = if consecutive { register + i + 1 } else { register };
+                    self.write_internal(memory, renderer, target, value, mask);
                 }
-                let value = words[index];
-                index += 1;
-                let target = if consecutive { register + i + 1 } else { register };
-                self.write_internal(memory, renderer, target, value, mask);
             }
 
             // each command is padded so its total length (the base pair plus
@@ -751,6 +756,33 @@ impl Gpu {
 
         self.flush_immediate(memory);
         self.command_lists += 1;
+    }
+
+    /// hands a shader unit the float uniforms of a burst at once, when every
+    /// word of it goes to the unit's uniform data registers. a draw's
+    /// matrices are most of the words in a list, one write each would take
+    /// longer than the rest of the list.
+    fn upload_uniforms(&mut self, register: usize, consecutive: bool, burst: &[u32]) -> bool {
+        let last = if consecutive { register + burst.len() } else { register };
+        let data = |block: usize| {
+            (block + SHADER_UNIFORM_DATA..=block + SHADER_UNIFORM_DATA_END).contains(&register)
+                && last <= block + SHADER_UNIFORM_DATA_END
+        };
+        let unit = if data(REG_VS_BLOCK) {
+            &mut self.vertex_shader
+        } else if data(REG_GS_BLOCK) {
+            &mut self.geometry_shader
+        } else {
+            return false;
+        };
+        unit.upload_float_uniforms(burst);
+        // the registers keep the last word each took
+        if consecutive {
+            self.internal[register + 1..=last].copy_from_slice(burst);
+        } else if let Some(&word) = burst.last() {
+            self.internal[register] = word;
+        }
+        true
     }
 
     /// decodes the programs a draw runs. the geometry unit gets the vertex
@@ -1257,6 +1289,34 @@ mod tests {
         assert_eq!(gpu.internal[0x0100], 0x1111, "the sub-buffer ran");
         assert_eq!(gpu.internal[0x0102], 0x2222, "the jump back ran");
         assert_eq!(gpu.internal[0x0101], 0, "a jump does not return");
+    }
+
+    /// float uniforms sent in a burst, to one data register or along all
+    /// of them, land as the words do one at a time.
+    #[test]
+    fn a_burst_of_uniforms_lands_like_single_writes() {
+        let data = REG_VS_BLOCK + SHADER_UNIFORM_DATA;
+        let header = |extra: u32, consecutive: bool| data as u32 | (0xF << 16) | (extra << 20) | ((consecutive as u32) << 31);
+        let [a, b] = [pack([1.0, 2.0, 3.0, 4.0]), pack([5.0, 6.0, 7.0, 8.0])];
+        // single floats go w first
+        let wide = [12.0f32, 11.0, 10.0, 9.0].map(f32::to_bits);
+        let list: Vec<u32> = [
+            &command(REG_VS_BLOCK + SHADER_UNIFORM_INDEX, 5)[..],
+            &[a[0], header(5, false), a[1], a[2], b[0], b[1], b[2], 0],
+            &command(REG_VS_BLOCK + SHADER_UNIFORM_INDEX, 0x8000_0009),
+            &[wide[0], header(3, true), wide[1], wide[2], wide[3], 0],
+        ]
+        .concat();
+        let mut memory = FlatMemory(vec![0; 0x200]);
+        for (i, word) in list.iter().enumerate() {
+            memory.0[0x100 + i * 4..][..4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut gpu = Gpu::new();
+        let mut renderer = SoftwareRenderer::default();
+        gpu.process_command_list(&mut memory, &mut renderer, 0x100, list.len() as u32 * 4);
+        assert_eq!(gpu.vertex_shader.float_uniforms[5..7], [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
+        assert_eq!(gpu.vertex_shader.float_uniforms[9], [9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(gpu.internal[data..data + 4], wide);
     }
 
     #[test]

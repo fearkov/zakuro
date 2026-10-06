@@ -158,6 +158,7 @@ impl ShaderUnit {
 
     /// float uniforms arrive component by component, three words carry four
     /// packed 24-bit floats, or four words carry plain singles.
+    #[inline]
     pub fn upload_float_uniform(&mut self, word: u32) {
         let needed = if self.float_uniform_wide { 4 } else { 3 };
         if self.float_uniform_component < 4 {
@@ -202,6 +203,13 @@ impl ShaderUnit {
             self.float_uniforms[self.float_uniform_index] = value;
         }
         self.float_uniform_index += 1;
+    }
+
+    /// float uniform words in a row, as upload_float_uniform takes them.
+    pub fn upload_float_uniforms(&mut self, words: &[u32]) {
+        for &word in words {
+            self.upload_float_uniform(word);
+        }
     }
 }
 
