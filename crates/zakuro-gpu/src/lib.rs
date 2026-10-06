@@ -4,6 +4,7 @@ pub mod backend;
 pub mod blend;
 #[cfg(feature = "vulkan")]
 mod device;
+mod pattern;
 pub mod proctex;
 pub mod fog;
 pub mod format;
@@ -314,7 +315,7 @@ impl Gpu {
         // megabytes, else over the range in the last fill's buffer
         let mut buffer = std::mem::take(&mut self.resources.fill);
         match memory.slice_mut(address, length) {
-            Some(range) => repeat(pattern, range),
+            Some(range) => pattern::fill(range, pattern),
             None => {
                 buffer.resize(length, 0);
                 repeat(pattern, &mut buffer);

@@ -3263,6 +3263,114 @@ mod tests {
         assert_eq!(first[..], fill[..], "and the fill stays");
     }
 
+    /// a transfer on the GPU of an 8 pixel wide buffer at COLOR, of rows
+    /// pixels, to a plain one at OUTPUT, and the pixels it leaves there.
+    #[cfg(feature = "vulkan")]
+    fn transferred(memory: &mut ConsoleMemory, resources: &mut Resources, rows: u32) -> Vec<[u8; 4]> {
+        const OUTPUT: u32 = 0x10_0000;
+        let hardware = resources.hardware.as_mut().unwrap();
+        let transfer = hardware::Transfer {
+            input: COLOR,
+            output: OUTPUT,
+            input_width: 8,
+            input_height: rows,
+            output_width: 8,
+            output_height: rows,
+            copy: (8, rows),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: ColorFormat::Rgba8,
+            output_format: ColorFormat::Rgba8,
+        };
+        assert!(hardware.display_transfer(memory, &transfer).unwrap());
+        hardware.flush(memory).unwrap();
+        let mut out = vec![0u8; 8 * rows as usize * 4];
+        memory.read(OUTPUT, &mut out);
+        out.as_chunks::<4>().0.iter().map(|p| ColorFormat::Rgba8.decode(p)).collect()
+    }
+
+    /// a pixel written over a buffer a fill cleared, as the CPU writes one,
+    /// is in the buffer the next time it is used, the fill's pixel standing
+    /// in for its shadow notices it as the bytes would.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_pixel_written_after_a_fill_reaches_the_buffer() {
+        for mut memory in [ConsoleMemory::default(), ConsoleMemory::scattered()] {
+            let Ok(hardware) = hardware::Hardware::new() else { return };
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            rasterize_shaded(&target_registers(), &mut memory, &mut resources, &cover(-0.5, RED));
+            let (mut blue, mut green) = ([0u8; 4], [0u8; 4]);
+            ColorFormat::Rgba8.encode([0, 0, 255, 255], &mut blue);
+            ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+            let fill = blue.repeat(64);
+            memory.write(COLOR, &fill);
+            resources.hardware.as_mut().unwrap().filled(COLOR, &fill).unwrap();
+            memory.write(COLOR + 4 * 37, &green);
+            let pixels = transferred(&mut memory, &mut resources, 8);
+            assert_eq!(pixels.iter().filter(|&&p| p == [0, 255, 0, 255]).count(), 1, "the pixel written");
+            assert_eq!(pixels.iter().filter(|&&p| p == [0, 0, 255, 255]).count(), 63, "and the fill");
+        }
+    }
+
+    /// memory of one pixel but for one past the first few kilobytes is not
+    /// kept as that pixel, the drawing over it reaches memory when written
+    /// back, rather than looking like a write made after it.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_drawing_over_a_pixel_past_the_first_group_reaches_memory() {
+        for mut memory in [ConsoleMemory::default(), ConsoleMemory::scattered()] {
+            let Ok(hardware) = hardware::Hardware::new() else { return };
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            let mut registers = target_registers();
+            sized(&mut registers, 64, 64);
+            registers[REG_DEPTH_BUFFER_ADDRESS] = 0x8_0000 >> 3;
+            let (mut gray, mut green) = ([0u8; 4], [0u8; 4]);
+            ColorFormat::Rgba8.encode([128, 128, 128, 255], &mut gray);
+            ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+            let size = 64 * 64 * 4;
+            memory.write(COLOR, &gray.repeat(64 * 64));
+            let at = size as u32 - 4 * 3;
+            memory.write(COLOR + at, &green);
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+            resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+            let mut all = vec![0u8; size];
+            memory.read(COLOR, &mut all);
+            let red = all.as_chunks::<4>().0.iter().filter(|p| ColorFormat::Rgba8.decode(&p[..]) == [255, 0, 0, 255]).count();
+            assert_eq!(red, 64 * 64, "the drawing reached all of memory, the pixel past the first group too");
+        }
+    }
+
+    /// a buffer over memory all of one pixel, which its shadow keeps as that
+    /// pixel, has a pixel changed there the next time it is used, with the
+    /// rows it drew.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_pixel_changed_in_memory_of_one_pixel_reaches_the_buffer() {
+        for mut memory in [ConsoleMemory::default(), ConsoleMemory::scattered()] {
+            let Ok(hardware) = hardware::Hardware::new() else { return };
+            let mut registers = target_registers();
+            sized(&mut registers, 8, 16);
+            // the window's top half, the first rows of memory
+            registers[REG_VIEWPORT_XY] = 8 << 16;
+            registers[REG_VIEWPORT_HEIGHT] = float24(4.0);
+            let (mut gray, mut green) = ([0u8; 4], [0u8; 4]);
+            ColorFormat::Rgba8.encode([128, 128, 128, 255], &mut gray);
+            ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+            memory.write(COLOR, &gray.repeat(128));
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+            // a sync of rows it did not draw, which has it look at memory again
+            resources.hardware.as_mut().unwrap().sync(&mut memory, COLOR + 256, 256).unwrap();
+            memory.write(COLOR + 256 + 4 * 5, &green);
+            let pixels = transferred(&mut memory, &mut resources, 16);
+            assert_eq!(pixels.iter().filter(|&&p| p == [255, 0, 0, 255]).count(), 64, "the rows drawn");
+            assert_eq!(pixels.iter().filter(|&&p| p == [0, 255, 0, 255]).count(), 1, "the pixel written");
+            assert_eq!(pixels.iter().filter(|&&p| p == [128, 128, 128, 255]).count(), 63, "and what memory held");
+        }
+    }
+
     /// memory written after the GPU drew over it by something that does not
     /// wait for the drawing stays when the drawing is written back.
     #[cfg(feature = "vulkan")]

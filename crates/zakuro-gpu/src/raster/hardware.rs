@@ -238,6 +238,10 @@ struct Surface {
     tiled: bool,
     /// the guest's bytes the last time the image matched them.
     shadow: Vec<u8>,
+    /// the pixel all of those are, when a fill left them so or memory held
+    /// nothing else, standing in for them. a frame's fills would copy
+    /// megabytes into shadows, and memory compares faster with a pixel.
+    pixel: Option<[u8; 4]>,
     /// the image is known to match guest memory in this batch.
     checked: bool,
     /// the rows drawn into since guest memory last got the image, rows of
@@ -275,6 +279,64 @@ impl Surface {
     /// the bytes a row of the buffer takes.
     fn row_bytes(&self) -> u32 {
         self.width * self.kind.bytes()
+    }
+
+    /// whether the shadow holds bytes over a range of the buffer's memory,
+    /// one starting at a pixel. the shadow holds all of the buffer or none.
+    fn shadows(&self, range: std::ops::Range<usize>, bytes: &[u8]) -> bool {
+        match self.pixel {
+            Some(pixel) => {
+                debug_assert!(range.start.is_multiple_of(self.kind.bytes() as usize));
+                range.end <= self.size() as usize
+                    && bytes.len() == range.len()
+                    && crate::pattern::holds(bytes, &pixel[..self.kind.bytes() as usize])
+            }
+            None => self.shadow.get(range) == Some(bytes),
+        }
+    }
+
+    /// has the shadow hold the buffer's bytes as memory does, through the
+    /// pixel they all are when they are, as memory under a buffer the GPU
+    /// draws often is.
+    fn keep(&mut self, bytes: &[u8]) {
+        let bpp = self.kind.bytes() as usize;
+        let size = self.size() as usize;
+        match bytes.get(..bpp).filter(|pixel| bytes.len() == size && crate::pattern::holds(bytes, pixel)) {
+            Some(pixel) => self.keep_pixel(pixel),
+            None => {
+                // copied, so each shadow keeps a size of its own
+                self.pixel = None;
+                self.shadow.clear();
+                self.shadow.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    /// has the shadow hold the pixel all over the buffer.
+    fn keep_pixel(&mut self, pixel: &[u8]) {
+        let mut kept = [0; 4];
+        kept[..pixel.len()].copy_from_slice(pixel);
+        self.pixel = Some(kept);
+    }
+
+    /// has the shadow hold the pixel over a range of the buffer's memory,
+    /// one starting at a pixel, when it holds the buffer at all.
+    fn keep_rows(&mut self, range: std::ops::Range<usize>, pixel: &[u8]) {
+        // a shadow all of the same pixel holds them already
+        if self.pixel.is_none_or(|kept| kept[..pixel.len()] != *pixel) {
+            if let Some(shadow) = self.shadow().get_mut(range) {
+                crate::pattern::fill(shadow, pixel);
+            }
+        }
+    }
+
+    /// the shadow's bytes, written out where a pixel stood in for them.
+    fn shadow(&mut self) -> &mut Vec<u8> {
+        if let Some(pixel) = self.pixel.take() {
+            self.shadow.resize(self.size() as usize, 0);
+            crate::pattern::fill(&mut self.shadow, &pixel[..self.kind.bytes() as usize]);
+        }
+        &mut self.shadow
     }
 
     /// whether guest memory over a range is behind the image, where the GPU
@@ -1867,6 +1929,7 @@ impl Hardware {
                     kind,
                     tiled,
                     shadow: Vec::new(),
+                    pixel: None,
                     checked: false,
                     dirty: None,
                     guarded: None,
@@ -1900,12 +1963,13 @@ impl Hardware {
         // for each costs more than reading them. compared in place where
         // memory is in one piece, most lookups find nothing changed
         let mut bytes = std::mem::take(&mut self.scratch);
-        let same = memory.slice(addr, size as usize).is_some_and(|now| now == self.surfaces[index].shadow);
+        let whole = 0..size as usize;
+        let same = memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now));
         if !same {
             bytes.resize(size as usize, 0);
             memory.read(addr, &mut bytes);
         }
-        if !same && bytes != self.surfaces[index].shadow {
+        if !same && !self.surfaces[index].shadows(whole, &bytes) {
             if self.surfaces[index].dirty.is_some() {
                 // memory changed beside rows the GPU drew and it lacks, which
                 // an upload alone would lose. they come down first, along
@@ -1915,10 +1979,7 @@ impl Hardware {
                 memory.read(addr, &mut bytes);
             }
             self.upload(index, &bytes)?;
-            // copied, so each shadow keeps a size of its own
-            let shadow = &mut self.surfaces[index].shadow;
-            shadow.clear();
-            shadow.extend_from_slice(&bytes);
+            self.surfaces[index].keep(&bytes);
         }
         self.scratch = bytes;
         self.surfaces[index].checked = true;
@@ -2249,9 +2310,10 @@ impl Hardware {
         }
     }
 
-    /// a memory fill wrote bytes at addr. a surface it covered with one
-    /// value is cleared to it on the GPU as well, rather than uploaded again
-    /// the next time it is drawn into.
+    /// a memory fill wrote bytes at addr, a pattern of up to four bytes over
+    /// and over. a surface it covered with one value is cleared to it on the
+    /// GPU as well, rather than uploaded again the next time it is drawn
+    /// into.
     pub(crate) fn filled(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         let end = addr as u64 + bytes.len() as u64;
         for index in 0..self.surfaces.len() {
@@ -2268,10 +2330,7 @@ impl Hardware {
                     let pixel = filled[..bpp].to_vec();
                     self.clear_rows(index, rows, &pixel)?;
                     let surface = &mut self.surfaces[index];
-                    let range = rows.0 as usize * row..rows.1 as usize * row;
-                    if let Some(shadow) = surface.shadow.get_mut(range) {
-                        shadow.copy_from_slice(filled);
-                    }
+                    surface.keep_rows(rows.0 as usize * row..rows.1 as usize * row, &pixel);
                     // memory holds those rows as the image does now, what
                     // the GPU drew that has not come down is the rest. a
                     // buffer of another shape drawn over the filled rows
@@ -2307,6 +2366,7 @@ impl Hardware {
                 // the image is not what memory holds, even when the fill left
                 // memory as the shadow had it
                 surface.shadow.clear();
+                surface.pixel = None;
                 surface.dirty = None;
                 surface.guarded = None;
                 surface.write_guarded = None;
@@ -2354,10 +2414,8 @@ impl Hardware {
             }
             self.uploads = true;
             let surface = &mut self.surfaces[index];
-            // in what the shadow already holds, which a fill each frame
-            // would otherwise allocate anew
-            surface.shadow.clear();
-            surface.shadow.extend_from_slice(filled);
+            // the pixel stands in for the bytes rather than a copy of them
+            surface.keep_pixel(&pixel);
             surface.dirty = None;
             surface.guarded = None;
             surface.write_guarded = None;
@@ -3612,8 +3670,8 @@ impl Hardware {
         })?;
         let s = &mut self.surfaces[found];
         let first = (addr - s.addr) / row_bytes;
-        let shown = s.shadow.get((first * row_bytes) as usize..((first + height) * row_bytes) as usize);
-        if s.dirty.is_none() && shown != Some(guest) {
+        let shown = (first * row_bytes) as usize..((first + height) * row_bytes) as usize;
+        if s.dirty.is_none() && !s.shadows(shown, guest) {
             return None;
         }
         let (surface, size) = (s.addr, (s.width, s.height));
@@ -4065,6 +4123,8 @@ impl Hardware {
 
     /// writes what the GPU read back of a surface to guest memory.
     fn store<M: GpuMemory>(&mut self, memory: &mut M, index: usize, data: &[u8]) {
+        // the drawing goes over some rows of a shadow a pixel stood in for
+        self.surfaces[index].shadow();
         let s = &self.surfaces[index];
         let (width, height, kind, tiled) = (s.width, s.height, s.kind, s.tiled);
         let pixels = (width * height) as usize;
@@ -4449,6 +4509,104 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what a surface keeps of guest memory, through a pixel standing in for
+    /// its shadow or not, is what the plain bytes would be, after uploads of
+    /// memory of one pixel or not, fills over all of it or rows of it, and
+    /// write-backs that have the bytes written out.
+    #[test]
+    fn a_pixel_standing_in_for_the_shadow_keeps_what_the_bytes_would() {
+        let mut seed = 3u32;
+        let mut random = move |range: usize| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as usize % range
+        };
+        let kinds = [Kind::Color(ColorFormat::Rgba8), Kind::Color(ColorFormat::Rgb8), Kind::Color(ColorFormat::Rgb565), Kind::Depth(2), Kind::Depth(3), Kind::Depth(4)];
+        for kind in kinds {
+            let (width, height) = (16, 24);
+            let nothing = Image { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null() };
+            let mut surface = Surface {
+                image: nothing,
+                addr: 0,
+                width,
+                height,
+                kind,
+                tiled: true,
+                shadow: Vec::new(),
+                pixel: None,
+                checked: false,
+                dirty: None,
+                guarded: None,
+                write_guarded: None,
+                cleared: None,
+                capture: None,
+                native: None,
+                screen: None,
+                upright: None,
+                generation: 0,
+            };
+            let (size, bpp, row) = (surface.size() as usize, kind.bytes() as usize, surface.row_bytes() as usize);
+            // the bytes the shadow stands for, none before the first upload
+            let mut bytes: Option<Vec<u8>> = None;
+            let mut pixel: Vec<u8> = vec![0; bpp];
+            for step in 0..300 {
+                // a pixel of its own, or the last one again
+                if random(2) == 0 {
+                    pixel = (0..bpp).map(|_| random(256) as u8).collect();
+                }
+                match random(5) {
+                    0 | 1 => {
+                        // an upload of memory, of one pixel or not
+                        let mut uploaded = pixel.repeat(size / bpp);
+                        if random(2) == 0 {
+                            uploaded[random(size)] ^= 1 + random(255) as u8;
+                        }
+                        surface.keep(&uploaded);
+                        bytes = Some(uploaded);
+                    }
+                    2 => {
+                        // a fill over all of it
+                        surface.keep_pixel(&pixel);
+                        bytes = Some(pixel.repeat(size / bpp));
+                    }
+                    3 => {
+                        // a fill over rows of tiles
+                        let from = random(height as usize / 8) * 8;
+                        let to = from + 8 * (1 + random((height as usize - from) / 8));
+                        surface.keep_rows(from * row..to * row, &pixel);
+                        if let Some(bytes) = &mut bytes {
+                            bytes[from * row..to * row].copy_from_slice(&pixel.repeat((to - from) * row / bpp));
+                        }
+                    }
+                    _ => {
+                        // a write-back, which reads the bytes and changes rows
+                        assert_eq!(*surface.shadow(), bytes.clone().unwrap_or_default(), "{kind:?} at step {step}");
+                        if let Some(bytes) = &mut bytes {
+                            let at = random(height as usize) * row;
+                            let drawn: Vec<u8> = (0..row).map(|_| random(256) as u8).collect();
+                            surface.shadow()[at..at + row].copy_from_slice(&drawn);
+                            bytes[at..at + row].copy_from_slice(&drawn);
+                        }
+                    }
+                }
+                match &bytes {
+                    Some(bytes) => {
+                        assert!(surface.shadows(0..size, bytes), "{kind:?} at step {step}");
+                        let mut changed = bytes.clone();
+                        changed[random(size)] ^= 0x10;
+                        assert!(!surface.shadows(0..size, &changed), "{kind:?} at step {step}");
+                        // rows of it, as a screen shows them
+                        let (first, rows) = (random(height as usize), random(4) + 1);
+                        let rows = first * row..((first + rows) * row).min(size);
+                        assert!(surface.shadows(rows.clone(), &bytes[rows.clone()]), "{kind:?} at step {step}");
+                        let past = [&bytes[rows.start..], &bytes[..row]].concat();
+                        assert!(!surface.shadows(rows.start..size + row, &past), "{kind:?} past the end");
+                    }
+                    None => assert!(!surface.shadows(0..size, &vec![0; size]), "{kind:?} before an upload"),
+                }
+            }
+        }
+    }
 
     /// the generic pipelines made at the start are every one a draw can ask
     /// for while the blend state is dynamic.
