@@ -216,8 +216,9 @@ pub struct ExHeader {
 
     pub memory_type: MemoryType,
     pub handle_table_size: u32,
-    /// SVC numbers the title is allowed to call.
-    pub allowed_svcs: [u32; 4],
+    /// SVC numbers the title is allowed to call, the eight tables a mask
+    /// descriptor can name reach up to 191.
+    pub allowed_svcs: [u32; 6],
 }
 
 impl ExHeader {
@@ -257,7 +258,7 @@ impl ExHeader {
         // ARM11 kernel capabilities, 28 tagged u32 descriptors at ACI+0x170.
         let mut memory_type = MemoryType::Application;
         let mut handle_table_size = 0x200;
-        let mut allowed_svcs = [0u32; 4];
+        let mut allowed_svcs = [0u32; 6];
         for i in 0..28 {
             let desc = aci.u32(0x170 + i * 4)?;
             if desc == 0xFFFF_FFFF {
@@ -318,5 +319,26 @@ impl ExHeader {
     pub fn code_span(&self) -> u32 {
         let end = self.data.address + self.data.num_pages * 0x1000 + self.bss_size;
         end.saturating_sub(self.text.address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a syscall mask descriptor names one of eight tables of 24 calls,
+    /// the last ones past the calls the console has, which a dump can
+    /// carry all the same.
+    #[test]
+    fn every_syscall_table_a_descriptor_names_is_read() {
+        let mut data = vec![0u8; 0x800];
+        let descriptors = [0xF000_0002u32, 0xF700_0005, 0xFE00_0123];
+        for (i, slot) in data[0x370..0x370 + 28 * 4].as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *slot = descriptors.get(i).copied().unwrap_or(0xFFFF_FFFF).to_le_bytes();
+        }
+        let header = ExHeader::parse(&data).unwrap();
+        // call 1 from the first table, 168 and 170 from the last
+        assert_eq!(header.allowed_svcs, [1 << 1, 0, 0, 0, 0, 1 << 8 | 1 << 10]);
+        assert_eq!(header.handle_table_size, 0x123);
     }
 }
