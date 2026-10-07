@@ -59,6 +59,6 @@ jobs:
           cat > notes.md <<'NOTES'
           On Windows, unzip zakuro-windows-x86_64.zip and run zakuro.exe. On Linux, extract zakuro-linux-x86_64.tar.gz and run ./zakuro, which needs the ALSA library (libasound2 on Debian and Ubuntu, alsa-lib on Arch).
 
-          Games need to be decrypted ROMs. Recompiling a game, which makes it run much faster, needs a C compiler such as gcc or clang. On Windows, gcc from MinGW-w64 (through MSYS2 or WinLibs) works out of the box.
+          Games need to be decrypted ROMs. Recompiling a game, which makes it run much faster, needs a C compiler. Zakuro uses gcc or clang when the computer has one, and otherwise offers to download Zig, which needs no installing, into its own folder.
           NOTES
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Zakuro $TAG" --notes-file notes.md --generate-notes

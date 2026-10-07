@@ -32,7 +32,7 @@ Cargo puts it in ~/.cargo/bin, which has to be on your PATH. Then `zakuro` in a 
 
 Without a ROM it opens a library with the games in a folder you pick, where you can also recompile them. Esc brings up a menu over the game, and the settings (controls, sound, graphics, a background for the library) are in there too.
 
-Games run faster with their code recompiled ahead of time by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which comes with Zakuro: press Recompile next to a game in the library, once per game. It takes around ten minutes and needs a C compiler, such as gcc or clang. On Windows, gcc from MinGW-w64 (through MSYS2 or WinLibs) works out of the box. From then on Zakuro runs the recompiled code on its own, and anything it doesn't cover still goes through the interpreter.
+Games run faster with their code recompiled ahead of time by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which comes with Zakuro: press Recompile next to a game in the library, once per game. It takes around ten minutes and needs a C compiler. If your computer has gcc or clang, Zakuro uses it, and if it has neither, Zakuro offers to download Zig, which comes with one and needs no installing, into its own folder. From then on Zakuro runs the recompiled code on its own, and anything it doesn't cover still goes through the interpreter.
 
 3dsrecomp also works on its own, from the terminal:
 

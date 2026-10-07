@@ -259,7 +259,7 @@ impl Menus {
                                     }
                                     _ => {
                                         let label = if game.recompiled { "Recompile again" } else { "Recompile" };
-                                        if ui.button(label).on_hover_text("Turn the game's code into native code with 3dsrecomp, which makes it run faster. It takes around ten minutes and needs a C compiler, such as gcc or clang.").clicked() {
+                                        if ui.button(label).on_hover_text("Turn the game's code into native code with 3dsrecomp, which makes it run faster. It takes around ten minutes and needs a C compiler, gcc or clang, or Zig, which Zakuro offers to download when the computer has neither.").clicked() {
                                             actions.push(Action::Recompile(index));
                                         }
                                         if let Some(Stage::Failed(error)) = job.map(Job::stage) {
