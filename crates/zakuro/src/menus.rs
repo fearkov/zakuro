@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{Keys, PadButtons, Renderer, Screens, Settings};
+use crate::settings::{Filter, Keys, PadButtons, Renderer, Screens, Settings};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -281,9 +281,19 @@ impl Menus {
 
     /// what goes over a running game, the menu when it is open and the
     /// frame rate when asked for.
-    pub fn game(&mut self, ui: &mut egui::Ui, name: &str, fps: Option<f32>, recompiled: bool, jobs: &[Job]) -> Vec<Action> {
+    pub fn game(&mut self, ui: &mut egui::Ui, name: &str, fps: Option<f32>, recompiled: bool, fast: bool, jobs: &[Job]) -> Vec<Action> {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
+        if fast {
+            egui::Area::new(egui::Id::new("fast forward"))
+                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-8.0, 8.0))
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(RichText::new("» fast forward").monospace());
+                    });
+                });
+        }
         if let Some(fps) = fps {
             // clicks go through to the screen under it
             egui::Area::new(egui::Id::new("fps")).fixed_pos(egui::pos2(8.0, 8.0)).interactable(false).show(&ctx, |ui| {
@@ -373,6 +383,15 @@ impl Menus {
                     ui.selectable_value(&mut settings.layout, layout, layout.name());
                 }
             });
+            egui::ComboBox::from_label("Filter").selected_text(settings.filter.name()).show_ui(ui, |ui| {
+                for filter in Filter::ALL {
+                    ui.selectable_value(&mut settings.filter, filter, filter.name());
+                }
+            })
+            .response
+            .on_hover_text("How the screens' pixels look scaled up: smooth, sharp with soft edges, or plain squares.");
+            ui.checkbox(&mut settings.integer_scale, "Scale by whole numbers only")
+                .on_hover_text("Every pixel gets the same size, with a border around the screens.");
             ui.label(
                 RichText::new("F9 switches them while playing, F10 between the top and the bottom screen alone.").weak(),
             );

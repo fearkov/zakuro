@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use glow::HasContext;
 
-use super::{layout, Overlay, OverlayVertex, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
+use super::{layout, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Viewport};
 
 const VERTEX_SHADER: &str = r#"#version 330 core
 // a single oversized triangle covers the viewport with no vertex buffer.
@@ -22,11 +22,24 @@ const FRAGMENT_SHADER: &str = r#"#version 330 core
 in vec2 uv;
 out vec4 color;
 uniform sampler2D screen;
+// how a screen drawn bigger than its pixels is filtered: 0 smooth, 1
+// pixels, 2 sharp, as in the Vulkan presenter's shader.
+uniform int mode;
 void main() {
     vec2 size = vec2(textureSize(screen, 0));
     vec2 covered = fwidth(uv) * size;
-    if (max(covered.x, covered.y) <= 1.0) {
-        color = vec4(texture(screen, uv).rgb, 1.0);
+    if (max(covered.x, covered.y) <= 1.001) {
+        vec2 texel = uv * size;
+        vec2 at = uv;
+        if (mode == 1) {
+            at = (floor(texel) + 0.5) / size;
+        } else if (mode == 2) {
+            vec2 scale = 1.0 / max(covered, vec2(1e-6));
+            vec2 centred = texel - 0.5;
+            vec2 blend = clamp((fract(centred) - 0.5) * scale + 0.5, 0.0, 1.0);
+            at = (floor(centred) + 0.5 + blend) / size;
+        }
+        color = vec4(texture(screen, at).rgb, 1.0);
         return;
     }
     ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
@@ -87,6 +100,8 @@ pub struct GlPresenter {
     sizes: [(u32, u32); 2],
     window: (u32, u32),
     arrangement: ScreenLayout,
+    filter: ScreenFilter,
+    integer: bool,
 }
 
 impl GlPresenter {
@@ -151,6 +166,8 @@ impl GlPresenter {
             sizes: [(0, 0); 2],
             window,
             arrangement: ScreenLayout::default(),
+            filter: ScreenFilter::default(),
+            integer: false,
         })
     }
 
@@ -233,9 +250,12 @@ impl Presenter for GlPresenter {
             if let Some(location) = gl.get_uniform_location(self.program, "screen") {
                 gl.uniform_1_i32(Some(&location), 0);
             }
+            if let Some(location) = gl.get_uniform_location(self.program, "mode") {
+                gl.uniform_1_i32(Some(&location), self.filter.mode());
+            }
         }
 
-        let (top_viewport, bottom_viewport) = layout(self.window.0, self.window.1, self.arrangement);
+        let (top_viewport, bottom_viewport) = layout(self.window.0, self.window.1, self.arrangement, self.integer);
         if let Some(viewport) = top_viewport.filter(|_| !top.is_empty()) {
             self.draw_screen(0, viewport);
         }
@@ -256,6 +276,11 @@ impl Presenter for GlPresenter {
 
     fn set_layout(&mut self, arrangement: ScreenLayout) {
         self.arrangement = arrangement;
+    }
+
+    fn set_scaling(&mut self, filter: ScreenFilter, integer: bool) {
+        self.filter = filter;
+        self.integer = integer;
     }
 }
 

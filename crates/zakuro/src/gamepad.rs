@@ -45,6 +45,11 @@ impl Gamepads {
         pressed
     }
 
+    /// whether a controller holds button down.
+    pub fn holding(&self, button: Button) -> bool {
+        self.gilrs.as_ref().is_some_and(|gilrs| gilrs.gamepads().any(|(_, pad)| pad.is_pressed(button)))
+    }
+
     /// what the controllers hold down, over what the keyboard does.
     pub fn apply(&self, mut state: InputState) -> InputState {
         let Some(gilrs) = &self.gilrs else { return state };

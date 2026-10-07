@@ -8,7 +8,7 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::vulkan_overlay::OverlayPainter;
-use super::{layout, GpuScreen, Overlay, PresentError, Presenter, ScreenImage, ScreenLayout, Viewport};
+use super::{layout, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Viewport};
 use crate::raster::hardware::{can_render, render_device};
 use crate::SharedDevice;
 
@@ -106,6 +106,8 @@ pub struct VulkanPresenter {
     overlay: Option<OverlayPainter>,
     window: (u32, u32),
     arrangement: ScreenLayout,
+    filter: ScreenFilter,
+    integer: bool,
     /// set when the swapchain no longer matches the window.
     stale: bool,
 }
@@ -361,6 +363,8 @@ impl VulkanPresenter {
             overlay: Some(overlay),
             window: size,
             arrangement: ScreenLayout::default(),
+            filter: ScreenFilter::default(),
+            integer: false,
             stale: false,
         };
 
@@ -699,7 +703,7 @@ impl VulkanPresenter {
                 self.pipeline,
             );
 
-            let (top, bottom) = layout(self.extent.width, self.extent.height, self.arrangement);
+            let (top, bottom) = layout(self.extent.width, self.extent.height, self.arrangement, self.integer);
             for (index, viewport) in [top, bottom].into_iter().enumerate() {
                 let Some(viewport) = viewport else { continue };
                 let (descriptor, crop) = match sources[index] {
@@ -720,7 +724,8 @@ impl VulkanPresenter {
                     &[descriptor],
                     &[],
                 );
-                let constants: Vec<u8> = crop.iter().flat_map(|c| c.to_le_bytes()).collect();
+                let mut constants: Vec<u8> = crop.iter().flat_map(|c| c.to_le_bytes()).collect();
+                constants.extend_from_slice(&self.filter.mode().to_le_bytes());
                 device.cmd_push_constants(command_buffer, self.pipeline_layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
@@ -863,6 +868,11 @@ impl Presenter for VulkanPresenter {
 
     fn set_layout(&mut self, arrangement: ScreenLayout) {
         self.arrangement = arrangement;
+    }
+
+    fn set_scaling(&mut self, filter: ScreenFilter, integer: bool) {
+        self.filter = filter;
+        self.integer = integer;
     }
 }
 
@@ -1052,7 +1062,7 @@ fn create_pipeline(
     // where the screen lies in the image and the bounds its samples keep in
     let constants = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        .size(size_of_val(&WHOLE) as u32)];
+        .size((size_of_val(&WHOLE) + size_of::<i32>()) as u32)];
     let pipeline_layout = unsafe {
         device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()

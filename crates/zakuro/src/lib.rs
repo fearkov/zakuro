@@ -84,6 +84,9 @@ pub fn run(linked: Option<Linked>) {
         shown: 0,
         spent: Spent::default(),
         paused: false,
+        fast_forward_key: false,
+        fast_forwarding: false,
+        next_shown: Instant::now(),
         stop: false,
         maximized_before_full_screen: false,
         resize_after_full_screen: false,
@@ -342,6 +345,13 @@ struct App {
     spent: Spent,
     /// stopped with F1, without the menu.
     paused: bool,
+    /// Tab is held down, for fast forward.
+    fast_forward_key: bool,
+    /// the game runs as fast as it can, its sound left out.
+    fast_forwarding: bool,
+    /// when fast forward shows its next frame, on a grid at the console's
+    /// frame rate.
+    next_shown: Instant,
     stop: bool,
     /// the window was maximized when it went full screen, which leaving
     /// full screen brings back.
@@ -421,6 +431,7 @@ impl ApplicationHandler for App {
             Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
                 backend.set_layout(self.layout.screens());
+                backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
                 self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
@@ -436,12 +447,23 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Tab is fast forward while a game runs, not a key for moving the
+        // interface's focus around
+        let tab = matches!(&event, WindowEvent::KeyboardInput { event, .. } if event.physical_key == PhysicalKey::Code(KeyCode::Tab));
+        let in_game = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_none())
+            && !self.menus.menu_open
+            && !self.menus.settings_open;
         let consumed = match (&mut self.gui, &self.window) {
-            (Some(gui), Some(window)) => gui.event(window, &event),
+            (Some(gui), Some(window)) if !(tab && in_game) => gui.event(window, &event),
             _ => false,
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            // keys let go while another window has the keyboard never come
+            WindowEvent::Focused(false) => {
+                self.fast_forward_key = false;
+                self.keyboard.release();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(backend) = &mut self.backend {
                     backend.resize(size.width, size.height);
@@ -601,6 +623,10 @@ impl App {
             }
             return;
         }
+        if code == KeyCode::Tab && !event.repeat && !self.settings.keys.binds(KeyCode::Tab) {
+            // fast forward while it is held
+            self.fast_forward_key = pressed && self.game.is_some();
+        }
         if pressed && !event.repeat {
             match code {
                 KeyCode::Escape if self.game.is_some() => {
@@ -662,7 +688,7 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens());
+        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.settings.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
@@ -730,6 +756,9 @@ impl App {
     /// puts the screens' arrangement and the window scale to use, sizing
     /// the window to them.
     fn apply_layout(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
+        }
         let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
         if scale != self.scale || self.settings.layout != self.layout {
             self.scale = scale;
@@ -911,6 +940,27 @@ impl App {
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
         let playing =
             self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open && !typing;
+        // Tab or a controller's right trigger, unless it is bound to a
+        // button of the console's
+        let trigger = gilrs::Button::RightTrigger2;
+        let trigger_free = self.settings.pad.map().iter().all(|&(_, bound)| bound != trigger);
+        let fast = playing && (self.fast_forward_key || (trigger_free && self.gamepads.holding(trigger)));
+        if fast {
+            // the output waits out fast forward rather than run dry
+            if let Some(audio) = &self.audio {
+                audio.hold();
+            }
+        }
+        if fast != self.fast_forwarding {
+            self.fast_forwarding = fast;
+            if !fast {
+                // back at the console's pace, with no sound piled up
+                if let Some(audio) = &self.audio {
+                    audio.clear();
+                }
+                self.next_frame = Instant::now();
+            }
+        }
         if playing {
             let start = Instant::now();
             self.emulate();
@@ -921,18 +971,27 @@ impl App {
         }
 
         self.next_frame += FRAME_TIME;
+        if fast {
+            // nothing to wait for
+            self.next_frame = Instant::now();
+        }
         // behind the schedule, showing the frame would wait on the display,
         // so it goes unshown, a few at most. a presenter that does not wait,
         // in mailbox mode, shows them all, a game that could not keep up
-        // showed a fifth of its frames
+        // showed a fifth of its frames. fast forward shows them at the
+        // console's frame rate, waiting on the display for no more
         let behind = Instant::now() > self.next_frame;
         let waits = self.backend.as_ref().is_some_and(Backend::waits_for_display);
-        if skips_showing(playing, behind, waits, self.skipped) {
+        let unshown = if fast { Instant::now() < self.next_shown } else { skips_showing(playing, behind, waits, self.skipped) };
+        if unshown {
             self.skipped += 1;
         } else {
             self.skipped = 0;
             let start = Instant::now();
             self.present(event_loop);
+            // the next one a frame later, or right away after falling
+            // behind, at the console's rate on average
+            self.next_shown = (self.next_shown + FRAME_TIME).max(Instant::now() - FRAME_TIME);
             self.spent.showing.add(start.elapsed());
             self.shown += 1;
         }
@@ -983,7 +1042,8 @@ impl App {
         let outcome = game.system.run_frame();
         game.count_frame();
         let sound = game.system.take_audio();
-        if let Some(audio) = &self.audio {
+        // fast forward plays no sound, there is too much of it too soon
+        if let (Some(audio), false) = (&self.audio, self.fast_forwarding) {
             audio.push(&sound);
         }
         match outcome {
@@ -1011,13 +1071,14 @@ impl App {
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
+        let fast = self.fast_forwarding;
         let keyboard = self.game.as_ref().and_then(|game| game.system.keyboard_request().cloned());
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
             match &game {
                 Some((name, fps, recompiled)) => {
-                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, jobs))
+                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs))
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }

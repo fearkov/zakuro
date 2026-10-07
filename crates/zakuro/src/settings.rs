@@ -9,9 +9,10 @@ use winit::keyboard::KeyCode;
 use zakuro_core::services::hid::PadState;
 use zakuro_gpu::ScreenLayout;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Renderer {
+    #[default]
     Vulkan,
     OpenGl,
 }
@@ -25,10 +26,11 @@ pub enum Screens {
     SideBySide,
     TopOnly,
     BottomOnly,
+    LargeTop,
 }
 
 impl Screens {
-    pub const ALL: [Screens; 4] = [Screens::Stacked, Screens::SideBySide, Screens::TopOnly, Screens::BottomOnly];
+    pub const ALL: [Screens; 5] = [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::TopOnly, Screens::BottomOnly];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -36,6 +38,7 @@ impl Screens {
             Screens::SideBySide => "Side by side",
             Screens::TopOnly => "Top screen only",
             Screens::BottomOnly => "Bottom screen only",
+            Screens::LargeTop => "Big top screen, small bottom one",
         }
     }
 
@@ -45,6 +48,7 @@ impl Screens {
             Screens::SideBySide => ScreenLayout::SideBySide,
             Screens::TopOnly => ScreenLayout::TopOnly,
             Screens::BottomOnly => ScreenLayout::BottomOnly,
+            Screens::LargeTop => ScreenLayout::LargeTop,
         }
     }
 
@@ -60,6 +64,36 @@ impl Screens {
             Screens::TopOnly => Screens::BottomOnly,
             Screens::BottomOnly => Screens::TopOnly,
             both => both,
+        }
+    }
+}
+
+/// how the screens' pixels look scaled up to the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Filter {
+    #[default]
+    Smooth,
+    Sharp,
+    Pixels,
+}
+
+impl Filter {
+    pub const ALL: [Filter; 3] = [Filter::Smooth, Filter::Sharp, Filter::Pixels];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Filter::Smooth => "Smooth",
+            Filter::Sharp => "Sharp",
+            Filter::Pixels => "Pixels",
+        }
+    }
+
+    pub fn screens(self) -> zakuro_gpu::ScreenFilter {
+        match self {
+            Filter::Smooth => zakuro_gpu::ScreenFilter::Smooth,
+            Filter::Sharp => zakuro_gpu::ScreenFilter::Sharp,
+            Filter::Pixels => zakuro_gpu::ScreenFilter::Pixels,
         }
     }
 }
@@ -110,6 +144,11 @@ impl Default for Keys {
 }
 
 impl Keys {
+    /// whether a console button is on key.
+    pub fn binds(&self, key: KeyCode) -> bool {
+        self.clone().all_mut().into_iter().any(|(_, bound)| *bound == key)
+    }
+
     /// every binding with the name it goes by, to show and change them.
     pub fn all_mut(&mut self) -> [(&'static str, &mut KeyCode); 16] {
         [
@@ -215,6 +254,7 @@ impl PadButtons {
 pub struct Settings {
     /// the folder the library lists games from.
     pub games: Option<PathBuf>,
+    #[serde(deserialize_with = "or_default")]
     pub renderer: Renderer,
     /// draw the 3D on the GPU rather than in software.
     pub hardware_rasterizer: bool,
@@ -225,7 +265,13 @@ pub struct Settings {
     pub recompiled: bool,
     /// window size, times the console's.
     pub scale: u32,
+    #[serde(deserialize_with = "or_default")]
     pub layout: Screens,
+    /// how the screens' pixels look scaled up.
+    #[serde(deserialize_with = "or_default")]
+    pub filter: Filter,
+    /// scale the screens by whole numbers only, leaving a border.
+    pub integer_scale: bool,
     /// 0 to 1.
     pub volume: f32,
     pub mute: bool,
@@ -248,6 +294,8 @@ impl Default for Settings {
             recompiled: true,
             scale: 2,
             layout: Screens::Stacked,
+            filter: Filter::Smooth,
+            integer_scale: false,
             volume: 1.0,
             mute: false,
             show_fps: false,
@@ -257,6 +305,18 @@ impl Default for Settings {
             pad: PadButtons::default(),
         }
     }
+}
+
+/// a setting's value, or its default when the file holds one this build
+/// does not know, a newer Zakuro's say, so that one value does not lose all
+/// the others.
+fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).unwrap_or_default())
 }
 
 impl Settings {
@@ -315,6 +375,14 @@ mod tests {
         settings.pad.a = Button::South;
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    #[test]
+    fn a_value_this_build_does_not_know_keeps_the_others() {
+        let settings: Settings = toml::from_str("show_fps = true\nlayout = \"three_screens\"\nfilter = \"crt\"\n").unwrap();
+        assert!(settings.show_fps);
+        assert_eq!(settings.layout, Screens::default());
+        assert_eq!(settings.filter, Filter::default());
     }
 
     #[test]

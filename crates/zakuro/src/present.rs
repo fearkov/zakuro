@@ -94,6 +94,14 @@ impl Backend {
         }
     }
 
+    pub fn set_scaling(&mut self, filter: zakuro_gpu::ScreenFilter, integer: bool) {
+        match self {
+            Backend::OpenGl { presenter, .. } => presenter.set_scaling(filter, integer),
+            Backend::Vulkan(presenter) => presenter.set_scaling(filter, integer),
+            Backend::None => {}
+        }
+    }
+
     pub fn set_layout(&mut self, arrangement: ScreenLayout) {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_layout(arrangement),
