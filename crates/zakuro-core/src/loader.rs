@@ -300,10 +300,13 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
 
         let start = source_offset as usize;
         let end = start + info.size as usize;
-        let bytes = code.get(start..end).ok_or(LoadError::ShortCodeImage)?;
+        code.get(start..end).ok_or(LoadError::ShortCodeImage)?;
+        // the image's bytes to the end of the segment's pages, as the console
+        // loads them, a mod's code among them in what padded the segment.
         // the write has to go to physical memory, .text and .rodata are about
         // to be visible to the guest without write permission.
-        system.memory.write_physical(block.addr, bytes);
+        let paged = &code[start..code.len().min(start + mapped_size as usize)];
+        system.memory.write_physical(block.addr, paged);
 
         log::debug!(
             "mapped {name} at 0x{:08X}, 0x{:X} bytes in 0x{mapped_size:X}",
@@ -332,6 +335,18 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
         );
         system.memory.zero_physical(block.addr, bss_size);
         log::debug!("mapped .bss at 0x{bss_start:08X}, 0x{bss_size:X} bytes");
+        // the image goes on past .data's pages into the BSS, flat, as Luma3DS
+        // and Citra lay it, where mods made with Magikoopa put their code, in
+        // BSS their exheader.bin makes bigger
+        let past_data = ((exheader.text.num_pages + exheader.rodata.num_pages + exheader.data.num_pages) * PAGE_SIZE) as usize;
+        if let Some(tail) = code.get(past_data..).filter(|tail| !tail.is_empty()) {
+            let fits = tail.len().min(bss_size as usize);
+            system.memory.write_physical(block.addr, &tail[..fits]);
+            log::info!("0x{fits:X} bytes of code past .data, from a mod, are in the BSS at 0x{bss_start:08X}");
+            if fits < tail.len() {
+                log::warn!("0x{:X} bytes of a mod's code reach past the BSS and are left out", tail.len() - fits);
+            }
+        }
     }
 
     Ok(modded)
@@ -354,4 +369,68 @@ fn map_stack(system: &mut System, stack_size: u32) {
     );
     system.memory.zero_physical(block.addr, size);
     log::debug!("mapped the main stack at 0x{base:08X}, 0x{size:X} bytes");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the id of the game the tests make, which no real game has.
+    const PROGRAM_ID: u64 = 0x0004_0000_0FF3_DE01;
+
+    fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// writes a decrypted .cxi whose code is all text and that has no RomFS.
+    fn rom(test: &str, code: &[u8]) -> std::path::PathBuf {
+        // the NCCH header, the exheader after it, and the ExeFS at 0x600
+        // with .code its only file
+        let mut out = vec![0; 0x800];
+        put(&mut out, 0x100, b"NCCH");
+        put(&mut out, 0x118, &PROGRAM_ID.to_le_bytes());
+        out[0x18F] = 0x04;
+        put(&mut out, 0x1A0, &3u32.to_le_bytes());
+        put(&mut out, 0x210, &[0x0010_0000, 1, code.len() as u32].map(u32::to_le_bytes).concat());
+        put(&mut out, 0x600, b".code");
+        put(&mut out, 0x60C, &(code.len() as u32).to_le_bytes());
+        out.extend_from_slice(code);
+        let path = std::env::temp_dir().join(format!("zakuro-loader-{}-{test}.cxi", std::process::id()));
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// a mod's code past .data, in a BSS its exheader.bin makes bigger, is
+    /// in memory once the game loads, the way Magikoopa's mods put it.
+    #[test]
+    fn code_a_mod_puts_past_data_lands_in_the_bss() {
+        let rom = rom("bss-code", &[0; 8]);
+        let data_dir = std::env::temp_dir().join(format!("zakuro-loader-{}-bss-code", std::process::id()));
+        let mods = crate::mods::dir(&data_dir, PROGRAM_ID);
+        std::fs::create_dir_all(&mods).unwrap();
+        // the text in one page, then two pages of BSS right after it
+        let mut exheader = vec![0; 0x400];
+        put(&mut exheader, 0x10, &[0x0010_0000u32, 1, 8].map(u32::to_le_bytes).concat());
+        put(&mut exheader, 0x20, &[0x0010_1000u32, 0, 0].map(u32::to_le_bytes).concat());
+        put(&mut exheader, 0x30, &[0x0010_1000u32, 0, 0].map(u32::to_le_bytes).concat());
+        put(&mut exheader, 0x3C, &0x2000u32.to_le_bytes());
+        std::fs::write(mods.join("exheader.bin"), &exheader).unwrap();
+        // the text, a stub in its padding, and code past it
+        let mut code = vec![0; 0x1000];
+        put(&mut code, 0x800, &[0x22; 4]);
+        code.extend_from_slice(&[0x11; 16]);
+        std::fs::write(mods.join("code.bin"), &code).unwrap();
+
+        let config = Config { data_dir: Some(data_dir.clone()), ..Config::default() };
+        let mut system = load(&rom, config).unwrap();
+        let mut read = [0; 16];
+        system.memory.read_bytes(0x0010_1000, &mut read);
+        assert_eq!(read, [0x11; 16]);
+        let mut stub = [0; 4];
+        system.memory.read_bytes(0x0010_0800, &mut stub);
+        assert_eq!(stub, [0x22; 4]);
+
+        std::fs::remove_dir_all(data_dir).unwrap();
+        std::fs::remove_file(rom).unwrap();
+    }
 }
