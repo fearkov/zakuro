@@ -53,6 +53,8 @@ If your mod changes the game's code, recompile the game with the mod already in 
 
 Texture packs need "Draw the 3D on the GPU", which is on by default. Their pictures load in the background, so the first time something shows up you may see the game's own texture for a moment. Only PNGs are read for now, which is what almost every pack uses.
 
+Got updates or DLC for a game? Just drop them in the same folder as your games and Zakuro figures out which game they belong to, and uses them when you play it. They need to be decrypted, same as the games. If you have more than one update for the same game, it picks the newest. And if you recompiled the game before adding its update, recompile it again, or the parts the update changed will run slower.
+
 No copyrighted data is included. I do not condone piracy, and I will not help you with that. So, don't ask me about that.
 
 Controls:
