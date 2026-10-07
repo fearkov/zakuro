@@ -7,9 +7,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use recomp3ds::build::{self, Event};
+use recomp3ds::compile::Compiler;
+
+/// the compiler a recompile uses: one there is, or Zig, downloaded first
+/// into this folder of tools.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Toolchain {
+    Ready(Compiler),
+    Download(PathBuf),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
+    /// fetching the compiler, how much of it has arrived, 0 to 1.
+    Downloading(f32),
     /// finding the code and writing it as C.
     Generating,
     Compiling { done: usize, total: usize },
@@ -27,6 +38,7 @@ impl Stage {
     /// how far along it is, 0 to 1, going by the part that takes longest.
     pub fn fraction(&self) -> f32 {
         match self {
+            Stage::Downloading(arrived) => *arrived,
             Stage::Generating => 0.05,
             Stage::Compiling { done, total } => 0.05 + 0.9 * *done as f32 / (*total).max(1) as f32,
             Stage::Installing => 0.95,
@@ -62,10 +74,12 @@ pub struct Job {
 }
 
 impl Job {
-    /// starts recompiling the game at rom, with what its mods in data_dir
-    /// change.
-    pub fn start(rom: &Path, program_id: u64, name: &str, data_dir: Option<&Path>) -> Job {
-        let state = Arc::new(Mutex::new(State { stage: Stage::Generating, finished_at: None }));
+    /// starts recompiling the game at rom with toolchain's compiler, with
+    /// what its mods in data_dir change. the compilers run below normal
+    /// priority, so that a game can be played meanwhile.
+    pub fn start(rom: &Path, program_id: u64, name: &str, data_dir: Option<&Path>, toolchain: Toolchain) -> Job {
+        let first = if matches!(toolchain, Toolchain::Download(_)) { Stage::Downloading(0.0) } else { Stage::Generating };
+        let state = Arc::new(Mutex::new(State { stage: first, finished_at: None }));
         let cancel = Arc::new(AtomicBool::new(false));
         let (progress, stop, rom) = (state.clone(), cancel.clone(), rom.to_owned());
         let (game, data_dir) = (name.to_owned(), data_dir.map(Path::to_owned));
@@ -75,7 +89,22 @@ impl Job {
                     state.stage = stage;
                 }
             };
-            let result = recompile(&rom, program_id, &game, data_dir.as_deref(), &stop, &events);
+            let compiler = match toolchain {
+                Toolchain::Ready(compiler) => Ok(compiler),
+                Toolchain::Download(tools) => {
+                    let arrived = |fraction: f32| {
+                        if let Ok(mut state) = progress.lock() {
+                            state.stage = Stage::Downloading(fraction);
+                        }
+                    };
+                    let downloaded = crate::zig::download(&tools, &arrived, &stop);
+                    if let Ok(mut state) = progress.lock() {
+                        state.stage = Stage::Generating;
+                    }
+                    downloaded
+                }
+            };
+            let result = compiler.and_then(|compiler| recompile(&rom, program_id, &game, data_dir.as_deref(), compiler, &stop, &events));
             if let Ok(mut state) = progress.lock() {
                 state.stage = match result {
                     Ok(_) => Stage::Done,
@@ -112,12 +141,14 @@ fn recompile(
     program_id: u64,
     name: &str,
     data_dir: Option<&Path>,
+    compiler: Compiler,
     cancel: &AtomicBool,
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<PathBuf, String> {
     let changes = data_dir.and_then(|data_dir| Changes::read(rom, program_id, data_dir));
     let files = |path: &str| changes.as_ref()?.module(path);
-    let mut options = build::Options { cancel: Some(cancel), ..build::Options::default() };
+    log::info!("recompiling {name} with {}", compiler.describe());
+    let mut options = build::Options { cancel: Some(cancel), compiler: Some(compiler), background: true, ..build::Options::default() };
     if let Some(changes) = &changes {
         log::info!(
             "recompiling {name} with its mods, which change {}. the library replaces one made without them, and should the mods go, the functions they changed run in the interpreter",

@@ -19,6 +19,9 @@ pub enum Action {
     Play(PathBuf),
     /// recompile the library's game at this index.
     Recompile(usize),
+    /// download a compiler, then recompile the library's game at this
+    /// index with it.
+    DownloadCompiler(usize),
     /// show the mods folder of the game with this program id.
     Mods(u64),
     CancelRecompile(u64),
@@ -55,6 +58,9 @@ pub struct Menus {
     pub report: Option<(String, String)>,
     /// what is being typed into the game's keyboard, and what it asked for.
     typing: Option<(Request, String)>,
+    /// the library's game to recompile once the player agrees to download a
+    /// compiler for it.
+    pub compiler_offer: Option<usize>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
     background: Background,
 }
@@ -504,6 +510,33 @@ impl Menus {
         action
     }
 
+    /// asks whether to download a compiler, there being none to recompile
+    /// with.
+    pub fn compiler_offer(&mut self, ctx: &egui::Context) -> Option<Action> {
+        let index = self.compiler_offer?;
+        let size = crate::zig::download_size().map_or_else(String::new, |size| format!(", {} MB to download and around 400 MB once unpacked", size / 1_000_000));
+        let mut action = None;
+        egui::Window::new("Recompile")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Recompiling needs a C compiler, and Zakuro didn't find one on this computer. It can download Zig, a compiler that needs no installing, into its own folder{size}."
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Download it and recompile").clicked() {
+                        action = Some(Action::DownloadCompiler(index));
+                        self.compiler_offer = None;
+                    }
+                    if ui.button("Not now").clicked() {
+                        self.compiler_offer = None;
+                    }
+                });
+            });
+        action
+    }
+
     pub fn message(&mut self, ctx: &egui::Context) {
         let Some(text) = self.message.clone() else { return };
         egui::Window::new("Zakuro")
@@ -531,6 +564,7 @@ impl Menus {
 fn progress(ui: &mut egui::Ui, job: &Job) {
     let stage = job.stage();
     let text = match &stage {
+        Stage::Downloading(arrived) => format!("downloading the compiler, {:.0}%", arrived * 100.0),
         Stage::Generating => "finding the code".to_owned(),
         Stage::Compiling { done, total } => format!("compiling {done} of {total}"),
         Stage::Installing => "installing".to_owned(),

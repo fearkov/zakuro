@@ -13,6 +13,7 @@ mod present;
 mod recompile;
 mod report;
 mod settings;
+mod zig;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -32,7 +33,7 @@ use input::Keyboard;
 use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
-use recompile::{Job, Stage};
+use recompile::{Job, Stage, Toolchain};
 use settings::{Renderer, Screens, Settings};
 
 pub use zakuro_core::recompiled::Linked;
@@ -754,13 +755,35 @@ impl App {
         winit::dpi::LogicalSize::new(width * self.scale, height * self.scale)
     }
 
-    fn recompile(&mut self, index: usize) {
+    /// recompiles the library's game at index, with the computer's C
+    /// compiler, or the Zig Zakuro downloaded, or else, when download is
+    /// set, with Zig downloaded first. with none of those it asks whether
+    /// to download it.
+    fn recompile(&mut self, index: usize, download: bool) {
         let Some(game) = self.library.games.get(index) else { return };
         self.jobs.retain(|job| job.program_id != game.program_id || !job.stage().finished());
         if self.jobs.iter().any(|job| job.program_id == game.program_id) {
             return;
         }
-        self.jobs.push(Job::start(&game.path, game.program_id, &game.name, self.data_dir.as_deref()));
+        let tools = zig::tools_dir(self.data_dir.as_deref());
+        let toolchain = match recomp3ds::compile::check(None) {
+            Ok(compiler) => Toolchain::Ready(compiler),
+            Err(error) => match tools.as_deref().and_then(zig::installed) {
+                Some(compiler) => Toolchain::Ready(compiler),
+                None => match tools {
+                    Some(tools) if download && zig::download_size().is_some() => Toolchain::Download(tools),
+                    Some(_) if zig::download_size().is_some() => {
+                        self.menus.compiler_offer = Some(index);
+                        return;
+                    }
+                    _ => {
+                        self.menus.message = Some(format!("Recompiling needs a C compiler: {error}."));
+                        return;
+                    }
+                },
+            },
+        };
+        self.jobs.push(Job::start(&game.path, game.program_id, &game.name, self.data_dir.as_deref(), toolchain));
     }
 
     /// tells about recompiles as they finish.
@@ -796,7 +819,8 @@ impl App {
                     self.menus.message = Some(error);
                 }
             }
-            Action::Recompile(index) => self.recompile(index),
+            Action::Recompile(index) => self.recompile(index, false),
+            Action::DownloadCompiler(index) => self.recompile(index, true),
             Action::Mods(program_id) => {
                 if let Some(data_dir) = &self.data_dir {
                     let folder = zakuro_core::mods::dir(data_dir, program_id);
@@ -993,6 +1017,7 @@ impl App {
             if let Some(request) = &keyboard {
                 actions.extend(menus.keyboard(ui.ctx(), request));
             }
+            actions.extend(menus.compiler_offer(ui.ctx()));
             menus.message(ui.ctx());
         });
         self.library.changed = false;
