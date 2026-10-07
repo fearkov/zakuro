@@ -2366,7 +2366,9 @@ impl Hardware {
         }
         // read meanwhile, uploaded in a batch with room for it
         self.waiting.entry(hash).or_insert_with(|| (material.clone(), batch)).1 = batch;
-        let picture = material.picture()?;
+        // as fine as the GPU draws the largest textures, 1024 texels across
+        let kept = (1024 * self.scale).next_power_of_two().max(4096).min(self.max_image_size);
+        let picture = material.picture(kept)?;
         let bytes = picture.texels.len() as u64;
         let (width, height) = (picture.width, picture.height);
         if width > self.max_image_size || height > self.max_image_size || bytes > self.replaced_budget {

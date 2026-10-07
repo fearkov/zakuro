@@ -71,10 +71,6 @@ pub struct Level {
 /// the largest picture read, as big as any pack's.
 const MAX_SIZE: u32 = 8192;
 
-/// the largest size of a picture kept, a bigger one is halved down to it.
-/// the GPU draws at 4 times the console's resolution at most, where even
-/// the largest textures, 1024 texels across, take 4096 pixels.
-const KEPT_SIZE: u32 = 4096;
 
 impl Pack {
     /// the pack in dir, none when it holds no picture.
@@ -157,8 +153,9 @@ impl Material {
     }
 
     /// the picture once it has been read, and otherwise none, starting to
-    /// read it unless that is under way or failed before.
-    pub fn picture(self: &Arc<Self>) -> Option<Arc<Picture>> {
+    /// read it unless that is under way or failed before. one wider or
+    /// higher than kept is halved down to it, as the GPU draws no finer.
+    pub fn picture(self: &Arc<Self>, kept: u32) -> Option<Arc<Picture>> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *state {
             State::Read(picture) => Some(picture.clone()),
@@ -168,7 +165,7 @@ impl Material {
                 readers().spawn(move || {
                     // a game closed meanwhile takes its pack with it
                     if let Some(material) = material.upgrade() {
-                        material.read();
+                        material.read(kept);
                     }
                 });
                 None
@@ -181,8 +178,8 @@ impl Material {
         }
     }
 
-    fn read(&self) {
-        let read = read_png(&self.path, self.flipped);
+    fn read(&self, kept: u32) {
+        let read = read_png(&self.path, self.flipped, kept);
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *state = match (&*state, read) {
             (State::Broken, _) => return,
@@ -565,8 +562,8 @@ fn etc1_colors(block: u64) -> [[[u8; 3]; 4]; 2] {
 }
 
 /// a PNG as RGBA8 rows from the top, turned over when stored from the
-/// bottom, halved down to KEPT_SIZE, with its smaller sizes after it.
-fn read_png(path: &Path, flipped: bool) -> Result<Picture, String> {
+/// bottom, halved down to kept, with its smaller sizes after it.
+fn read_png(path: &Path, flipped: bool, kept: u32) -> Result<Picture, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut decoder = png::Decoder::new_with_limits(std::io::BufReader::new(file), png::Limits { bytes: 1 << 30 });
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -605,7 +602,7 @@ fn read_png(path: &Path, flipped: bool) -> Result<Picture, String> {
         texels
     };
     let mut top = Level { offset: 0, width, height };
-    while top.width > KEPT_SIZE || top.height > KEPT_SIZE {
+    while top.width > kept || top.height > kept {
         let smaller = halve(&mut texels, top);
         texels = texels.split_off(smaller.offset);
         top = Level { offset: 0, ..smaller };
@@ -919,13 +916,13 @@ mod tests {
         write_png(&path, 1, 1, &[1, 2, 3, 255]);
         let material = Material { hash: 1, path: path.clone(), flipped: false, state: Mutex::new(State::Reading { wanted: true }) };
         material.release();
-        material.read();
+        material.read(4096);
         assert!(matches!(*material.state.lock().unwrap(), State::OnDisk));
         *material.state.lock().unwrap() = State::Reading { wanted: true };
-        material.read();
+        material.read(4096);
         assert!(matches!(*material.state.lock().unwrap(), State::Read(_)));
         material.refuse();
-        material.read();
+        material.read(4096);
         assert!(matches!(*material.state.lock().unwrap(), State::Broken));
         std::fs::remove_file(&path).unwrap();
     }
@@ -941,13 +938,13 @@ mod tests {
             }
         }
         write_png(&path, 3, 2, &texels);
-        let upright = read_png(&path, false).unwrap();
+        let upright = read_png(&path, false, 4096).unwrap();
         assert_eq!((upright.width, upright.height), (3, 2));
         assert_eq!(&upright.texels[..4], &[255, 0, 0, 255]);
         assert_eq!(upright.levels, vec![Level { offset: 0, width: 3, height: 2 }, Level { offset: 24, width: 1, height: 1 }]);
         assert_eq!(&upright.texels[24..28], &[128, 0, 128, 255]);
         assert_eq!(upright.texels.len(), 28);
-        let flipped = read_png(&path, true).unwrap();
+        let flipped = read_png(&path, true, 4096).unwrap();
         assert_eq!(&flipped.texels[..4], &[0, 0, 255, 255]);
         std::fs::remove_file(&path).unwrap();
     }
@@ -962,16 +959,15 @@ mod tests {
         assert_eq!(&texels[16..], &[255, 255, 255, 128]);
     }
 
-    /// a picture past KEPT_SIZE is halved down to it before its smaller
-    /// sizes are made.
+    /// a picture past the size kept is halved down to it before its
+    /// smaller sizes are made.
     #[test]
     fn a_huge_picture_is_halved_to_the_size_kept() {
         let path = std::env::temp_dir().join(format!("zakuro-huge-{}.png", std::process::id()));
-        let width = KEPT_SIZE * 2;
-        write_png(&path, width, 2, &vec![200; (width * 2 * 4) as usize]);
-        let picture = read_png(&path, false).unwrap();
-        assert_eq!((picture.width, picture.height), (KEPT_SIZE, 1));
-        assert_eq!(picture.levels[0], Level { offset: 0, width: KEPT_SIZE, height: 1 });
+        write_png(&path, 8192, 2, &vec![200; 8192 * 2 * 4]);
+        let picture = read_png(&path, false, 4096).unwrap();
+        assert_eq!((picture.width, picture.height), (4096, 1));
+        assert_eq!(picture.levels[0], Level { offset: 0, width: 4096, height: 1 });
         assert_eq!(picture.levels.last().map(|level| (level.width, level.height)), Some((1, 1)));
         assert_eq!(&picture.texels[..4], &[200; 4]);
         std::fs::remove_file(&path).unwrap();
