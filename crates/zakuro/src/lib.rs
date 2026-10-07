@@ -515,6 +515,7 @@ impl App {
             linked: self.linked.filter(|_| !interpret),
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
+            texture_packs: self.settings.texture_packs,
             resolution: self.settings.resolution,
             device: self.backend.as_ref().and_then(Backend::shared_device),
             ..Config::default()
@@ -872,7 +873,8 @@ impl App {
             Action::Mods(program_id) => {
                 if let Some(data_dir) = &self.data_dir {
                     let folder = zakuro_core::mods::dir(data_dir, program_id);
-                    match std::fs::create_dir_all(folder.join("romfs")) {
+                    let made = std::fs::create_dir_all(folder.join("romfs")).and_then(|()| std::fs::create_dir_all(folder.join("textures")));
+                    match made {
                         Ok(()) => show_folder(&folder),
                         Err(error) => self.menus.message = Some(format!("The mods folder can't be made: {error}")),
                     }

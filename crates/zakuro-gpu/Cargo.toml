@@ -17,6 +17,10 @@ thiserror.workspace = true
 rayon.workspace = true
 wide = "1.7"
 raw-window-handle = "0.6"
+# texture packs, their PNGs, pack.json and the hash Citra names pictures by
+png = "0.18.1"
+serde_json = "1"
+cityhasher = "0.1"
 
 glow = { version = "0.16", optional = true }
 ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }

@@ -46,8 +46,11 @@ You can use mods too. I kept the same folders Luma3DS and Azahar use, so if a mo
 - `romfs/` is for files that replace the game's own, or add new ones.
 - `romfs_ext/` is for .ips and .bps patches to the game's files, and .stub files to remove one.
 - `code.bin`, `code.ips` or `code.bps`, in the folder or in `exefs/`, change the game's code.
+- `textures/` is for texture packs made for Citra or Azahar. Put in it what the pack puts in `load/textures/<title ID>/`, its pack.json and its folders of PNGs.
 
 If your mod changes the game's code, recompile the game with the mod already in its folder, and everything keeps running at full speed. Otherwise the parts the mod touches go through the interpreter and run slower, and if you recompiled the game before 0.2.19, the whole game goes through it until you recompile it again.
+
+Texture packs need "Draw the 3D on the GPU", which is on by default. Their pictures load in the background, so the first time something shows up you may see the game's own texture for a moment. Only PNGs are read for now, which is what almost every pack uses.
 
 No copyrighted data is included. I do not condone piracy, and I will not help you with that. So, don't ask me about that.
 

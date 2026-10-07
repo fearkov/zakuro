@@ -865,6 +865,9 @@ struct BoundTexture {
     width: u32,
     height: u32,
     border: [f32; 4],
+    /// the texture pack's picture for it, which the host's GPU draws with
+    /// in its place once it has been read.
+    replacement: Option<Arc<crate::pack::Material>>,
 }
 
 /// what draws keep from one to the next.
@@ -962,9 +965,16 @@ pub struct TextureCache {
     list: u64,
     /// where the draws of this list wrote, as address and length.
     written: Vec<(u32, u32)>,
+    /// the texture pack whose pictures replace textures, and where a
+    /// texture is laid out to hash it as Citra did.
+    pack: Option<Arc<crate::pack::Pack>>,
+    rows: Vec<u8>,
 }
 
 type TextureKey = (u32, TextureFormat, u32, u32);
+
+/// a texture's texels, and the texture pack's picture replacing it.
+type Found = (Arc<[[u8; 4]]>, Option<Arc<crate::pack::Material>>);
 
 struct Decoded {
     /// the hash of the bytes it was decoded from, and the bytes, so that a
@@ -975,12 +985,20 @@ struct Decoded {
     /// the list it was last checked in, and how many writes that list had
     /// made by then.
     checked: (u64, usize),
+    replacement: Option<Arc<crate::pack::Material>>,
 }
 
 /// how many texels the cache holds before it starts over, 256 MiB of them.
 const CACHED_TEXELS: usize = 64 * 1024 * 1024;
 
 impl TextureCache {
+    /// replaces textures with the pack's pictures from now on, or with none.
+    pub fn set_pack(&mut self, pack: Option<Arc<crate::pack::Pack>>) {
+        self.pack = pack;
+        self.entries.clear();
+        self.texels = 0;
+    }
+
     /// a new command list starts, and memory may have changed since the last.
     pub fn begin_list(&mut self) {
         self.list += 1;
@@ -996,17 +1014,17 @@ impl TextureCache {
 
     /// the texture, when it was checked during this list and nothing drew
     /// over it since.
-    fn checked(&self, key: TextureKey, size: u32) -> Option<Arc<[[u8; 4]]>> {
+    fn checked(&self, key: TextureKey, size: u32) -> Option<Found> {
         let decoded = self.entries.get(&key)?;
         let (list, writes) = decoded.checked;
         let addr = key.0;
         let overwritten = self.written[writes.min(self.written.len())..]
             .iter()
             .any(|&(start, length)| start < addr.saturating_add(size) && addr < start.saturating_add(length));
-        (list == self.list && !overwritten).then(|| decoded.texels.clone())
+        (list == self.list && !overwritten).then(|| (decoded.texels.clone(), decoded.replacement.clone()))
     }
 
-    fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Arc<[[u8; 4]]> {
+    fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
         let (_, format, width, height) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
@@ -1030,10 +1048,11 @@ impl TextureCache {
                 decoded.bytes.copy_from_slice(data);
                 decoded.texels = copy;
                 decoded.hash = hash;
+                decoded.replacement = picture_for(self.pack.as_deref(), data, &decoded.texels, key, &mut self.rows);
             }
             if decoded.hash == hash {
                 decoded.checked = checked;
-                return decoded.texels.clone();
+                return (decoded.texels.clone(), decoded.replacement.clone());
             }
         }
         let count = (width * height) as usize;
@@ -1045,13 +1064,29 @@ impl TextureCache {
             .flat_map(|y| (0..width).map(move |x| (x, y)))
             .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
             .collect();
-        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked };
+        let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
+        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
         }
         self.texels += count;
-        texels
+        (texels, replacement)
     }
+}
+
+/// the pack's picture for a texture of these bytes, whenever they change.
+fn picture_for(
+    pack: Option<&crate::pack::Pack>,
+    data: &[u8],
+    texels: &[[u8; 4]],
+    key: TextureKey,
+    rows: &mut Vec<u8>,
+) -> Option<Arc<crate::pack::Material>> {
+    let (_, format, width, height) = key;
+    if crate::pack::recording() {
+        crate::pack::record(data, texels, format, width, height);
+    }
+    pack?.find(data, format, width, height, rows)
 }
 
 /// a quick hash of a texture's bytes, to notice when they change. four
@@ -1194,9 +1229,9 @@ fn bind_texture<M: GpuMemory>(
     let size = bits.div_ceil(8) as usize;
 
     let key = (addr, format, width, height);
-    let texels = match (drawn, cache.checked(key, size as u32)) {
-        (Some(_), _) => Arc::default(),
-        (None, Some(texels)) => texels,
+    let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
+        (Some(_), _) => (Arc::default(), None),
+        (None, Some(found)) => found,
         (None, None) => match memory.slice(addr, size) {
             Some(data) => cache.decoded(key, data),
             None => {
@@ -1220,6 +1255,7 @@ fn bind_texture<M: GpuMemory>(
         height,
         // the border color register comes first in each unit's block, RGBA8
         border: registers[base].to_le_bytes().map(|c| c as f32 / 255.0),
+        replacement,
     })
 }
 
@@ -2850,6 +2886,7 @@ mod tests {
             width: 8,
             height: 8,
             border: RED,
+            replacement: None,
         };
         let white = [1.0; 4];
         assert_eq!(texture(Wrap::ClampToBorder).texel(-1, 3), RED);
@@ -2893,9 +2930,9 @@ mod tests {
             after[6 * tile..7 * tile].iter_mut().for_each(|byte| *byte = byte.wrapping_mul(3).wrapping_add(1));
             let key = (0x1000, format, width, height);
             let mut cache = TextureCache::default();
-            let old = cache.decoded(key, &before);
-            let updated = cache.decoded(key, &after);
-            let whole = TextureCache::default().decoded(key, &after);
+            let old = cache.decoded(key, &before).0;
+            let updated = cache.decoded(key, &after).0;
+            let whole = TextureCache::default().decoded(key, &after).0;
             assert_eq!(updated, whole, "{format:?}");
             let changed = old.iter().zip(updated.iter()).enumerate().filter(|(_, (a, b))| a != b);
             assert!(changed.clone().count() > 0, "{format:?} changed nothing");
@@ -2910,10 +2947,10 @@ mod tests {
     fn the_texture_cache_notices_changed_bytes() {
         let mut cache = TextureCache::default();
         let key = (0x1000, TextureFormat::Rgba8, 8, 8);
-        let first = cache.decoded(key, &[0x11; 256]);
-        let again = cache.decoded(key, &[0x11; 256]);
+        let first = cache.decoded(key, &[0x11; 256]).0;
+        let again = cache.decoded(key, &[0x11; 256]).0;
         assert!(Arc::ptr_eq(&first, &again));
-        let changed = cache.decoded(key, &[0x22; 256]);
+        let changed = cache.decoded(key, &[0x22; 256]).0;
         assert_ne!(first[0], changed[0]);
     }
 

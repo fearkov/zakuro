@@ -25,6 +25,7 @@ use ash::vk;
 use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
 use crate::blend::LogicOp;
 use crate::fog;
+use crate::pack::Material;
 use crate::proctex;
 use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
@@ -671,6 +672,50 @@ struct Texture {
     used: u64,
 }
 
+/// a texture pack's picture, drawn with for every texture it replaces.
+struct Replaced {
+    image: Image,
+    bytes: u64,
+    used: u64,
+    width: u32,
+    height: u32,
+    levels: u32,
+}
+
+impl Replaced {
+    /// the smallest of its sizes a texture of this size is drawn with, the
+    /// one nearest the texture's own and no smaller, so that what a game
+    /// shows at a distance stays as it was, and alpha tested leaves and
+    /// fences do not thin out as smaller sizes average them away.
+    fn smallest(&self, (width, height): (u32, u32)) -> u32 {
+        let times = (self.width / width.max(1)).min(self.height / height.max(1));
+        times.max(1).ilog2().min(self.levels - 1)
+    }
+}
+
+/// how long a batch spends uploading texture pack pictures, and how many
+/// bytes of them it uploads, past the first picture, so that a scene's
+/// pictures coming in at once are spread over a few frames rather than hold
+/// one up. each costs most of a millisecond however small.
+const REPLACING_TIME: std::time::Duration = std::time::Duration::from_millis(2);
+const REPLACING_BYTES: u64 = 64 << 20;
+
+/// pictures up to this size are staged in the ring rather than a buffer
+/// of their own, which takes a while to make.
+const RING_PICTURE: u64 = 4 << 20;
+
+/// batches a picture goes unused before it goes to make room for others,
+/// when they take most of the room they may, otherwise they stay.
+const REPLACED_IDLE: u64 = 60;
+
+/// batches a picture read for a texture no longer drawn waits to be
+/// uploaded before the memory it takes goes.
+const WAITING_IDLE: u64 = 120;
+
+/// batches pictures wait to be read and uploaded after the GPU had no
+/// memory for one.
+const REPLACING_PAUSE: u64 = 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PipelineKey {
     /// the blend function register, when blending.
@@ -1238,7 +1283,7 @@ pub struct Hardware {
     /// the same writing an image, made the first time it is needed.
     upright_image: Option<Compute>,
     samples: Option<Local>,
-    samplers: QuickMap<(bool, Wrap, Wrap), vk::Sampler>,
+    samplers: QuickMap<(bool, Wrap, Wrap, u32), vk::Sampler>,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -1247,6 +1292,27 @@ pub struct Hardware {
     textures: HashMap<usize, Texture>,
     /// textures copied from surfaces, by what they are.
     copies: HashMap<DrawnTexture, Copied>,
+    /// texture pack pictures, by the hash of the textures they replace.
+    replaced: HashMap<u64, Replaced>,
+    /// the bytes those take, and how many they may, half the GPU's memory.
+    replaced_bytes: u64,
+    replaced_budget: u64,
+    /// how many of them may stay, each being memory of its own, of which
+    /// some drivers give out 4096 in all.
+    replaced_most: usize,
+    /// how long the batch being recorded spent uploading them, and how many
+    /// bytes it uploaded.
+    replacing: (std::time::Duration, u64),
+    /// the buffers they were uploaded from, by batch, freed once it is done.
+    staged: Vec<(u64, Buffer)>,
+    /// pictures asked for and not uploaded yet, by hash, with the batch
+    /// they were last asked for in.
+    waiting: HashMap<u64, (Arc<Material>, u64)>,
+    /// the batch pictures are read and uploaded again from, after the GPU
+    /// had no memory for one.
+    replacing_from: u64,
+    /// the widest or highest image the GPU makes.
+    max_image_size: u32,
     /// what unused texture units sample.
     blank: Image,
     /// the tables' generation and where the batch copied them.
@@ -1439,6 +1505,25 @@ impl Hardware {
                 surfaces: Vec::new(),
                 textures: HashMap::new(),
                 copies: HashMap::new(),
+                replaced: HashMap::new(),
+                replaced_bytes: 0,
+                // half the GPU's own memory, up to 4 GiB, and a quarter, up
+                // to 2, of an integrated one's, which is the computer's
+                replaced_budget: {
+                    let heaps = &memory_types.memory_heaps[..memory_types.memory_heap_count as usize];
+                    let local = heaps.iter().filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|heap| heap.size);
+                    let local = local.max().unwrap_or(1 << 30);
+                    match properties.device_type {
+                        vk::PhysicalDeviceType::INTEGRATED_GPU => (local / 4).min(2 << 30),
+                        _ => (local / 2).min(4 << 30),
+                    }
+                },
+                replaced_most: (properties.limits.max_memory_allocation_count / 2).min(4096) as usize,
+                replacing: (std::time::Duration::ZERO, 0),
+                staged: Vec::new(),
+                waiting: HashMap::new(),
+                replacing_from: 0,
+                max_image_size: properties.limits.max_image_dimension2_d,
                 tables: None,
                 recording: false,
                 uploads: false,
@@ -1534,17 +1619,31 @@ impl Hardware {
                 .map_err(vk_error("create a buffer"))?;
             let requirements = self.device.get_buffer_memory_requirements(buffer);
             let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
-            let (memory, flags) = if readback {
+            let allocated = if readback {
                 self.allocate(requirements, visible | vk::MemoryPropertyFlags::HOST_CACHED)
-                    .or_else(|_| self.allocate(requirements, visible | vk::MemoryPropertyFlags::HOST_COHERENT))?
+                    .or_else(|_| self.allocate(requirements, visible | vk::MemoryPropertyFlags::HOST_COHERENT))
             } else {
-                self.allocate(requirements, visible | vk::MemoryPropertyFlags::HOST_COHERENT)?
+                self.allocate(requirements, visible | vk::MemoryPropertyFlags::HOST_COHERENT)
             };
-            self.device.bind_buffer_memory(buffer, memory, 0).map_err(vk_error("bind buffer memory"))?;
-            let mapped = self
-                .device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .map_err(vk_error("map memory"))? as *mut u8;
+            // what was made goes again when a later step fails
+            let (memory, flags) = match allocated {
+                Ok(allocated) => allocated,
+                Err(error) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(error);
+                }
+            };
+            let mapped = self.device.bind_buffer_memory(buffer, memory, 0).map_err(vk_error("bind buffer memory")).and_then(|()| {
+                self.device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).map_err(vk_error("map memory"))
+            });
+            let mapped = match mapped {
+                Ok(mapped) => mapped as *mut u8,
+                Err(error) => {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                    return Err(error);
+                }
+            };
             let incoherent = !flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
             Ok(Buffer { buffer, memory, size, mapped, incoherent })
         }
@@ -1576,6 +1675,19 @@ impl Hardware {
     /// an image in device memory, put in the general layout by the batch
     /// being recorded, which it never leaves.
     fn image(&self, width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags, aspect: vk::ImageAspectFlags) -> Result<Image, String> {
+        self.image_levels(width, height, 1, format, usage, aspect)
+    }
+
+    /// the same with levels sizes, each half the last.
+    fn image_levels(
+        &self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<Image, String> {
         // SAFETY: plain object creation on our device, and a barrier into
         // the command buffer being recorded
         unsafe {
@@ -1586,7 +1698,7 @@ impl Hardware {
                         .image_type(vk::ImageType::TYPE_2D)
                         .format(format)
                         .extent(vk::Extent3D { width, height, depth: 1 })
-                        .mip_levels(1)
+                        .mip_levels(levels)
                         .array_layers(1)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
@@ -1597,20 +1709,35 @@ impl Hardware {
                 )
                 .map_err(vk_error("create an image"))?;
             let requirements = self.device.get_image_memory_requirements(image);
-            let (memory, _) = self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            self.device.bind_image_memory(image, memory, 0).map_err(vk_error("bind image memory"))?;
-            let range = vk::ImageSubresourceRange::default().aspect_mask(aspect).level_count(1).layer_count(1);
-            let view = self
-                .device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(format)
-                        .subresource_range(range),
-                    None,
-                )
-                .map_err(vk_error("create an image view"))?;
+            // what was made goes again when a later step fails
+            let memory = match self.allocate(requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+                Ok((memory, _)) => memory,
+                Err(error) => {
+                    self.device.destroy_image(image, None);
+                    return Err(error);
+                }
+            };
+            let range = vk::ImageSubresourceRange::default().aspect_mask(aspect).level_count(levels).layer_count(1);
+            let view = self.device.bind_image_memory(image, memory, 0).map_err(vk_error("bind image memory")).and_then(|()| {
+                self.device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format)
+                            .subresource_range(range),
+                        None,
+                    )
+                    .map_err(vk_error("create an image view"))
+            });
+            let view = match view {
+                Ok(view) => view,
+                Err(error) => {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return Err(error);
+                }
+            };
             let barrier = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -2179,12 +2306,18 @@ impl Hardware {
         };
     }
 
-    /// the texture's image, uploaded the first time it is drawn with.
-    fn texture(&mut self, bound: &BoundTexture) -> Result<vk::ImageView, String> {
+    /// the texture's image, uploaded the first time it is drawn with, and
+    /// the smallest of its sizes to draw with. a texture pack's picture
+    /// takes its place once it has been read.
+    fn texture(&mut self, bound: &BoundTexture) -> Result<(vk::ImageView, u32), String> {
+        let size = (bound.width, bound.height);
+        if let Some(found) = bound.replacement.as_ref().and_then(|material| self.replacement(material, size)) {
+            return Ok(found);
+        }
         let key = Arc::as_ptr(&bound.texels) as *const u8 as usize;
         if let Some(texture) = self.textures.get_mut(&key) {
             texture.used = self.batch;
-            return Ok(texture.image.view);
+            return Ok((texture.image.view, 0));
         }
         self.mark(Work::Upload, false);
         self.end_rendering();
@@ -2213,11 +2346,126 @@ impl Hardware {
         self.uploads = true;
         let view = image.view;
         self.textures.insert(key, Texture { image, _texels: bound.texels.clone(), used: self.batch });
-        Ok(view)
+        Ok((view, 0))
     }
 
-    fn sampler(&mut self, linear: bool, s: Wrap, t: Wrap) -> Result<vk::Sampler, String> {
-        if let Some(&sampler) = self.samplers.get(&(linear, s, t)) {
+    /// the image of a texture pack's picture for a texture of size, and
+    /// the smallest of its sizes to draw with, uploaded once it has been
+    /// read, none until then, or while the pictures take most of the room
+    /// they may, the texture drawing as it is meanwhile.
+    fn replacement(&mut self, material: &Arc<Material>, size: (u32, u32)) -> Option<(vk::ImageView, u32)> {
+        let (hash, batch) = (material.hash(), self.batch);
+        if let Some(replaced) = self.replaced.get_mut(&hash) {
+            replaced.used = batch;
+            return Some((replaced.image.view, replaced.smallest(size)));
+        }
+        if self.crowded() || batch < self.replacing_from {
+            return None;
+        }
+        // read meanwhile, uploaded in a batch with room for it
+        self.waiting.entry(hash).or_insert_with(|| (material.clone(), batch)).1 = batch;
+        let picture = material.picture()?;
+        let bytes = picture.texels.len() as u64;
+        let (width, height) = (picture.width, picture.height);
+        if width > self.max_image_size || height > self.max_image_size || bytes > self.replaced_budget {
+            log::warn!("a texture pack picture, {width}x{height}, is more than the GPU takes");
+            material.refuse();
+            self.waiting.remove(&hash);
+            return None;
+        }
+        let (spent, uploaded) = self.replacing;
+        if spent >= REPLACING_TIME || uploaded >= REPLACING_BYTES || self.replaced_bytes + bytes > self.replaced_budget {
+            return None;
+        }
+        let start = std::time::Instant::now();
+        let image = self.upload_picture(&picture);
+        self.replacing = (spent + start.elapsed(), uploaded + bytes);
+        match image {
+            Ok(image) => {
+                // the GPU's copy is the one kept, read again should it go
+                material.release();
+                self.waiting.remove(&hash);
+                self.replaced_bytes += bytes;
+                let replaced = Replaced { image, bytes, used: batch, width, height, levels: picture.levels.len() as u32 };
+                let found = (replaced.image.view, replaced.smallest(size));
+                self.replaced.insert(hash, replaced);
+                Some(found)
+            }
+            Err(error) => {
+                // memory may well come free, the picture waits until then
+                log::warn!("a texture pack picture can't go on the GPU yet, {error}");
+                self.replacing_from = batch + REPLACING_PAUSE;
+                None
+            }
+        }
+    }
+
+    /// uploads a picture and its smaller sizes, through the ring when there
+    /// is room, otherwise through a buffer of its own, as one can be bigger
+    /// than the ring.
+    fn upload_picture(&mut self, picture: &crate::pack::Picture) -> Result<Image, String> {
+        let (width, height) = (picture.width, picture.height);
+        self.mark(Work::Upload, false);
+        self.end_rendering();
+        let size = picture.texels.len() as u64;
+        let (source, start, staging) = if size <= RING_PICTURE && self.used + size <= RING_FLUSH {
+            let offset = self.stage(size, 16)?;
+            self.ring(offset, size).copy_from_slice(&picture.texels);
+            (self.ring.buffer, offset, None)
+        } else {
+            let staging = self.buffer(size, vk::BufferUsageFlags::TRANSFER_SRC, false)?;
+            // SAFETY: the buffer is mapped for its whole size, the picture's
+            unsafe { std::ptr::copy_nonoverlapping(picture.texels.as_ptr(), staging.mapped, picture.texels.len()) };
+            (staging.buffer, 0, Some(staging))
+        };
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        let levels = picture.levels.len() as u32;
+        let image = match self.image_levels(width, height, levels, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR) {
+            Ok(image) => image,
+            Err(error) => {
+                if let Some(staging) = staging {
+                    self.destroy_buffer(&staging);
+                }
+                return Err(error);
+            }
+        };
+        let regions: Vec<vk::BufferImageCopy> = picture
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(index, level)| {
+                vk::BufferImageCopy::default()
+                    .buffer_offset(start + level.offset as u64)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(index as u32).layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width: level.width, height: level.height, depth: 1 })
+            })
+            .collect();
+        // SAFETY: recording, the regions lie inside the buffer and the image
+        unsafe {
+            self.unfenced = true;
+            self.device.cmd_copy_buffer_to_image(self.commands, source, image.image, vk::ImageLayout::GENERAL, &regions)
+        };
+        self.uploads = true;
+        if let Some(staging) = staging {
+            self.staged.push((self.batch, staging));
+        }
+        Ok(image)
+    }
+
+    fn destroy_buffer(&self, buffer: &Buffer) {
+        // SAFETY: only called once the GPU is done with the buffer
+        unsafe {
+            self.device.destroy_buffer(buffer.buffer, None);
+            self.device.free_memory(buffer.memory, None);
+        }
+    }
+
+    /// a sampler for a unit, which goes between an image's sizes down to
+    /// smallest, as texture pack pictures have them.
+    fn sampler(&mut self, linear: bool, s: Wrap, t: Wrap, smallest: u32) -> Result<vk::Sampler, String> {
+        if let Some(&sampler) = self.samplers.get(&(linear, s, t, smallest)) {
             return Ok(sampler);
         }
         // the border is the shader's to draw, past the edge it clamps
@@ -2227,17 +2475,22 @@ impl Hardware {
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
         let filter = if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+        let between = if smallest > 0 && linear { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
+        // a picture drawn a little smaller than its own size, as at 3 times
+        // the console's resolution, stays as sharp as it is
+        let bias = if smallest > 0 { -0.5 } else { 0.0 };
         let info = vk::SamplerCreateInfo::default()
             .mag_filter(filter)
             .min_filter(filter)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .mipmap_mode(between)
+            .mip_lod_bias(bias)
             .address_mode_u(mode(s))
             .address_mode_v(mode(t))
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .max_lod(0.0);
+            .max_lod(smallest as f32);
         // SAFETY: plain object creation on our device
         let sampler = unsafe { self.device.create_sampler(&info, None) }.map_err(vk_error("create a sampler"))?;
-        self.samplers.insert((linear, s, t), sampler);
+        self.samplers.insert((linear, s, t, smallest), sampler);
         Ok(sampler)
     }
 
@@ -2900,14 +3153,15 @@ impl Hardware {
         for (unit, bound) in draw.textures.iter().enumerate() {
             match bound {
                 Some(bound) => {
-                    views[unit] = match bound.drawn {
-                        Some(drawn) => self.copy_texture(&drawn)?,
+                    let (view, smallest) = match bound.drawn {
+                        Some(drawn) => (self.copy_texture(&drawn)?, 0),
                         None => self.texture(bound)?,
                     };
-                    samplers[unit] = self.sampler(bound.linear, bound.wrap_s, bound.wrap_t)?;
+                    views[unit] = view;
+                    samplers[unit] = self.sampler(bound.linear, bound.wrap_s, bound.wrap_t, smallest)?;
                     enabled |= 1 << unit;
                 }
-                None => samplers[unit] = self.sampler(false, Wrap::ClampToEdge, Wrap::ClampToEdge)?,
+                None => samplers[unit] = self.sampler(false, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
             }
         }
         let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
@@ -4006,7 +4260,49 @@ impl Hardware {
                 self.destroy_image(&copy.image);
             }
         }
+        self.replacing = (std::time::Duration::ZERO, 0);
+        self.let_go_of_pictures();
         Ok(())
+    }
+
+    /// whether the pictures take most of the room they may, in bytes or in
+    /// how many there are.
+    fn crowded(&self) -> bool {
+        self.replaced_bytes > self.replaced_budget / 8 * 7 || self.replaced.len() > self.replaced_most / 8 * 7
+    }
+
+    /// pictures read for textures no longer drawn go rather than wait in
+    /// memory to be uploaded. uploaded ones stay, unless they take most of
+    /// the room they may, when those unused for a second or so go, the
+    /// longest unused first, none a batch in flight may still read.
+    fn let_go_of_pictures(&mut self) {
+        let batch = self.batch;
+        self.waiting.retain(|_, (material, asked)| {
+            let wanted = batch - *asked <= WAITING_IDLE;
+            if !wanted {
+                material.release();
+            }
+            wanted
+        });
+        if !self.crowded() {
+            return;
+        }
+        let mut idle: Vec<(u64, u64)> = self
+            .replaced
+            .iter()
+            .filter(|(_, replaced)| batch - replaced.used > REPLACED_IDLE)
+            .map(|(&hash, replaced)| (replaced.used, hash))
+            .collect();
+        idle.sort_unstable();
+        for (_, hash) in idle {
+            if self.replaced_bytes <= self.replaced_budget / 4 * 3 && self.replaced.len() <= self.replaced_most / 4 * 3 {
+                break;
+            }
+            if let Some(replaced) = self.replaced.remove(&hash) {
+                self.destroy_image(&replaced.image);
+                self.replaced_bytes -= replaced.bytes;
+            }
+        }
     }
 
     /// waits for the GPU to finish everything handed to it.
@@ -4070,6 +4366,14 @@ impl Hardware {
         let batch = frame.pending.take();
         self.add_times(frame.commands)?;
         self.free.push(frame);
+        // the buffers pictures were uploaded from in it
+        if let Some(batch) = batch {
+            let (done, waiting) = std::mem::take(&mut self.staged).into_iter().partition(|&(staged, _)| staged <= batch);
+            self.staged = waiting;
+            for (_, buffer) in done {
+                self.destroy_buffer(&buffer);
+            }
+        }
         // pictures for screens are read out before a later batch can draw
         // over them
         for index in 0..self.surfaces.len() {
@@ -4319,6 +4623,12 @@ impl Drop for Hardware {
             }
             for copy in self.copies.values() {
                 self.destroy_image(&copy.image);
+            }
+            for replaced in self.replaced.values() {
+                self.destroy_image(&replaced.image);
+            }
+            for (_, buffer) in &self.staged {
+                self.destroy_buffer(buffer);
             }
             for surface in &self.surfaces {
                 self.destroy_image(&surface.image);

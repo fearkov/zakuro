@@ -14,6 +14,12 @@ pub fn dir(data_dir: &Path, program_id: u64) -> PathBuf {
     if !upper.exists() && lower.exists() { lower } else { upper }
 }
 
+/// the folder of a title's texture pack, in its mods folder, laid out as in
+/// Citra's load/textures/<title id>.
+pub fn textures(data_dir: &Path, program_id: u64) -> PathBuf {
+    dir(data_dir, program_id).join("textures")
+}
+
 /// the files that change a title's code, each in the mod's folder or in its
 /// exefs folder.
 const CODE: [&str; 3] = ["code.bin", "code.ips", "code.bps"];

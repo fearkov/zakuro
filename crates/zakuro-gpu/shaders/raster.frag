@@ -148,17 +148,20 @@ vec4 sample_unit(uint unit, vec2 uv) {
     // precise as the combiners are. the coordinate itself the driver may
     // still interpolate a hair apart from one shader to another
     precise vec2 st = vec2(uv.x, 1.0 - uv.y);
+    // sampled before the border is decided on for each fragment, so that a
+    // texture pack's picture picks which of its sizes to draw with from all
+    // of a fragment's neighbours
+    vec4 sampled;
+    if (unit == 0u) {
+        sampled = texture(texture0, st);
+    } else if (unit == 1u) {
+        sampled = texture(texture1, st);
+    } else {
+        sampled = texture(texture2, st);
+    }
     bool border_s = (wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0);
     bool border_t = (wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0);
-    if (border_s || border_t) {
-        return unpack_color(units[unit].y);
-    }
-    if (unit == 0u) {
-        return texture(texture0, st);
-    } else if (unit == 1u) {
-        return texture(texture1, st);
-    }
-    return texture(texture2, st);
+    return border_s || border_t ? unpack_color(units[unit].y) : sampled;
 }
 
 precise float lookup(uint table, uint entry, float delta) {

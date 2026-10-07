@@ -267,7 +267,7 @@ impl Menus {
                                         }
                                     }
                                 }
-                                if ui.button("Mods").on_hover_text("Open the game's mods folder. Files put in its romfs folder replace the game's, the way Luma3DS and Citra take mods.").clicked() {
+                                if ui.button("Mods").on_hover_text("Open the game's mods folder. Files put in its romfs folder replace the game's, the way Luma3DS and Citra take mods, and a texture pack made for Citra or Azahar goes in its textures folder.").clicked() {
                                     actions.push(Action::Mods(game.program_id));
                                 }
                             });
@@ -377,6 +377,8 @@ impl Menus {
                 settings.hardware_rasterizer,
                 egui::Slider::new(&mut settings.resolution, 1..=4).text("Resolution").suffix("x"),
             );
+            ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
+                .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
             ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
             egui::ComboBox::from_label("Screens").selected_text(settings.layout.name()).show_ui(ui, |ui| {
                 for layout in Screens::ALL {

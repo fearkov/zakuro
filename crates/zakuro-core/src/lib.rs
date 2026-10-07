@@ -48,6 +48,9 @@ pub struct Config {
     pub data_dir: Option<std::path::PathBuf>,
     /// draw on the host's GPU through Vulkan, when there is one that can.
     pub hardware_renderer: bool,
+    /// draw the pictures of the texture pack in the title's mods folder in
+    /// place of its textures, which takes the host's GPU.
+    pub texture_packs: bool,
     /// how many times the console's resolution the host's GPU draws at.
     pub resolution: u32,
     /// the Vulkan presenter's device, to draw on and show the screens
@@ -71,6 +74,7 @@ impl Default for Config {
             find_recompiled: false,
             data_dir: None,
             hardware_renderer: false,
+            texture_packs: true,
             resolution: 1,
             device: None,
             clock: None,

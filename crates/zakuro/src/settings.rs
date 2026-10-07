@@ -260,6 +260,8 @@ pub struct Settings {
     pub hardware_rasterizer: bool,
     /// how many times the console's resolution the GPU draws the 3D at.
     pub resolution: u32,
+    /// draw the texture packs put in games' mods folders.
+    pub texture_packs: bool,
     /// run a game's recompiled code when it has some, rather than
     /// interpreting everything.
     pub recompiled: bool,
@@ -291,6 +293,7 @@ impl Default for Settings {
             renderer: Renderer::Vulkan,
             hardware_rasterizer: true,
             resolution: 3,
+            texture_packs: true,
             recompiled: true,
             scale: 2,
             layout: Screens::Stacked,

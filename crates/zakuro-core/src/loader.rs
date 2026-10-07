@@ -114,10 +114,24 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
+    let mut on_gpu = false;
     if system.config.hardware_renderer {
         match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone()) {
-            Ok(name) => log::info!("drawing on {name} through Vulkan"),
+            Ok(name) => {
+                log::info!("drawing on {name} through Vulkan");
+                on_gpu = true;
+            }
             Err(error) => log::warn!("{error}, drawing in software"),
+        }
+    }
+    if let Some(data_dir) = system.config.data_dir.as_deref().filter(|_| system.config.texture_packs) {
+        let dir = crate::mods::textures(data_dir, title.program_id());
+        if !on_gpu {
+            if std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_some()) {
+                log::warn!("the texture pack in {} needs the 3D drawn on the GPU, it is left out", dir.display());
+            }
+        } else if let Some(pack) = zakuro_gpu::pack::Pack::open(&dir) {
+            system.gpu.set_texture_pack(Some(std::sync::Arc::new(pack)));
         }
     }
 

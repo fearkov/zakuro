@@ -9,6 +9,7 @@ pub mod proctex;
 pub mod fog;
 pub mod format;
 pub mod lighting;
+pub mod pack;
 pub mod raster;
 pub mod registers;
 pub mod renderer;
@@ -591,6 +592,19 @@ impl Gpu {
         let name = format!("{} at {scale}x{shaded}{direct}", hardware.name());
         self.resources.hardware = Some(hardware);
         Ok(name)
+    }
+
+    /// draws the texture pack's pictures in place of the textures they
+    /// replace, or no pack's. only the host's GPU draws them, so a pack
+    /// waits for enable_hardware_renderer, and says whether it is drawn.
+    pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
+        #[cfg(feature = "vulkan")]
+        let pack = pack.filter(|_| self.resources.hardware.is_some());
+        #[cfg(not(feature = "vulkan"))]
+        let pack = pack.filter(|_| false);
+        let drawn = pack.is_some();
+        self.resources.textures.set_pack(pack);
+        drawn
     }
 
     /// whether the screens the host's GPU draws are shown straight from it,
