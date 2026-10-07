@@ -812,9 +812,14 @@ impl App {
             Err(error) => match tools.as_deref().and_then(zig::installed) {
                 Some(compiler) => Toolchain::Ready(compiler),
                 None => match tools {
-                    Some(tools) if download && zig::download_size().is_some() => Toolchain::Download(tools),
-                    Some(_) if zig::download_size().is_some() => {
+                    Some(tools) if download && zig::download_size().is_some() && zig::can_download() => Toolchain::Download(tools),
+                    Some(_) if zig::download_size().is_some() && zig::can_download() => {
                         self.menus.compiler_offer = Some(index);
+                        return;
+                    }
+                    Some(_) if zig::download_size().is_some() => {
+                        self.menus.message =
+                            Some(format!("Recompiling needs a C compiler, gcc or clang, or curl or wget for Zakuro to download one: {error}."));
                         return;
                     }
                     _ => {

@@ -66,43 +66,102 @@ pub fn installed(tools: &Path) -> Option<Compiler> {
     program.is_file().then(|| Compiler::new(program, &["cc"]))
 }
 
+/// the program downloads go through, curl, which Linux, macOS and Windows
+/// 10 and later mostly have, or else wget, which some Linux systems have
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Fetcher {
+    Curl,
+    Wget,
+}
+
+impl Fetcher {
+    fn find() -> Option<Fetcher> {
+        let runs = |program: &str| {
+            Command::new(program).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|status| status.success())
+        };
+        [Fetcher::Curl, Fetcher::Wget].into_iter().find(|fetcher| runs(fetcher.program()))
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            Fetcher::Curl => "curl",
+            Fetcher::Wget => "wget",
+        }
+    }
+
+    /// a command downloading url to path, or to its output without one,
+    /// giving up after seconds.
+    fn command(self, url: &str, path: Option<&Path>, seconds: u32) -> Command {
+        let mut command = Command::new(self.program());
+        match self {
+            Fetcher::Curl => {
+                command.args(["-fL", "--silent", "--show-error", "--connect-timeout", "20", "--max-time", &seconds.to_string()]);
+                if let Some(path) = path {
+                    command.arg("-o").arg(path);
+                }
+            }
+            // wget has no limit on the whole download, a stall ends it
+            Fetcher::Wget => {
+                command.args(["--quiet", "--timeout=20", &format!("--read-timeout={}", seconds.min(60)), "-O"]);
+                match path {
+                    Some(path) => command.arg(path),
+                    None => command.arg("-"),
+                };
+            }
+        }
+        command.arg(url);
+        command
+    }
+}
+
+/// whether Zakuro can download Zig here, having curl or wget to.
+pub fn can_download() -> bool {
+    Fetcher::find().is_some()
+}
+
 /// downloads Zig into tools and unpacks it, telling progress how much of the
 /// archive has arrived, 0 to 1. the mirrors the Zig project lists go first,
 /// in a random order, and ziglang.org last, as it asks of tools, and what
 /// arrives has to match the SHA-256 above whichever served it.
 pub fn download(tools: &Path, progress: &dyn Fn(f32), cancel: &AtomicBool) -> Result<Compiler, String> {
     let archive = archive().ok_or("Zakuro has no compiler to download for this system")?;
+    let fetcher = Fetcher::find().ok_or("Zakuro downloads with curl or wget, and this computer has neither")?;
     std::fs::create_dir_all(tools).map_err(|error| format!("could not create {}, {error}", tools.display()))?;
     let partial = tools.join(format!("{}.part", archive.name));
-    let mut sources = mirrors();
+    let mut sources = mirrors(fetcher);
     sources.push(format!("https://ziglang.org/download/{VERSION}"));
+    let mut last = String::new();
     for source in sources {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let url = format!("{}/{}", source.trim_end_matches('/'), archive.name);
         log::info!("downloading Zig from {url}");
-        match fetch(&url, &partial, archive.size, progress, cancel).and_then(|()| verify(&partial, &archive)) {
+        match fetch(fetcher, &url, &partial, archive.size, progress, cancel).and_then(|()| verify(&partial, &archive)) {
             Ok(()) => {
                 let unpacked = unpack(&partial, tools);
                 let _ = std::fs::remove_file(&partial);
                 unpacked?;
                 return installed(tools).ok_or_else(|| "Zig was unpacked but its zig program is missing".to_owned());
             }
-            Err(error) => log::warn!("Zig from {url}: {error}"),
+            Err(error) => {
+                log::warn!("Zig from {url}: {error}");
+                last = error;
+            }
         }
     }
     let _ = std::fs::remove_file(&partial);
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".to_owned());
     }
-    Err("could not download Zig, from ziglang.org or any of its mirrors".to_owned())
+    Err(format!("could not download Zig, from ziglang.org or any of its mirrors, the last said {last}"))
 }
 
 /// the mirrors the Zig project lists, in a random order, none when the list
 /// can't be had.
-fn mirrors() -> Vec<String> {
-    let listed = Command::new("curl").args(["-fsSL", "--max-time", "30", MIRRORS]).stderr(Stdio::null()).output();
+fn mirrors(fetcher: Fetcher) -> Vec<String> {
+    let listed = fetcher.command(MIRRORS, None, 30).stderr(Stdio::null()).output();
     let mut mirrors: Vec<String> = match listed {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -123,18 +182,15 @@ fn mirrors() -> Vec<String> {
     mirrors
 }
 
-/// downloads url to path with curl, which Linux, macOS and Windows 10 and
-/// later all have, following how much of size has arrived.
-fn fetch(url: &str, path: &Path, size: u64, progress: &dyn Fn(f32), cancel: &AtomicBool) -> Result<(), String> {
+/// downloads url to path, following how much of size has arrived.
+fn fetch(fetcher: Fetcher, url: &str, path: &Path, size: u64, progress: &dyn Fn(f32), cancel: &AtomicBool) -> Result<(), String> {
     let _ = std::fs::remove_file(path);
-    let mut child = Command::new("curl")
-        .args(["-fL", "--silent", "--show-error", "--connect-timeout", "20", "--max-time", "1800", "-o"])
-        .arg(path)
-        .arg(url)
+    let mut child = fetcher
+        .command(url, Some(path), 1800)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("curl could not start, {error}"))?;
+        .map_err(|error| format!("{} could not start, {error}", fetcher.program()))?;
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -227,6 +283,16 @@ mod tests {
         std::fs::write(&program, b"").unwrap();
         assert_eq!(installed(&tools), Some(Compiler::new(&program, &["cc"])));
         std::fs::remove_dir_all(tools).unwrap();
+    }
+
+    #[test]
+    fn wget_writes_where_curl_would() {
+        let args = |command: Command| command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let curl = args(Fetcher::Curl.command("https://x/z", Some(Path::new("/t/z.part")), 1800));
+        assert!(curl.windows(2).any(|pair| pair == ["-o", "/t/z.part"]) && curl.last().map(String::as_str) == Some("https://x/z"));
+        let wget = args(Fetcher::Wget.command("https://x/z", Some(Path::new("/t/z.part")), 1800));
+        assert!(wget.windows(2).any(|pair| pair == ["-O", "/t/z.part"]) && wget.last().map(String::as_str) == Some("https://x/z"));
+        assert!(args(Fetcher::Wget.command("https://x/list", None, 30)).windows(2).any(|pair| pair == ["-O", "-"]));
     }
 
     #[test]
