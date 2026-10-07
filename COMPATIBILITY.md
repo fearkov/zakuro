@@ -30,7 +30,7 @@ Games tested in Zakuro so far, as of v0.2.20. Recompiled means the game was test
 | The Legend of Zelda: A Link Between Worlds | 00040000000EC300 | USA | Playable | Yes | |
 | Persona Q: Shadow of the Labyrinth | 0004000000123400 | USA | Playable | Yes | |
 | Animal Crossing: New Leaf | 0004000000086300 | USA | Playable | Yes | Needs v0.2.9 or newer, you got stuck, all black, after getting off the train before |
-| Tomodachi Life | 000400000008C300 | USA | Playable | Yes | |
+| Tomodachi Life | 000400000008C300 | USA | In-game | Yes | |
 | Monster Hunter 4 Ultimate | 0004000000126300 | USA | Playable | Yes | Needs v0.2.8 or newer, the screen stayed black before |
 | Monster Hunter XX | 0004000000197100 | JPN | Playable | Yes | |
 | Yo-kai Watch | 0004000000167800 | EUR | Playable | Yes | Needs v0.2.7 or newer |
