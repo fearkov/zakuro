@@ -2360,7 +2360,7 @@ dependencies = [
 [[package]]
 name = "recomp-abi"
 version = "0.1.0"
-source = "git+https://github.com/fearkov/3dsrecomp#390e8f7ba7318ab784b43099a10ef32a88d8feb8"
+source = "git+https://github.com/fearkov/3dsrecomp#f285ccc8a3841bafaa492b805158025a12dab238"
 dependencies = [
  "libloading",
 ]
@@ -2368,7 +2368,7 @@ dependencies = [
 [[package]]
 name = "recomp3ds"
 version = "0.1.0"
-source = "git+https://github.com/fearkov/3dsrecomp#390e8f7ba7318ab784b43099a10ef32a88d8feb8"
+source = "git+https://github.com/fearkov/3dsrecomp#f285ccc8a3841bafaa492b805158025a12dab238"
 dependencies = [
  "recomp-abi",
 ]

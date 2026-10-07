@@ -760,7 +760,7 @@ impl App {
         if self.jobs.iter().any(|job| job.program_id == game.program_id) {
             return;
         }
-        self.jobs.push(Job::start(&game.path, game.program_id, &game.name));
+        self.jobs.push(Job::start(&game.path, game.program_id, &game.name, self.data_dir.as_deref()));
     }
 
     /// tells about recompiles as they finish.

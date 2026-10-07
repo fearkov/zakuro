@@ -130,6 +130,44 @@ impl Layered {
         }
         count
     }
+
+    /// the files the mod put in, replacing, patching or adding them, whose
+    /// paths wanted takes, with their bytes. a path goes from where the
+    /// mod's paths start, / separated.
+    pub fn modded_files(&self, wanted: impl Fn(&str) -> bool) -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        let Ok(romfs) = RomFs::parse_level3(&self.meta, 0) else { return files };
+        let Ok(root) = romfs.root() else { return files };
+        let mut pending = vec![(String::new(), root)];
+        while let Some((path, dir)) = pending.pop() {
+            for (_, file) in romfs.files(&dir) {
+                let path = join(&path, &file.name);
+                if !wanted(&path) {
+                    continue;
+                }
+                if let Some(bytes) = self.modded(romfs.file_data_offset(&file), file.data_size) {
+                    files.push((path, bytes));
+                }
+            }
+            for (_, child) in romfs.subdirs(&dir) {
+                pending.push((join(&path, &child.name), child));
+            }
+        }
+        files
+    }
+
+    /// the size bytes at start in the image, when they are a file the mod
+    /// put there.
+    fn modded(&self, start: u64, size: u64) -> Option<Vec<u8>> {
+        let piece = self.pieces.iter().find(|piece| piece.start == start && piece.size == size)?;
+        let mut bytes = vec![0; size as usize];
+        match &piece.source {
+            Source::Image(_) => return None,
+            Source::Memory(data) => bytes.copy_from_slice(data),
+            Source::Host(path) => read_host(path, 0, &mut bytes),
+        }
+        Some(bytes)
+    }
 }
 
 /// a file of the tree being put together.
@@ -325,6 +363,16 @@ fn dir(name: String, parent: usize) -> Dir {
     Dir { name, parent, children: Vec::new(), files: Vec::new(), offset: 0 }
 }
 
+/// the path of name in the directory at path. paths skip the nameless
+/// directories, the root and the one some images keep everything in.
+fn join(path: &str, name: &str) -> String {
+    if path.is_empty() || name.is_empty() {
+        format!("{path}{name}")
+    } else {
+        format!("{path}/{name}")
+    }
+}
+
 /// a host directory's entries and their names, in order of name, so a
 /// mod lays out the same way every time.
 fn entries(host: &Path) -> Result<Vec<(PathBuf, String)>, FsError> {
@@ -479,6 +527,39 @@ mod tests {
         let layered = Layered::new(&romfs, &image, &mods).unwrap().unwrap();
         assert_eq!(layered.changes, Changes { replaced: 1, ..Changes::default() });
         assert_eq!(file(&whole(&layered, &image), "US/country.bin").unwrap(), [2, 2]);
+        assert_eq!(layered.modded_files(|_| true), [("US/country.bin".to_owned(), vec![2, 2])]);
+        std::fs::remove_dir_all(mods).unwrap();
+    }
+
+    /// the files a mod replaced, patched or added read back by their paths,
+    /// in the game's spelling, and the game's own and those the mod took
+    /// away do not.
+    #[test]
+    fn the_files_a_mod_put_in_read_back_by_path() {
+        let image = game(&[
+            ("cro/Battle.cro", b"old battle"),
+            ("cro/Field.cro", b"field"),
+            ("cro/Gone.cro", b"gone"),
+            ("static.crs", b"crs"),
+            ("Data/model.bin", b"model"),
+        ]);
+        let romfs = RomFs::parse_level3(&image, 0).unwrap();
+        let mods = folder("modded");
+        put(&mods, "romfs/cro/battle.cro", b"new battle");
+        put(&mods, "romfs/cro/Extra.cro", b"extra");
+        put(&mods, "romfs/Data/model.bin", b"new model");
+        let mut ips = b"PATCH".to_vec();
+        ips.extend_from_slice(&[0, 0, 0, 0, 1, b'C']);
+        ips.extend_from_slice(b"EOF");
+        put(&mods, "romfs_ext/static.crs.ips", &ips);
+        put(&mods, "romfs_ext/cro/Gone.cro.stub", b"");
+
+        let layered = Layered::new(&romfs, &image, &mods).unwrap().unwrap();
+        let mut modules = layered.modded_files(|path| path.ends_with(".cro") || path == "static.crs");
+        modules.sort();
+        let expected = [("cro/Battle.cro", &b"new battle"[..]), ("cro/Extra.cro", b"extra"), ("static.crs", b"Crs")];
+        assert_eq!(modules, expected.map(|(path, bytes)| (path.to_owned(), bytes.to_vec())));
+        assert_eq!(layered.modded_files(|_| true).len(), 4);
         std::fs::remove_dir_all(mods).unwrap();
     }
 
