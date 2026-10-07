@@ -22,6 +22,9 @@ fn main() {
             .unwrap_or(zakuro_core::services::cfg::LANGUAGE_ENGLISH),
         // ZAKURO_RECOMPILED=path runs the code 3dsrecomp built for the title.
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().map(Into::into),
+        // ZAKURO_FIND_RECOMPILED=1 runs the library 3dsrecomp installed for
+        // it, as the frontend does.
+        find_recompiled: std::env::var_os("ZAKURO_FIND_RECOMPILED").is_some(),
         // ZAKURO_RASTERIZER=hardware draws on the host GPU.
         hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
         // ZAKURO_RESOLUTION=3 draws at three times the console's resolution.
@@ -115,7 +118,34 @@ fn main() {
     let typed = std::env::var("ZAKURO_KEYBOARD").unwrap_or_else(|_| "Zakuro".to_owned());
 
     let profile_from: Option<u64> = std::env::var("ZAKURO_PROFILE_FROM").ok().and_then(|f| f.parse().ok());
+    // ZAKURO_SWAP_AT=frame:library switches the running game to that library
+    // at that frame, as the frontend does when a recompile finishes, and
+    // with frame:library:built it first moves built over library the way
+    // 3dsrecomp installs one.
+    let swap: Option<(u64, String, Option<String>)> = std::env::var("ZAKURO_SWAP_AT").ok().and_then(|spec| {
+        let mut parts = spec.splitn(3, ':');
+        Some((parts.next()?.parse().ok()?, parts.next()?.to_owned(), parts.next().map(str::to_owned)))
+    });
     for frame in 0..frames {
+        if let Some((at, library, built)) = swap.as_ref().filter(|(at, ..)| *at == frame) {
+            if let Some(built) = built {
+                std::fs::rename(built, library).expect("moving the new library into place");
+            }
+            match loader::swap_recompiled(&mut system, std::path::Path::new(library)) {
+                Ok(()) => println!("frame {at}: switched to {library}"),
+                Err(error) => println!("frame {at}: could not switch, {error}"),
+            }
+            // which files of the library are mapped now, a deleted one is
+            // the old library still loaded
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+            let name = std::path::Path::new(library).file_name().unwrap().to_string_lossy().into_owned();
+            let mapped: std::collections::BTreeSet<String> = maps
+                .lines()
+                .filter(|line| line.contains(&name))
+                .map(|line| line.split_whitespace().skip(5).collect::<Vec<_>>().join(" "))
+                .collect();
+            println!("frame {at}: mapped {mapped:?}");
+        }
         if profile_from == Some(frame) {
             system.enable_profiler();
         }

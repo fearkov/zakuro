@@ -800,8 +800,16 @@ impl App {
                 Stage::Done => {
                     self.library.refresh_recompiled();
                     let playing = self.game.as_ref().is_some_and(|game| game.system.title.as_ref().is_some_and(|title| title.program_id() == program_id));
-                    if playing {
-                        self.menus.message = Some(format!("{name} is recompiled. Reset it from the menu, Esc, to run it on the new code."));
+                    let installed = zakuro_core::recompiled::installed(program_id);
+                    if let (true, Some(game), Some(path)) = (playing, self.game.as_mut(), installed) {
+                        // from here on the game runs on the new code, no reset needed
+                        match zakuro_core::loader::swap_recompiled(&mut game.system, &path) {
+                            Ok(()) => self.menus.message = Some(format!("{name} is recompiled, and it runs on the new code now.")),
+                            Err(error) => {
+                                log::warn!("could not switch {name} to its new code, {error}");
+                                self.menus.message = Some(format!("{name} is recompiled. Reset it from the menu, Esc, to run it on the new code."));
+                            }
+                        }
                     }
                 }
                 Stage::Failed(error) if error != "cancelled" => {

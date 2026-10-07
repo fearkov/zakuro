@@ -125,6 +125,43 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     Ok(system)
 }
 
+/// switches a running game to the library at path, which 3dsrecomp has just
+/// built for it, between two steps, when no recompiled code is running. the
+/// old library goes first, so that the new file is the one loaded even where
+/// it took the old one's place, then the new one is checked against memory
+/// and told where the modules already loaded are, as at boot. the game goes
+/// on from where it was. an error says why it can't.
+pub fn swap_recompiled(system: &mut System, path: &std::path::Path) -> Result<(), String> {
+    if system.config.linked.is_some() || !system.config.find_recompiled {
+        return Err("the game runs code linked in, or a library given to it, or nothing but the interpreter".to_owned());
+    }
+    let title = system.title.as_ref().ok_or("no game is running")?;
+    let text = exheader_text(title);
+    if let Some(hints) = &mut system.hints {
+        hints.save();
+    }
+    system.hints = None;
+    system.recompiled = None;
+    let mut library = crate::recompiled::Library::open(path).map_err(|error| format!("could not load {}, {error}", path.display()))?;
+    if !library.checks_itself() {
+        let modded = crate::mods::code(title, system.config.data_dir.as_deref()).is_ok_and(|(_, modded)| modded);
+        if modded {
+            return Err(format!("a mod changed the game's code and {} can't tell where", path.display()));
+        }
+    }
+    log::info!("running recompiled code from {} from here on, {}", path.display(), library.describe());
+    let stale = library.check(&mut system.memory);
+    if stale > 0 {
+        log::warn!("{stale} functions changed since the game was recompiled, by a mod or in another version of the game, they run in the interpreter");
+    }
+    for module in &system.cro.modules {
+        library.place(&module.name, module.base, &mut system.memory);
+    }
+    system.hints = Some(crate::hints::Hints::new(path, text));
+    system.recompiled = Some(library);
+    Ok(())
+}
+
 /// where the executable's code is.
 fn exheader_text(title: &Title) -> std::ops::Range<u32> {
     let text = &title.exheader.text;
