@@ -154,7 +154,7 @@ fn recompile(
             "recompiling {name} with its mods, which change {}. the library replaces one made without them, and should the mods go, the functions they changed run in the interpreter",
             changes.describe()
         );
-        options.mods = recomp3ds::Mods { code: changes.code.as_deref(), romfs: Some(&files) };
+        options.mods = recomp3ds::Mods { code: changes.code.as_deref(), exheader: changes.exheader.as_deref(), romfs: Some(&files) };
     }
     build::build(rom, &options, events)
 }
@@ -166,6 +166,8 @@ struct Changes {
     /// the game's modules and static.crs they replace or patch, by their
     /// paths in the RomFS, with their bytes.
     modules: Vec<(String, Vec<u8>)>,
+    /// the exheader they give, which says where the code's segments lie.
+    exheader: Option<Vec<u8>>,
 }
 
 impl Changes {
@@ -176,6 +178,7 @@ impl Changes {
             return None;
         }
         let mut title = zakuro_fs::Title::load(rom).inspect_err(|error| log::warn!("mods: {}: {error}", rom.display())).ok()?;
+        let exheader = zakuro_core::mods::exheader(&title, data_dir).map(|(bytes, _)| bytes);
         zakuro_core::mods::lay(&mut title, Some(data_dir));
         let code = match zakuro_core::mods::code(&title, Some(data_dir)) {
             Ok((code, modded)) => modded.then_some(code),
@@ -190,7 +193,7 @@ impl Changes {
             (Some(layered), Some(game)) => layered.modded_files(|path| is_module(path) && game.lookup(path).is_ok()),
             _ => Vec::new(),
         };
-        (code.is_some() || !modules.is_empty()).then_some(Changes { code, modules })
+        (code.is_some() || !modules.is_empty()).then_some(Changes { code, modules, exheader })
     }
 
     /// the bytes the mods put in place of the module at path.
@@ -295,6 +298,37 @@ mod tests {
         let mut described: Vec<String> = changes.describe().split(", ").map(str::to_owned).collect();
         described.sort();
         assert_eq!(described, ["cro/Battle.cro", "static.crs", "the code"]);
+
+        std::fs::remove_dir_all(data_dir).unwrap();
+        std::fs::remove_file(rom).unwrap();
+    }
+
+    /// a mod's exheader.bin takes the place of the game's when it is the
+    /// game's own with its code made longer, and goes to 3dsrecomp, and one
+    /// that looks like another game's, or still encrypted, is left out.
+    #[test]
+    fn a_mods_exheader_is_taken_when_it_is_the_games() {
+        let rom = rom("exheader", &[0; 8], &[]);
+        let data_dir = std::env::temp_dir().join(format!("zakuro-recompile-{}-exheader", std::process::id()));
+        let mods = zakuro_core::mods::dir(&data_dir, PROGRAM_ID);
+        let mut exheader = vec![0; 0x800];
+        put(&mut exheader, 0x10, &[0x0010_0000, 1, 12].map(u32::to_le_bytes).concat());
+        write(&mods.join("exheader.bin"), &exheader);
+        write(&mods.join("code.bin"), &[0xAA; 12]);
+        let laid = || {
+            let mut title = zakuro_fs::Title::load(&rom).unwrap();
+            zakuro_core::mods::lay(&mut title, Some(&data_dir));
+            title.exheader.text.size
+        };
+        assert_eq!(laid(), 12);
+        let changes = Changes::read(&rom, PROGRAM_ID, &data_dir).unwrap();
+        assert_eq!(changes.exheader.as_deref().map(<[u8]>::len), Some(0x400));
+        assert_eq!(changes.code.as_deref(), Some(&[0xAA; 12][..]));
+
+        put(&mut exheader, 0x10, &0x0020_0000u32.to_le_bytes());
+        write(&mods.join("exheader.bin"), &exheader);
+        assert_eq!(laid(), 8, "another game's exheader is left out");
+        assert!(Changes::read(&rom, PROGRAM_ID, &data_dir).unwrap().exheader.is_none());
 
         std::fs::remove_dir_all(data_dir).unwrap();
         std::fs::remove_file(rom).unwrap();
