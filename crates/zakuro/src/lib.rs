@@ -551,6 +551,11 @@ impl App {
             audio.clear();
         }
         let mut config = self.config();
+        // the update and DLC found with the game in the library
+        if let Some(game) = self.library.games.iter().find(|game| game.path == path) {
+            config.update = game.update.as_ref().map(|update| update.path.clone());
+            config.dlc = game.dlc.iter().map(|dlc| dlc.path.clone()).collect();
+        }
         // a recording starts the clock at a known time, for playing it back
         let record = std::env::var_os("ZAKURO_RECORD").map(PathBuf::from);
         let clock = zakuro_core::memory::config::host_clock();
@@ -829,7 +834,8 @@ impl App {
                 },
             },
         };
-        self.jobs.push(Job::start(&game.path, game.program_id, &game.name, self.data_dir.as_deref(), toolchain));
+        let update = game.update.as_ref().map(|update| update.path.as_path());
+        self.jobs.push(Job::start(&game.path, update, game.program_id, &game.name, self.data_dir.as_deref(), toolchain));
     }
 
     /// tells about recompiles as they finish.

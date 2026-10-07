@@ -21,3 +21,4 @@ ab_glyph = "0.2"
 
 [dev-dependencies]
 env_logger = "0.11"
+zakuro-fs = { workspace = true, features = ["testing"] }

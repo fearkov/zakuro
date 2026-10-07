@@ -21,6 +21,18 @@ pub struct Game {
     pub modded: bool,
     /// why it can't be played, when it can't, an encrypted dump say.
     pub problem: Option<String>,
+    /// its update in the folder, the newest there.
+    pub update: Option<Addon>,
+    /// its DLC in the folder.
+    pub dlc: Vec<Addon>,
+}
+
+/// an update or DLC in the folder, which goes with the game of its id.
+#[derive(Debug, Clone)]
+pub struct Addon {
+    pub path: PathBuf,
+    pub title_id: u64,
+    pub version: u16,
 }
 
 /// the games in the chosen folder, found in the background.
@@ -79,18 +91,54 @@ impl Library {
 
 fn scan(folder: &Path, data_dir: Option<&Path>) -> Vec<Game> {
     let Ok(entries) = std::fs::read_dir(folder) else { return Vec::new() };
-    let mut games: Vec<Game> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| GAME_FILES.contains(&extension.to_ascii_lowercase().as_str()))
-        })
-        .map(|path| read_or_list_unreadable(&path, data_dir))
-        .collect();
+    let paths = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| GAME_FILES.contains(&extension.to_ascii_lowercase().as_str()))
+    });
+    let (mut games, mut addons) = (Vec::new(), Vec::new());
+    for path in paths {
+        match addon(&path) {
+            Some(Ok(addon)) => addons.push(addon),
+            Some(Err(problem)) => games.push(unplayable(&path, problem)),
+            None => games.push(read_or_list_unreadable(&path, data_dir)),
+        }
+    }
+    // each update and DLC goes with the game of its id, the newest update
+    for addon in addons {
+        let update = zakuro_fs::TitleKind::of(addon.title_id) == zakuro_fs::TitleKind::Update;
+        let game = games.iter_mut().find(|game| game.problem.is_none() && game.program_id & 0xFFFF_FFFF == addon.title_id & 0xFFFF_FFFF);
+        match (game, update) {
+            (Some(game), true) => {
+                if game.update.as_ref().is_none_or(|known| known.version < addon.version) {
+                    game.update = Some(addon);
+                }
+            }
+            (Some(game), false) => game.dlc.push(addon),
+            (None, true) => games.push(unplayable(&addon.path, "An update for a game that isn't in this folder".to_owned())),
+            (None, false) => games.push(unplayable(&addon.path, "DLC for a game that isn't in this folder".to_owned())),
+        }
+    }
     // the ones that can't be played go last
     games.sort_by_key(|game| (game.problem.is_some(), game.name.to_lowercase()));
     games
+}
+
+/// the update or DLC in the file at path, none when it holds neither, and
+/// why it can't be used when it can't.
+fn addon(path: &Path) -> Option<Result<Addon, String>> {
+    if !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cia")) {
+        return None;
+    }
+    let image = zakuro_fs::RomImage::open(path).ok()?;
+    let cia = zakuro_fs::Cia::read(image.data()).ok()?;
+    if cia.kind() == zakuro_fs::TitleKind::Game {
+        return None;
+    }
+    if cia.contents.iter().any(|content| content.offset.is_some() && content.encrypted()) {
+        return Some(Err("Encrypted, Zakuro needs a decrypted dump".to_owned()));
+    }
+    Some(Ok(Addon { path: path.to_owned(), title_id: cia.title_id, version: cia.version }))
 }
 
 /// a game read, or one that made reading it fail on a bug listed as
@@ -113,6 +161,8 @@ fn unplayable(path: &Path, problem: String) -> Game {
         recompiled: false,
         modded: false,
         problem: Some(problem),
+        update: None,
+        dlc: Vec::new(),
     }
 }
 
@@ -142,6 +192,8 @@ fn read_game(path: &Path, data_dir: Option<&Path>) -> Game {
         recompiled: zakuro_core::recompiled::installed(program_id).is_some(),
         modded: data_dir.is_some_and(|data_dir| zakuro_core::mods::present(data_dir, program_id)),
         problem: None,
+        update: None,
+        dlc: Vec::new(),
     }
 }
 
@@ -156,7 +208,7 @@ fn problem(error: &zakuro_fs::FsError) -> String {
             if let Some(first) = what.get_mut(..1) {
                 first.make_ascii_uppercase();
             }
-            format!("{what}, not a game. Zakuro can't install updates or DLC yet")
+            format!("{what} Zakuro couldn't read, it goes in the folder next to its game")
         }
         _ => format!("Can't be read, {error}"),
     }
@@ -242,7 +294,7 @@ mod tests {
         assert_eq!(problem(&zakuro_fs::FsError::EncryptedCia), "Encrypted, Zakuro needs a decrypted dump");
         assert_eq!(
             problem(&zakuro_fs::FsError::NotAGame("an update")),
-            "An update, not a game. Zakuro can't install updates or DLC yet"
+            "An update Zakuro couldn't read, it goes in the folder next to its game"
         );
     }
 
@@ -277,5 +329,33 @@ mod tests {
         assert_eq!(pixel(1, 0), [255, 0, 0, 255]);
         assert_eq!(pixel(0, 1), [0, 0, 255, 255]);
         assert_eq!(pixel(8, 0), [0, 255, 0, 255]);
+    }
+
+    /// an update and DLC in the folder go with their game, the newest
+    /// update, and one whose game isn't there is listed as such.
+    #[test]
+    fn updates_and_dlc_go_with_their_game() {
+        use zakuro_fs::testing::{cia, ncch};
+        let folder = std::env::temp_dir().join(format!("zakuro-library-addons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let game = 0x0004_0000_00AB_CD00u64;
+        let update = |version: u16| cia(game | 0x000E_0000_0000, version, &[(0, Some(&ncch(game | 0x000E_0000_0000, Some(&[2; 8]), &[])))]);
+        std::fs::write(folder.join("game.cxi"), ncch(game, Some(&[1; 8]), &[])).unwrap();
+        std::fs::write(folder.join("old.cia"), update(0x0400)).unwrap();
+        std::fs::write(folder.join("new.cia"), update(0x0410)).unwrap();
+        let dlc = game | 0x008C_0000_0000;
+        std::fs::write(folder.join("dlc.cia"), cia(dlc, 1, &[(0, Some(&ncch(dlc, None, &[])))])).unwrap();
+        let orphan = 0x0004_000E_0000_0001u64;
+        std::fs::write(folder.join("orphan.cia"), cia(orphan, 1, &[(0, Some(&ncch(orphan, Some(&[3; 8]), &[])))])).unwrap();
+
+        let games = scan(&folder, None);
+        let found = games.iter().find(|entry| entry.program_id == game).unwrap();
+        assert_eq!(found.update.as_ref().map(|update| update.version), Some(0x0410));
+        assert_eq!(found.dlc.len(), 1);
+        let unplayable: Vec<&str> = games.iter().filter_map(|entry| entry.problem.as_deref()).collect();
+        assert_eq!(unplayable, ["An update for a game that isn't in this folder"]);
+        assert_eq!(games.len(), 2);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }

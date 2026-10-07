@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# builders of NCCH and CIA files, for the tests of the crates that read them
+testing = []
+
 [dependencies]
 zakuro-common.workspace = true
 log.workspace = true

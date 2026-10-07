@@ -34,3 +34,6 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 recomp3ds = { git = "https://github.com/fearkov/3dsrecomp" }
 sha2 = "0.10"
 gilrs = { version = "0.11.2", features = ["serde-serialize"] }
+
+[dev-dependencies]
+zakuro-fs = { workspace = true, features = ["testing"] }

@@ -15,6 +15,49 @@ pub enum LoadError {
     ShortCodeImage,
 }
 
+/// whether a title id is the same game's, its update's or its DLC's, which
+/// share the low half.
+fn same_game(title_id: u64, program_id: u64) -> bool {
+    title_id & 0xFFFF_FFFF == program_id & 0xFFFF_FFFF
+}
+
+/// runs the title with the update at path, when it is the title's, and
+/// says whether it is.
+pub fn attach_update(title: &mut Title, path: &std::path::Path) -> bool {
+    match zakuro_fs::Update::load(path) {
+        Ok(update) if same_game(update.title_id, title.program_id()) => {
+            log::info!("the update to v{} from {}", zakuro_fs::version_name(update.version), path.display());
+            title.attach_update(update);
+            true
+        }
+        Ok(update) => {
+            log::warn!("{} updates {:016X}, not this game, it is left out", path.display(), update.title_id);
+            false
+        }
+        Err(error) => {
+            log::warn!("the update {} can't be read, {error}, playing without it", path.display());
+            false
+        }
+    }
+}
+
+/// the DLC at paths that is the title's.
+fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> {
+    let mut found = Vec::new();
+    for path in paths {
+        match zakuro_fs::Dlc::load(path) {
+            Ok(dlc) if same_game(dlc.title_id, title.program_id()) => {
+                let held = dlc.contents.iter().filter(|content| content.offset.is_some()).count();
+                log::info!("DLC v{} from {}, {held} of its {} contents", zakuro_fs::version_name(dlc.version), path.display(), dlc.contents.len());
+                found.push(dlc);
+            }
+            Ok(dlc) => log::warn!("{} is DLC of {:016X}, not this game, it is left out", path.display(), dlc.title_id),
+            Err(error) => log::warn!("the DLC {} can't be read, {error}, playing without it", path.display()),
+        }
+    }
+    found
+}
+
 /// the main thread's stack ends where the shared-memory region begins, which
 /// is what the retail kernel does.
 const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
@@ -22,7 +65,11 @@ const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
     let mut title = Title::load(path)?;
     log::info!("loaded {}", title.describe());
+    if let Some(update) = &config.update {
+        attach_update(&mut title, update);
+    }
     crate::mods::lay(&mut title, config.data_dir.as_deref());
+    let dlc = load_dlc(&title, &config.dlc);
 
     let exheader = &title.exheader;
     let app_bytes = exheader.system_mode.application_memory();
@@ -39,6 +86,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     }
 
     let mut system = System::new(config);
+    system.dlc = dlc;
     system.memory = memory::Memory::new(system.config.new3ds, app_bytes);
     system.kernel = crate::kernel::Kernel::new(
         title.program_id(),
@@ -432,5 +480,30 @@ mod tests {
 
         std::fs::remove_dir_all(data_dir).unwrap();
         std::fs::remove_file(rom).unwrap();
+    }
+
+    /// a game given its update runs the update's code, and has its DLC,
+    /// and an update or DLC of another game is left out.
+    #[test]
+    fn a_game_runs_with_its_update_and_dlc() {
+        use zakuro_fs::testing::{cia, ncch, write};
+        let update_id = PROGRAM_ID & 0xFFFF_FFFF | 0x0004_000E_0000_0000;
+        let dlc_id = PROGRAM_ID & 0xFFFF_FFFF | 0x0004_008C_0000_0000;
+        let game = write("loader-update", "game.cxi", &ncch(PROGRAM_ID, Some(&[1; 8]), &[]));
+        let update = write("loader-update", "update.cia", &cia(update_id, 0x10, &[(0, Some(&ncch(update_id, Some(&[2; 12]), &[])))]));
+        let dlc = write("loader-update", "dlc.cia", &cia(dlc_id, 1, &[(0, Some(&ncch(dlc_id, None, &[("d.bin", b"y")])))]));
+        let other = write("loader-update", "other.cia", &cia(0x0004_008C_0000_0001, 1, &[(0, Some(&ncch(0x0004_008C_0000_0001, None, &[])))]));
+
+        let config = Config { update: Some(update.clone()), dlc: vec![dlc.clone(), other.clone()], ..Config::default() };
+        let mut system = load(&game, config).unwrap();
+        let mut code = [0; 12];
+        system.memory.read_bytes(0x0010_0000, &mut code);
+        assert_eq!(code, [2; 12]);
+        assert!(system.title.as_ref().unwrap().update().is_some());
+        assert_eq!(system.dlc.iter().map(|dlc| dlc.title_id).collect::<Vec<_>>(), vec![dlc_id]);
+
+        for path in [game, update, dlc, other] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }

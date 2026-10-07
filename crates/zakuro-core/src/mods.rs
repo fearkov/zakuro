@@ -142,4 +142,18 @@ pub fn lay(title: &mut Title, data_dir: Option<&Path>) {
         Ok(None) => log::info!("mods: {} changes nothing in the game's files", dir.display()),
         Err(error) => log::warn!("mods: {} can't be laid over the game: {error}", dir.display()),
     }
+    // and over the update's files, which a game reads besides its own
+    if let Some(update) = title.update_mut() {
+        match update.title.lay_mods(&dir) {
+            Ok(Some(changes)) => log::info!(
+                "mods over the update's files: {} replaced, {} added, {} patched, {} removed",
+                changes.replaced,
+                changes.added,
+                changes.patched,
+                changes.removed
+            ),
+            Ok(None) => {}
+            Err(error) => log::warn!("mods: {} can't be laid over the update: {error}", dir.display()),
+        }
+    }
 }

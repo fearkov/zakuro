@@ -29,6 +29,10 @@ fn main() {
         hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
         // ZAKURO_RESOLUTION=3 draws at three times the console's resolution.
         resolution: std::env::var("ZAKURO_RESOLUTION").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+        // ZAKURO_UPDATE=file.cia runs the title with its update, and
+        // ZAKURO_DLC=a.cia:b.cia with its DLC.
+        update: std::env::var_os("ZAKURO_UPDATE").map(Into::into),
+        dlc: std::env::var_os("ZAKURO_DLC").map(|paths| std::env::split_paths(&paths).collect()).unwrap_or_default(),
         // ZAKURO_DATA=dir keeps saves in dir/user and takes mods from
         // dir/mods, the working directory's user folder and no mods without it.
         data_dir: std::env::var_os("ZAKURO_DATA").map(Into::into),

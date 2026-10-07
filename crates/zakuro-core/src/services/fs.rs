@@ -26,6 +26,7 @@ pub const ARCHIVE_NCCH: u32 = 0x2345_678A;
 
 /// media the NCCH archive's path can select.
 const MEDIA_NAND: u8 = 0;
+const MEDIA_SDMC: u8 = 1;
 const MEDIA_GAMECARD: u8 = 2;
 
 /// high title IDs of the two NAND archives a game reads shared data from.
@@ -101,14 +102,14 @@ const DIRECTORY_ENTRY_SIZE: u32 = 0x228;
 /// an open file, and where its bytes come from.
 #[derive(Debug, Clone)]
 pub enum FileBacking {
-    /// a window into the loaded ROM image.
-    RomImage { offset: u64, size: u64 },
+    /// a window into a ROM image, the title's, its update's or its DLC's.
+    RomImage { image: std::sync::Arc<zakuro_fs::RomImage>, offset: u64, size: u64 },
     /// a file in one of the writable archives, kept on the host.
     Host(PathBuf),
     /// read-only bytes generated in memory.
     Memory(Vec<u8>),
-    /// the title's RomFS with mods over it.
-    Layered(std::sync::Arc<zakuro_fs::layered::Layered>),
+    /// a RomFS with mods over it, and the image it is in.
+    Layered(std::sync::Arc<zakuro_fs::layered::Layered>, std::sync::Arc<zakuro_fs::RomImage>),
 }
 
 impl FileBacking {
@@ -117,7 +118,7 @@ impl FileBacking {
             FileBacking::RomImage { size, .. } => *size,
             FileBacking::Host(path) => host_archive::size_of(path),
             FileBacking::Memory(data) => data.len() as u64,
-            FileBacking::Layered(layered) => layered.len(),
+            FileBacking::Layered(layered, _) => layered.len(),
         }
     }
 }
@@ -971,6 +972,12 @@ fn open_file(
                     let kind = system.memory.read32(path_ptr + 8);
                     open_ncch_kind(system, kind)
                 }
+                MEDIA_SDMC => {
+                    let content_index = system.memory.read32(path_ptr + 4) as u16;
+                    let kind = system.memory.read32(path_ptr + 8);
+                    let title_id = (archive_path.high_program_id as u64) << 32 | archive_path.low_program_id as u64;
+                    open_sd_title(system, title_id, content_index, kind)
+                }
                 other => {
                     log::warn!(
                         "fs: NCCH archive media type {other} is not implemented ({:08X}{:08X})",
@@ -1038,29 +1045,16 @@ fn system_archive_data(path: NcchArchivePath, data_dir: Option<&std::path::Path>
 fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     match kind {
+        // the update's RomFS, which a game opens besides its own, its own
+        // when there is no update
         SELF_NCCH_ROMFS | SELF_NCCH_UPDATE_ROMFS => {
-            if let Some(layered) = title.layered.clone() {
-                log::debug!("fs: opened SelfNCCH RomFS with mods over it, {} MiB", layered.len() / (1024 * 1024));
-                return Some(system.services.fs.add_file(OpenFile {
-                    path: "romfs:/".into(),
-                    backing: FileBacking::Layered(layered),
-                }));
-            }
-            let romfs = title.romfs.as_ref()?;
-            let size = title.ncch.romfs_size.saturating_sub(0x1000);
-            let backing = FileBacking::RomImage {
-                offset: romfs.base,
-                size,
+            let update = title.update().filter(|_| kind == SELF_NCCH_UPDATE_ROMFS);
+            let (backing, path) = match update {
+                Some(update) => (romfs_backing(&update.title)?, "patch:/"),
+                None => (romfs_backing(title)?, "romfs:/"),
             };
-            log::debug!(
-                "fs: opened SelfNCCH RomFS at file offset 0x{:X}, {} MiB",
-                romfs.base,
-                size / (1024 * 1024)
-            );
-            Some(system.services.fs.add_file(OpenFile {
-                path: "romfs:/".into(),
-                backing,
-            }))
+            log::debug!("fs: opened {path}, {} MiB", backing.size() / (1024 * 1024));
+            Some(system.services.fs.add_file(OpenFile { path: path.into(), backing }))
         }
         SELF_NCCH_CODE | SELF_NCCH_EXEFS => {
             let data = title.exefs_file(".code")?.to_vec();
@@ -1074,6 +1068,48 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
             None
         }
     }
+}
+
+/// what a title's RomFS reads through, with its mods over it when it has
+/// any.
+fn romfs_backing(title: &zakuro_fs::Title) -> Option<FileBacking> {
+    if let Some(layered) = title.layered.clone() {
+        return Some(FileBacking::Layered(layered, title.shared_image()));
+    }
+    let romfs = title.romfs.as_ref()?;
+    // from level 3 to the end of the RomFS
+    let end = title.ncch_offset() + title.ncch.romfs_offset + title.ncch.romfs_size;
+    Some(FileBacking::RomImage { image: title.shared_image(), offset: romfs.base, size: end.saturating_sub(romfs.base) })
+}
+
+/// opens a title on the SD card through the NCCH archive, the game itself
+/// installed from a CIA, its update, or the content of an index of its DLC.
+fn open_sd_title(system: &mut System, title_id: u64, content_index: u16, kind: u32) -> Option<u32> {
+    let title = system.title.as_ref()?;
+    if title_id == title.program_id() {
+        return open_ncch_kind(system, kind);
+    }
+    if title.update().is_some_and(|update| update.title_id == title_id) {
+        return open_ncch_kind(system, if kind == SELF_NCCH_ROMFS { SELF_NCCH_UPDATE_ROMFS } else { kind });
+    }
+    let Some(dlc) = system.dlc.iter().find(|dlc| dlc.title_id == title_id) else {
+        log::warn!("fs: {title_id:016X} is not on the SD card");
+        return None;
+    };
+    if kind != SELF_NCCH_ROMFS {
+        log::warn!("fs: DLC {title_id:016X} opened as path type {kind}, which DLC does not have");
+        return None;
+    }
+    let Some((offset, size)) = dlc.romfs(content_index) else {
+        log::warn!("fs: DLC {title_id:016X} has no content {content_index}");
+        return None;
+    };
+    let image = dlc.image();
+    log::debug!("fs: opened DLC {title_id:016X} content {content_index}, {} KiB", size / 1024);
+    Some(system.services.fs.add_file(OpenFile {
+        path: format!("dlc:/{content_index}"),
+        backing: FileBacking::RomImage { image, offset, size },
+    }))
 }
 
 /// how long a read of length bytes takes on the console, in nanoseconds,
@@ -1092,6 +1128,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
 
     match file.backing {
         FileBacking::RomImage {
+            image,
             offset: base,
             size: total,
         } => {
@@ -1099,11 +1136,8 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
                 return 0;
             }
             let count = (size as u64).min(total - offset) as usize;
-            let Some(title) = system.title.as_ref() else {
-                return 0;
-            };
             let start = (base + offset) as usize;
-            let Some(slice) = title.image().data().get(start..start + count) else {
+            let Some(slice) = image.data().get(start..start + count) else {
                 log::warn!("fs: read past the end of the ROM image");
                 return 0;
             };
@@ -1128,12 +1162,9 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             system.write_from_service(dest, &data[start..start + count]);
             count as u32
         }
-        FileBacking::Layered(layered) => {
-            let Some(title) = system.title.as_ref() else {
-                return 0;
-            };
+        FileBacking::Layered(layered, image) => {
             let mut data = vec![0u8; (size as u64).min(layered.len().saturating_sub(offset)) as usize];
-            let count = layered.read(title.image().data(), offset, &mut data);
+            let count = layered.read(image.data(), offset, &mut data);
             system.write_from_service(dest, &data[..count]);
             count as u32
         }

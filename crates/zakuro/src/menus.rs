@@ -241,6 +241,13 @@ impl Menus {
                                     if game.modded {
                                         ui.label(RichText::new("mods").color(Color32::from_rgb(120, 170, 230)));
                                     }
+                                    if let Some(update) = &game.update {
+                                        let version = zakuro_fs::version_name(update.version);
+                                        ui.label(RichText::new(format!("update {version}")).color(Color32::from_rgb(220, 180, 100)));
+                                    }
+                                    if !game.dlc.is_empty() {
+                                        ui.label(RichText::new("DLC").color(Color32::from_rgb(220, 180, 100)));
+                                    }
                                 });
                             });
                             if game.problem.is_some() {

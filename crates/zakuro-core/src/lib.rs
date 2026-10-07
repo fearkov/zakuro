@@ -51,6 +51,10 @@ pub struct Config {
     /// draw the pictures of the texture pack in the title's mods folder in
     /// place of its textures, which takes the host's GPU.
     pub texture_packs: bool,
+    /// the title's update, an update's CIA, whose code and data it runs.
+    pub update: Option<std::path::PathBuf>,
+    /// the title's downloadable content, DLC CIAs.
+    pub dlc: Vec<std::path::PathBuf>,
     /// how many times the console's resolution the host's GPU draws at.
     pub resolution: u32,
     /// the Vulkan presenter's device, to draw on and show the screens
@@ -75,6 +79,8 @@ impl Default for Config {
             data_dir: None,
             hardware_renderer: false,
             texture_packs: true,
+            update: None,
+            dlc: Vec::new(),
             resolution: 1,
             device: None,
             clock: None,
@@ -104,6 +110,8 @@ pub struct System {
     pub gpu: Gpu,
     pub renderer: Box<dyn Renderer>,
     pub title: Option<Title>,
+    /// the title's downloadable content.
+    pub dlc: Vec<zakuro_fs::Dlc>,
     pub config: Config,
 
     pub exited: bool,
@@ -194,6 +202,7 @@ impl System {
             gpu: Gpu::new(),
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
+            dlc: Vec::new(),
             config,
             exited: false,
             broke: false,

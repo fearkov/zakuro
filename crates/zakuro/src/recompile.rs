@@ -77,11 +77,11 @@ impl Job {
     /// starts recompiling the game at rom with toolchain's compiler, with
     /// what its mods in data_dir change. the compilers run below normal
     /// priority, so that a game can be played meanwhile.
-    pub fn start(rom: &Path, program_id: u64, name: &str, data_dir: Option<&Path>, toolchain: Toolchain) -> Job {
+    pub fn start(rom: &Path, update: Option<&Path>, program_id: u64, name: &str, data_dir: Option<&Path>, toolchain: Toolchain) -> Job {
         let first = if matches!(toolchain, Toolchain::Download(_)) { Stage::Downloading(0.0) } else { Stage::Generating };
         let state = Arc::new(Mutex::new(State { stage: first, finished_at: None }));
         let cancel = Arc::new(AtomicBool::new(false));
-        let (progress, stop, rom) = (state.clone(), cancel.clone(), rom.to_owned());
+        let (progress, stop, rom, update) = (state.clone(), cancel.clone(), rom.to_owned(), update.map(Path::to_owned));
         let (game, data_dir) = (name.to_owned(), data_dir.map(Path::to_owned));
         std::thread::spawn(move || {
             let events = |event: Event| {
@@ -104,7 +104,8 @@ impl Job {
                     downloaded
                 }
             };
-            let result = compiler.and_then(|compiler| recompile(&rom, program_id, &game, data_dir.as_deref(), compiler, &stop, &events));
+            let result =
+                compiler.and_then(|compiler| recompile(&rom, update.as_deref(), program_id, &game, data_dir.as_deref(), compiler, &stop, &events));
             if let Ok(mut state) = progress.lock() {
                 state.stage = match result {
                     Ok(_) => Stage::Done,
@@ -134,10 +135,12 @@ impl Job {
     }
 }
 
-/// recompiles the game at rom, its code and its modules the way its mods
-/// in data_dir leave them when they change any.
+/// recompiles the game at rom, its code and its modules the way its update
+/// and its mods in data_dir leave them when they change any.
+#[allow(clippy::too_many_arguments)]
 fn recompile(
     rom: &Path,
+    update: Option<&Path>,
     program_id: u64,
     name: &str,
     data_dir: Option<&Path>,
@@ -145,13 +148,13 @@ fn recompile(
     cancel: &AtomicBool,
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<PathBuf, String> {
-    let changes = data_dir.and_then(|data_dir| Changes::read(rom, program_id, data_dir));
+    let changes = Changes::read(rom, update, program_id, data_dir);
     let files = |path: &str| changes.as_ref()?.module(path);
     log::info!("recompiling {name} with {}", compiler.describe());
     let mut options = build::Options { cancel: Some(cancel), compiler: Some(compiler), background: true, ..build::Options::default() };
     if let Some(changes) = &changes {
         log::info!(
-            "recompiling {name} with its mods, which change {}. the library replaces one made without them, and should the mods go, the functions they changed run in the interpreter",
+            "recompiling {name} with its update or mods, which change {}. the library replaces one made without them, and should they go, the functions they changed run in the interpreter",
             changes.describe()
         );
         options.mods = recomp3ds::Mods { code: changes.code.as_deref(), exheader: changes.exheader.as_deref(), romfs: Some(&files) };
@@ -171,28 +174,42 @@ struct Changes {
 }
 
 impl Changes {
-    /// what the mods in data_dir change for the game at rom, none when they
-    /// leave its code and its modules alone.
-    fn read(rom: &Path, program_id: u64, data_dir: &Path) -> Option<Changes> {
-        if !zakuro_core::mods::present(data_dir, program_id) {
+    /// what the update at update and the mods in data_dir change for the
+    /// game at rom, none when they leave its code and its modules alone.
+    fn read(rom: &Path, update: Option<&Path>, program_id: u64, data_dir: Option<&Path>) -> Option<Changes> {
+        let modded = data_dir.is_some_and(|data_dir| zakuro_core::mods::present(data_dir, program_id));
+        if !modded && update.is_none() {
             return None;
         }
         let mut title = zakuro_fs::Title::load(rom).inspect_err(|error| log::warn!("mods: {}: {error}", rom.display())).ok()?;
-        let exheader = zakuro_core::mods::exheader(&title, data_dir).map(|(bytes, _)| bytes);
-        zakuro_core::mods::lay(&mut title, Some(data_dir));
-        let code = match zakuro_core::mods::code(&title, Some(data_dir)) {
-            Ok((code, modded)) => modded.then_some(code),
+        let updated = update.is_some_and(|update| zakuro_core::loader::attach_update(&mut title, update));
+        // the mods' exheader, or the update's, which says where its code's
+        // segments are
+        let exheader = data_dir
+            .and_then(|data_dir| zakuro_core::mods::exheader(&title, data_dir))
+            .map(|(bytes, _)| bytes)
+            .or_else(|| updated.then(|| title.exheader_bytes().to_vec()));
+        zakuro_core::mods::lay(&mut title, data_dir);
+        let code = match zakuro_core::mods::code(&title, data_dir) {
+            Ok((code, modded)) => (modded || updated).then_some(code),
             Err(error) => {
                 log::warn!("mods: the game's code can't be read: {error}");
                 None
             }
         };
-        // 3dsrecomp reads the modules the game has, one the mod adds is left
-        // to the interpreter
-        let modules = match (&title.layered, &title.romfs) {
-            (Some(layered), Some(game)) => layered.modded_files(|path| is_module(path) && game.lookup(path).is_ok()),
+        // 3dsrecomp reads the modules the game has, the update's version of
+        // one, and the mods' over either. one either adds is left to the
+        // interpreter
+        let mut modules = match (title.update(), &title.romfs) {
+            (Some(update), Some(game)) => update_modules(&update.title, game),
             _ => Vec::new(),
         };
+        if let (Some(layered), Some(game)) = (&title.layered, &title.romfs) {
+            for (path, bytes) in layered.modded_files(|path| is_module(path) && game.lookup(path).is_ok()) {
+                modules.retain(|(at, _)| !at.eq_ignore_ascii_case(&path));
+                modules.push((path, bytes));
+            }
+        }
         (code.is_some() || !modules.is_empty()).then_some(Changes { code, modules, exheader })
     }
 
@@ -206,6 +223,33 @@ impl Changes {
         let code = self.code.as_ref().map(|_| "the code");
         code.into_iter().chain(self.modules.iter().map(|(path, _)| path.as_str())).collect::<Vec<_>>().join(", ")
     }
+}
+
+/// the modules of the game an update has a version of, by their paths, with
+/// that version's bytes, with the mods over the update when there are any.
+fn update_modules(update: &zakuro_fs::Title, game: &zakuro_fs::RomFs) -> Vec<(String, Vec<u8>)> {
+    let Some(romfs) = &update.romfs else { return Vec::new() };
+    let modded: Vec<(String, Vec<u8>)> = update.layered.as_ref().map(|layered| layered.modded_files(is_module)).unwrap_or_default();
+    let mut modules = Vec::new();
+    let Ok(root) = romfs.root() else { return modules };
+    let mut pending = vec![(String::new(), root)];
+    while let Some((path, dir)) = pending.pop() {
+        for (_, file) in romfs.files(&dir) {
+            let path = if path.is_empty() { file.name.clone() } else { format!("{path}/{}", file.name) };
+            if !is_module(&path) || game.lookup(&path).is_err() {
+                continue;
+            }
+            let bytes = match modded.iter().find(|(at, _)| at.eq_ignore_ascii_case(&path)) {
+                Some((_, bytes)) => Some(bytes.clone()),
+                None => update.read_romfs(&file, 0, file.data_size as usize).map(<[u8]>::to_vec),
+            };
+            modules.extend(bytes.map(|bytes| (path, bytes)));
+        }
+        for (_, child) in romfs.subdirs(&dir) {
+            pending.push((if path.is_empty() { child.name.clone() } else { format!("{path}/{}", child.name) }, child));
+        }
+    }
+    modules
 }
 
 /// whether the RomFS file at path is code 3dsrecomp reads, a CRO module or
@@ -280,16 +324,16 @@ mod tests {
         let rom = rom("found", &[0; 8], &files);
         let data_dir = std::env::temp_dir().join(format!("zakuro-recompile-{}-found", std::process::id()));
         let mods = zakuro_core::mods::dir(&data_dir, PROGRAM_ID);
-        assert!(Changes::read(&rom, PROGRAM_ID, &data_dir).is_none());
+        assert!(Changes::read(&rom, None, PROGRAM_ID, Some(&data_dir)).is_none());
         write(&mods.join("romfs/a.bin"), b"b");
         write(&mods.join("romfs/cro/Extra.cro"), b"extra");
-        assert!(Changes::read(&rom, PROGRAM_ID, &data_dir).is_none(), "neither the code nor the game's modules changed");
+        assert!(Changes::read(&rom, None, PROGRAM_ID, Some(&data_dir)).is_none(), "neither the code nor the game's modules changed");
 
         let ips = |data: &[u8]| [&b"PATCH"[..], &[0, 0, 0, 0, data.len() as u8], data, b"EOF"].concat();
         write(&mods.join("exefs/code.ips"), &ips(&[0xAA]));
         write(&mods.join("romfs/cro/battle.cro"), b"modded battle");
         write(&mods.join("romfs_ext/static.crs.ips"), &ips(b"C"));
-        let changes = Changes::read(&rom, PROGRAM_ID, &data_dir).unwrap();
+        let changes = Changes::read(&rom, None, PROGRAM_ID, Some(&data_dir)).unwrap();
         assert_eq!(changes.code.as_deref(), Some(&[0xAA, 0, 0, 0, 0, 0, 0, 0][..]));
         assert_eq!(changes.module("cro/Battle.cro").as_deref(), Some(&b"modded battle"[..]));
         assert_eq!(changes.module("static.crs").as_deref(), Some(&b"Crs"[..]));
@@ -321,14 +365,14 @@ mod tests {
             title.exheader.text.size
         };
         assert_eq!(laid(), 12);
-        let changes = Changes::read(&rom, PROGRAM_ID, &data_dir).unwrap();
+        let changes = Changes::read(&rom, None, PROGRAM_ID, Some(&data_dir)).unwrap();
         assert_eq!(changes.exheader.as_deref().map(<[u8]>::len), Some(0x400));
         assert_eq!(changes.code.as_deref(), Some(&[0xAA; 12][..]));
 
         put(&mut exheader, 0x10, &0x0020_0000u32.to_le_bytes());
         write(&mods.join("exheader.bin"), &exheader);
         assert_eq!(laid(), 8, "another game's exheader is left out");
-        assert!(Changes::read(&rom, PROGRAM_ID, &data_dir).unwrap().exheader.is_none());
+        assert!(Changes::read(&rom, None, PROGRAM_ID, Some(&data_dir)).unwrap().exheader.is_none());
 
         std::fs::remove_dir_all(data_dir).unwrap();
         std::fs::remove_file(rom).unwrap();
