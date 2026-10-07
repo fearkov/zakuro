@@ -325,7 +325,10 @@ impl Settings {
         let Some(path) = path() else { return Settings::default() };
         match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).unwrap_or_else(|error| {
-                log::warn!("could not read {}, {error}, using the defaults", path.display());
+                // kept aside, the next save would write over it
+                let aside = path.with_extension("toml.bad");
+                let _ = std::fs::copy(&path, &aside);
+                log::warn!("could not read {}, {error}, using the defaults, it is kept as {}", path.display(), aside.display());
                 Settings::default()
             }),
             Err(_) => Settings::default(),

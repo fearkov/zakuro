@@ -449,12 +449,17 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Tab is fast forward while a game runs, not a key for moving the
         // interface's focus around
-        let tab = matches!(&event, WindowEvent::KeyboardInput { event, .. } if event.physical_key == PhysicalKey::Code(KeyCode::Tab));
+        let (tab, repeat) = match &event {
+            WindowEvent::KeyboardInput { event, .. } => (event.physical_key == PhysicalKey::Code(KeyCode::Tab), event.repeat),
+            _ => (false, false),
+        };
         let in_game = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_none())
             && !self.menus.menu_open
             && !self.menus.settings_open;
+        // a Tab held down keeps repeating over a message too
+        let withheld = tab && (in_game || (repeat && self.game.is_some()));
         let consumed = match (&mut self.gui, &self.window) {
-            (Some(gui), Some(window)) if !(tab && in_game) => gui.event(window, &event),
+            (Some(gui), Some(window)) if !withheld => gui.event(window, &event),
             _ => false,
         };
         match event {
@@ -779,9 +784,15 @@ impl App {
     }
 
     /// the window size that fits the screens at the chosen scale.
-    fn window_size(&self) -> winit::dpi::LogicalSize<u32> {
+    fn window_size(&self) -> winit::dpi::Size {
         let (width, height) = self.layout.screens().size();
-        winit::dpi::LogicalSize::new(width * self.scale, height * self.scale)
+        // scaled by whole numbers, a desktop scaled by 125% say would leave a
+        // border, so the window gets whole multiples of the screens' pixels
+        if let (true, Some(window)) = (self.settings.integer_scale, &self.window) {
+            let times = (self.scale as f64 * window.scale_factor()).round().max(1.0) as u32;
+            return winit::dpi::PhysicalSize::new(width * times, height * times).into();
+        }
+        winit::dpi::LogicalSize::new(width * self.scale, height * self.scale).into()
     }
 
     /// recompiles the library's game at index, with the computer's C
