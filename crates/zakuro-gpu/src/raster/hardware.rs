@@ -1600,7 +1600,9 @@ impl Hardware {
     /// drawn, when the GPU can scale surfaces, and says the one it took.
     pub fn set_scale(&mut self, scale: u32) -> u32 {
         if self.surfaces.is_empty() && self.blits {
-            self.scale = scale.clamp(1, 4);
+            // up to 8, and no more than keeps the largest buffers, 1024
+            // pixels across, within what the GPU makes
+            self.scale = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
         }
         self.scale
     }

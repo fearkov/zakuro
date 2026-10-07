@@ -375,8 +375,9 @@ impl Menus {
             ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
             ui.add_enabled(
                 settings.hardware_rasterizer,
-                egui::Slider::new(&mut settings.resolution, 1..=4).text("Resolution").suffix("x"),
-            );
+                egui::Slider::new(&mut settings.resolution, 1..=8).text("Resolution").suffix("x"),
+            )
+            .on_hover_text("How many times the console's resolution the 3D is drawn at. Past what the window shows, the extra pixels smooth the edges, at a cost to the GPU that grows fast.");
             ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
                 .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
             ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
