@@ -168,9 +168,15 @@ impl Library {
     }
 
     /// whether the code came from an older 3dsrecomp than the one this
-    /// build has, so that recompiling the game again makes it run faster.
+    /// build has, so that recompiling the game again makes it better.
     pub fn outdated(&self) -> bool {
         self.code.generation() < recomp_abi::GENERATION
+    }
+
+    /// whether the code can tell the functions whose code changed in
+    /// memory, which it can from generation 2 on.
+    pub fn checks_itself(&self) -> bool {
+        self.code.origins(0).is_some()
     }
 
     /// how many instructions the code has handed to the interpreter.
@@ -201,15 +207,30 @@ impl Library {
         self.lookup(address).is_some()
     }
 
+    /// marks the executable's functions whose code in memory is not what
+    /// they were recompiled from, which a mod or another version of the
+    /// game does, so that the interpreter runs them. how many there are.
+    pub fn check(&mut self, memory: &mut Memory) -> usize {
+        let stale = self.code.check(0, 0, |address, bytes| memory.read_bytes(address, bytes));
+        self.found = Library::nothing_found();
+        stale
+    }
+
     /// tells the code of the module called name where the title loaded it,
-    /// zero when it unloads it.
-    pub fn place(&mut self, name: &str, base: u32) {
+    /// zero when it unloads it, and checks the module's code once it is in
+    /// memory.
+    pub fn place(&mut self, name: &str, base: u32, memory: &mut Memory) {
         let Some(index) = self.code.module_index(name) else { return };
         self.code.place(index, base);
         // what was found before may have moved or gone
         self.found = Library::nothing_found();
-        if base != 0 {
-            log::info!("recompiled code for {name} runs at 0x{base:08X}");
+        if base == 0 {
+            return;
+        }
+        log::info!("recompiled code for {name} runs at 0x{base:08X}");
+        let stale = self.code.check(index + 1, base, |address, bytes| memory.read_bytes(address, bytes));
+        if stale > 0 {
+            log::warn!("{stale} functions of {name} changed since it was recompiled, they run in the interpreter");
         }
     }
 

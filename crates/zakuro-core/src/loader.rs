@@ -47,7 +47,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     );
 
     map_special_pages(&mut system, app_bytes);
-    map_code(&mut system, &title)?;
+    let modded = map_code(&mut system, &title)?;
     map_stack(&mut system, exheader.stack_size);
 
     system.kernel.heap_top = HEAP_VADDR;
@@ -90,10 +90,21 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     } else if let Some(path) = system.config.recompiled.clone().or_else(|| installed(&system, &title)) {
         let path = if path.is_dir() { path.join(recomp_abi::library_name(title.program_id())) } else { path };
         match crate::recompiled::Library::open(&path) {
-            Ok(library) => {
+            // code a mod changed would go on running as it was recompiled
+            Ok(library) if modded && !library.checks_itself() => log::warn!(
+                "a mod changed the game's code and {} can't tell where, which code recompiled again can, interpreting everything",
+                path.display()
+            ),
+            Ok(mut library) => {
                 log::info!("running recompiled code from {}, {}", path.display(), library.describe());
                 if library.outdated() {
-                    log::warn!("an older 3dsrecomp made {}, recompiling the game again makes it faster", path.display());
+                    log::warn!("an older 3dsrecomp made {}, recompiling the game again brings the newest improvements", path.display());
+                }
+                let stale = library.check(&mut system.memory);
+                if stale > 0 {
+                    log::warn!(
+                        "{stale} functions changed since the game was recompiled, by a mod or in another version of the game, they run in the interpreter"
+                    );
                 }
                 system.recompiled = Some(library);
                 let text = exheader_text(&title);
@@ -193,8 +204,9 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
     );
 }
 
-fn map_code(system: &mut System, title: &Title) -> Result<(), LoadError> {
-    let code = title.code()?;
+/// maps the code segments, saying whether a mod changed them.
+fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
+    let (code, modded) = crate::mods::code(title, system.config.data_dir.as_deref())?;
     let exheader = &title.exheader;
 
     let segments = [
@@ -271,7 +283,7 @@ fn map_code(system: &mut System, title: &Title) -> Result<(), LoadError> {
         log::debug!("mapped .bss at 0x{bss_start:08X}, 0x{bss_size:X} bytes");
     }
 
-    Ok(())
+    Ok(modded)
 }
 
 fn map_stack(system: &mut System, stack_size: u32) {

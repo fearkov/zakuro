@@ -561,7 +561,7 @@ impl App {
         }
         if outdated {
             self.menus.message = Some(format!(
-                "{} was recompiled by an older version of Zakuro. Recompile it again from the library and it runs faster.",
+                "{} was recompiled by an older version of Zakuro. Recompile it again from the library to get the newest improvements.",
                 game.name
             ));
         }

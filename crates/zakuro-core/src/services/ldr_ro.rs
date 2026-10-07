@@ -82,7 +82,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                     copy_back(system, base, size);
                     shrink(system, base, if fix_size == 0 { size } else { fix_size });
                     if let (Some(library), Some(module)) = (&mut system.recompiled, system.cro.modules.last()) {
-                        library.place(&module.name, module.base);
+                        library.place(&module.name, module.base, &mut system.memory);
                     }
                     buffer.reply(&mut system.memory, id, &[fix_size])
                 }
@@ -102,7 +102,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let address = buffer.get(&mut system.memory, 1);
             let module = system.cro.modules.iter().find(|m| m.base == address);
             if let (Some(library), Some(module)) = (&mut system.recompiled, module) {
-                library.place(&module.name, 0);
+                library.place(&module.name, 0, &mut system.memory);
             }
             system.cro.unload(&mut system.memory, address);
             copy_out(system, address);
