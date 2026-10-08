@@ -855,7 +855,8 @@ pub(crate) struct DrawnTexture {
 
 /// texture unit 0's configuration and backing data for one draw call.
 struct BoundTexture {
-    /// the texture decoded, row by row from the top, none when it is drawn.
+    /// the texture decoded, row by row from the top, none when it is drawn
+    /// unless it reaches past the rows drawn.
     texels: Arc<[[u8; 4]]>,
     drawn: Option<DrawnTexture>,
     /// bilinear rather than point sampling when magnifying.
@@ -1201,6 +1202,7 @@ fn bind_texture<M: GpuMemory>(
     cache: &mut TextureCache,
     unit: usize,
     drawn: Option<DrawnTexture>,
+    past: bool,
 ) -> Option<BoundTexture> {
     // one bit per unit in GPUREG_TEXUNIT_CONFIG.
     if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
@@ -1230,9 +1232,9 @@ fn bind_texture<M: GpuMemory>(
 
     let key = (addr, format, width, height);
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
-        (Some(_), _) => (Arc::default(), None),
-        (None, Some(found)) => found,
-        (None, None) => match memory.slice(addr, size) {
+        (Some(_), _) if !past => (Arc::default(), None),
+        (_, Some(found)) => found,
+        (_, None) => match memory.slice(addr, size) {
             Some(data) => cache.decoded(key, data),
             None => {
                 let mut data = vec![0u8; size];
@@ -1255,7 +1257,8 @@ fn bind_texture<M: GpuMemory>(
         height,
         // the border color register comes first in each unit's block, RGBA8
         border: registers[base].to_le_bytes().map(|c| c as f32 / 255.0),
-        replacement,
+        // a buffer drawn into is the GPU's, not a pack's picture
+        replacement: replacement.filter(|_| drawn.is_none()),
     })
 }
 
@@ -2298,11 +2301,15 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // it before it is read
     // one the GPU still holds it copies there
     let mut drawn: [Option<DrawnTexture>; 3] = [None; 3];
+    // the rest of one reaching past the rows drawn is read as memory holds
+    // it, as of what was written back last
+    let mut past = [false; 3];
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {
         for (unit, drawn) in drawn.iter_mut().enumerate() {
             *drawn = drawn_texture(registers, memory, unit).filter(|texture| hardware.holds(texture));
-            if drawn.is_some() {
+            if let Some(texture) = drawn {
+                past[unit] = !hardware.covers(texture);
                 continue;
             }
             if let Some((addr, len)) = texture_range(registers, memory, unit) {
@@ -2313,7 +2320,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         }
     }
     let textures: [Option<BoundTexture>; 3] =
-        std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit, drawn[unit]));
+        std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit, drawn[unit], past[unit]));
     let tex_env = resources.tex_env.read(registers);
     // the lighting only matters to a draw whose combiners read it.
     let lighting = if tex_env.reads_lighting() { resources.lighting.read(registers) } else { None };
@@ -3548,6 +3555,118 @@ mod tests {
         let mut first = [0u8; 256];
         memory.read(COLOR, &mut first);
         assert_eq!(first[..], fill[..], "and the fill stays");
+    }
+
+    /// a fill over the start of a buffer the GPU drew, in a pattern its
+    /// pixels can't take, does not have the drawing come down then, which
+    /// waits for the GPU. once it does come down, the bytes the fill wrote
+    /// stay, even ones the fill left as memory held them.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_fill_over_part_of_a_drawing_leaves_the_rest_on_the_gpu() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&target_registers(), &mut memory, &mut resources, &cover(-0.5, RED));
+        // a three byte pattern of zeros, as memory held them, over 100 bytes
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.before_fill(&mut memory, COLOR, 100, 3).unwrap();
+        memory.write(COLOR, &[0; 100]);
+        hardware.filled(COLOR, &[0; 100]).unwrap();
+        let mut all = [0u8; 256];
+        memory.read(COLOR, &mut all);
+        assert_eq!(all, [0; 256], "the drawing came down for the fill");
+        hardware.sync(&mut memory, COLOR, 256).unwrap();
+        memory.read(COLOR, &mut all);
+        assert_eq!(all[..100], [0; 100], "the fill stays");
+        assert!(all[100..].as_chunks::<4>().0.iter().all(|p| ColorFormat::Rgba8.decode(p) == [255, 0, 0, 255]), "the rest of the drawing comes down");
+    }
+
+    /// a texture reaching past the rows of the buffer drawn into it, as its
+    /// sides are powers of two, samples the same from a copy the GPU makes,
+    /// without the buffer coming down first, as from memory once it has the
+    /// buffer, the rows past the buffer as memory holds them either way.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_texture_reaching_past_a_drawing_samples_like_memory() {
+        let (Ok(first), Ok(second)) = (hardware::Hardware::new(), hardware::Hardware::new()) else { return };
+        const SIZE: u32 = 32;
+        const TARGET: u32 = 0x10_0000;
+        // a buffer half as tall as the texture drawn into
+        let mut drawing = target_registers();
+        drawing[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        drawing[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 4.0);
+        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12);
+        let mut sampling = target_registers();
+        sampling[REG_COLOR_BUFFER_ADDRESS] = TARGET >> 3;
+        sampling[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        sampling[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        sampling[REG_TEXTURE_CONFIG] = 1;
+        sampling[REG_TEXTURE0_DIMENSIONS] = SIZE | (SIZE << 16);
+        sampling[REG_TEXTURE0_ADDRESS] = COLOR >> 3;
+        sampling[0x0C0] = 0x3 | (0x3 << 16);
+        for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            sampling[stage] = 0xF | (0xF << 16);
+        }
+
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let triangles: Vec<Vec<Vertex>> = (0..30)
+            .map(|_| {
+                let color = [random(), random(), random(), 1.0];
+                (0..3)
+                    .map(|_| Vertex {
+                        clip: [random() * 2.0 - 1.0, random() * 2.0 - 1.0, -random(), 1.0],
+                        color,
+                        texcoords: [[0.0; 2]; 3],
+                        quaternion: [0.0, 0.0, 0.0, 1.0],
+                        view: [0.0; 3],
+                    })
+                    .collect()
+            })
+            .collect();
+        // the rows past the buffer, whatever memory holds there
+        let past: Vec<u8> = (0..SIZE * SIZE / 2 * 4).map(|_| (random() * 256.0) as u8).collect();
+        let quad: Vec<Vertex> = [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
+            .into_iter()
+            .map(|[x, y, u, v]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: [1.0; 4],
+                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for (hardware, back_first) in [(first, false), (second, true)] {
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            let mut memory = ConsoleMemory::default();
+            memory.write(COLOR + SIZE * SIZE / 2 * 4, &past);
+            for triangle in &triangles {
+                rasterize_shaded(&drawing, &mut memory, &mut resources, triangle);
+            }
+            if back_first {
+                resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+            }
+            rasterize_shaded(&sampling, &mut memory, &mut resources, &quad);
+            if !back_first {
+                let mut drawn = vec![0u8; (SIZE * SIZE / 2 * 4) as usize];
+                memory.read(COLOR, &mut drawn);
+                assert!(drawn.iter().all(|&b| b == 0), "the drawing came down for the texture");
+            }
+            resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+            let mut sampled = vec![0u8; (SIZE * SIZE * 4) as usize];
+            memory.read(TARGET, &mut sampled);
+            results.push(sampled);
+        }
+        assert!(results[0] == results[1], "the copy samples as memory does");
+        let colors: std::collections::HashSet<&[u8]> = results[0].chunks(4).collect();
+        assert!(colors.len() > 8, "only {} colors", colors.len());
     }
 
     /// a transfer on the GPU of an 8 pixel wide buffer at COLOR, of rows

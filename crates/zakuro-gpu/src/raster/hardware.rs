@@ -283,6 +283,10 @@ struct Surface {
     /// rows a fill cleared while others it drew had not come down, which
     /// another surface over the same memory may have drawn over since.
     cleared: Option<(u32, u32)>,
+    /// bytes a fill wrote after the GPU drew there, from the buffer's start,
+    /// memory's from then on and none of the image's, what it drew past
+    /// them still has to come down, around them.
+    stale: Option<(u32, u32)>,
     capture: Option<Capture>,
     /// when drawing scaled, an image at the console's resolution the
     /// surface goes through on its way to and from guest memory, and a
@@ -374,8 +378,35 @@ impl Surface {
     fn dirty_overlaps(&self, addr: u32, len: u32) -> bool {
         self.dirty.is_some_and(|(start, end)| {
             let (from, to) = (self.addr + start * self.row_bytes(), self.addr + end * self.row_bytes());
-            addr < to && from < addr + len
+            let overlaps = |from: u32, to: u32| from < to && addr < to && from < addr + len;
+            match self.stale {
+                // what a fill wrote over since is memory's
+                Some((stale_from, stale_to)) => {
+                    overlaps(from, to.min(self.addr + stale_from)) || overlaps(from.max(self.addr + stale_to), to)
+                }
+                None => overlaps(from, to),
+            }
         })
+    }
+
+    /// a fill wrote over some of the bytes it drew, which are memory's now,
+    /// the rest of what it drew stays on the GPU until something needs it.
+    /// false when they do not join the bytes stale already, one span holds
+    /// them all.
+    fn supersede(&mut self, addr: u32, len: u32) -> bool {
+        let start = addr.max(self.addr) - self.addr;
+        let end = ((addr as u64 + len as u64).min(self.addr as u64 + self.size() as u64) - self.addr as u64) as u32;
+        let joined = match self.stale {
+            None => Some((start, end)),
+            Some((from, to)) if start <= to && from <= end => Some((from.min(start), to.max(end))),
+            Some(_) => None,
+        };
+        if let Some(span) = joined {
+            self.stale = Some(span);
+            // memory is newer than the image there, a draw looks again
+            self.checked = false;
+        }
+        joined.is_some()
     }
 
     /// the GPU changed rows of the image, rows of memory from the start.
@@ -662,6 +693,9 @@ struct Copied {
     surface: usize,
     /// the surface's generation when it was copied.
     generation: u64,
+    /// the texture as memory held it, for the rows past the surface when
+    /// it reaches past its last row.
+    memory: Option<Arc<[[u8; 4]]>>,
     used: u64,
 }
 
@@ -2122,6 +2156,7 @@ impl Hardware {
                     guarded: None,
                     write_guarded: None,
                     cleared: None,
+                    stale: None,
                     capture: None,
                     native,
                     screen: None,
@@ -2151,12 +2186,15 @@ impl Hardware {
         // memory is in one piece, most lookups find nothing changed
         let mut bytes = std::mem::take(&mut self.scratch);
         let whole = 0..size as usize;
-        let same = memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now));
+        // bytes a fill wrote can hold what the shadow does, and still be
+        // newer than the image
+        let stale = self.surfaces[index].stale.is_some();
+        let same = !stale && memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now));
         if !same {
             bytes.resize(size as usize, 0);
             memory.read(addr, &mut bytes);
         }
-        if !same && !self.surfaces[index].shadows(whole, &bytes) {
+        if !same && (stale || !self.surfaces[index].shadows(whole, &bytes)) {
             if self.surfaces[index].dirty.is_some() {
                 // memory changed beside rows the GPU drew and it lacks, which
                 // an upload alone would lose. they come down first, along
@@ -2327,7 +2365,7 @@ impl Hardware {
             bound.width,
             bound.height,
             COLOR_FORMAT,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
         )?;
         let size = bound.texels.len() as u64 * 4;
@@ -2664,6 +2702,10 @@ impl Hardware {
                         surface.guarded = None;
                         surface.write_guarded = None;
                     }
+                    if left.is_none() {
+                        // nothing it drew is left to come down around them
+                        surface.stale = None;
+                    }
                     if left.is_some() {
                         surface.cleared = Some(surface.cleared.map_or(rows, |(from, to)| (from.min(rows.0), to.max(rows.1))));
                     }
@@ -2692,6 +2734,7 @@ impl Hardware {
                 surface.guarded = None;
                 surface.write_guarded = None;
                 surface.cleared = None;
+                surface.stale = None;
                 surface.checked = false;
                 continue;
             }
@@ -2741,6 +2784,7 @@ impl Hardware {
             surface.guarded = None;
             surface.write_guarded = None;
             surface.cleared = None;
+            surface.stale = None;
             surface.checked = false;
             surface.replaced();
         }
@@ -2769,8 +2813,13 @@ impl Hardware {
                 s.dirty_overlaps(addr, len) && (s.addr < addr || s.addr as u64 + s.size() as u64 > end) && !cleared(s)
             })
             .collect();
-        if !partial.is_empty() {
-            self.write_back(memory, partial)?;
+        // rather than coming down now, which waits for the GPU, what it
+        // drew past the fill can come down when something needs it. Inazuma
+        // Eleven GO clears a depth buffer over the start of another every
+        // frame, which it clears whole before drawing into it again
+        let written: Vec<usize> = partial.into_iter().filter(|&i| !self.surfaces[i].supersede(addr, len)).collect();
+        if !written.is_empty() {
+            self.write_back(memory, written)?;
         }
         Ok(())
     }
@@ -3158,7 +3207,7 @@ impl Hardware {
             match bound {
                 Some(bound) => {
                     let (view, smallest) = match bound.drawn {
-                        Some(drawn) => (self.copy_texture(&drawn)?, 0),
+                        Some(drawn) => (self.copy_texture(&drawn, bound)?, 0),
                         None => self.texture(bound)?,
                     };
                     views[unit] = view;
@@ -3633,7 +3682,10 @@ impl Hardware {
     /// they line up the way the PICA lays both out.
     /// a color buffer in its own format, or a depth buffer whose samples
     /// are as wide as the texture's pixels, d24s8 read as rgba8 or d24 as
-    /// rgb8.
+    /// rgb8. a texture can reach past a color buffer's last row, as a
+    /// texture's sides are powers of two and the buffer drawn into it need
+    /// not be, Inazuma Eleven GO reads 800 rows drawn as 1024, one holding
+    /// all of it goes first.
     fn texture_source(&self, texture: &DrawnTexture) -> Option<(usize, u32)> {
         let depth = match texture.format {
             ColorFormat::Rgba8 => Some(Kind::Depth(4)),
@@ -3649,9 +3701,15 @@ impl Hardware {
                     return None;
                 }
                 let row = texture.addr.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * 8;
-                (row + texture.height <= s.height).then_some((i, row))
+                let past = row + texture.height > s.height;
+                (row < s.height && (!past || matches!(s.kind, Kind::Color(_)))).then_some((i, row))
             })
-            .max_by_key(|&(i, row)| newest(&self.surfaces[i], (row, row + texture.height)))
+            .max_by_key(|&(i, row)| (row + texture.height <= self.surfaces[i].height, newest(&self.surfaces[i], (row, row + texture.height))))
+    }
+
+    /// whether the surface a texture is rows of holds all of its rows.
+    pub(crate) fn covers(&self, texture: &DrawnTexture) -> bool {
+        self.texture_source(texture).is_some_and(|(index, row)| row + texture.height <= self.surfaces[index].height)
     }
 
     /// whether a texture is rows of a surface the GPU drew and guest memory
@@ -3669,28 +3727,75 @@ impl Hardware {
                 && (!surface.checked
                     || (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(at, (to - from) * surface.row_bytes())))
         });
-        surface.dirty.is_some() && !changed
+        // nor where a fill wrote over what it drew
+        let row_bytes = surface.row_bytes();
+        let stale = surface.stale.is_some_and(|(from, to)| from < (row + texture.height) * row_bytes && row * row_bytes < to);
+        surface.dirty.is_some() && !changed && !stale
     }
 
     /// the image of a texture copied from the surface it is part of, copied
-    /// again whenever the surface changed.
-    fn copy_texture(&mut self, texture: &DrawnTexture) -> Result<vk::ImageView, String> {
+    /// again whenever the surface changed. a texture reaching past the
+    /// surface's last row has the rows past it as memory holds them.
+    fn copy_texture(&mut self, texture: &DrawnTexture, bound: &BoundTexture) -> Result<vk::ImageView, String> {
         self.mark(Work::Copy, false);
         let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
         let generation = self.surfaces[source].generation;
+        let rows = (self.surfaces[source].height - row).min(texture.height);
+        let memory = if rows < texture.height {
+            if bound.texels.len() != (texture.width * texture.height) as usize {
+                return Err("a texture reaching past the buffer drawn into it came without its texels".to_owned());
+            }
+            Some(bound.texels.clone())
+        } else {
+            None
+        };
         let batch = self.batch;
         if let Some(copy) = self.copies.get_mut(texture) {
-            if copy.surface == source && copy.generation == generation {
+            let same_memory = match (&copy.memory, &memory) {
+                (Some(kept), Some(now)) => Arc::ptr_eq(kept, now),
+                (kept, now) => kept.is_none() && now.is_none(),
+            };
+            if copy.surface == source && copy.generation == generation && same_memory {
                 copy.used = batch;
                 return Ok(copy.image.view);
             }
         }
         if !self.copies.contains_key(texture) {
-            let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+            let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST;
             let image = self.image(texture.width * self.scale, texture.height * self.scale, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
-            self.copies.insert(*texture, Copied { image, surface: source, generation, used: batch });
+            self.copies.insert(*texture, Copied { image, surface: source, generation, memory: None, used: batch });
         }
-        let view = self.copies[texture].image.view;
+        let (view, image) = (self.copies[texture].image.view, self.copies[texture].image.image);
+        if memory.is_some() {
+            // the rows past the surface as memory has them, scaled up, the
+            // copy's rows run as memory's do
+            self.texture(bound)?;
+            let key = Arc::as_ptr(&bound.texels) as *const u8 as usize;
+            let from = self.textures.get(&key).ok_or("a texture reaching past the buffer drawn into it was not uploaded")?.image.image;
+            self.end_rendering();
+            self.barrier();
+            let n = self.scale;
+            let rect = |n: u32| {
+                let (width, top, bottom) = ((texture.width * n) as i32, (rows * n) as i32, (texture.height * n) as i32);
+                [vk::Offset3D { x: 0, y: top, z: 0 }, vk::Offset3D { x: width, y: bottom, z: 1 }]
+            };
+            let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+            let region = [vk::ImageBlit::default().src_subresource(layers).src_offsets(rect(1)).dst_subresource(layers).dst_offsets(rect(n))];
+            // SAFETY: recording, outside rendering, between two color images
+            // in the general layout made for transfers, both their size
+            unsafe {
+                self.unfenced = true;
+                self.device.cmd_blit_image(
+                    self.commands,
+                    from,
+                    vk::ImageLayout::GENERAL,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &region,
+                    vk::Filter::NEAREST,
+                )
+            };
+        }
         if let Kind::Depth(bytes) = self.surfaces[source].kind {
             self.copy_depth(source, row, bytes, view, texture)?;
         } else {
@@ -3699,15 +3804,16 @@ impl Hardware {
             // memory would have them
             let format = format_index(texture.format);
             let n = self.scale;
-            let (width, height) = ((texture.width * n) as i32, (texture.height * n) as i32);
+            let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
             let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
             let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height];
-            self.dispatch_transfer((self.surfaces[source].image.view, view), constants, (texture.width * n, texture.height * n))?;
+            self.dispatch_transfer((self.surfaces[source].image.view, view), constants, (texture.width * n, rows * n))?;
         }
         self.uploads = true;
         if let Some(copy) = self.copies.get_mut(texture) {
             copy.surface = source;
             copy.generation = generation;
+            copy.memory = memory;
             copy.used = batch;
         }
         Ok(view)
@@ -4570,6 +4676,15 @@ impl Hardware {
                 }
             }
         }
+        // and the bytes a fill wrote over since are memory's whatever they hold
+        if let Some((from, to)) = s.stale {
+            let (from, to) = ((from as usize).max(rows.start), (to as usize).min(rows.end));
+            if from < to {
+                let mut now = vec![0u8; to - from];
+                memory.read(addr + from as u32, &mut now);
+                bytes[from..to].copy_from_slice(&now);
+            }
+        }
         memory.write(addr + rows.start as u32, &bytes[rows.clone()]);
         let surface = &mut self.surfaces[index];
         if surface.shadow.len() == bytes.len() {
@@ -4586,6 +4701,13 @@ impl Hardware {
         surface.guarded = None;
         surface.write_guarded = None;
         surface.cleared = None;
+        // where a fill wrote, the image is behind memory, which it takes
+        // again before it is used, whatever the shadow came to hold
+        if surface.stale.take().is_some() {
+            surface.shadow.clear();
+            surface.pixel = None;
+            surface.checked = false;
+        }
     }
 }
 
@@ -4959,6 +5081,7 @@ mod tests {
                 guarded: None,
                 write_guarded: None,
                 cleared: None,
+                stale: None,
                 capture: None,
                 native: None,
                 screen: None,
