@@ -46,5 +46,6 @@ Games tested in Zakuro so far, as of v0.2.20. Recompiled means the game was test
 | Inazuma Eleven GO: Chrono Stones: Thunderflash | 0004000000136D00 | EUR | Playable | Yes | |
 | Phoenix Wright: Ace Attorney Trilogy | 0004000000138F00 | USA | Playable | Yes | |
 | Rabbids Travel in Time 3D | 0004000000037700 | EUR | Playable | Yes | |
+| Rayman 3D | 0004000000036400 | USA | Playable | Yes | |
 
 Tested a game that isn't here, or found a problem with one that is? Tell us on the [Discord server](https://discord.gg/7dduXVv2xm) or open a [game report](https://github.com/fearkov/zakuro/issues/new?template=game-report.yml).
