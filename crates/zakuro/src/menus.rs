@@ -39,12 +39,24 @@ pub enum Action {
     Settings,
     /// close the game's keyboard with this text and the button pressed.
     Keyboard(String, usize),
+    /// turn the running game's cheat at this index on or off.
+    Cheat(usize, bool),
+    /// add a cheat, its name and its code, to the running game.
+    AddCheat(String, String),
+    /// read the running game's cheats from their file again.
+    ReloadCheats,
+    /// show the cheats folder.
+    CheatsFolder,
 }
 
 #[derive(Default)]
 pub struct Menus {
     /// the menu over a running game.
     pub menu_open: bool,
+    /// the cheats window, and the cheat being written in it.
+    pub cheats_open: bool,
+    cheat_name: String,
+    cheat_code: String,
     pub settings_open: bool,
     /// the binding waiting for a key, by its place in Keys::all_mut.
     pub rebinding: Option<usize>,
@@ -333,6 +345,9 @@ impl Menus {
                 if wide(ui, "Settings") {
                     self.settings_open = true;
                 }
+                if wide(ui, "Cheats") {
+                    self.cheats_open = true;
+                }
                 if wide(ui, "Copy info for a report") {
                     actions.push(Action::CopyReport);
                 }
@@ -348,6 +363,47 @@ impl Menus {
                     progress(ui, job);
                 }
             });
+        actions
+    }
+
+    /// the cheats window over a game, when open, its cheats by name, whether
+    /// each is on, and their notes.
+    pub fn cheats(&mut self, ctx: &egui::Context, cheats: &[(String, bool, String)]) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut open = self.cheats_open;
+        egui::Window::new("Cheats").open(&mut open).default_width(380.0).show(ctx, |ui| {
+            if cheats.is_empty() {
+                ui.label(RichText::new("No cheats yet. Add one below, or put the cheat file Citra or Azahar has for this game in the cheats folder.").weak());
+            }
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for (index, (name, enabled, notes)) in cheats.iter().enumerate() {
+                    let mut on = *enabled;
+                    let mut response = ui.checkbox(&mut on, name);
+                    if !notes.is_empty() {
+                        response = response.on_hover_text(notes);
+                    }
+                    if response.changed() {
+                        actions.push(Action::Cheat(index, on));
+                    }
+                }
+            });
+            ui.separator();
+            ui.label("Add a cheat");
+            ui.add(egui::TextEdit::singleline(&mut self.cheat_name).hint_text("Name"));
+            ui.add(egui::TextEdit::multiline(&mut self.cheat_code).hint_text("00000000 00000000").desired_rows(4).font(egui::TextStyle::Monospace));
+            ui.horizontal(|ui| {
+                if ui.button("Add").clicked() && !self.cheat_code.trim().is_empty() {
+                    actions.push(Action::AddCheat(std::mem::take(&mut self.cheat_name), std::mem::take(&mut self.cheat_code)));
+                }
+                if ui.button("Reload").on_hover_text("Read the cheats again from their file, after changing it.").clicked() {
+                    actions.push(Action::ReloadCheats);
+                }
+                if ui.button("Open the cheats folder").clicked() {
+                    actions.push(Action::CheatsFolder);
+                }
+            });
+        });
+        self.cheats_open = open;
         actions
     }
 

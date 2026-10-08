@@ -87,6 +87,14 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
 
     let mut system = System::new(config);
     system.dlc = dlc;
+    if let Some(data_dir) = &system.config.data_dir {
+        let path = crate::cheats::path(data_dir, title.program_id());
+        system.cheats = crate::cheats::load(&path);
+        let on = system.cheats.iter().filter(|cheat| cheat.enabled).count();
+        if !system.cheats.is_empty() {
+            log::info!("{} cheats in {}, {on} of them on", system.cheats.len(), path.display());
+        }
+    }
     system.memory = memory::Memory::new(system.config.new3ds, app_bytes);
     system.kernel = crate::kernel::Kernel::new(
         title.program_id(),

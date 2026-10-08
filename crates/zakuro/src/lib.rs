@@ -937,6 +937,42 @@ impl App {
                     self.menus.message = Some("The game's details and the end of the log are copied. Paste them in your report and fill in what happens.".into());
                 }
             }
+            Action::Cheat(index, on) => {
+                if let Some(cheat) = self.game.as_mut().and_then(|game| game.system.cheats.get_mut(index)) {
+                    cheat.enabled = on;
+                    log::info!("cheat {} {}", cheat.name, if on { "on" } else { "off" });
+                }
+                self.save_cheats();
+            }
+            Action::AddCheat(name, code) => {
+                let lines: Vec<String> = code.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect();
+                if lines.iter().any(|line| !zakuro_core::cheats::is_code(line)) {
+                    self.menus.message = Some("Some of those lines aren't codes like 00000000 00000000, the cheat skips them.".into());
+                }
+                if let Some(game) = &mut self.game {
+                    let name = match name.trim() {
+                        "" => format!("Cheat {}", game.system.cheats.len() + 1),
+                        name => name.to_owned(),
+                    };
+                    let mut cheat = zakuro_core::cheats::Cheat::new(&name, lines, Vec::new());
+                    cheat.enabled = true;
+                    game.system.cheats.push(cheat);
+                }
+                self.save_cheats();
+            }
+            Action::ReloadCheats => {
+                if let (Some(path), Some(game)) = (self.cheats_path(), &mut self.game) {
+                    game.system.cheats = zakuro_core::cheats::load(&path);
+                }
+            }
+            Action::CheatsFolder => {
+                if let Some(folder) = self.cheats_path().and_then(|path| path.parent().map(Path::to_owned)) {
+                    match std::fs::create_dir_all(&folder) {
+                        Ok(()) => show_folder(&folder),
+                        Err(error) => self.menus.message = Some(format!("The cheats folder can't be made: {error}")),
+                    }
+                }
+            }
             Action::Quit => event_loop.exit(),
             Action::Settings => self.apply_settings(),
             Action::Keyboard(text, button) => {
@@ -1090,6 +1126,20 @@ impl App {
         }
     }
 
+    /// the file of the running game's cheats.
+    fn cheats_path(&self) -> Option<PathBuf> {
+        let program_id = self.game.as_ref()?.system.title.as_ref()?.program_id();
+        Some(zakuro_core::cheats::path(self.data_dir.as_ref()?, program_id))
+    }
+
+    /// writes the running game's cheats to their file.
+    fn save_cheats(&mut self) {
+        let (Some(path), Some(game)) = (self.cheats_path(), &self.game) else { return };
+        if let Err(error) = zakuro_core::cheats::save(&path, &game.system.cheats) {
+            self.menus.message = Some(format!("The cheats can't be saved: {error}"));
+        }
+    }
+
     /// the menus, and the actions they asked for, done.
     fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
@@ -1097,6 +1147,9 @@ impl App {
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
         let fast = self.fast_forwarding;
         let keyboard = self.game.as_ref().and_then(|game| game.system.keyboard_request().cloned());
+        let cheats = self.game.as_ref().filter(|_| self.menus.cheats_open).map(|game| {
+            game.system.cheats.iter().map(|cheat| (cheat.name.clone(), cheat.enabled, cheat.notes.join("\n"))).collect::<Vec<_>>()
+        });
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
@@ -1107,6 +1160,9 @@ impl App {
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
             actions.extend(menus.settings(ui.ctx(), settings));
+            if let Some(cheats) = &cheats {
+                actions.extend(menus.cheats(ui.ctx(), cheats));
+            }
             if let Some(request) = &keyboard {
                 actions.extend(menus.keyboard(ui.ctx(), request));
             }

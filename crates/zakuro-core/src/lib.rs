@@ -1,6 +1,7 @@
 //! the emulated console, CPU, memory, HLE kernel, HLE services and GPU, and
 //! the loop that drives them.
 
+pub mod cheats;
 pub mod cro;
 pub mod hints;
 pub mod kernel;
@@ -112,6 +113,8 @@ pub struct System {
     pub title: Option<Title>,
     /// the title's downloadable content.
     pub dlc: Vec<zakuro_fs::Dlc>,
+    /// the title's cheats, from its file in the data folder.
+    pub cheats: Vec<cheats::Cheat>,
     pub config: Config,
 
     pub exited: bool,
@@ -203,6 +206,7 @@ impl System {
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
             dlc: Vec::new(),
+            cheats: Vec::new(),
             config,
             exited: false,
             broke: false,
@@ -266,6 +270,7 @@ impl System {
         // anything
         let input = self.services.hid.input;
         services::hid::update(self, input);
+        cheats::run(self);
         // run up to the boundary step() would end the frame at, and end it
         // here, once, instead of again when the next frame's first step
         // finds the boundary passed
