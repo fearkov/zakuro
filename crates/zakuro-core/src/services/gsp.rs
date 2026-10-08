@@ -157,6 +157,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 "gsp: SetBufferSwap screen {screen} active {active} left 0x{left:08X} right \
                  0x{right:08X} stride {stride} format 0x{format:X}"
             );
+            let (left, right) = (virtual_to_physical(system, left), virtual_to_physical(system, right));
             system.set_framebuffer(screen, active, left, right, stride, format);
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -165,6 +166,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // command with the same name.
         SET_COMMAND_LIST => {
             let address = buffer.get(&mut system.memory, 1) & !7;
+            let address = virtual_to_physical(system, address);
             let size = buffer.get(&mut system.memory, 2) & !3;
             system.submit_command_list(address, size);
             signal_interrupt(system, InterruptId::P3d);
@@ -211,7 +213,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // SetDisplayTransfer(input, output, input dim, output dim, flags)
         SET_DISPLAY_TRANSFER => {
             let input = buffer.get(&mut system.memory, 1);
+            let input = virtual_to_physical(system, input);
             let output = buffer.get(&mut system.memory, 2);
+            let output = virtual_to_physical(system, output);
             let input_dimensions = buffer.get(&mut system.memory, 3);
             let output_dimensions = buffer.get(&mut system.memory, 4);
             let flags = buffer.get(&mut system.memory, 5);
@@ -223,7 +227,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // SetTextureCopy(input, output, size, input gap, output gap, flags)
         SET_TEXTURE_COPY => {
             let input = buffer.get(&mut system.memory, 1);
+            let input = virtual_to_physical(system, input);
             let output = buffer.get(&mut system.memory, 2);
+            let output = virtual_to_physical(system, output);
             let size = buffer.get(&mut system.memory, 3);
             let input_gap = buffer.get(&mut system.memory, 4);
             let output_gap = buffer.get(&mut system.memory, 5);
@@ -244,7 +250,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                     continue;
                 }
                 let width = fill_width(control);
-                system.memory_fill(start, end, value, width);
+                let physical = virtual_to_physical(system, start);
+                system.memory_fill(physical, physical + (end - start), value, width);
                 signal_interrupt(
                     system,
                     if bank == 0 {
@@ -349,7 +356,9 @@ pub fn apply_framebuffer_updates(system: &mut System) {
 
         let entry = record + FRAMEBUFFER_ENTRY_BASE + index * FRAMEBUFFER_ENTRY_STRIDE;
         let left = system.memory.read32(entry + 0x04);
+        let left = virtual_to_physical(system, left);
         let right = system.memory.read32(entry + 0x08);
+        let right = virtual_to_physical(system, right);
         let stride = system.memory.read32(entry + 0x0C);
         let format = system.memory.read32(entry + 0x10);
         system.set_framebuffer(screen, index, left, right, stride, format);
@@ -509,7 +518,7 @@ fn execute_command(system: &mut System, command: GxCommand) {
         }
         // ProcessCommandList(address, size, ...)
         0x01 => {
-            let address = command.data[0] & !7;
+            let address = virtual_to_physical(system, command.data[0] & !7);
             let size = command.data[1] & !3;
             system.submit_command_list(address, size);
             signal_interrupt(system, InterruptId::P3d);
@@ -524,7 +533,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
                     continue;
                 }
                 let width = fill_width(command.data[6] >> (bank as u32 * 16));
-                system.memory_fill(start, end, value, width);
+                let physical = virtual_to_physical(system, start);
+                system.memory_fill(physical, physical + (end - start), value, width);
                 signal_interrupt(
                     system,
                     if bank == 0 {
@@ -538,8 +548,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
         // DisplayTransfer(input, output, input dim, output dim, flags)
         0x03 => {
             system.display_transfer(
-                command.data[0],
-                command.data[1],
+                virtual_to_physical(system, command.data[0]),
+                virtual_to_physical(system, command.data[1]),
                 command.data[2],
                 command.data[3],
                 command.data[4],
@@ -549,8 +559,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
         // TextureCopy(input, output, size, input gap, output gap, flags)
         0x04 => {
             system.texture_copy(
-                command.data[0],
-                command.data[1],
+                virtual_to_physical(system, command.data[0]),
+                virtual_to_physical(system, command.data[1]),
                 command.data[2],
                 command.data[3],
                 command.data[4],
@@ -560,6 +570,23 @@ fn execute_command(system: &mut System, command: GxCommand) {
         // CacheFlush
         0x05 => {}
         other => log::warn!("unknown GX command 0x{other:02X}"),
+    }
+}
+
+/// converts an address a title hands the GSP, a virtual one in VRAM or its
+/// linear heap, to the physical one the GPU takes, as the GSP does. the
+/// linear heap at 0x30000000 is above where FCRAM starts, so the GPU can't
+/// tell one from the other itself. anything else goes as it is.
+pub fn virtual_to_physical(system: &System, vaddr: u32) -> u32 {
+    use zakuro_common::memory_map::*;
+    let linear = system.kernel.linear_base;
+    let size = if linear == LINEAR_HEAP_VADDR_NEW3DS { LINEAR_HEAP_SIZE_NEW3DS } else { LINEAR_HEAP_SIZE_OLD3DS };
+    if (VRAM_VADDR..VRAM_VADDR + VRAM_SIZE).contains(&vaddr) {
+        VRAM_PADDR + (vaddr - VRAM_VADDR)
+    } else if vaddr >= linear && vaddr - linear < size {
+        FCRAM_PADDR + (vaddr - linear)
+    } else {
+        vaddr
     }
 }
 
@@ -646,7 +673,8 @@ mod tests {
 
         apply_framebuffer_updates(&mut system);
 
-        assert_eq!(system.gpu.framebuffers[0].address_left(), 0x1F30_0000);
+        // the GPU gets the physical address of the VRAM the title named
+        assert_eq!(system.gpu.framebuffers[0].address_left(), 0x1830_0000);
         assert_eq!(system.gpu.framebuffers[0].stride, 720);
         assert_eq!(
             system.memory.read32(record) & 0xFF00,

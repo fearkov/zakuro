@@ -134,6 +134,42 @@ impl PhysicalMemory {
         None
     }
 
+    /// allocates size bytes of physically contiguous FCRAM from the top of
+    /// the region, where the kernel puts a process's code, stack and heap,
+    /// keeping the bottom for the linear heap, so the linear heap gives out
+    /// the addresses the console does, which cheats count on.
+    pub fn allocate_top(&mut self, region: MemoryRegion, size: u32) -> Option<PhysicalBlock> {
+        let needed = (align_up(size, PAGE_SIZE) / PAGE_SIZE) as usize;
+        if needed == 0 {
+            return Some(PhysicalBlock {
+                addr: FCRAM_PADDR,
+                size: 0,
+            });
+        }
+
+        let (start, count) = self.region_pages(region);
+        let (start, count) = (start as usize, count as usize);
+
+        let mut run = 0usize;
+        for i in (start..start + count).rev() {
+            if self.allocated[i] {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            if run == needed {
+                for page in &mut self.allocated[i..i + needed] {
+                    *page = true;
+                }
+                return Some(PhysicalBlock {
+                    addr: FCRAM_PADDR + (i as u32 * PAGE_SIZE),
+                    size: needed as u32 * PAGE_SIZE,
+                });
+            }
+        }
+        None
+    }
+
     pub fn free(&mut self, block: PhysicalBlock) {
         let first = ((block.addr - FCRAM_PADDR) / PAGE_SIZE) as usize;
         let count = (block.size / PAGE_SIZE) as usize;
@@ -187,6 +223,20 @@ mod tests {
         // the freed hole is reused.
         let c = phys.allocate(MemoryRegion::Application, 0x2000).unwrap();
         assert_eq!(c.addr, FCRAM_PADDR);
+    }
+
+    #[test]
+    fn the_top_and_the_bottom_fill_toward_each_other() {
+        let mut phys = PhysicalMemory::new(false, 0x8000);
+        let code = phys.allocate_top(MemoryRegion::Application, 0x2000).unwrap();
+        let heap = phys.allocate_top(MemoryRegion::Application, 0x3000).unwrap();
+        assert_eq!(code.addr, FCRAM_PADDR + 0x6000);
+        assert_eq!(heap.addr, FCRAM_PADDR + 0x3000);
+        // the linear heap still starts where the region does
+        let linear = phys.allocate(MemoryRegion::Application, 0x1000).unwrap();
+        assert_eq!(linear.addr, FCRAM_PADDR);
+        assert!(phys.allocate_top(MemoryRegion::Application, 0x3000).is_none());
+        assert_eq!(phys.allocate_top(MemoryRegion::Application, 0x2000).unwrap().addr, FCRAM_PADDR + 0x1000);
     }
 
     #[test]

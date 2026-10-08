@@ -78,9 +78,14 @@ pub const PAGE_MASK: u32 = PAGE_SIZE - 1;
 /// number of entries in a flat 32-bit page table.
 pub const PAGE_TABLE_ENTRIES: usize = 1 << (32 - PAGE_BITS);
 
-/// returns the linear-heap base for the given console model.
-pub const fn linear_heap_base(new3ds: bool) -> VAddr {
-    if new3ds {
+/// firmware 8.0's kernel version, a title made for it or a later one gets
+/// its linear heap at 0x30000000, on either console.
+pub const NEW_LINEAR_HEAP_KERNEL: u16 = 0x22C;
+
+/// returns where the linear heap starts for a title, which goes by the
+/// kernel it was made for, from its exheader, not by the console.
+pub const fn linear_heap_base(kernel_version: u16) -> VAddr {
+    if kernel_version >= NEW_LINEAR_HEAP_KERNEL {
         LINEAR_HEAP_VADDR_NEW3DS
     } else {
         LINEAR_HEAP_VADDR_OLD3DS

@@ -166,7 +166,7 @@ fn control_memory(system: &mut System) {
                 addr0
             };
             let region = system.kernel.memory_region;
-            let Some(block) = system.memory.phys.allocate(region, size) else {
+            let Some(block) = system.memory.phys.allocate_top(region, size) else {
                 log::error!("out of heap memory allocating 0x{size:X}");
                 system.cpu.regs[0] = errors::OUT_OF_MEMORY.0;
                 return;
@@ -184,11 +184,26 @@ fn control_memory(system: &mut System) {
             system.cpu.regs[1] = base;
         }
         MEMOP_FREE => {
-            if let Some(mapping) = system.memory.mapping_at(addr0).copied() {
-                system.memory.phys.free(crate::memory::PhysicalBlock {
-                    addr: mapping.paddr,
-                    size: size.min(mapping.size),
-                });
+            // the pages behind the range go back, from where it starts in each
+            // heap or linear mapping it covers, a heap shrunk from its end
+            // gives back its end
+            let end = addr0 as u64 + size as u64;
+            let freed: Vec<crate::memory::PhysicalBlock> = system
+                .memory
+                .mappings()
+                .filter(|m| matches!(m.state, MemoryState::Private | MemoryState::Continuous))
+                .filter(|m| (m.base as u64) < end && (addr0 as u64) < m.base as u64 + m.size as u64)
+                .map(|m| {
+                    let start = m.base.max(addr0);
+                    let stop = (m.base as u64 + m.size as u64).min(end);
+                    crate::memory::PhysicalBlock {
+                        addr: m.paddr + (start - m.base),
+                        size: (stop - start as u64) as u32,
+                    }
+                })
+                .collect();
+            for block in freed {
+                system.memory.phys.free(block);
             }
             system.memory.unmap(addr0, size);
             system.cpu.regs[0] = 0;
@@ -248,14 +263,20 @@ fn create_memory_block(system: &mut System) {
     let size = system.cpu.regs[2];
 
     // an address of zero asks the kernel to take the pages from the BASE
-    // region instead of the caller's address space.
+    // region instead of the caller's address space, or from the bottom of
+    // the caller's own region, where its linear heap is, when its exheader
+    // says shared device memory
+    let region = if system.kernel.shared_device_memory {
+        system.kernel.memory_region
+    } else {
+        crate::memory::MemoryRegion::Base
+    };
     let paddr = if addr == 0 {
-        match system
-            .memory
-            .phys
-            .allocate(crate::memory::MemoryRegion::Base, size)
-        {
-            Some(block) => block.addr,
+        match system.memory.phys.allocate(region, size) {
+            Some(block) => {
+                system.memory.zero_physical(block.addr, block.size);
+                block.addr
+            }
             None => {
                 system.cpu.regs[0] = errors::OUT_OF_MEMORY.0;
                 return;
@@ -1148,5 +1169,33 @@ mod tests {
         };
         let first = read();
         assert_eq!(read() - first, SYSTEM_TICK_COST);
+    }
+
+    /// svcControlMemory with an operation, giving back r0 and r1.
+    fn control(system: &mut System, operation: u32, addr0: u32, size: u32) -> (u32, u32) {
+        system.cpu.regs[..5].copy_from_slice(&[operation, addr0, 0, size, 3]);
+        dispatch(system, 0x01);
+        (system.cpu.regs[0], system.cpu.regs[1])
+    }
+
+    /// the heap comes from the top of the region and the linear heap from
+    /// its bottom, so the first linear block is where the console has it,
+    /// and a heap shrunk from its end gives back the pages of its end.
+    #[test]
+    fn the_linear_heap_starts_where_the_console_has_it() {
+        let mut system = System::new(crate::Config::default());
+        assert_eq!(control(&mut system, MEMOP_ALLOC, HEAP_VADDR, 0x4000), (0, HEAP_VADDR));
+        let linear = control(&mut system, MEMOP_ALLOC | MEMOP_LINEAR_FLAG, 0, 0x2000);
+        assert_eq!(linear, (0, system.kernel.linear_base));
+        let heap = system.memory.mapping_at(HEAP_VADDR).unwrap().paddr;
+        assert!(heap > FCRAM_PADDR + 0x2000);
+
+        assert_eq!(control(&mut system, MEMOP_FREE, HEAP_VADDR + 0x2000, 0x2000).0, 0);
+        let kept = system.memory.mapping_at(HEAP_VADDR).unwrap();
+        assert_eq!((kept.paddr, kept.size), (heap, 0x2000));
+        assert!(system.memory.mapping_at(HEAP_VADDR + 0x2000).is_none());
+        // what went back is what the top gives next
+        assert_eq!(control(&mut system, MEMOP_ALLOC, HEAP_VADDR + 0x2000, 0x2000).0, 0);
+        assert_eq!(system.memory.mapping_at(HEAP_VADDR + 0x2000).unwrap().paddr, heap + 0x2000);
     }
 }

@@ -221,9 +221,29 @@ impl Memory {
             self.cpu_read_table[index] = std::ptr::null_mut();
             self.cpu_write_table[index] = std::ptr::null_mut();
         }
-        self.mappings.retain(|_, m| {
-            !(m.base >= vaddr && m.base + m.size <= vaddr.wrapping_add(size))
-        });
+        // a mapping the range covers only part of keeps the rest, at the
+        // pages behind it, so freeing them later frees the right ones
+        let end = vaddr as u64 + size as u64;
+        let touched: Vec<Mapping> = self
+            .mappings
+            .values()
+            .filter(|m| (m.base as u64) < end && (vaddr as u64) < m.base as u64 + m.size as u64)
+            .copied()
+            .collect();
+        for m in touched {
+            self.mappings.remove(&m.base);
+            if m.base < vaddr {
+                self.mappings.insert(m.base, Mapping { size: vaddr - m.base, ..m });
+            }
+            let m_end = m.base as u64 + m.size as u64;
+            if m_end > end {
+                let base = end as u32;
+                self.mappings.insert(
+                    base,
+                    Mapping { base, size: (m_end - end) as u32, paddr: m.paddr + (base - m.base), ..m },
+                );
+            }
+        }
     }
 
     pub fn mapping_at(&self, vaddr: VAddr) -> Option<&Mapping> {

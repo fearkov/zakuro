@@ -200,7 +200,7 @@ impl System {
         System {
             cpu: Cpu::new(),
             memory: Memory::new(config.new3ds, app_bytes),
-            kernel: Kernel::new(0, memory::MemoryRegion::Application, linear_heap_base(config.new3ds)),
+            kernel: Kernel::new(0, memory::MemoryRegion::Application, linear_heap_base(0)),
             services,
             gpu: Gpu::new(),
             renderer: Box::new(SoftwareRenderer::default()),
@@ -757,17 +757,19 @@ impl System {
             .texture_copy(&mut guest, input, output, size, input_gap, output_gap);
     }
 
-    /// the nine words gsp::ImportDisplayCaptureInfo returns.
+    /// the nine words gsp::ImportDisplayCaptureInfo returns, the addresses
+    /// virtual, as the title gave them.
     pub fn display_capture_info(&mut self) -> [u32; 9] {
         let top = self.gpu.framebuffers[0];
         let bottom = self.gpu.framebuffers[1];
+        let address = |paddr: u32| if paddr == 0 { 0 } else { services::gsp::physical_to_virtual(self, paddr) };
         [
-            top.address_left(),
-            top.address_right(),
+            address(top.address_left()),
+            address(top.address_right()),
             top.format,
             top.stride,
-            bottom.address_left(),
-            bottom.address_right(),
+            address(bottom.address_left()),
+            address(bottom.address_right()),
             bottom.format,
             bottom.stride,
             0,

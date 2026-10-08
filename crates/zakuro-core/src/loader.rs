@@ -99,8 +99,9 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     system.kernel = crate::kernel::Kernel::new(
         title.program_id(),
         region,
-        linear_heap_base(system.config.new3ds),
+        linear_heap_base(exheader.kernel_version),
     );
+    system.kernel.shared_device_memory = exheader.shared_device_memory;
 
     map_special_pages(&mut system, app_bytes);
     let modded = map_code(&mut system, &title)?;
@@ -340,7 +341,7 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
         let block = system
             .memory
             .phys
-            .allocate(system.kernel.memory_region, mapped_size)
+            .allocate_top(system.kernel.memory_region, mapped_size)
             .expect("FCRAM for a code segment");
         system.memory.map(
             info.address,
@@ -380,7 +381,7 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
         let block = system
             .memory
             .phys
-            .allocate(system.kernel.memory_region, bss_size)
+            .allocate_top(system.kernel.memory_region, bss_size)
             .expect("FCRAM for BSS");
         system.memory.map(
             bss_start,
@@ -414,7 +415,7 @@ fn map_stack(system: &mut System, stack_size: u32) {
     let block = system
         .memory
         .phys
-        .allocate(system.kernel.memory_region, size)
+        .allocate_top(system.kernel.memory_region, size)
         .expect("FCRAM for the main stack");
     system.memory.map(
         base,

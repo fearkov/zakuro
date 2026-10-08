@@ -40,6 +40,9 @@ pub struct Kernel {
     /// current top of the linear heap.
     pub linear_top: VAddr,
     pub linear_base: VAddr,
+    /// the exheader's flag that has memory blocks created without an address
+    /// come from the process's own region, at the bottom with its linear heap
+    pub shared_device_memory: bool,
 
     /// set when something happened that might make a different thread
     /// runnable, so the run loop knows to call [Kernel::schedule].
@@ -78,6 +81,7 @@ impl Kernel {
             heap_top: zakuro_common::memory_map::HEAP_VADDR,
             linear_top: linear_base,
             linear_base,
+            shared_device_memory: false,
             reschedule_pending: false,
             all_blocked: false,
             relief: false,

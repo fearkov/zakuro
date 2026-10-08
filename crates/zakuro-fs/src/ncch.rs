@@ -215,6 +215,12 @@ pub struct ExHeader {
     pub service_access: Vec<String>,
 
     pub memory_type: MemoryType,
+    /// the kernel the title was made for, major in the high byte, from 0x22C,
+    /// firmware 8.0's, its linear heap is at 0x30000000
+    pub kernel_version: u16,
+    /// memory blocks the title creates without an address come from its own
+    /// region rather than the BASE one
+    pub shared_device_memory: bool,
     pub handle_table_size: u32,
     /// SVC numbers the title is allowed to call, the eight tables a mask
     /// descriptor can name reach up to 191.
@@ -257,6 +263,8 @@ impl ExHeader {
 
         // ARM11 kernel capabilities, 28 tagged u32 descriptors at ACI+0x170.
         let mut memory_type = MemoryType::Application;
+        let mut kernel_version = 0;
+        let mut shared_device_memory = false;
         let mut handle_table_size = 0x200;
         let mut allowed_svcs = [0u32; 6];
         for i in 0..28 {
@@ -275,11 +283,14 @@ impl ExHeader {
                         allowed_svcs[svc / 32] |= 1 << (svc % 32);
                     }
                 }
+            } else if tag & 0xFE0 == 0xFC0 {
+                kernel_version = desc as u16;
             } else if tag & 0xFF0 == 0xFE0 {
                 handle_table_size = desc & 0x3FF;
             } else if tag & 0xFF8 == 0xFF0 {
                 // misc parameters, bits 8..11 hold the memory type.
                 memory_type = MemoryType::from_raw((desc >> 8) & 0xF);
+                shared_device_memory = desc & 0x40 != 0;
             }
             // the remaining tags describe mapped IO ranges and interrupts,
             // which an HLE kernel does not need to honour.
@@ -310,6 +321,8 @@ impl ExHeader {
             resource_limit_category: aci.u8(0x16F)?,
             service_access,
             memory_type,
+            kernel_version,
+            shared_device_memory,
             handle_table_size,
             allowed_svcs,
         })
