@@ -55,6 +55,8 @@ Texture packs need "Draw the 3D on the GPU", which is on by default. Their pictu
 
 Got updates or DLC for a game? Just drop them in the same folder as your games and Zakuro figures out which game they belong to, and uses them when you play it. They need to be decrypted, same as the games. If you have more than one update for the same game, it picks the newest. And if you recompiled the game before adding its update, recompile it again, or the parts the update changed will run slower.
 
+Cheats work too, the same files Citra and Azahar use, so if you already have them there, just copy them over to the cheats folder in Zakuro's data folder. You can also turn them on and off, or paste a new one, from the Cheats button in the menu while you're playing.
+
 No copyrighted data is included. I do not condone piracy, and I will not help you with that. So, don't ask me about that.
 
 Controls:
