@@ -57,6 +57,8 @@ Got updates or DLC for a game? Just drop them in the same folder as your games a
 
 Cheats work too, the same files Citra and Azahar use, so if you already have them there, just copy them over to the cheats folder in Zakuro's data folder. You can also turn them on and off, or paste a new one, from the Cheats button in the menu while you're playing.
 
+For some games, the Cheats window also has a 60 FPS switch. It's a code someone from the community made (their name is right there), and I only list it for the exact version of the game I tested it on, so it might not show up for your copy. One thing to know: most of these games count time in frames, so with 60 FPS on, the whole game runs twice as fast too. Great for grinding in Pokémon, maybe less so for everything else.
+
 No copyrighted data is included. I do not condone piracy, and I will not help you with that. So, don't ask me about that.
 
 Controls:
