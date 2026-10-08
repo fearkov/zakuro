@@ -516,6 +516,12 @@ impl App {
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
             texture_packs: self.settings.texture_packs,
+            enhancements: self
+                .settings
+                .enhancements
+                .iter()
+                .filter_map(|(id, names)| Some((u64::from_str_radix(id, 16).ok()?, names.clone())))
+                .collect(),
             resolution: self.settings.resolution,
             device: self.backend.as_ref().and_then(Backend::shared_device),
             ..Config::default()
@@ -938,11 +944,22 @@ impl App {
                 }
             }
             Action::Cheat(index, on) => {
-                if let Some(cheat) = self.game.as_mut().and_then(|game| game.system.cheats.get_mut(index)) {
-                    cheat.enabled = on;
-                    log::info!("cheat {} {}", cheat.name, if on { "on" } else { "off" });
+                let Some(game) = &mut self.game else { return };
+                let program_id = game.system.title.as_ref().map_or(0, |title| title.program_id());
+                let Some(cheat) = game.system.cheats.get_mut(index) else { return };
+                cheat.enabled = on;
+                log::info!("{} {} {}", if cheat.builtin { "enhancement" } else { "cheat" }, cheat.name, if on { "on" } else { "off" });
+                if cheat.builtin {
+                    // an enhancement stays on for the game in the settings
+                    let names = self.settings.enhancements.entry(format!("{program_id:016X}")).or_default();
+                    names.retain(|name| *name != cheat.name);
+                    if on {
+                        names.push(cheat.name.clone());
+                    }
+                    self.settings.save();
+                } else {
+                    self.save_cheats();
                 }
-                self.save_cheats();
             }
             Action::AddCheat(name, code) => {
                 let lines: Vec<String> = code.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect();
@@ -962,7 +979,9 @@ impl App {
             }
             Action::ReloadCheats => {
                 if let (Some(path), Some(game)) = (self.cheats_path(), &mut self.game) {
+                    let enhancements: Vec<_> = game.system.cheats.drain(..).filter(|cheat| cheat.builtin).collect();
                     game.system.cheats = zakuro_core::cheats::load(&path);
+                    game.system.cheats.extend(enhancements);
                 }
             }
             Action::CheatsFolder => {
@@ -1148,7 +1167,7 @@ impl App {
         let fast = self.fast_forwarding;
         let keyboard = self.game.as_ref().and_then(|game| game.system.keyboard_request().cloned());
         let cheats = self.game.as_ref().filter(|_| self.menus.cheats_open).map(|game| {
-            game.system.cheats.iter().map(|cheat| (cheat.name.clone(), cheat.enabled, cheat.notes.join("\n"))).collect::<Vec<_>>()
+            game.system.cheats.iter().map(|cheat| (cheat.name.clone(), cheat.enabled, cheat.notes.join("\n"), cheat.builtin)).collect::<Vec<_>>()
         });
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();

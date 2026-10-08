@@ -1,0 +1,77 @@
+# enhancements, one game after another:
+# = <title id> <name>
+# <enhancement> | <build> | <who made it> | <what to know about it>
+# <code lines>
+# the build is any, rev<remaster version> for a cartridge without an update,
+# or update <major>.<minor> for a game with that update. each code here was
+# tested on its build in Zakuro, where it doubled the frames the game draws.
+# the 60 FPS codes come from the 60 FPS cheat thread on GBAtemp and Reshiban's
+# collection of them. most of these games count time in frames, so they run
+# faster too, which the note says where the code's author said so or where
+# it showed in testing.
+
+= 0004000000054000 Super Mario 3D Land (USA)
+60 FPS | rev0 | Hazerou | The whole game runs twice as fast with it.
+D3000000 15000000
+2091621C 00000001
+D2000000 00000000
+
+= 0004000000055D00 Pokémon X (USA)
+60 FPS | rev0 | Reshiban | The whole game runs twice as fast with it.
+28C61A85 00000000
+
+= 0004000000055E00 Pokémon Y (USA)
+60 FPS | rev0 | Reshiban | The whole game runs twice as fast with it.
+28C61A85 00000000
+
+= 000400000008C300 Tomodachi Life (USA)
+60 FPS | rev2 | Hazerou | The game runs faster with it.
+D3000000 08000000
+2020A748 0000003C
+D2000000 00000000
+
+= 000400000011C400 Pokémon Omega Ruby (USA)
+60 FPS | rev3 | Reshiban | The whole game runs twice as fast with it.
+28C650C1 00000000
+
+= 000400000011C500 Pokémon Alpha Sapphire (USA)
+60 FPS | rev3 | Reshiban | The whole game runs twice as fast with it.
+28C650C1 00000000
+
+= 0004000000125500 The Legend of Zelda: Majora's Mask 3D (USA)
+60 FPS | rev2 | NanashiFinal13 | The whole game runs twice as fast with it.
+206A3A14 00000001
+
+= 0004000000136D00 Inazuma Eleven GO: Chrono Stones Thunderflash (EUR)
+60 FPS | rev0 | lucky | Some things may run faster with it.
+2062C929 00000001
+
+= 0004000000164800 Pokémon Sun (USA)
+60 FPS | rev0 | Reshiban | The whole game runs twice as fast with it.
+D3000000 30000000
+2417E569 00000000
+D2000000 00000000
+
+= 00040000001B5000 Pokémon Ultra Sun (USA)
+60 FPS | rev0 | Reshiban | The whole game runs twice as fast with it.
+D3000000 30000000
+23F67FE9 00000000
+D2000000 00000000
+
+= 00040000001B5100 Pokémon Ultra Moon (USA)
+60 FPS | rev0 | Reshiban | The whole game runs twice as fast with it.
+D3000000 30000000
+23F67FE9 00000000
+D2000000 00000000
+
+= 0004000000167800 Yo-kai Watch (EUR)
+60 FPS | rev0 | lucky | The game runs faster with it.
+20601951 00000001
+
+= 000400000016E700 Final Fantasy Explorers (EUR)
+60 FPS | rev0 | lucky | The whole game runs twice as fast with it.
+280927E8 00000001
+
+= 00040000001B2900 Yo-kai Watch 2: Psychic Specters (EUR)
+60 FPS | rev0 | lucky | Some things may run faster with it.
+2086128D 00000001

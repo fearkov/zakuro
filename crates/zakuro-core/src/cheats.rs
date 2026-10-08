@@ -19,6 +19,9 @@ pub struct Cheat {
     /// its lines as written, "XXXXXXXX YYYYYYYY" each.
     lines: Vec<String>,
     code: Vec<Option<Line>>,
+    /// one of Zakuro's enhancements rather than the player's, which stays
+    /// out of the cheat file.
+    pub builtin: bool,
 }
 
 /// a line of code taken apart, its type being its first digit, or its first
@@ -61,7 +64,7 @@ pub fn is_code(line: &str) -> bool {
 impl Cheat {
     pub fn new(name: &str, lines: Vec<String>, notes: Vec<String>) -> Cheat {
         let code = lines.iter().map(|line| Line::parse(line)).collect();
-        Cheat { name: name.to_owned(), enabled: false, notes, lines, code }
+        Cheat { name: name.to_owned(), enabled: false, notes, lines, code, builtin: false }
     }
 
     pub fn lines(&self) -> &[String] {
@@ -116,7 +119,7 @@ pub fn parse(text: &str) -> Vec<Cheat> {
 /// cheats as Citra writes them, for its file.
 pub fn to_text(cheats: &[Cheat]) -> String {
     let mut text = String::new();
-    for cheat in cheats {
+    for cheat in cheats.iter().filter(|cheat| !cheat.builtin) {
         text += &format!("[{}]\n", cheat.name);
         if cheat.enabled {
             text += ENABLED;

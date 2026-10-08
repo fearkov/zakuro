@@ -284,6 +284,8 @@ pub struct Settings {
     pub background_opacity: f32,
     pub keys: Keys,
     pub pad: PadButtons,
+    /// the enhancements turned on, by name, for each game by its title id.
+    pub enhancements: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
@@ -306,6 +308,7 @@ impl Default for Settings {
             background_opacity: 0.35,
             keys: Keys::default(),
             pad: PadButtons::default(),
+            enhancements: std::collections::BTreeMap::new(),
         }
     }
 }

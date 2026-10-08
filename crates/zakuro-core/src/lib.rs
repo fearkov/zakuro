@@ -2,6 +2,7 @@
 //! the loop that drives them.
 
 pub mod cheats;
+pub mod enhancements;
 pub mod cro;
 pub mod hints;
 pub mod kernel;
@@ -56,6 +57,8 @@ pub struct Config {
     pub update: Option<std::path::PathBuf>,
     /// the title's downloadable content, DLC CIAs.
     pub dlc: Vec<std::path::PathBuf>,
+    /// the enhancements turned on, by name, for each title by its id.
+    pub enhancements: std::collections::BTreeMap<u64, Vec<String>>,
     /// how many times the console's resolution the host's GPU draws at.
     pub resolution: u32,
     /// the Vulkan presenter's device, to draw on and show the screens
@@ -82,6 +85,7 @@ impl Default for Config {
             texture_packs: true,
             update: None,
             dlc: Vec::new(),
+            enhancements: std::collections::BTreeMap::new(),
             resolution: 1,
             device: None,
             clock: None,

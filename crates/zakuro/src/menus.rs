@@ -368,23 +368,37 @@ impl Menus {
 
     /// the cheats window over a game, when open, its cheats by name, whether
     /// each is on, and their notes.
-    pub fn cheats(&mut self, ctx: &egui::Context, cheats: &[(String, bool, String)]) -> Vec<Action> {
+    pub fn cheats(&mut self, ctx: &egui::Context, cheats: &[(String, bool, String, bool)]) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut open = self.cheats_open;
         egui::Window::new("Cheats").open(&mut open).default_width(380.0).show(ctx, |ui| {
-            if cheats.is_empty() {
+            let mut checkbox = |ui: &mut egui::Ui, index: usize, name: &str, enabled: bool, notes: &str| {
+                let mut on = enabled;
+                let mut response = ui.checkbox(&mut on, name);
+                if !notes.is_empty() {
+                    response = response.on_hover_text(notes);
+                }
+                if response.changed() {
+                    actions.push(Action::Cheat(index, on));
+                }
+            };
+            // Zakuro's own, tested on this build of the game
+            if cheats.iter().any(|cheat| cheat.3) {
+                ui.label(RichText::new("Enhancements").strong());
+                for (index, (name, enabled, notes, _)) in cheats.iter().enumerate().filter(|(_, cheat)| cheat.3) {
+                    checkbox(ui, index, name, *enabled, "");
+                    // what it does to the game and who made it, in sight
+                    // before it is turned on
+                    ui.indent(index, |ui| ui.label(RichText::new(notes).weak().small()));
+                }
+                ui.separator();
+            }
+            if !cheats.iter().any(|cheat| !cheat.3) {
                 ui.label(RichText::new("No cheats yet. Add one below, or put the cheat file Citra or Azahar has for this game in the cheats folder.").weak());
             }
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for (index, (name, enabled, notes)) in cheats.iter().enumerate() {
-                    let mut on = *enabled;
-                    let mut response = ui.checkbox(&mut on, name);
-                    if !notes.is_empty() {
-                        response = response.on_hover_text(notes);
-                    }
-                    if response.changed() {
-                        actions.push(Action::Cheat(index, on));
-                    }
+                for (index, (name, enabled, notes, _)) in cheats.iter().enumerate().filter(|(_, cheat)| !cheat.3) {
+                    checkbox(ui, index, name, *enabled, notes);
                 }
             });
             ui.separator();
