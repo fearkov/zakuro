@@ -426,134 +426,143 @@ impl Menus {
         let mut actions = Vec::new();
         let before = settings.clone();
         let mut open = self.settings_open;
-        egui::Window::new("Settings").open(&mut open).resizable(false).show(ctx, |ui| {
-            ui.heading("Games");
-            ui.horizontal(|ui| {
-                match &settings.games {
-                    Some(folder) => ui.label(folder.display().to_string()),
-                    None => ui.label(RichText::new("none").weak()),
-                };
-                if ui.button("Choose…").clicked() {
-                    actions.push(Action::ChooseFolder);
-                }
-            });
-
-            ui.separator();
-            ui.heading("Graphics");
-            egui::ComboBox::from_label("Presented with")
-                .selected_text(match settings.renderer {
-                    Renderer::Vulkan => "Vulkan",
-                    Renderer::OpenGl => "OpenGL",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut settings.renderer, Renderer::Vulkan, "Vulkan");
-                    ui.selectable_value(&mut settings.renderer, Renderer::OpenGl, "OpenGL");
+        // taller than a screen has room for, so it scrolls, and it can be
+        // dragged to any size that fits
+        let room = ctx.content_rect().height() - 16.0;
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings"))
+            .open(&mut open)
+            .vscroll(true)
+            .default_size([460.0, room])
+            .max_height(room)
+            .show(ctx, |ui| {
+                ui.heading("Games");
+                ui.horizontal(|ui| {
+                    match &settings.games {
+                        Some(folder) => ui.label(folder.display().to_string()),
+                        None => ui.label(RichText::new("none").weak()),
+                    };
+                    if ui.button("Choose…").clicked() {
+                        actions.push(Action::ChooseFolder);
+                    }
                 });
-            ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
-            ui.add_enabled(
-                settings.hardware_rasterizer,
-                egui::Slider::new(&mut settings.resolution, 1..=8).text("Resolution").suffix("x"),
-            )
-            .on_hover_text("How many times the console's resolution the 3D is drawn at. Past what the window shows, the extra pixels smooth the edges, at a cost to the GPU that grows fast.");
-            ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
-                .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
-            ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
-            egui::ComboBox::from_label("Screens").selected_text(settings.layout.name()).show_ui(ui, |ui| {
-                for layout in Screens::ALL {
-                    ui.selectable_value(&mut settings.layout, layout, layout.name());
+
+                ui.separator();
+                ui.heading("Graphics");
+                egui::ComboBox::from_label("Presented with")
+                    .selected_text(match settings.renderer {
+                        Renderer::Vulkan => "Vulkan",
+                        Renderer::OpenGl => "OpenGL",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.renderer, Renderer::Vulkan, "Vulkan");
+                        ui.selectable_value(&mut settings.renderer, Renderer::OpenGl, "OpenGL");
+                    });
+                ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
+                ui.add_enabled(
+                    settings.hardware_rasterizer,
+                    egui::Slider::new(&mut settings.resolution, 1..=8).text("Resolution").suffix("x"),
+                )
+                .on_hover_text("How many times the console's resolution the 3D is drawn at. Past what the window shows, the extra pixels smooth the edges, at a cost to the GPU that grows fast.");
+                ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
+                    .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
+                ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
+                egui::ComboBox::from_label("Screens").selected_text(settings.layout.name()).show_ui(ui, |ui| {
+                    for layout in Screens::ALL {
+                        ui.selectable_value(&mut settings.layout, layout, layout.name());
+                    }
+                });
+                egui::ComboBox::from_label("Filter").selected_text(settings.filter.name()).show_ui(ui, |ui| {
+                    for filter in Filter::ALL {
+                        ui.selectable_value(&mut settings.filter, filter, filter.name());
+                    }
+                })
+                .response
+                .on_hover_text("How the screens' pixels look scaled up: smooth, sharp with soft edges, or plain squares.");
+                ui.checkbox(&mut settings.integer_scale, "Scale by whole numbers only")
+                    .on_hover_text("Every pixel gets the same size, with a border around the screens.");
+                ui.label(
+                    RichText::new("F9 switches them while playing, F10 between the top and the bottom screen alone.").weak(),
+                );
+                ui.label(RichText::new("The presenter changes the next time Zakuro starts, the 3D with the next game.").weak());
+
+                ui.separator();
+                ui.heading("Emulation");
+                ui.radio_value(&mut settings.recompiled, true, "Recompiled code when there is some");
+                ui.radio_value(&mut settings.recompiled, false, "Interpreter only");
+                ui.label(RichText::new("It changes with the next game started, or Reset.").weak());
+
+                ui.separator();
+                ui.heading("Sound");
+                ui.add(egui::Slider::new(&mut settings.volume, 0.0..=1.0).text("Volume").show_value(false));
+                ui.checkbox(&mut settings.mute, "Mute");
+
+                ui.separator();
+                ui.heading("Interface");
+                ui.checkbox(&mut settings.show_fps, "Show the frame rate");
+                ui.horizontal(|ui| {
+                    ui.label("Library background");
+                    match &settings.background {
+                        Some(path) => ui.label(path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()),
+                        None => ui.label(RichText::new("none").weak()),
+                    };
+                    if ui.button("Choose…").clicked() {
+                        actions.push(Action::ChooseBackground);
+                    }
+                    if settings.background.is_some() && ui.button("Remove").clicked() {
+                        settings.background = None;
+                    }
+                });
+                ui.add_enabled(
+                    settings.background.is_some(),
+                    egui::Slider::new(&mut settings.background_opacity, 0.0..=1.0)
+                        .text("Opacity")
+                        .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+                );
+
+
+                ui.separator();
+                ui.heading("Controls");
+                egui::Grid::new("controls").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
+                    for (i, (name, key)) in settings.keys.all_mut().into_iter().enumerate() {
+                        ui.label(name);
+                        let text = if self.rebinding == Some(i) { "press a key…".to_owned() } else { key_name(*key) };
+                        if ui.add_sized([110.0, 20.0], egui::Button::new(text)).clicked() {
+                            self.rebinding = Some(i);
+                            self.rebinding_pad = None;
+                        }
+                        if i % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                if ui.button("Default controls").clicked() {
+                    settings.keys = Keys::default();
+                    self.rebinding = None;
+                }
+                ui.label(RichText::new("Drag with the right mouse button to tilt the console, for games that use the motion sensors.").weak());
+
+                ui.separator();
+                ui.heading("Controller");
+                egui::Grid::new("controller").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
+                    for (i, (name, button)) in settings.pad.all_mut().into_iter().enumerate() {
+                        ui.label(name);
+                        let text = if self.rebinding_pad == Some(i) { "press a button…" } else { button_name(*button) };
+                        if ui.add_sized([110.0, 20.0], egui::Button::new(text)).clicked() {
+                            self.rebinding_pad = Some(i);
+                            self.rebinding = None;
+                        }
+                        if i % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.label(RichText::new("The circle pad is the left stick, and Home opens the menu over the game.").weak());
+                if ui.button("Default controller").clicked() {
+                    settings.pad = PadButtons::default();
+                    self.rebinding_pad = None;
                 }
             });
-            egui::ComboBox::from_label("Filter").selected_text(settings.filter.name()).show_ui(ui, |ui| {
-                for filter in Filter::ALL {
-                    ui.selectable_value(&mut settings.filter, filter, filter.name());
-                }
-            })
-            .response
-            .on_hover_text("How the screens' pixels look scaled up: smooth, sharp with soft edges, or plain squares.");
-            ui.checkbox(&mut settings.integer_scale, "Scale by whole numbers only")
-                .on_hover_text("Every pixel gets the same size, with a border around the screens.");
-            ui.label(
-                RichText::new("F9 switches them while playing, F10 between the top and the bottom screen alone.").weak(),
-            );
-            ui.label(RichText::new("The presenter changes the next time Zakuro starts, the 3D with the next game.").weak());
-
-            ui.separator();
-            ui.heading("Emulation");
-            ui.radio_value(&mut settings.recompiled, true, "Recompiled code when there is some");
-            ui.radio_value(&mut settings.recompiled, false, "Interpreter only");
-            ui.label(RichText::new("It changes with the next game started, or Reset.").weak());
-
-            ui.separator();
-            ui.heading("Sound");
-            ui.add(egui::Slider::new(&mut settings.volume, 0.0..=1.0).text("Volume").show_value(false));
-            ui.checkbox(&mut settings.mute, "Mute");
-
-            ui.separator();
-            ui.heading("Interface");
-            ui.checkbox(&mut settings.show_fps, "Show the frame rate");
-            ui.horizontal(|ui| {
-                ui.label("Library background");
-                match &settings.background {
-                    Some(path) => ui.label(path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()),
-                    None => ui.label(RichText::new("none").weak()),
-                };
-                if ui.button("Choose…").clicked() {
-                    actions.push(Action::ChooseBackground);
-                }
-                if settings.background.is_some() && ui.button("Remove").clicked() {
-                    settings.background = None;
-                }
-            });
-            ui.add_enabled(
-                settings.background.is_some(),
-                egui::Slider::new(&mut settings.background_opacity, 0.0..=1.0)
-                    .text("Opacity")
-                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
-            );
-
-
-            ui.separator();
-            ui.heading("Controls");
-            egui::Grid::new("controls").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
-                for (i, (name, key)) in settings.keys.all_mut().into_iter().enumerate() {
-                    ui.label(name);
-                    let text = if self.rebinding == Some(i) { "press a key…".to_owned() } else { key_name(*key) };
-                    if ui.add_sized([110.0, 20.0], egui::Button::new(text)).clicked() {
-                        self.rebinding = Some(i);
-                        self.rebinding_pad = None;
-                    }
-                    if i % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
-            if ui.button("Default controls").clicked() {
-                settings.keys = Keys::default();
-                self.rebinding = None;
-            }
-            ui.label(RichText::new("Drag with the right mouse button to tilt the console, for games that use the motion sensors.").weak());
-
-            ui.separator();
-            ui.heading("Controller");
-            egui::Grid::new("controller").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
-                for (i, (name, button)) in settings.pad.all_mut().into_iter().enumerate() {
-                    ui.label(name);
-                    let text = if self.rebinding_pad == Some(i) { "press a button…" } else { button_name(*button) };
-                    if ui.add_sized([110.0, 20.0], egui::Button::new(text)).clicked() {
-                        self.rebinding_pad = Some(i);
-                        self.rebinding = None;
-                    }
-                    if i % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
-            ui.label(RichText::new("The circle pad is the left stick, and Home opens the menu over the game.").weak());
-            if ui.button("Default controller").clicked() {
-                settings.pad = PadButtons::default();
-                self.rebinding_pad = None;
-            }
-        });
         self.settings_open = open;
         if !open {
             self.rebinding = None;
@@ -712,6 +721,25 @@ mod tests {
         assert_eq!(decoded.size, [BACKGROUND_SIDE as usize, BACKGROUND_SIDE as usize / 2]);
         assert_eq!(decoded.pixels[0].to_array(), [10, 20, 30, 255]);
         assert!(decode(Path::new("/nowhere/at/all.png")).is_err());
+    }
+
+    /// the settings stay inside a short screen, scrolling in it instead of
+    /// running past its bottom.
+    #[test]
+    fn the_settings_fit_a_short_screen() {
+        let ctx = egui::Context::default();
+        let mut menus = Menus { settings_open: true, ..Menus::default() };
+        let mut settings = Settings::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 360.0));
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            ctx.run_ui(input, |ui| {
+                menus.settings(ui.ctx(), &mut settings);
+            })
+            .drop_without_applying_deltas();
+        }
+        let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("settings"))).unwrap();
+        assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
     }
 
     #[test]
