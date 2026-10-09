@@ -4,6 +4,8 @@ pub mod isa;
 mod batch;
 #[cfg(feature = "vulkan")]
 pub(crate) mod glsl;
+#[cfg(feature = "jit")]
+mod jit;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -467,6 +469,16 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    // the program compiled, the batches it gives back shaded the way below
+    #[cfg(feature = "jit")]
+    if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
+        let mut uniforms = None;
+        jit::run_vertices(&compiled, unit, program, inputs, &mut outputs, |inputs, outputs| {
+            let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
+            batch::run(unit, uniforms, program, inputs, outputs, &mut blocks, &mut forks);
+        });
+        return outputs;
+    }
     let mut state = ShaderState::new();
     let uniforms = batch::Uniforms::new(unit);
     for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
@@ -506,6 +518,17 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut triangles = Vec::with_capacity(inputs.len());
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    #[cfg(feature = "jit")]
+    if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
+        let mut uniforms = None;
+        jit::run_geometry(&compiled, unit, program, inputs, &mut triangles, |inputs, triangles| {
+            let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
+            let mut emitters = batch::Emitters::new();
+            batch::run_geometry(unit, uniforms, program, inputs, &mut emitters, &mut blocks, &mut forks);
+            triangles.extend(emitters.triangles.into_iter().take(inputs.len()));
+        });
+        return triangles;
+    }
     let uniforms = batch::Uniforms::new(unit);
     for inputs in inputs.chunks(batch::LANES) {
         if trace_nan {
@@ -952,6 +975,27 @@ mod tests {
             .collect()
     }
 
+    /// the batches alone, without the program compiled.
+    fn batched(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
+        let program = unit.decoded.as_ref().expect("a prepared unit");
+        let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
+        let (mut blocks, mut forks) = (Vec::new(), Vec::new());
+        let uniforms = batch::Uniforms::new(unit);
+        for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
+            batch::run(unit, &uniforms, program, inputs, outputs, &mut blocks, &mut forks);
+        }
+        outputs
+    }
+
+    /// the unit's program compiles, as it has to wherever there is a
+    /// compiler.
+    fn assert_compiled(unit: &ShaderUnit) {
+        #[cfg(feature = "jit")]
+        if let Err(error) = jit::compile(unit.decoded.as_ref().expect("a prepared unit"), unit.entry_point) {
+            panic!("the program did not compile, {error}");
+        }
+    }
+
     /// the same results, a NaN matching any NaN and zeros their sign.
     fn same(a: &[[Vec4; OUTPUT_REGISTERS]], b: &[[Vec4; OUTPUT_REGISTERS]]) -> bool {
         let same = |x: f32, y: f32| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits();
@@ -1015,7 +1059,10 @@ mod tests {
             let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..count)
                 .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| random.float())))
                 .collect();
-            assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)), "program {program:08X?}");
+            let single = one_by_one(&unit, &inputs);
+            assert!(same(&run_vertices(&unit, &inputs), &single), "program {program:08X?}");
+            assert_compiled(&unit);
+            assert!(same(&batched(&unit, &inputs), &single), "program {program:08X?} batched");
         }
     }
 
@@ -1095,7 +1142,85 @@ mod tests {
             let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..count)
                 .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| random.float())))
                 .collect();
+            let single = one_by_one(&unit, &inputs);
+            assert!(same(&run_vertices(&unit, &inputs), &single), "program {program:08X?}");
+            assert_compiled(&unit);
+            assert!(same(&batched(&unit, &inputs), &single), "program {program:08X?} batched");
+        }
+    }
+
+    /// ifs nested in ifs, on conditions and on booleans, and a call, whose
+    /// vertices part ways at every one, come out the same compiled as one
+    /// vertex at a time, without a batch going back.
+    #[test]
+    fn parted_branches_shade_like_the_interpreter() {
+        fn block(random: &mut Random, program: &mut Vec<u32>, depth: u32) {
+            let arithmetic = [0x00, 0x01, 0x02, 0x03, 0x08, 0x0B, 0x0C, 0x0D, 0x0E, 0x12, 0x13];
+            for _ in 0..1 + random.below(3) {
+                match random.below(if depth < 3 { 5 } else { 3 }) {
+                    0 | 1 => {
+                        let op = arithmetic[random.below(arithmetic.len() as u32) as usize];
+                        let (destination, wide, narrow) = (random.below(32), random.below(0x80), random.below(0x20));
+                        program.push((op << 26) | (destination << 21) | (random.below(4) << 19) | (wide << 12) | (narrow << 7) | random.below(32));
+                    }
+                    2 => {
+                        let modes = (random.below(6) << 24) | (random.below(6) << 21);
+                        program.push((0x2E << 26) | modes | (random.below(0x80) << 12) | (random.below(0x20) << 7));
+                    }
+                    _ => {
+                        let at = program.len();
+                        program.push(0);
+                        block(random, program, depth + 1);
+                        let otherwise = program.len() as u32;
+                        if random.below(3) != 0 {
+                            block(random, program, depth + 1);
+                        }
+                        let count = program.len() as u32 - otherwise;
+                        program[at] = match random.below(4) {
+                            0 => (0x27 << 26) | (random.below(16) << 22),
+                            _ => (0x28 << 26) | (random.below(4) << 24) | (random.below(4) << 22),
+                        } | (otherwise << 10)
+                            | count;
+                    }
+                }
+            }
+        }
+        let mut random = Random(5);
+        for _ in 0..300 {
+            let mut unit = ShaderUnit::new();
+            for uniform in unit.float_uniforms.iter_mut() {
+                *uniform = std::array::from_fn(|_| random.float());
+            }
+            for descriptor in unit.descriptors.iter_mut() {
+                *descriptor = (random.next() & 0x7FFF_FFF0) | (random.below(15) + 1);
+            }
+            unit.bool_uniforms = random.next() as u16;
+            // the address registers and conditions from the inputs first
+            let mut program = vec![(0x12 << 26) | (random.below(16) << 12) | random.below(32)];
+            block(&mut random, &mut program, 0);
+            // a call to a routine past the end
+            let call = program.len();
+            program.push(0);
+            block(&mut random, &mut program, 2);
+            program.push(0x22 << 26);
+            let routine = program.len() as u32;
+            block(&mut random, &mut program, 3);
+            let count = program.len() as u32 - routine;
+            program[call] = (0x25 << 26) | (random.below(4) << 24) | (random.below(4) << 22) | (routine << 10) | count;
+            for (i, &word) in program.iter().enumerate() {
+                unit.program[i] = word;
+            }
+            unit.prepare();
+            let count = 1 + random.below(24) as usize;
+            let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..count)
+                .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| random.float())))
+                .collect();
             assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)), "program {program:08X?}");
+            #[cfg(feature = "jit")]
+            {
+                let compiled = jit::compiled(&unit, unit.decoded.as_ref().expect("prepared")).expect("compiled");
+                assert_eq!(compiled.returned(), 0, "program {program:08X?} gave batches back");
+            }
         }
     }
 
@@ -1132,21 +1257,73 @@ mod tests {
             unit.program[i] = word;
         }
         unit.prepare();
+        // a draw's worth, which the cache holds, as a draw's inputs are,
+        // shaded many times over
         let inputs: Vec<[Vec4; INPUT_REGISTERS]> =
-            (0..80_000).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0))).collect();
-        let instructions = (program.len() - 1) as f64 * inputs.len() as f64;
-        let start = std::time::Instant::now();
-        let wide = run_vertices(&unit, &inputs);
-        let batched = start.elapsed().as_secs_f64();
-        let start = std::time::Instant::now();
-        let single = one_by_one(&unit, &inputs);
-        let alone = start.elapsed().as_secs_f64();
-        assert!(same(&wide, &single));
+            (0..4096).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0))).collect();
+        const TIMES: usize = 50;
+        let instructions = (program.len() - 1) as f64 * inputs.len() as f64 * TIMES as f64;
+        let timed = |shade: &dyn Fn() -> Vec<[Vec4; OUTPUT_REGISTERS]>| {
+            let start = std::time::Instant::now();
+            for _ in 1..TIMES {
+                std::hint::black_box(shade());
+            }
+            let outputs = shade();
+            (outputs, start.elapsed().as_secs_f64())
+        };
+        // once to compile it, then timed
+        run_vertices(&unit, &inputs[..8]);
+        let (fast, compiled_time) = timed(&|| run_vertices(&unit, &inputs));
+        let (wide, batched_time) = timed(&|| batched(&unit, &inputs));
+        let (single, alone) = timed(&|| one_by_one(&unit, &inputs));
+        assert!(same(&wide, &single) && same(&fast, &single));
         println!(
-            "batched {:.2} ns an instruction a vertex, one by one {:.2}",
-            batched * 1e9 / instructions,
+            "compiled {:.2} ns an instruction a vertex, batched {:.2}, one by one {:.2}",
+            compiled_time * 1e9 / instructions,
+            batched_time * 1e9 / instructions,
             alone * 1e9 / instructions
         );
+    }
+
+    /// the compiled program alone, many times over, for a profiler.
+    #[test]
+    #[ignore]
+    fn compiled_speed() {
+        let mut random = Random(7);
+        let mut unit = ShaderUnit::new();
+        for uniform in unit.float_uniforms.iter_mut() {
+            *uniform = std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0 - 1.0);
+        }
+        unit.descriptors[0] = IDENTITY;
+        let dp4 = |dest: u32, uniform: u32, src: u32| (0x02 << 26) | (dest << 21) | (uniform << 12) | (src << 7);
+        let mut program = Vec::new();
+        for _ in 0..8 {
+            for i in 0..4 {
+                program.push(dp4(0x10, 0x20 + i, 0));
+            }
+            for i in 0..4 {
+                program.push(dp4(0x00, 0x24 + i, 0x10));
+            }
+            program.push((0b111 << 29) | (0x11 << 24) | (1 << 17) | (0x28 << 10) | (0x10 << 5));
+            program.push((0x0C << 26) | (0x12 << 21) | (0x11 << 12) | (1 << 7));
+            program.push((0x08 << 26) | (0x01 << 21) | (0x29 << 12) | (0x12 << 7));
+            program.push((0x13 << 26) | (0x02 << 21) | (2 << 12));
+        }
+        program.push(0x22 << 26);
+        for (i, &word) in program.iter().enumerate() {
+            unit.program[i] = word;
+        }
+        unit.prepare();
+        // a draw's worth, which the cache holds, as a draw's inputs are
+        let inputs: Vec<[Vec4; INPUT_REGISTERS]> =
+            (0..4096).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0))).collect();
+        run_vertices(&unit, &inputs[..8]);
+        let start = std::time::Instant::now();
+        for _ in 0..400 {
+            std::hint::black_box(run_vertices(&unit, &inputs));
+        }
+        let instructions = (program.len() - 1) as f64 * inputs.len() as f64 * 400.0;
+        println!("compiled {:.3} ns an instruction a vertex", start.elapsed().as_secs_f64() * 1e9 / instructions);
     }
 
     /// a branch half the vertices take and half do not still sends each
@@ -1249,6 +1426,31 @@ mod tests {
         let unit = unit_with(&[jump], &[IDENTITY]);
         let mut state = ShaderState::new();
         run(&unit, &mut state);
+    }
+
+    /// a program that never ends stops where the interpreter stops it, the
+    /// compiled code giving the batch back once it runs that long.
+    #[test]
+    fn a_runaway_program_stops_the_same_compiled() {
+        // jmpc 0 on a condition that holds, forever
+        let mut unit = unit_with(&[0x2C << 26], &[IDENTITY]);
+        unit.prepare();
+        let inputs = vec![[[1.0; 4]; INPUT_REGISTERS]; 4];
+        assert_compiled(&unit);
+        assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)));
+    }
+
+    /// a program calling itself goes too deep to compile, and the batches
+    /// shade it.
+    #[test]
+    fn a_program_too_deep_to_compile_still_shades() {
+        // call 0 for one instruction, which calls it again
+        let mut unit = unit_with(&[(0x24 << 26) | 1, 0x22 << 26], &[IDENTITY]);
+        unit.prepare();
+        #[cfg(feature = "jit")]
+        assert!(jit::compile(unit.decoded.as_ref().expect("prepared"), 0).is_err());
+        let inputs = vec![[[1.0; 4]; INPUT_REGISTERS]; 4];
+        assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)));
     }
 
     #[test]

@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["jit"]
 opengl = ["dep:glow"]
 vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
+# the shaders the CPU runs compiled to the host's code instead of interpreted
+jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
 [dependencies]
 zakuro-common.workspace = true
@@ -28,3 +30,9 @@ ash-window = { version = "0.13", optional = true }
 # turns translated vertex shaders into SPIR-V. wgsl-in only so 30.0.1 builds,
 # its glsl-in needs code it gates on wgsl-in
 naga = { version = "30.0.1", optional = true, features = ["glsl-in", "wgsl-in", "spv-out"] }
+# 0.135 is the last that builds with Rust 1.95
+cranelift-codegen = { version = "0.135", optional = true }
+cranelift-frontend = { version = "0.135", optional = true }
+cranelift-jit = { version = "0.135", optional = true }
+cranelift-module = { version = "0.135", optional = true }
+cranelift-native = { version = "0.135", optional = true }
