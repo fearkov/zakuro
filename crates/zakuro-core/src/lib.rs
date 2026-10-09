@@ -616,7 +616,7 @@ impl System {
 
         // pick up any buffer swap the game queued directly in GSP shared
         // memory before the LCDs latch whatever is currently configured.
-        services::gsp::apply_framebuffer_updates(self);
+        services::gsp::refresh(self);
 
         // both LCDs finish scanning out, in that order.
         services::gsp::signal_interrupt(self, services::gsp::InterruptId::Pdc0);

@@ -61,6 +61,11 @@ pub struct GspState {
     pub has_right: bool,
     /// commands pulled off the ring that the GPU has not run yet.
     pub pending: Vec<GxCommand>,
+    /// the picture each screen has waiting in shared memory for the next
+    /// refresh, as the first look since the last one found it.
+    pub waiting: [Option<(u32, u32)>; 2],
+    /// the ring waits for the next refresh, see outdrawn.
+    pub held: bool,
 }
 
 /// command ids, straight from 3dbrew's GSP::GPU table.
@@ -206,7 +211,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         // TriggerCmdReqQueue, run whatever the client queued in shared memory.
         TRIGGER_CMD_REQ_QUEUE => {
-            process_command_queue(system);
+            if !outdrawn(system) {
+                process_command_queue(system);
+            }
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -367,6 +374,45 @@ pub fn apply_framebuffer_updates(system: &mut System) {
         // title that polls it to know its previous frame was consumed keeps
         // moving instead of assuming GSP is stuck.
         system.memory.write32(record, index);
+    }
+}
+
+/// whether the title drew past what the screens can show, a picture over
+/// one still waiting for a refresh, so the ring waits for the next one.
+/// the console's GPU takes its time, which paces a title that never waits
+/// for a refresh, and ours finishes at once, Monster Hunter 3 Ultimate drew
+/// twenty pictures for each refresh that no one saw. a title that waits for
+/// a refresh sets one picture for each and is never held.
+fn outdrawn(system: &mut System) -> bool {
+    let base = system.services.gsp.shared_memory_address;
+    if base == 0 || system.services.gsp.held {
+        return system.services.gsp.held;
+    }
+    let client = system.services.gsp.thread_index * FRAMEBUFFER_INFO_CLIENT_STRIDE;
+    for screen in 0..2 {
+        let record = base + FRAMEBUFFER_INFO_BASE + client + screen as u32 * FRAMEBUFFER_INFO_SCREEN_STRIDE;
+        let header = system.memory.read32(record);
+        if (header >> 8) & 0xFF == 0 {
+            continue;
+        }
+        let index = header & 0xFF;
+        let left = system.memory.read32(record + FRAMEBUFFER_ENTRY_BASE + index * FRAMEBUFFER_ENTRY_STRIDE + 0x04);
+        match system.services.gsp.waiting[screen] {
+            None => system.services.gsp.waiting[screen] = Some((index, left)),
+            Some(waiting) if waiting != (index, left) => system.services.gsp.held = true,
+            Some(_) => {}
+        }
+    }
+    system.services.gsp.held
+}
+
+/// the screens refresh, taking the pictures set for them, and a ring held
+/// for it runs.
+pub fn refresh(system: &mut System) {
+    apply_framebuffer_updates(system);
+    system.services.gsp.waiting = [None; 2];
+    if std::mem::take(&mut system.services.gsp.held) {
+        process_command_queue(system);
     }
 }
 
@@ -681,6 +727,50 @@ mod tests {
             0,
             "is_dirty should be cleared once the swap is applied"
         );
+    }
+
+    /// a title that never waits for a refresh sets a picture over one the
+    /// screens have not shown yet, and its commands wait in the ring for
+    /// the next refresh, as with a GPU that takes its time. one that sets a
+    /// picture for each refresh never waits.
+    #[test]
+    fn a_picture_over_one_not_shown_holds_the_ring_until_the_refresh() {
+        let (mut system, vaddr) = system_with_mapped_gsp_shm();
+        let record = vaddr + FRAMEBUFFER_INFO_BASE;
+        let ring = vaddr + COMMAND_BUFFER_BASE;
+        let picture = |system: &mut System, index: u32, left: u32| {
+            system.memory.write32(record + FRAMEBUFFER_ENTRY_BASE + index * FRAMEBUFFER_ENTRY_STRIDE + 0x04, left);
+            system.memory.write32(record, 0x100 | index);
+        };
+        // queues a cache flush, which does nothing, and asks for the ring to
+        // run, what it leaves in it waits
+        let trigger = |system: &mut System| {
+            let control = system.memory.read32(ring);
+            let (index, count) = (control & 0xFF, (control >> 8) & 0xFF);
+            system.memory.write32(ring + 0x20 + (index + count) % 15 * 0x20, 0x05);
+            system.memory.write32(ring, index | (count + 1) << 8);
+            let buffer = CommandBuffer::new(vaddr + 0x100);
+            let header = Header::new(command::TRIGGER_CMD_REQ_QUEUE, 0, 0);
+            buffer.set(&mut system.memory, 0, header.0);
+            handle(system, &buffer, header);
+            (system.memory.read32(ring) >> 8) & 0xFF
+        };
+
+        for (index, left) in [(0, 0x1F30_0000), (1, 0x1F35_DC00), (0, 0x1F3B_B800)] {
+            picture(&mut system, index, left);
+            assert_eq!(trigger(&mut system), 0, "one picture for each refresh runs at once");
+            refresh(&mut system);
+        }
+        picture(&mut system, 1, 0x1F30_0000);
+        assert_eq!(trigger(&mut system), 0);
+        picture(&mut system, 0, 0x1F35_DC00);
+        assert_eq!(trigger(&mut system), 1, "a second picture before the refresh holds the ring");
+        assert_eq!(trigger(&mut system), 2);
+        refresh(&mut system);
+        assert_eq!((system.memory.read32(ring) >> 8) & 0xFF, 0, "the refresh runs what waited");
+        assert_eq!(system.gpu.framebuffers[0].address_left(), 0x1835_DC00, "showing the newest picture");
+        picture(&mut system, 1, 0x1F3B_B800);
+        assert_eq!(trigger(&mut system), 0);
     }
 
     /// a record with is_dirty clear (the steady state right after a swap
