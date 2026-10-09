@@ -3600,9 +3600,15 @@ impl Hardware {
         else {
             return Ok(false);
         };
-        let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
+        // rows read where the output goes, the CPU does in order. the rest
+        // of the input's buffer can be under the output, Monster Hunter 3
+        // Ultimate puts the bottom screen right before the rows it reads, and
+        // the output drawn over them is the overdrawn below
+        let row_bytes = (input_size.0 * input_kind.bytes()) as u64;
+        let read_start = addr as u64 + (row + first) as u64 * row_bytes;
+        let read_end = read_start + rows as u64 * row_bytes;
         let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
-        if (addr as u64) < output_end && (t.output as u64) < input_end {
+        if read_start < output_end && (t.output as u64) < read_end {
             return Ok(false);
         }
         self.begin()?;

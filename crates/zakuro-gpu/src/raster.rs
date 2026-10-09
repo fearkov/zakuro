@@ -3669,6 +3669,47 @@ mod tests {
         assert!(colors.len() > 8, "only {} colors", colors.len());
     }
 
+    /// a transfer out of the last rows of a buffer the GPU drew stays on
+    /// the GPU when its output lies over the buffer's first rows, which it
+    /// does not read, as Monster Hunter 3 Ultimate's bottom screen does.
+    /// over rows it reads, the CPU does it in order.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_transfer_over_rows_it_does_not_read_stays_on_the_gpu() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut registers = target_registers();
+        // eight by sixteen, two rows of tiles
+        registers[REG_VIEWPORT_HEIGHT] = float24(8.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12);
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        let hardware = resources.hardware.as_mut().unwrap();
+        let transfer = |input: u32, output: u32| hardware::Transfer {
+            input,
+            output,
+            input_width: 8,
+            input_height: 8,
+            output_width: 8,
+            output_height: 8,
+            copy: (8, 8),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: ColorFormat::Rgba8,
+            output_format: ColorFormat::Rgba8,
+        };
+        // the second row of tiles to a plain buffer over the first
+        assert!(hardware.display_transfer(&mut memory, &transfer(COLOR + 256, COLOR)).unwrap(), "the CPU did it");
+        hardware.flush(&mut memory).unwrap();
+        let mut out = [0u8; 256];
+        memory.read(COLOR, &mut out);
+        assert!(out.as_chunks::<4>().0.iter().all(|p| ColorFormat::Rgba8.decode(p) == [255, 0, 0, 255]));
+        // over the rows it reads
+        assert!(!hardware.display_transfer(&mut memory, &transfer(COLOR + 256, COLOR + 384)).unwrap());
+    }
+
     /// a transfer on the GPU of an 8 pixel wide buffer at COLOR, of rows
     /// pixels, to a plain one at OUTPUT, and the pixels it leaves there.
     #[cfg(feature = "vulkan")]
