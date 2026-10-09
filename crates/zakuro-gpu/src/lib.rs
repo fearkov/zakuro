@@ -350,11 +350,11 @@ impl Gpu {
     ) {
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
-        let (input_base, output_base) = (memory.translate(input_paddr), memory.translate(output_paddr));
 
         // flag layout, from the transfer engine's register,
         //   bit 0      flip the input vertically
         //   bit 1      linear to tiled, tiled to linear without it
+        //   bit 2      crop the input's lines to the output's width
         //   bit 3      raw copy, no format conversion
         //   bit 5      keep the layout, tiled or linear on both sides
         //   bits 8-10  input color format
@@ -382,6 +382,19 @@ impl Gpu {
         let copy_width = output_width.min(input_width / scale_x);
         let copy_height = output_height.min(input_height / scale_y);
 
+        // flipped and cropped, the console starts the output as many bytes
+        // later as the lines cropped off take, all but the last one. titles
+        // count on it, Tales of the Abyss hands it its framebuffers that much
+        // earlier
+        let crop = flags & (1 << 2) != 0;
+        let skew = if flip_vertically && crop {
+            input_width.saturating_sub(output_dimensions & 0xFFFF) * output_height.saturating_sub(1) * output_bpp as u32
+        } else {
+            0
+        };
+        let output_paddr = output_paddr.wrapping_add(skew);
+        let (input_base, output_base) = (memory.translate(input_paddr), memory.translate(output_paddr));
+
         log::debug!(
             "display transfer: 0x{input_paddr:08X} {input_width}x{input_height} \
              {input_format:?} {} -> 0x{output_paddr:08X} {output_width}x{output_height} \
@@ -397,7 +410,6 @@ impl Gpu {
                 input: input_base,
                 output: output_base,
                 input_width,
-                input_height,
                 output_width,
                 output_height,
                 copy: (copy_width, copy_height),
@@ -452,12 +464,15 @@ impl Gpu {
         let trace_pixels = std::env::var("ZAKURO_TRACE_PIXELS").is_ok();
         let mut distinct = std::collections::HashSet::new();
 
+        // the input's rows are read from the first, a flip writes them from
+        // the output's last row up
         for y in 0..copy_height {
+            let out_y = if flip_vertically { output_height - 1 - y } else { y };
             for x in 0..copy_width {
                 let dst = if output_tiled {
-                    morton(x, y, output_width, output_bpp)
+                    morton(x, out_y, output_width, output_bpp)
                 } else {
-                    (y * output_width + x) as usize * output_bpp
+                    (out_y * output_width + x) as usize * output_bpp
                 };
                 if dst + output_bpp > output.len() {
                     continue;
@@ -469,10 +484,7 @@ impl Gpu {
                 for dy in 0..scale_y {
                     for dx in 0..scale_x {
                         let src_x = x * scale_x + dx;
-                        let mut src_y = y * scale_y + dy;
-                        if flip_vertically {
-                            src_y = input_height.saturating_sub(1 + src_y);
-                        }
+                        let src_y = y * scale_y + dy;
                         let src = if input_linear {
                             (src_y * input_width + src_x) as usize * input_bpp
                         } else {
@@ -2216,5 +2228,28 @@ mod tests {
         gpu.display_transfer(&mut memory, 0x100, 0x180, 4 | (2 << 16), 4 | (2 << 16), flags);
         let red_at = |i: usize| ColorFormat::Rgba8.decode(&memory.0[0x180 + i * 4..0x184 + i * 4])[0];
         assert_eq!([red_at(0), red_at(1)], [50, 100]);
+    }
+
+    /// a flipped transfer cropping its input's lines writes its output as
+    /// many bytes later as the cropped lines take but the last, the address
+    /// Tales of the Abyss gives is that far before its framebuffer.
+    #[test]
+    fn a_flipped_cropped_transfer_starts_its_output_later() {
+        let mut memory = FlatMemory(vec![0; 0x400]);
+        // a 4x2 linear RGBA8 input, its first line red, its second green
+        for x in 0..4 {
+            ColorFormat::Rgba8.encode([255, 0, 0, 255], &mut memory.0[0x100 + x * 4..0x104 + x * 4]);
+            ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut memory.0[0x110 + x * 4..0x114 + x * 4]);
+        }
+        let mut gpu = Gpu::new();
+        // linear in and out, cropped to two pixels a line, flipped, RGB8 out
+        let flags = 1 | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 12);
+        gpu.display_transfer(&mut memory, 0x100, 0x200, 4 | (2 << 16), 2 | (2 << 16), flags);
+        // two pixels cropped off one line before the last, three bytes each
+        let pixel = |at: usize| ColorFormat::Rgb8.decode(&memory.0[at..at + 3]);
+        let start = 0x200 + 2 * 3;
+        assert_eq!(pixel(start), [0, 255, 0, 255], "the flipped output begins with the input's last line");
+        assert_eq!(pixel(start + 2 * 3), [255, 0, 0, 255]);
+        assert_eq!(&memory.0[0x200..start], &[0; 6], "nothing before where it starts");
     }
 }

@@ -658,7 +658,6 @@ pub(crate) struct Transfer {
     pub(crate) input: u32,
     pub(crate) output: u32,
     pub(crate) input_width: u32,
-    pub(crate) input_height: u32,
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
     /// the pixels written, width and height.
@@ -3575,27 +3574,29 @@ impl Hardware {
         // a tiled output of part of a tile goes to the CPU, which leaves out
         // the pixels the layout puts past its end, as draws do
         let whole = t.output_width.is_multiple_of(8) && t.output_height.is_multiple_of(8);
-        if t.copy.0 == 0 || t.copy.1 == 0 || (t.output_tiled && !whole) {
+        // flipped, an input shorter than the output fills the output's last
+        // rows, which the CPU puts where they go
+        let short = t.flip && t.copy.1 < t.output_height;
+        if t.copy.0 == 0 || t.copy.1 == 0 || (t.output_tiled && !whole) || short {
             return Ok(false);
         }
-        // the input rows read, which can start some rows into a buffer the
-        // GPU holds, titles draw both screens into one, a tiled buffer a
-        // row of tiles at a time
+        // the input rows read, from the first, which can start some rows into
+        // a buffer the GPU holds, titles draw both screens into one, a tiled
+        // buffer a row of tiles at a time
         let tiled = !t.input_linear;
         let rows = t.copy.1 * t.scale.1;
-        let first = if t.flip { t.input_height - rows } else { 0 };
         let step = if tiled { 8 } else { 1 };
         let step_bytes = step * t.input_width * input_kind.bytes();
         let row_in = |s: &Surface| {
             let offset = t.input.checked_sub(s.addr).filter(|offset| offset % step_bytes == 0)? / step_bytes * step;
-            (offset + first + rows <= s.height).then_some(offset)
+            (offset + rows <= s.height).then_some(offset)
         };
         let Some((addr, input_size, row)) = self
             .surfaces
             .iter()
             .filter(|s| s.kind == input_kind && s.tiled == tiled && s.width == t.input_width)
             .filter_map(|s| Some((s, row_in(s)?)))
-            .max_by_key(|&(s, row)| newest(s, (row + first, row + first + rows)))
+            .max_by_key(|&(s, row)| newest(s, (row, row + rows)))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
         else {
             return Ok(false);
@@ -3605,7 +3606,7 @@ impl Hardware {
         // Ultimate puts the bottom screen right before the rows it reads, and
         // the output drawn over them is the overdrawn below
         let row_bytes = (input_size.0 * input_kind.bytes()) as u64;
-        let read_start = addr as u64 + (row + first) as u64 * row_bytes;
+        let read_start = addr as u64 + row as u64 * row_bytes;
         let read_end = read_start + rows as u64 * row_bytes;
         let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
         if read_start < output_end && (t.output as u64) < read_end {
@@ -3615,7 +3616,7 @@ impl Hardware {
         // a flush looking one of them up drops what the other had checked
         let (source, target) = loop {
             // the rows it reads, what is drawn over the rest stays on the GPU
-            let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, Some((row + first, row + first + rows)))?;
+            let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, Some((row, row + rows)))?;
             let target = self.surface(memory, t.output, output_size, output_kind, t.output_tiled)?;
             if self.surfaces[source].checked && self.surfaces[target].checked {
                 break (source, target);
@@ -3627,7 +3628,8 @@ impl Hardware {
         let constants: [i32; 11] = [
             t.copy.0 as i32 * n,
             t.copy.1 as i32 * n,
-            t.input_height as i32 * n,
+            // a flip turns the rows read over, not the whole input
+            rows as i32 * n,
             t.output_height as i32 * n,
             t.scale.0 as i32,
             t.scale.1 as i32,
