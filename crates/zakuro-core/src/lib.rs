@@ -125,6 +125,8 @@ struct Pacing {
     /// the screens show the pictures in between at this refresh, and the
     /// title's own at the next.
     between: bool,
+    /// the refreshes that showed pictures in between so far.
+    shown: u64,
 }
 
 pub struct System {
@@ -678,6 +680,7 @@ impl System {
         let pacing = &mut self.pacing;
         pacing.matches = matches;
         pacing.between = gap == 2 && matches.is_some_and(|matches| matches.smooth());
+        pacing.shown += pacing.between as u64;
         // the next frame is drawn in between too while the title keeps to
         // every other refresh
         self.gpu.set_twins(gap == 2);
@@ -1011,6 +1014,9 @@ impl System {
             self.gpu.fills,
             self.gpu.busy,
         );
+        if self.gpu.interpolates() {
+            line += &format!(" | in between {}", self.pacing.shown);
+        }
         if let Some(library) = &self.recompiled {
             // the fallbacks ran inside recompiled code, which counted them
             let interpreted = self.interpreted_instructions + library.fallbacks();

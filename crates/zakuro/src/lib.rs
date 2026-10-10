@@ -767,7 +767,8 @@ impl App {
         self.settings.save();
         if let Some(game) = &mut self.game {
             if game.system.gpu.interpolates() != self.settings.frame_interpolation {
-                game.system.set_interpolation(self.settings.frame_interpolation);
+                let on = game.system.set_interpolation(self.settings.frame_interpolation);
+                log::info!("frame interpolation {}", if on { "on" } else { "off" });
             }
         }
         self.keyboard.set_keys(self.settings.keys.clone());

@@ -189,8 +189,11 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             Err(error) => log::warn!("{error}, drawing in software"),
         }
     }
-    if system.config.interpolate && !system.set_interpolation(true) {
-        log::warn!("frame interpolation takes the 3D drawn on the GPU and shown with Vulkan, it is off");
+    if system.config.interpolate {
+        match system.set_interpolation(true) {
+            true => log::info!("frame interpolation on"),
+            false => log::warn!("frame interpolation takes the 3D drawn on the GPU and shown with Vulkan, it is off"),
+        }
     }
     if let Some(data_dir) = system.config.data_dir.as_deref().filter(|_| system.config.texture_packs) {
         let dir = crate::mods::textures(data_dir, title.program_id());
