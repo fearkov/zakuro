@@ -1,6 +1,6 @@
 # Compatibility
 
-Games tested in Zakuro so far, as of v0.2.25. Recompiled means the game was tested with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which is how it runs at full speed; without it, it runs in the interpreter, slower.
+Games tested in Zakuro so far, as of v0.2.26. Recompiled means the game was tested with its code recompiled by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which is how it runs at full speed; without it, it runs in the interpreter, slower.
 
 | Status | Meaning |
 |---|---|
