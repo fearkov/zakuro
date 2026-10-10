@@ -1219,7 +1219,7 @@ mod tests {
             #[cfg(feature = "jit")]
             {
                 let compiled = jit::compiled(&unit, unit.decoded.as_ref().expect("prepared")).expect("compiled");
-                assert_eq!(compiled.returned(), 0, "program {program:08X?} gave batches back");
+                assert_eq!(compiled.parted(), 0, "program {program:08X?} gave batches back where they parted");
             }
         }
     }

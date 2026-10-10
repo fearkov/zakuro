@@ -179,6 +179,8 @@ pub(super) struct Compiled {
     /// vertices part ways often, which batch shades better.
     runs: AtomicU32,
     returned: AtomicU32,
+    /// the batches given back where the lanes parted ways, for the tests.
+    parted: AtomicU32,
     given_up: AtomicBool,
 }
 
@@ -203,13 +205,21 @@ impl Compiled {
     fn run(&self, context: &mut Context) -> bool {
         // SAFETY: the function was compiled for a context laid out like this
         // one, which outlives the call
-        unsafe { (self.function)(context) == 0 }
+        match unsafe { (self.function)(context) } {
+            0 => true,
+            1 => {
+                self.parted.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            _ => false,
+        }
     }
 
-    /// how many batches it gave back, for the tests.
+    /// how many batches it gave back where their lanes parted ways, for the
+    /// tests.
     #[cfg(test)]
-    pub(super) fn returned(&self) -> u32 {
-        self.returned.load(Ordering::Relaxed)
+    pub(super) fn parted(&self) -> u32 {
+        self.parted.load(Ordering::Relaxed)
     }
 
     /// counts batches run and given back, giving up once a quarter of them
@@ -271,7 +281,7 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
     kept.insert(key, Slot::Compiling);
     drop(kept);
     let program = program.clone();
-    let spawned = std::thread::Builder::new().name("shader compiler".to_owned()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("shader jit".to_owned()).spawn(move || {
         let found = compile_logged(&program, key.1);
         codes().insert(key, Slot::Done(found));
     });
@@ -292,7 +302,13 @@ fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
             None
         }
     };
-    log::trace!(target: "zakuro_gpu::shader::jit", "the program {:016X} at {entry} took {:?}", program.fingerprint, start.elapsed());
+    log::trace!(
+        target: "zakuro_gpu::shader::jit",
+        "the program {:016X} at {entry} took {:?}, {} instructions",
+        program.fingerprint,
+        start.elapsed(),
+        program.ops.iter().filter(|op| op.opcode != OpCode::Nop && op.instruction.0 != 0).count()
+    );
     found
 }
 
@@ -379,7 +395,10 @@ struct Helpers {
 /// backend or the program goes too many ways.
 pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String> {
     let mut flags = settings::builder();
-    for (name, value) in [("opt_level", "speed"), ("use_colocated_libcalls", "false"), ("is_pic", "false")] {
+    // the verifier looks the code over for Cranelift's own sake, a quarter
+    // of the time compiling took, the tests have it
+    let verify = if cfg!(debug_assertions) { "true" } else { "false" };
+    for (name, value) in [("opt_level", "speed"), ("use_colocated_libcalls", "false"), ("is_pic", "false"), ("enable_verifier", verify)] {
         flags.set(name, value).map_err(|error| format!("{name}, {error}"))?;
     }
     let isa = cranelift_native::builder()?.finish(settings::Flags::new(flags)).map_err(|error| error.to_string())?;
@@ -447,6 +466,7 @@ pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String>
         function,
         runs: AtomicU32::new(0),
         returned: AtomicU32::new(0),
+        parted: AtomicU32::new(0),
         given_up: AtomicBool::new(false),
     })
 }
@@ -471,15 +491,22 @@ struct Compiler<'a, 'b, 'c> {
     conditions: [Variable; 2],
     /// each depth's loop's repeats left.
     repeats: [Variable; DEEPEST],
-    /// the instructions the interpreter would still run.
+    /// the instructions the interpreter would still run, counted only in a
+    /// program that can come back to an instruction it ran, see may_loop.
     budget: Variable,
+    counted: bool,
     states: HashMap<State, Block>,
     pending: Vec<(State, Block)>,
     /// jumps to a state compiled before, which may close a loop, and so
     /// look at the budget first.
     checks: Vec<(Block, Block)>,
-    /// gives the batch back.
+    /// gives the batch back, where its lanes parted ways.
     give_back: Block,
+    /// gives the batch back, where a lane came out NaN, which the shader's
+    /// multiply may have made zero, the interpreter's arithmetic works it
+    /// out. it is rare, a hundredth of the batches of Ocarina of Time 3D at
+    /// most, and the code without the careful way kept in it goes faster.
+    give_back_nan: Block,
     /// the lanes the code being compiled runs for, all of them when none,
     /// the others keeping what they had, inside a branch the vertices
     /// parted at.
@@ -492,6 +519,7 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
         let start = builder.create_block();
         builder.append_block_params_for_function_params(start);
         let give_back = builder.create_block();
+        let give_back_nan = builder.create_block();
         builder.switch_to_block(start);
         let context = builder.block_params(start)[0];
         let uniforms = builder.ins().load(types::I64, constant(), context, offset_of!(Context, uniforms) as i32);
@@ -530,10 +558,12 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
             conditions,
             repeats,
             budget,
+            counted: program.may_loop(),
             states: HashMap::new(),
             pending: Vec::new(),
             checks: Vec::new(),
             give_back,
+            give_back_nan,
             mask: None,
         };
         let first = compiler.edge(entry, Vec::new());
@@ -554,14 +584,30 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
         compiler.builder.switch_to_block(give_back);
         let returned = compiler.builder.ins().iconst(types::I32, 1);
         compiler.builder.ins().return_(&[returned]);
+        compiler.builder.switch_to_block(give_back_nan);
+        let returned = compiler.builder.ins().iconst(types::I32, 2);
+        compiler.builder.ins().return_(&[returned]);
         Some(())
     }
 
+    /// an instruction run, counted against the budget where it is kept.
+    fn spend(&mut self) {
+        if self.counted {
+            let budget = self.builder.use_var(self.budget);
+            let spent = self.builder.ins().iadd_imm_s(budget, -1);
+            self.builder.def_var(self.budget, spent);
+        }
+    }
+
     /// the block a jump to a state goes to, the state's own when it is new,
-    /// one that looks at the budget first when it was there before.
+    /// one that looks at the budget first when it was there before and the
+    /// budget is kept.
     fn edge(&mut self, pc: u32, frames: Vec<Frame>) -> Block {
         let state = (pc, frames);
         if let Some(&block) = self.states.get(&state) {
+            if !self.counted {
+                return block;
+            }
             let check = self.builder.create_block();
             self.checks.push((check, block));
             return check;
@@ -618,9 +664,7 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
             self.finish();
             return Some(());
         }
-        let budget = self.builder.use_var(self.budget);
-        let spent = self.builder.ins().iadd_imm_s(budget, -1);
-        self.builder.def_var(self.budget, spent);
+        self.spend();
 
         let op = self.program.ops[pc as usize];
         let instruction = op.instruction;
@@ -744,9 +788,7 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
         let mut pc = start;
         while pc < end {
             let op = self.program.ops[pc as usize];
-            let budget = self.builder.use_var(self.budget);
-            let spent = self.builder.ins().iadd_imm_s(budget, -1);
-            self.builder.def_var(self.budget, spent);
+            self.spend();
             match op.opcode {
                 OpCode::IfC | OpCode::IfU => {
                     let lanes = if op.opcode == OpCode::IfC {
@@ -852,10 +894,8 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
     }
 
     /// a source's components, swizzled and negated as its descriptor says.
-    /// read again rather than taken from before, for the rare way around a
-    /// branch, which then holds nothing live past it.
-    fn source(&mut self, operand: &Operand, again: bool) -> [Value; 4] {
-        let flags = if again { MemFlagsData::trusted() } else { constant() };
+    fn source(&mut self, operand: &Operand) -> [Value; 4] {
+        let flags = constant();
         let register = operand.register as usize;
         let value: [Value; 4] = match register {
             0x00..=0x0F => std::array::from_fn(|component| {
@@ -922,61 +962,40 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
         self.builder.ins().vany_true(mask)
     }
 
-    /// the values worked out the quick way, or the careful way where a lane
-    /// of them is NaN, which the shader's multiply would have made zero.
-    fn checked(&mut self, quick: Vec<Value>, careful: impl FnOnce(&mut Self) -> Vec<Value>) -> Vec<Value> {
-        let nan = self.any_nan(&quick);
-        let slow = self.builder.create_block();
-        let join = self.builder.create_block();
-        for _ in &quick {
-            self.builder.append_block_param(join, types::F32X4);
+    /// carries on with the components of an instruction's value worked out
+    /// the quick way, the batch going back where a lane of the ones written
+    /// is NaN.
+    fn checked(&mut self, op: &Op, quick: Vec<Value>) -> Vec<Value> {
+        // a dot product writes the one value it has to every component
+        let written: Vec<Value> = if quick.len() == 1 {
+            quick.clone()
+        } else {
+            quick.iter().enumerate().filter(|(component, _)| op.mask & (0b1000 >> component) != 0).map(|(_, &value)| value).collect()
+        };
+        if written.is_empty() {
+            return quick;
         }
-        let quick: Vec<_> = quick.into_iter().map(Into::into).collect();
-        self.builder.ins().brif(nan, slow, &[], join, &quick);
-        self.builder.switch_to_block(slow);
-        // a store first, so that what the careful way reads again is read
-        // again, not taken from the quick way's loads, which would then have
-        // to stay live past the branch
-        let nothing = self.builder.ins().iconst(types::I32, 0);
-        self.builder.ins().store(MemFlagsData::trusted(), nothing, self.context, offset_of!(Context, scratch) as i32);
-        let fixed: Vec<_> = careful(self).into_iter().map(Into::into).collect();
-        self.builder.ins().jump(join, &fixed);
-        self.builder.switch_to_block(join);
-        self.builder.block_params(join).to_vec()
-    }
-
-    /// the shader's multiply, zero rather than NaN for zero times infinity.
-    fn multiply(&mut self, a: Value, b: Value) -> Value {
-        let product = self.builder.ins().fmul(a, b);
-        let nan = self.builder.ins().fcmp(FloatCC::Unordered, product, product);
-        let a_nan = self.builder.ins().fcmp(FloatCC::Unordered, a, a);
-        let b_nan = self.builder.ins().fcmp(FloatCC::Unordered, b, b);
-        let either = self.builder.ins().bor(a_nan, b_nan);
-        let made = self.builder.ins().band_not(nan, either);
-        let made = self.floats(made);
-        let zero = self.splat(0.0);
-        self.builder.ins().bitselect(made, zero, product)
+        let nan = self.any_nan(&written);
+        let on = self.builder.create_block();
+        self.builder.ins().brif(nan, self.give_back_nan, &[], on, &[]);
+        self.builder.switch_to_block(on);
+        quick
     }
 
     /// a dot product of an instruction's two sources over the first count
-    /// components, which adds up exactly the way the interpreter's does.
-    fn dot(&mut self, op: &Op, a: &[Value; 4], b: &[Value; 4], count: usize) -> Value {
+    /// components, which adds up exactly the way the interpreter's does, its
+    /// fourth source's w added after for dph.
+    fn dot(&mut self, op: &Op, a: &[Value; 4], b: &[Value; 4], count: usize, w: bool) -> Value {
         let start = std::iter::empty::<f32>().sum::<f32>();
         let mut sum = self.splat(start);
         for component in 0..count {
             let product = self.builder.ins().fmul(a[component], b[component]);
             sum = self.builder.ins().fadd(sum, product);
         }
-        let op = *op;
-        self.checked(vec![sum], move |compiler| {
-            let (a, b) = (compiler.source(&op.sources[0], true), compiler.source(&op.sources[1], true));
-            let mut sum = compiler.splat(start);
-            for component in 0..count {
-                let product = compiler.multiply(a[component], b[component]);
-                sum = compiler.builder.ins().fadd(sum, product);
-            }
-            vec![sum]
-        })[0]
+        if w {
+            sum = self.builder.ins().fadd(sum, b[3]);
+        }
+        self.checked(op, vec![sum])[0]
     }
 
     /// floats through a helper, the rows in scratch and back.
@@ -1003,7 +1022,7 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
             return;
         }
         let sources = if matches!(op.opcode, OpCode::Mad | OpCode::MadI) { 3 } else { 2 };
-        let values: Vec<[Value; 4]> = op.sources[..sources].iter().map(|operand| self.source(operand, false)).collect();
+        let values: Vec<[Value; 4]> = op.sources[..sources].iter().map(|operand| self.source(operand)).collect();
         let (a, b) = (values[0], values[1]);
         let pairs = |compiler: &mut Self, f: fn(&mut Self, Value, Value) -> Value| -> [Value; 4] {
             std::array::from_fn(|component| f(compiler, a[component], b[component]))
@@ -1012,11 +1031,7 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
             OpCode::Add => pairs(self, |c, x, y| c.builder.ins().fadd(x, y)),
             OpCode::Mul => {
                 let quick: Vec<Value> = (0..4).map(|component| self.builder.ins().fmul(a[component], b[component])).collect();
-                let op = *op;
-                let fixed = self.checked(quick, move |compiler| {
-                    let (a, b) = (compiler.source(&op.sources[0], true), compiler.source(&op.sources[1], true));
-                    (0..4).map(|component| compiler.multiply(a[component], b[component])).collect()
-                });
+                let fixed = self.checked(op, quick);
                 std::array::from_fn(|component| fixed[component])
             }
             OpCode::Mad | OpCode::MadI => {
@@ -1027,16 +1042,7 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
                         self.builder.ins().fadd(product, c[component])
                     })
                     .collect();
-                let op = *op;
-                let fixed = self.checked(quick, move |compiler| {
-                    let [a, b, c] = [0, 1, 2].map(|source| compiler.source(&op.sources[source], true));
-                    (0..4)
-                        .map(|component| {
-                            let product = compiler.multiply(a[component], b[component]);
-                            compiler.builder.ins().fadd(product, c[component])
-                        })
-                        .collect()
-                });
+                let fixed = self.checked(op, quick);
                 std::array::from_fn(|component| fixed[component])
             }
             // x when it is greater, else y, which is how NaN behaves on hardware
@@ -1050,12 +1056,9 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
                 let less = c.floats(less);
                 c.builder.ins().bitselect(less, x, y)
             }),
-            OpCode::Dp3 => [self.dot(op, &a, &b, 3); 4],
-            OpCode::Dp4 => [self.dot(op, &a, &b, 4); 4],
-            OpCode::Dph | OpCode::DphI => {
-                let dot = self.dot(op, &a, &b, 3);
-                [self.builder.ins().fadd(dot, b[3]); 4]
-            }
+            OpCode::Dp3 => [self.dot(op, &a, &b, 3, false); 4],
+            OpCode::Dp4 => [self.dot(op, &a, &b, 4, false); 4],
+            OpCode::Dph | OpCode::DphI => [self.dot(op, &a, &b, 3, true); 4],
             OpCode::Mov => a,
             OpCode::Flr => {
                 let floored = self.helped(self.helpers.floor, &a);
@@ -1081,13 +1084,10 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
                 c.ones(mask)
             }),
             OpCode::Dst | OpCode::DstI => {
-                let quick = self.builder.ins().fmul(a[1], b[1]);
-                let op = *op;
-                let product = self.checked(vec![quick], move |compiler| {
-                    let (a, b) = (compiler.source(&op.sources[0], true), compiler.source(&op.sources[1], true));
-                    vec![compiler.multiply(a[1], b[1])]
-                })[0];
-                [self.splat(1.0), product, a[2], b[3]]
+                let one = self.splat(1.0);
+                let product = self.builder.ins().fmul(a[1], b[1]);
+                let checked = self.checked(op, vec![one, product, a[2], b[3]]);
+                [checked[0], checked[1], checked[2], checked[3]]
             }
             OpCode::LitP => {
                 let zero = self.splat(0.0);
@@ -1149,6 +1149,22 @@ fn if_ranges(pc: u32, destination: u32, count: u32) -> ((u32, u32), (u32, u32), 
 const DEEPEST_PARTED: usize = 8;
 
 impl Program {
+    /// whether the program can come back to an instruction it ran, by a
+    /// loop, a jump back, or an if whose blocks come back to before it. one
+    /// that can't runs each of its ways of reaching an instruction at most
+    /// once, far fewer instructions than the interpreter stops a program at.
+    fn may_loop(&self) -> bool {
+        self.ops.iter().zip(0u32..).any(|(op, pc)| {
+            let (destination, count) = op.instruction.flow_target();
+            match op.opcode {
+                OpCode::Loop => true,
+                OpCode::JmpC | OpCode::JmpU => destination <= pc,
+                OpCode::IfC | OpCode::IfU => destination + count <= pc,
+                _ => false,
+            }
+        })
+    }
+
     /// whether a range of instructions only works out values, with ifs
     /// inside that come back within it, which compiles for the lanes going
     /// either way of a branch.
