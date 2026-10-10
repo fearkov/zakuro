@@ -591,12 +591,20 @@ impl Gpu {
     /// says which GPU that is.
     /// scale is how many times the console's resolution it draws at, for
     /// sharper pictures. on the device of a Vulkan presenter, when it gives
-    /// one, the screens are shown straight from the images drawn.
+    /// one, the screens are shown straight from the images drawn. the
+    /// pipelines compiled are kept for the next time the game with the
+    /// title id given runs.
     #[cfg(feature = "vulkan")]
-    pub fn enable_hardware_renderer(&mut self, scale: u32, device: Option<std::sync::Arc<SharedDevice>>) -> Result<String, String> {
+    pub fn enable_hardware_renderer(
+        &mut self,
+        scale: u32,
+        device: Option<std::sync::Arc<SharedDevice>>,
+        title: Option<u64>,
+    ) -> Result<String, String> {
+        let kept = title.and_then(raster::hardware::pipeline_cache);
         let mut hardware = match device {
-            Some(device) => raster::hardware::Hardware::with_device(device, true)?,
-            None => raster::hardware::Hardware::new()?,
+            Some(device) => raster::hardware::Hardware::with_device(device, true, kept)?,
+            None => raster::hardware::Hardware::with_device(std::sync::Arc::new(raster::hardware::own_device()?), false, kept)?,
         };
         let scale = hardware.set_scale(scale);
         let shaded = if hardware.shades() { "" } else { ", vertices shaded on the CPU," };

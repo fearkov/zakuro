@@ -461,9 +461,16 @@ impl Surface {
     }
 }
 
-/// where the pipelines compiled before are kept, the system's place for
-/// caches. the tests keep none, theirs are no use to anyone playing.
-fn pipeline_cache_path() -> Option<std::path::PathBuf> {
+/// how big a game's pipelines get before they are thrown away and compiled
+/// again, a session of Ocarina of Time 3D makes 1.3 MB of them.
+const MOST_PIPELINE_BYTES: u64 = 64 << 20;
+
+/// where the pipelines compiled for a game are kept, the system's place for
+/// caches. each game keeps its own, all of them in one file only grew, the
+/// pipelines of every game played and of every version of Zakuro, to
+/// hundreds of megabytes read into memory at every start. the tests keep
+/// none, theirs are no use to anyone playing.
+pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
     if cfg!(test) {
         return None;
     }
@@ -474,16 +481,34 @@ fn pipeline_cache_path() -> Option<std::path::PathBuf> {
         var("HOME").map(|home| home.join("Library/Caches"))
     } else {
         var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|home| home.join(".cache")))
-    };
-    dir.map(|dir| dir.join("zakuro").join("pipelines.bin"))
+    }?;
+    let dir = dir.join("zakuro");
+    // the one file every game shared before
+    let old = dir.join("pipelines.bin");
+    if old.exists() {
+        match std::fs::remove_file(&old) {
+            Ok(()) => log::info!("removed {}, each game keeps its own pipelines now", old.display()),
+            Err(error) => log::warn!("could not remove {}, {error}", old.display()),
+        }
+    }
+    Some(dir.join("pipelines").join(format!("{title:016X}.bin")))
+}
+
+/// the pipelines kept for a game, none when there are none or they grew past
+/// MOST_PIPELINE_BYTES, which then go.
+fn read_pipeline_cache(path: &std::path::Path) -> Option<Vec<u8>> {
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > MOST_PIPELINE_BYTES {
+        log::info!("the {} MB of pipelines in {} are compiled again", size >> 20, path.display());
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    std::fs::read(path).ok()
 }
 
 /// keeps the pipelines compiled so far for the next run, by way of a file
 /// of its own, so a run killed halfway leaves the last one whole.
-fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache) {
-    let Some(path) = pipeline_cache_path() else {
-        return;
-    };
+fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &std::path::Path) {
     // SAFETY: the cache is the device's, and taking its data needs no one
     // else to keep off it
     let data = match unsafe { device.get_pipeline_cache_data(cache) } {
@@ -499,7 +524,7 @@ fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache) {
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::write(&partial, data))
-        .and_then(|()| std::fs::rename(&partial, &path));
+        .and_then(|()| std::fs::rename(&partial, path));
     match written {
         Ok(()) => log::debug!(target: "zakuro_gpu::pipelines", "kept {} KB of pipelines in {}", size / 1024, path.display()),
         Err(error) => {
@@ -942,6 +967,7 @@ impl Compiler {
     fn start(
         device: ash::Device,
         cache: vk::PipelineCache,
+        kept: Option<Arc<std::path::Path>>,
         layout: vk::PipelineLayout,
         fragments: [vk::ShaderModule; 2],
         dynamic: Dynamic,
@@ -959,10 +985,10 @@ impl Compiler {
         let count = thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3));
         let threads = (0..count)
             .map_while(|_| {
-                let (jobs, sent, device) = (queue.clone(), sent.clone(), device.clone());
+                let (jobs, sent, device, kept) = (queue.clone(), sent.clone(), device.clone(), kept.clone());
                 thread::Builder::new()
                     .name("shader compiler".into())
-                    .spawn(move || compile(&jobs, &sent, &device, cache, layout, fragments, dynamic))
+                    .spawn(move || compile(&jobs, &sent, &device, cache, kept.as_deref(), layout, fragments, dynamic))
                     .ok()
             })
             .collect();
@@ -1021,11 +1047,13 @@ impl Compiler {
 
 /// what a compiler thread does until it is told to stop, jobs as they come,
 /// and keeping the cache on disk now and then when there are none.
+#[allow(clippy::too_many_arguments)]
 fn compile(
     jobs: &(Mutex<Queue>, Condvar),
     sent: &mpsc::Sender<Made>,
     device: &ash::Device,
     cache: vk::PipelineCache,
+    kept: Option<&std::path::Path>,
     layout: vk::PipelineLayout,
     fragments: [vk::ShaderModule; 2],
     dynamic: Dynamic,
@@ -1051,7 +1079,9 @@ fn compile(
                 // the others find nothing to keep meanwhile
                 (waiting.compiled, waiting.saved) = (0, std::time::Instant::now());
                 drop(waiting);
-                save_pipeline_cache(device, cache);
+                if let Some(path) = kept {
+                    save_pipeline_cache(device, cache, path);
+                }
                 waiting = lock();
             }
         };
@@ -1371,16 +1401,22 @@ pub struct Hardware {
     /// the pipelines compiled before, kept on disk between runs, so a
     /// combination of fragment stages seen once does not stall again.
     pipeline_cache: vk::PipelineCache,
+    /// the file they are kept in, none for nowhere.
+    kept_pipelines: Option<Arc<std::path::Path>>,
 }
 
 impl Hardware {
+    /// on a device of its own, keeping no pipelines, as the tests draw.
+    #[cfg(test)]
     pub fn new() -> Result<Hardware, String> {
-        Hardware::with_device(Arc::new(own_device()?), false)
+        Hardware::with_device(Arc::new(own_device()?), false, None)
     }
 
     /// draws with a device made by render_device, which the presenter may
-    /// share, and then shows screens straight from the GPU when direct.
-    pub fn with_device(shared: Arc<SharedDevice>, direct: bool) -> Result<Hardware, String> {
+    /// share, and then shows screens straight from the GPU when direct. the
+    /// pipelines it compiles are kept in the file given.
+    pub fn with_device(shared: Arc<SharedDevice>, direct: bool, kept_pipelines: Option<std::path::PathBuf>) -> Result<Hardware, String> {
+        let kept_pipelines: Option<Arc<std::path::Path>> = kept_pipelines.map(Into::into);
         let (instance, device, physical, family) = (shared.instance.clone(), shared.device.clone(), shared.physical, shared.family);
         let (logic_ops, statistics, dynamic) = (shared.logic_ops, shared.statistics, shared.dynamic);
         // SAFETY: the physical device came from this instance
@@ -1467,12 +1503,12 @@ impl Hardware {
             });
             let timestamps = instance.get_physical_device_queue_family_properties(physical)[family as usize].timestamp_valid_bits > 0;
             // the driver checks the data is for this GPU and ignores it if not
-            let saved = pipeline_cache_path().and_then(|path| std::fs::read(path).ok()).unwrap_or_default();
+            let saved = kept_pipelines.as_deref().and_then(read_pipeline_cache).unwrap_or_default();
             let pipeline_cache = device
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
-            let compiler = Compiler::start(device.clone(), pipeline_cache, layout, [fragment_shader, depth_fragment_shader], dynamic);
+            let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, [fragment_shader, depth_fragment_shader], dynamic);
             let blend_state = dynamic.blend.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
             let logic_op_state = dynamic.logic_op.then(|| ash::ext::extended_dynamic_state2::Device::new(&instance, &device));
             let mut hardware = Hardware {
@@ -1584,6 +1620,7 @@ impl Hardware {
                 renderings: 0,
                 draws: 0,
                 pipeline_cache,
+                kept_pipelines,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -4750,7 +4787,9 @@ impl Drop for Hardware {
         // SAFETY: waits for the GPU before anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
-            save_pipeline_cache(&self.device, self.pipeline_cache);
+            if let Some(path) = &self.kept_pipelines {
+                save_pipeline_cache(&self.device, self.pipeline_cache, path);
+            }
             self.device.destroy_pipeline_cache(self.pipeline_cache, None);
             for texture in self.textures.values() {
                 self.destroy_image(&texture.image);

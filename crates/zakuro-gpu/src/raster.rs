@@ -5203,7 +5203,7 @@ mod tests {
         for scale in [1, 3] {
             let Ok(copied) = hardware::Hardware::new() else { return };
             let device = hardware::own_device().unwrap();
-            let direct = hardware::Hardware::with_device(std::sync::Arc::new(device), true).unwrap();
+            let direct = hardware::Hardware::with_device(std::sync::Arc::new(device), true, None).unwrap();
             let mut pictures = Vec::new();
             for mut hardware in [copied, direct] {
                 let scale = hardware.set_scale(scale);

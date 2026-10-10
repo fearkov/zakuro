@@ -181,7 +181,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
 
     let mut on_gpu = false;
     if system.config.hardware_renderer {
-        match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone()) {
+        match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone(), Some(title.program_id())) {
             Ok(name) => {
                 log::info!("drawing on {name} through Vulkan");
                 on_gpu = true;
