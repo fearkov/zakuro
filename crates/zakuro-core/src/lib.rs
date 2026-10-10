@@ -67,6 +67,10 @@ pub struct Config {
     /// the time the console's clock starts at, in milliseconds since 1900,
     /// the host's when none, a fixed one makes runs repeat exactly.
     pub clock: Option<u64>,
+    /// draw a picture in between each two of a title that draws one every
+    /// other refresh, see System::pace, when the host's GPU draws the 3D
+    /// and shows the screens straight from its device.
+    pub interpolate: bool,
 }
 
 impl Default for Config {
@@ -89,6 +93,7 @@ impl Default for Config {
             resolution: 1,
             device: None,
             clock: None,
+            interpolate: false,
         }
     }
 }
@@ -106,6 +111,21 @@ pub enum FrameOutcome {
 
 /// a screen's picture as RGBA, and its width and height.
 pub type Screen = (std::sync::Arc<Vec<u8>>, u32, u32);
+
+/// frame interpolation's count of the refreshes, see System::pace.
+#[derive(Default)]
+struct Pacing {
+    refreshes: u64,
+    /// the refresh the top screen got its last new picture at, and that
+    /// picture.
+    new_at: u64,
+    last: Option<zakuro_gpu::ScreenRef>,
+    /// how the draws of the frame before it matched the frame before that.
+    matches: Option<zakuro_gpu::Matches>,
+    /// the screens show the pictures in between at this refresh, and the
+    /// title's own at the next.
+    between: bool,
+}
 
 pub struct System {
     pub cpu: Cpu,
@@ -131,6 +151,8 @@ pub struct System {
     /// the scaled picture each screen had at the last presentation, which
     /// goes up at the next, once the GPU had a frame's time to draw it.
     showing: [Option<zakuro_gpu::ScreenRef>; 2],
+    /// frame interpolation's count of the refreshes.
+    pacing: Pacing,
     /// the dynamic module loader's state.
     pub cro: cro::CroManager,
     /// errors the title reported through err:f, newest last.
@@ -219,6 +241,7 @@ impl System {
             services_seen: BTreeSet::new(),
             lcd_force_black: false,
             showing: [None, None],
+            pacing: Pacing::default(),
             cro: cro::CroManager::default(),
             fatal_errors: Vec::new(),
             undefined_seen: BTreeMap::new(),
@@ -617,11 +640,66 @@ impl System {
         // pick up any buffer swap the game queued directly in GSP shared
         // memory before the LCDs latch whatever is currently configured.
         services::gsp::refresh(self);
+        if self.gpu.interpolates() {
+            self.pace();
+        }
 
         // both LCDs finish scanning out, in that order.
         services::gsp::signal_interrupt(self, services::gsp::InterruptId::Pdc0);
         services::gsp::signal_interrupt(self, services::gsp::InterruptId::Pdc1);
 
+    }
+
+    /// frame interpolation at a refresh. while a title sets a new picture
+    /// every other refresh, the GPU draws the picture in between along with
+    /// each, from the frame before's draws and this one's, see zakuro_gpu's
+    /// interpolation. it goes up at the refresh the title set the picture
+    /// at, and the title's own at the next, a refresh late, so the two take
+    /// a refresh each. a title at the full rate, or slower, shows its own
+    /// at once, and draws nothing in between.
+    fn pace(&mut self) {
+        let pacing = &mut self.pacing;
+        pacing.refreshes += 1;
+        pacing.between = false;
+        let top = self.screen_ref(zakuro_common::Screen::Top);
+        let pacing = &mut self.pacing;
+        if top.is_none() || top == pacing.last {
+            if pacing.refreshes - pacing.new_at > 2 {
+                // the title slowed down or stopped, the pictures in between
+                // of its next frame would be shown too late
+                self.gpu.set_twins(false);
+            }
+            return;
+        }
+        let gap = pacing.refreshes - pacing.new_at;
+        pacing.new_at = pacing.refreshes;
+        pacing.last = top;
+        let matches = self.gpu.frame_done();
+        let pacing = &mut self.pacing;
+        pacing.matches = matches;
+        pacing.between = gap == 2 && matches.is_some_and(|matches| matches.smooth());
+        // the next frame is drawn in between too while the title keeps to
+        // every other refresh
+        self.gpu.set_twins(gap == 2);
+    }
+
+    /// draws a picture in between each two of the title's own from now on,
+    /// when it draws one every other refresh, see pace, or stops. it says
+    /// whether it does, it takes the host's GPU showing the screens.
+    pub fn set_interpolation(&mut self, on: bool) -> bool {
+        self.pacing = Pacing::default();
+        self.gpu.set_interpolation(on)
+    }
+
+    /// how the draws of the last frame matched the frame before's, for frame
+    /// interpolation.
+    pub fn interpolation_matches(&self) -> Option<zakuro_gpu::Matches> {
+        self.pacing.matches
+    }
+
+    /// whether the screens show the pictures in between at this refresh.
+    pub fn shows_between(&self) -> bool {
+        self.pacing.between
     }
 
     /// the DSP finishing an audio frame, it plays its voices one frame on and
@@ -807,7 +885,22 @@ impl System {
             return None;
         }
         let now = self.screen_ref(screen)?;
+        // frame interpolation's picture in between, where the screen has one
+        if self.pacing.between {
+            if let Some(between) = self.gpu.between_image(now) {
+                return Some(between);
+            }
+        }
         self.gpu.screen_image(now)
+    }
+
+    /// a screen's picture as the GPU showing the screens has it, or the
+    /// picture in between it and the one before, see pace, for saving it.
+    /// it waits for the GPU.
+    pub fn upright_screen(&mut self, screen: zakuro_common::Screen, between: bool) -> Option<Screen> {
+        let now = self.screen_ref(screen)?;
+        let (image, scale) = self.gpu.upright_picture(now, between)?;
+        Some((image, screen.width() * scale, screen.height() * scale))
     }
 
     /// the picture the host's GPU drew scaled for a screen, when it is still

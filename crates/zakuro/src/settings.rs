@@ -262,6 +262,8 @@ pub struct Settings {
     pub resolution: u32,
     /// draw the texture packs put in games' mods folders.
     pub texture_packs: bool,
+    /// draw a picture in between each two of a game at 30 frames a second.
+    pub frame_interpolation: bool,
     /// run a game's recompiled code when it has some, rather than
     /// interpreting everything.
     pub recompiled: bool,
@@ -296,6 +298,7 @@ impl Default for Settings {
             hardware_rasterizer: true,
             resolution: 3,
             texture_packs: true,
+            frame_interpolation: false,
             recompiled: true,
             scale: 2,
             layout: Screens::Stacked,

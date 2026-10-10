@@ -516,6 +516,7 @@ impl App {
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
             texture_packs: self.settings.texture_packs,
+            interpolate: self.settings.frame_interpolation,
             enhancements: self
                 .settings
                 .enhancements
@@ -764,6 +765,11 @@ impl App {
     /// saves the settings and puts to use what can change right away.
     fn apply_settings(&mut self) {
         self.settings.save();
+        if let Some(game) = &mut self.game {
+            if game.system.gpu.interpolates() != self.settings.frame_interpolation {
+                game.system.set_interpolation(self.settings.frame_interpolation);
+            }
+        }
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
         self.apply_volume();

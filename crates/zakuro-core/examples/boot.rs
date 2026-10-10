@@ -41,6 +41,9 @@ fn main() {
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),
         // ZAKURO_PRESENT=direct draws on a device of the kind a Vulkan
         // presenter shares, which shows the screens straight from the GPU.
+        // ZAKURO_INTERPOLATE=1 draws the pictures in between, which takes
+        // ZAKURO_PRESENT=direct, and saves them with the screens
+        interpolate: std::env::var("ZAKURO_INTERPOLATE").is_ok_and(|v| v == "1"),
         device: std::env::var("ZAKURO_PRESENT").is_ok_and(|v| v == "direct").then(|| {
             let device = zakuro_gpu::SharedDevice::new().unwrap_or_else(|error| {
                 eprintln!("no device to show the screens from: {error}");
@@ -77,6 +80,8 @@ fn main() {
     let mut frame_times = Vec::with_capacity(frames as usize);
     let mut outcome = FrameOutcome::Completed;
     let mut executed = 0u64;
+    // refreshes that showed a picture in between, for frame interpolation
+    let mut betweens = 0u64;
 
     // headless runs otherwise never press a button, so a title parked on an
     // intro or "press start" screen, which is most titles, most of the time,
@@ -204,6 +209,7 @@ fn main() {
         let faults = system.memory.fault_summary().len();
         outcome = system.run_frame();
         executed = frame + 1;
+        betweens += system.shows_between() as u64;
         // when a new unmapped page is touched, which frame it was
         if system.memory.fault_summary().len() != faults {
             println!("frame {executed}: touched an unmapped page");
@@ -226,6 +232,18 @@ fn main() {
         if dump_at.contains(&executed) {
             for (screen, name) in SCREENS {
                 save_screen(&mut system, screen, &temp(&format!("zakuro-{name}-{executed}.ppm")));
+                // and as the GPU has them, with the pictures in between
+                if system.gpu.interpolates() {
+                    if let Some(own) = system.upright_screen(screen, false) {
+                        save_picture(&own, &temp(&format!("zakuro-{name}-gpu-{executed}.ppm")));
+                    }
+                    if let Some(between) = system.upright_screen(screen, true) {
+                        save_picture(&between, &temp(&format!("zakuro-{name}-between-{executed}.ppm")));
+                    }
+                }
+            }
+            if let Some(matches) = system.interpolation_matches() {
+                println!("frame {executed}: {matches:?}, in between {}", system.shows_between());
             }
             // ZAKURO_DUMP_MEM_AT=1 saves the ZAKURO_DUMP_MEM ranges with the
             // screens too, to watch memory change from frame to frame
@@ -280,6 +298,9 @@ fn main() {
             at(0.99),
             at(1.0)
         );
+    }
+    if system.gpu.interpolates() {
+        println!("in between:    {betweens} of {executed} refreshes");
     }
     println!("instructions:  {}", system.cpu.cycles);
     println!(
@@ -470,6 +491,15 @@ fn save_screen(
         .iter()
         .map(|c| [c[0], c[1], c[2]])
         .collect()
+}
+
+/// saves a picture as a PPM.
+fn save_picture((pixels, width, height): &zakuro_core::Screen, path: &str) {
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for chunk in pixels.as_chunks::<4>().0 {
+        ppm.extend_from_slice(&chunk[..3]);
+    }
+    let _ = std::fs::write(path, ppm);
 }
 
 /// a file in the system's temporary directory, /tmp on Linux.

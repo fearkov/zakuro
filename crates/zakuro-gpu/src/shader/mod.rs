@@ -454,6 +454,119 @@ impl Program {
     }
 }
 
+/// an if's body when it is taken, its else when it is not, and where both
+/// come back to, as the interpreter's blocks have them.
+fn if_ranges(pc: u32, destination: u32, count: u32) -> ((u32, u32), (u32, u32), u32) {
+    let then_end = (pc + 1) + (destination - (pc + 1).min(destination));
+    ((pc + 1, then_end), (destination, destination + count), destination + count)
+}
+
+impl Program {
+    /// the float uniforms what lands in the output registers given can come
+    /// from, in what the program can run from its entry point, one bit
+    /// each, those read as they are and those read through an address
+    /// register, which can be any from the one named on. the address
+    /// registers and the conditions are left out, they pick what runs
+    /// rather than feed what it works out.
+    pub(crate) fn uniforms_feeding(&self, entry: u32, outputs: u16) -> (u128, u128) {
+        let reached = self.reached(entry);
+        // outputs 0x00 to 0x0F and temporaries 0x10 to 0x1F, as both
+        // destinations and sources number them
+        let mut wanted = outputs as u32;
+        let (mut uniforms, mut indexed) = (0u128, 0u128);
+        loop {
+            let before = (wanted, uniforms, indexed);
+            for op in self.ops.iter().zip(&reached).filter(|&(_, &reached)| reached).map(|(op, _)| op) {
+                let sources = match op.opcode {
+                    OpCode::Mad | OpCode::MadI => 3,
+                    OpCode::Mov | OpCode::Rcp | OpCode::Rsq | OpCode::Ex2 | OpCode::Lg2 | OpCode::Flr | OpCode::LitP => 1,
+                    opcode if opcode.writes() => 2,
+                    _ => continue,
+                };
+                if op.destination >= 0x20 || wanted & (1 << op.destination) == 0 {
+                    continue;
+                }
+                for source in &op.sources[..sources] {
+                    match source.register {
+                        0x10..=0x1F => wanted |= 1 << source.register,
+                        0x20..=0x7F if source.index != 0 => indexed |= !0 << (source.register - 0x20),
+                        0x20..=0x7F => uniforms |= 1 << (source.register - 0x20),
+                        _ => {}
+                    }
+                }
+            }
+            if (wanted, uniforms, indexed) == before {
+                let all = (1 << FLOAT_UNIFORMS) - 1;
+                return (uniforms & all, indexed & all);
+            }
+        }
+    }
+
+    /// the instructions the program can run from its entry point, through
+    /// whichever way each branch goes.
+    fn reached(&self, entry: u32) -> Vec<bool> {
+        let mut reached = vec![false; self.ops.len()];
+        let mut walked = std::collections::HashSet::new();
+        let mut ranges = vec![(entry, self.ops.len() as u32)];
+        while let Some((start, end)) = ranges.pop() {
+            if !walked.insert((start, end)) {
+                continue;
+            }
+            let mut pc = start;
+            while pc < end && (pc as usize) < self.ops.len() {
+                reached[pc as usize] = true;
+                let op = &self.ops[pc as usize];
+                let (destination, count) = op.instruction.flow_target();
+                match op.opcode {
+                    OpCode::End => break,
+                    OpCode::Call | OpCode::CallC | OpCode::CallU => ranges.push((destination, destination + count)),
+                    OpCode::JmpC | OpCode::JmpU => ranges.push((destination, end)),
+                    OpCode::IfC | OpCode::IfU => {
+                        let (then, otherwise, next) = if_ranges(pc, destination, count);
+                        ranges.extend([then, otherwise]);
+                        if next <= pc {
+                            break;
+                        }
+                        pc = next;
+                        continue;
+                    }
+                    OpCode::Loop => {
+                        ranges.push((pc + 1, destination + 1));
+                        if destination < pc {
+                            break;
+                        }
+                        pc = destination + 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                pc += 1;
+            }
+        }
+        reached
+    }
+}
+
+impl ShaderUnit {
+    /// the float uniforms what lands in the output registers given comes
+    /// from, see Program::uniforms_feeding, all of them until the program
+    /// is prepared, as those that only these outputs read and those that
+    /// the texture coordinates' outputs can read through an address
+    /// register too, which a uniform the coordinates read as it is never
+    /// is. a palette of matrices that place the vertices is of the first,
+    /// also when the lighting reads it. a block of uniforms that a sprite
+    /// drawn among others finds both its place and its offset into its
+    /// sheet of sprites in, or a palette that a title's shader for every
+    /// material keeps such offsets in too, is of the second.
+    pub(crate) fn uniforms_feeding(&self, outputs: u16, coordinates: u16) -> (u128, u128) {
+        let Some(program) = &self.decoded else { return ((1 << FLOAT_UNIFORMS) - 1, 0) };
+        let (direct, indexed) = program.uniforms_feeding(self.entry_point, outputs);
+        let (textured, textured_indexed) = program.uniforms_feeding(self.entry_point, coordinates);
+        let own = direct | (indexed & !(textured | textured_indexed));
+        (own, indexed & textured_indexed & !textured & !own)
+    }
+}
+
 /// runs the vertex shader over many vertices, a batch of them at a time,
 /// giving what running it on each would give.
 pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
@@ -1000,6 +1113,55 @@ mod tests {
     fn same(a: &[[Vec4; OUTPUT_REGISTERS]], b: &[[Vec4; OUTPUT_REGISTERS]]) -> bool {
         let same = |x: f32, y: f32| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits();
         a.len() == b.len() && a.iter().flatten().flatten().zip(b.iter().flatten().flatten()).all(|(&x, &y)| same(x, y))
+    }
+
+    /// the uniforms that feed an output are those its value comes from,
+    /// through temporaries, not those of other outputs, and one read
+    /// through an address register can be any from it on. a program past
+    /// the end or not called is not looked at.
+    #[test]
+    fn the_uniforms_feeding_an_output_are_followed_through_the_program() {
+        // op, destination, address register, wide source, narrow source
+        let arithmetic = |op: u32, destination: u32, index: u32, wide: u32, narrow: u32| {
+            (op << 26) | (destination << 21) | (index << 19) | (wide << 12) | (narrow << 7)
+        };
+        let (add, dp4, mul, mov, end) = (0x00, 0x02, 0x08, 0x13, 0x22 << 26);
+        let program = [
+            // o0 = c0 . v0, r0 = c5 * v1, o1 = c6 + r0, o2 = c9
+            arithmetic(dp4, 0x00, 0, 0x20, 0x00),
+            arithmetic(mul, 0x10, 0, 0x25, 0x01),
+            arithmetic(add, 0x01, 0, 0x26, 0x10),
+            arithmetic(mov, 0x02, 0, 0x29, 0x00),
+            end,
+            // never run, a program after this one
+            arithmetic(mov, 0x00, 0, 0x2A, 0x00),
+        ];
+        let mut unit = unit_with(&program, &[IDENTITY]);
+        unit.prepare();
+        assert_eq!(unit.uniforms_feeding(0b001, 0), (1 << 0, 0));
+        assert_eq!(unit.uniforms_feeding(0b011, 0), (1 << 0 | 1 << 5 | 1 << 6, 0));
+        assert_eq!(unit.uniforms_feeding(0b100, 0), (1 << 9, 0));
+        // o0 = c[a0.x + 20] . v0, o1 = c[a0.x + 20] . v1, o2 = c94 + v1, a
+        // palette that the lighting in o1 reads too, and a texture's
+        // coordinates in o2
+        let indexed = [
+            arithmetic(dp4, 0x00, 1, 0x20 + 20, 0x00),
+            arithmetic(dp4, 0x01, 1, 0x20 + 20, 0x01),
+            arithmetic(add, 0x02, 0, 0x20 + 94, 0x01),
+            end,
+        ];
+        let mut unit = unit_with(&indexed, &[IDENTITY]);
+        unit.prepare();
+        let palette = ((1 << 96) - 1) & !((1 << 20) - 1);
+        assert_eq!(unit.uniforms_feeding(0b001, 0b100), (palette & !(1 << 94), 0), "the sprite's offset is not the palette's");
+        // o0 = c[a0.x + 20] . v0, o2 = c[a0.x + 30], a sprite's block of
+        // uniforms, its place and its offset in its sheet, of which only
+        // what the place reads before the offset's reach is its own
+        let sprites = [arithmetic(dp4, 0x00, 1, 0x20 + 20, 0x00), arithmetic(mov, 0x02, 1, 0x20 + 30, 0x00), end];
+        let mut unit = unit_with(&sprites, &[IDENTITY]);
+        unit.prepare();
+        let own = ((1 << 30) - 1) & !((1 << 20) - 1);
+        assert_eq!(unit.uniforms_feeding(0b001, 0b100), (own, ((1 << 96) - 1) & !((1 << 30) - 1)));
     }
 
     /// the batches give exactly what the interpreter gives, over programs

@@ -22,7 +22,7 @@ use std::thread;
 
 use ash::vk;
 
-use super::{BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, TEXTURE_UNIT_BASES};
+use super::{BoundTexture, DepthMap, DrawnTexture, Pass, Screen, Wrap, TEXTURE_UNIT_BASES};
 use crate::blend::LogicOp;
 use crate::fog;
 use crate::pack::Material;
@@ -134,6 +134,42 @@ pub(super) struct Draw<'a> {
     /// whether the fog is on, and its table.
     pub(super) fog: bool,
     pub(super) fog_table: &'a fog::Table,
+}
+
+/// where something is staged in the ring, and its bytes.
+type Staged = (u64, u64);
+
+/// a draw as recorded, once what it reads is staged, so the same draw can
+/// go into the twins of its buffers later.
+#[derive(Clone, Copy)]
+struct Recorded {
+    color: usize,
+    depth: Option<usize>,
+    pipeline: vk::Pipeline,
+    viewport: vk::Viewport,
+    scissor: vk::Rect2D,
+    cull: vk::CullModeFlags,
+    depth_test: bool,
+    depth_compare: vk::CompareOp,
+    depth_write: bool,
+    stencil_test: bool,
+    /// the stencil test register and the stencil op one.
+    stencil: (u32, u32),
+    writable: bool,
+    blend_constants: [f32; 4],
+    blend: Option<u32>,
+    color_mask: u32,
+    logic_op: Option<LogicOp>,
+    views: [vk::ImageView; 3],
+    samplers: [vk::Sampler; 3],
+    uniforms: u64,
+    tables: u64,
+    /// where the program, its uniforms, the inputs and the indices are
+    /// staged, for a draw the GPU shades.
+    shaded: Option<[(u64, u64); 4]>,
+    /// where the vertices and the indices are, for one the CPU placed.
+    placed: (u64, u64),
+    count: u32,
 }
 
 /// the triangles of a draw.
@@ -298,6 +334,15 @@ struct Surface {
     upright: Option<Upright>,
     /// counts the changes to the image, for the textures copied from it.
     generation: u64,
+    /// the buffer as frame interpolation's picture in between has it, kept
+    /// made for the next time once it no longer differs.
+    twin: Option<Image>,
+    /// the twin holds the buffer in between, which differs from the image.
+    twinned: bool,
+    /// counts the changes to the twin, as generation does the image's.
+    twin_generation: u64,
+    /// the twin turned upright, as upright has the image.
+    twin_upright: Option<Upright>,
 }
 
 impl Surface {
@@ -459,6 +504,35 @@ impl Surface {
     fn captured(&self) -> Option<&Capture> {
         self.capture.as_ref().filter(|capture| self.dirty.is_some() && capture.current)
     }
+
+    /// the buffer is the same in between as it is, all of it was cleared
+    /// or memory gave it.
+    fn untwin(&mut self) {
+        self.twinned = false;
+    }
+
+    /// something was drawn into the twin.
+    fn twin_changed(&mut self) {
+        self.twin_generation += 1;
+    }
+}
+
+/// the format, the uses and the aspects of the image a surface of a kind
+/// draws into.
+fn surface_image(kind: Kind) -> (vk::Format, vk::ImageUsageFlags, vk::ImageAspectFlags) {
+    let (format, usage, aspect) = match kind {
+        Kind::Color(_) => (
+            COLOR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+            vk::ImageAspectFlags::COLOR,
+        ),
+        Kind::Depth(_) => (
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        ),
+    };
+    (format, usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST, aspect)
 }
 
 /// how big a game's pipelines get before they are thrown away and compiled
@@ -1385,6 +1459,20 @@ pub struct Hardware {
     uploads: bool,
     /// the color and depth surfaces being rendered into.
     rendering: Option<(usize, Option<usize>)>,
+    /// what the draws do for frame interpolation.
+    pub(crate) pass: Pass,
+    /// whether draws go into twins at all, which frame interpolation turns
+    /// on for a title drawing a picture every other refresh.
+    twins: bool,
+    /// draws waiting to go into twins, after the rendering they follow ends,
+    /// so that each run of draws into the same buffers renders into their
+    /// twins once rather than once a draw.
+    twin_draws: Vec<Recorded>,
+    /// textures copied from twins, as copies has those from surfaces.
+    twin_copies: HashMap<DrawnTexture, Copied>,
+    /// the batch the draw a draw in between follows staged its vertices
+    /// and its indices in, and where, which the one in between reads too.
+    twinned_inputs: Option<(u64, Staged, Staged)>,
     batch: u64,
     name: String,
     /// how many times the console's resolution surfaces are drawn at.
@@ -1597,6 +1685,11 @@ impl Hardware {
                 recording: false,
                 uploads: false,
                 rendering: None,
+                pass: Pass::Real,
+                twins: false,
+                twin_draws: Vec::new(),
+                twin_copies: HashMap::new(),
+                twinned_inputs: None,
                 batch: 0,
                 name,
                 scale: 1,
@@ -2014,11 +2107,55 @@ impl Hardware {
         }
     }
 
+    /// ends the rendering, and draws what waits to go into twins, before
+    /// anything else reads or writes them.
     fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
             // SAFETY: rendering was begun in this command buffer
             unsafe { self.device.cmd_end_rendering(self.commands) };
         }
+        if !self.twin_draws.is_empty() {
+            self.draw_twins();
+        }
+    }
+
+    /// records the draws waiting to go into twins, each run of them into
+    /// the same buffers in a rendering of its own. what they read was made
+    /// before the rendering they follow, behind its barrier, and nothing
+    /// else wrote the twins since.
+    fn draw_twins(&mut self) {
+        let draws = std::mem::take(&mut self.twin_draws);
+        let mut into = None;
+        for recorded in &draws {
+            let buffers = (recorded.color, recorded.depth);
+            if into != Some(buffers) {
+                if into.take().is_some() {
+                    // SAFETY: begun below in this command buffer
+                    unsafe { self.device.cmd_end_rendering(self.commands) };
+                    self.unfenced = true;
+                    self.barrier();
+                }
+                let twin = |index: usize| self.surfaces[index].twin.as_ref().map(|twin| twin.view);
+                let Some(color) = twin(recorded.color) else { continue };
+                let depth = match recorded.depth {
+                    Some(index) => match twin(index) {
+                        Some(view) => Some(view),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                self.begin_rendering_into(recorded.color, color, depth);
+                into = Some(buffers);
+            }
+            self.record(recorded);
+        }
+        if into.is_some() {
+            // SAFETY: begun above in this command buffer
+            unsafe { self.device.cmd_end_rendering(self.commands) };
+        }
+        self.unfenced = true;
+        self.twin_draws = draws;
+        self.twin_draws.clear();
     }
 
     /// room for size bytes in the ring, where it starts.
@@ -2073,14 +2210,25 @@ impl Hardware {
     /// of memory given, or all of them.
     /// clears rows of memory of a surface to one pixel, on the GPU.
     fn clear_rows(&mut self, index: usize, rows: (u32, u32), pixel: &[u8]) -> Result<(), String> {
-        let surface = &self.surfaces[index];
-        let (width, height, kind, view) = (surface.width, surface.height, surface.kind, surface.image.view);
-        let scale = self.scale;
         self.begin()?;
         self.mark(Work::Clear, false);
-        self.renderings += 1;
         self.end_rendering();
         self.barrier();
+        self.clear_rows_of(index, self.surface_view(index, false), rows, pixel);
+        // and in between, where it has a twin
+        if self.surfaces[index].twinned {
+            self.clear_rows_of(index, self.surface_view(index, true), rows, pixel);
+        }
+        self.uploads = true;
+        Ok(())
+    }
+
+    /// records clearing rows of a surface's image or its twin's.
+    fn clear_rows_of(&mut self, index: usize, view: vk::ImageView, rows: (u32, u32), pixel: &[u8]) {
+        let surface = &self.surfaces[index];
+        let (width, height, kind) = (surface.width, surface.height, surface.kind);
+        let scale = self.scale;
+        self.renderings += 1;
         let attachment = [vk::RenderingAttachmentInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL)
@@ -2126,8 +2274,6 @@ impl Hardware {
             self.device.cmd_clear_attachments(self.commands, &[clear], &rect);
             self.device.cmd_end_rendering(self.commands);
         }
-        self.uploads = true;
-        Ok(())
     }
 
     /// the height of the tallest surface of a kind at an address and width,
@@ -2156,19 +2302,7 @@ impl Hardware {
         {
             Some(index) => index,
             None => {
-                let (format, usage, aspect) = match kind {
-                    Kind::Color(_) => (
-                        COLOR_FORMAT,
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
-                        vk::ImageAspectFlags::COLOR,
-                    ),
-                    Kind::Depth(_) => (
-                        DEPTH_FORMAT,
-                        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
-                    ),
-                };
-                let usage = usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+                let (format, usage, aspect) = surface_image(kind);
                 let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
                 let native = match self.scale {
                     1 => None,
@@ -2198,6 +2332,10 @@ impl Hardware {
                     screen: None,
                     upright: None,
                     generation: 0,
+                    twin: None,
+                    twinned: false,
+                    twin_generation: 0,
+                    twin_upright: None,
                 });
                 self.surfaces.len() - 1
             }
@@ -2262,6 +2400,75 @@ impl Hardware {
                 self.surfaces[i].checked = false;
             }
         }
+    }
+
+    /// whether draws go into twins.
+    pub(crate) fn twins(&self) -> bool {
+        self.twins
+    }
+
+    /// draws pictures in between into twins of the surfaces from now on,
+    /// for frame interpolation, or stops, the twins no longer different.
+    pub(crate) fn set_twins(&mut self, twins: bool) {
+        if !twins {
+            // what waits for them goes first, it may draw into them
+            if self.recording {
+                self.end_rendering();
+            }
+            self.twin_draws.clear();
+            for surface in &mut self.surfaces {
+                surface.untwin();
+            }
+        }
+        self.twins = twins;
+    }
+
+    /// whether a texture is rows of a surface with a twin.
+    fn reads_twin(&self, texture: &DrawnTexture) -> bool {
+        self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].twinned)
+    }
+
+    /// gives a surface a twin holding what the surface does, before a draw
+    /// in between goes into it.
+    fn make_twin(&mut self, index: usize) -> Result<(), String> {
+        if self.surfaces[index].twinned {
+            return Ok(());
+        }
+        self.begin()?;
+        self.end_rendering();
+        let (width, height, kind) = {
+            let s = &self.surfaces[index];
+            (s.width * self.scale, s.height * self.scale, s.kind)
+        };
+        if self.surfaces[index].twin.is_none() {
+            let (format, usage, aspect) = surface_image(kind);
+            let image = self.image(width, height, format, usage, aspect)?;
+            self.surfaces[index].twin = Some(image);
+        }
+        self.mark(Work::Copy, false);
+        self.barrier();
+        let s = &self.surfaces[index];
+        let Some(twin) = &s.twin else { unreachable!("made above") };
+        let aspect = match kind {
+            Kind::Color(_) => vk::ImageAspectFlags::COLOR,
+            Kind::Depth(_) => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+        };
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1);
+        let region = [vk::ImageCopy::default()
+            .src_subresource(layers)
+            .dst_subresource(layers)
+            .extent(vk::Extent3D { width, height, depth: 1 })];
+        // SAFETY: recording, outside rendering, between two images of the
+        // same size and format in the general layout made for transfers
+        unsafe {
+            self.unfenced = true;
+            self.device.cmd_copy_image(self.commands, s.image.image, vk::ImageLayout::GENERAL, twin.image, vk::ImageLayout::GENERAL, &region);
+        }
+        self.uploads = true;
+        let s = &mut self.surfaces[index];
+        s.twinned = true;
+        s.twin_changed();
+        Ok(())
     }
 
     /// copies a guest buffer's bytes into its surface.
@@ -2342,7 +2549,9 @@ impl Hardware {
             self.blit(index, true);
         }
         self.uploads = true;
+        // what memory holds is the same in between
         self.surfaces[index].replaced();
+        self.surfaces[index].untwin();
         Ok(())
     }
 
@@ -2763,7 +2972,8 @@ impl Hardware {
             if !filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
                 let surface = &mut self.surfaces[index];
                 // the image is not what memory holds, even when the fill left
-                // memory as the shadow had it
+                // memory as the shadow had it, which is the same in between
+                surface.untwin();
                 surface.shadow.clear();
                 surface.pixel = None;
                 surface.dirty = None;
@@ -2814,7 +3024,9 @@ impl Hardware {
             }
             self.uploads = true;
             let surface = &mut self.surfaces[index];
-            // the pixel stands in for the bytes rather than a copy of them
+            // the pixel stands in for the bytes rather than a copy of them,
+            // and is all of it in between too
+            surface.untwin();
             surface.keep_pixel(&pixel);
             surface.dirty = None;
             surface.guarded = None;
@@ -3159,6 +3371,15 @@ impl Hardware {
         self.shading = block;
         let uniforms = uniforms?;
 
+        // the draw in between reads the vertices its own draw staged just
+        // before, only its uniforms differ
+        let index_bytes = (shading.indices.len() * 4) as u64;
+        if let Some((batch, inputs, indices)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
+            if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes {
+                return Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices]);
+            }
+        }
+
         let inputs = self.stage(input_bytes, self.storage_alignment)?;
         match shading.inputs {
             Inputs::Decoded(decoded) => {
@@ -3182,15 +3403,24 @@ impl Hardware {
             }
         }
 
-        let index_bytes = (shading.indices.len() * 4) as u64;
         let indices = self.stage(index_bytes, 4)?;
         for (out, index) in self.ring(indices, index_bytes).as_chunks_mut::<4>().0.iter_mut().zip(shading.indices) {
             *out = index.to_le_bytes();
+        }
+        if self.pass == Pass::Twinned {
+            self.twinned_inputs = Some((self.batch, (inputs, input_bytes), (indices, index_bytes)));
         }
         Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)])
     }
 
     pub(super) fn draw<M: GpuMemory>(&mut self, memory: &mut M, draw: &Draw) -> Result<(), String> {
+        let pass = self.pass;
+        if pass == Pass::Twin && !self.twins {
+            return Ok(());
+        }
+        if pass != Pass::Twin {
+            self.twinned_inputs = None;
+        }
         let [left, bottom, right, top] = draw.scissor;
         let (left, bottom) = (left.max(0), bottom.max(0));
         let (right, top) = (right.min(draw.width as i32), top.min(draw.height as i32));
@@ -3236,17 +3466,59 @@ impl Hardware {
         };
         let (bottom, top) = (bottom + raise, top + raise);
 
+        // frame interpolation draws it into the twins of its buffers too, the
+        // draw in between where it moved, as it is where its buffers or what
+        // it reads have twins, which hold the picture in between
+        let twinned = self.twins
+            && match pass {
+                Pass::Real => {
+                    self.surfaces[color].twinned
+                        || depth.is_some_and(|depth| self.surfaces[depth].twinned)
+                        || draw.textures.iter().flatten().filter_map(|bound| bound.drawn).any(|drawn| self.reads_twin(&drawn))
+                }
+                Pass::Twinned | Pass::Twin => true,
+            };
+        if twinned {
+            // what the buffers hold before the draw, the title's own goes
+            // into them first
+            let made = self.make_twin(color).and_then(|()| depth.map_or(Ok(()), |depth| self.make_twin(depth)));
+            if let Err(error) = made {
+                log::error!("the GPU could not draw the pictures in between, {error}");
+                self.set_twins(false);
+                if pass == Pass::Twin {
+                    return Ok(());
+                }
+            }
+        }
+        let twinned = twinned && self.twins;
+        // drawn here as the title made it, and into the twins here or in the
+        // draw in between that follows
+        let real = pass != Pass::Twin;
+        let twin = twinned && pass != Pass::Twinned;
+
         let mut views = [self.blank.view; 3];
+        let mut twin_views = [self.blank.view; 3];
         let mut samplers = [vk::Sampler::null(); 3];
         let mut enabled = 0;
         for (unit, bound) in draw.textures.iter().enumerate() {
             match bound {
                 Some(bound) => {
-                    let (view, smallest) = match bound.drawn {
-                        Some(drawn) => (self.copy_texture(&drawn, bound)?, 0),
-                        None => self.texture(bound)?,
+                    let smallest = match bound.drawn {
+                        Some(drawn) => {
+                            if real {
+                                views[unit] = self.copy_texture(&drawn, bound, false)?;
+                            }
+                            if twin {
+                                twin_views[unit] = self.copy_texture(&drawn, bound, true)?;
+                            }
+                            0
+                        }
+                        None => {
+                            let (view, smallest) = self.texture(bound)?;
+                            (views[unit], twin_views[unit]) = (view, view);
+                            smallest
+                        }
                     };
-                    views[unit] = view;
                     samplers[unit] = self.sampler(bound.linear, bound.wrap_s, bound.wrap_t, smallest)?;
                     enabled |= 1 << unit;
                 }
@@ -3372,38 +3644,110 @@ impl Hardware {
             self.barrier();
             self.uploads = false;
         }
-        if self.rendering != Some((color, depth)) {
-            self.end_rendering();
-            self.barrier();
-            self.begin_rendering(color, depth);
+        if real {
+            if self.rendering != Some((color, depth)) {
+                self.end_rendering();
+                self.barrier();
+                self.begin_rendering(color, depth);
+            }
+            if color_mask != 0 {
+                self.surfaces[color].drew(rows);
+                self.surfaces[color].guard_writes(memory);
+                self.overdrawn(color, rows, depth);
+            }
+            if let Some(depth) = depth {
+                if depth_write || (stencil_test && writable) {
+                    self.surfaces[depth].drew(rows);
+                    self.overdrawn(depth, rows, Some(color));
+                    // only depth, which titles read to tell what is in view.
+                    // Super Mario 3D Land reads small color buffers back on
+                    // loading a course and stalls on what the GPU drew there,
+                    // it goes on with them as memory holds them
+                    self.surfaces[depth].guard(memory);
+                    self.surfaces[depth].guard_writes(memory);
+                }
+            }
         }
-        if color_mask != 0 {
-            self.surfaces[color].drew(rows);
-            self.surfaces[color].guard_writes(memory);
-            self.overdrawn(color, rows, depth);
-        }
-        if let Some(depth) = depth {
-            if depth_write || (stencil_test && writable) {
-                self.surfaces[depth].drew(rows);
-                self.overdrawn(depth, rows, Some(color));
-                // only depth, which titles read to tell what is in view.
-                // Super Mario 3D Land reads small color buffers back on
-                // loading a course and stalls on what the GPU drew there,
-                // it goes on with them as memory holds them
-                self.surfaces[depth].guard(memory);
-                self.surfaces[depth].guard_writes(memory);
+        if twin {
+            if color_mask != 0 {
+                self.surfaces[color].twin_changed();
+            }
+            if let Some(depth) = depth.filter(|_| depth_write || (stencil_test && writable)) {
+                self.surfaces[depth].twin_changed();
             }
         }
 
+        // where the PICA's viewport puts clip space, for what the GPU
+        // shades, the whole target for what the CPU placed on it
+        let (x, y, viewport_width, viewport_height) = match draw.geometry {
+            Geometry::Shaded(shading) => shading.viewport,
+            Geometry::Placed { .. } => (0.0, 0.0, width, height),
+        };
+        let y = y + raise as f32;
+        let cull = match draw.geometry {
+            Geometry::Shaded(shading) if shading.cull == 1 => vk::CullModeFlags::FRONT,
+            Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::BACK,
+            _ => vk::CullModeFlags::NONE,
+        };
+        let scale = self.scale;
+        let recorded = Recorded {
+            color,
+            depth,
+            pipeline,
+            viewport: vk::Viewport {
+                x: x * scale as f32,
+                y: y * scale as f32,
+                width: viewport_width * scale as f32,
+                height: viewport_height * scale as f32,
+                min_depth: depth_range.0,
+                max_depth: depth_range.1,
+            },
+            scissor: vk::Rect2D {
+                offset: vk::Offset2D { x: left * scale as i32, y: bottom * scale as i32 },
+                extent: vk::Extent2D { width: (right - left) as u32 * scale, height: (top - bottom) as u32 * scale },
+            },
+            cull,
+            // with the test off the PICA still writes depth, which Vulkan
+            // only does while testing
+            depth_test: depth.is_some() && (depth_test || depth_write),
+            depth_compare: if depth_test { COMPARES[((mask >> 4) & 7) as usize] } else { vk::CompareOp::ALWAYS },
+            depth_write: depth.is_some() && depth_write,
+            stencil_test,
+            stencil: (r[REG_STENCIL_TEST], r[REG_STENCIL_OP]),
+            writable,
+            blend_constants: r[REG_BLEND_COLOR].to_le_bytes().map(|c| c as f32 / 255.0),
+            blend,
+            color_mask,
+            logic_op,
+            views,
+            samplers,
+            uniforms: uniform_offset,
+            tables,
+            shaded,
+            placed: (vertex_offset, index_offset),
+            count: vertex_count as u32,
+        };
+        if real {
+            self.record(&recorded);
+        }
+        if twin {
+            self.twin_draws.push(Recorded { views: twin_views, ..recorded });
+        }
+        Ok(())
+    }
+
+    /// records a draw, inside the rendering into its buffers or their twins.
+    fn record(&mut self, recorded: &Recorded) {
+        let r = recorded;
         let image_infos: [[vk::DescriptorImageInfo; 1]; 3] = std::array::from_fn(|unit| {
             [vk::DescriptorImageInfo::default()
-                .sampler(samplers[unit])
-                .image_view(views[unit])
+                .sampler(r.samplers[unit])
+                .image_view(r.views[unit])
                 .image_layout(vk::ImageLayout::GENERAL)]
         });
-        let uniform_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(uniform_offset).range(UNIFORM_SIZE)];
-        let tables_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(tables).range(TABLES_SIZE)];
-        let vertex_infos = shaded.map(|staged| {
+        let uniform_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(r.uniforms).range(UNIFORM_SIZE)];
+        let tables_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(r.tables).range(TABLES_SIZE)];
+        let vertex_infos = r.shaded.map(|staged| {
             staged.map(|(offset, range)| [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(offset).range(range)])
         });
         let mut writes = [vk::WriteDescriptorSet::default(); 8];
@@ -3441,58 +3785,22 @@ impl Hardware {
             }
         }
         let writes = &writes[..count];
-        // where the PICA's viewport puts clip space, for what the GPU
-        // shades, the whole target for what the CPU placed on it
-        let (x, y, viewport_width, viewport_height) = match draw.geometry {
-            Geometry::Shaded(shading) => shading.viewport,
-            Geometry::Placed { .. } => (0.0, 0.0, width, height),
-        };
-        let y = y + raise as f32;
-        let cull = match draw.geometry {
-            Geometry::Shaded(shading) if shading.cull == 1 => vk::CullModeFlags::FRONT,
-            Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::BACK,
-            _ => vk::CullModeFlags::NONE,
-        };
-
         let commands = self.commands;
-        let scale = self.scale;
-        let viewport = vk::Viewport {
-            x: x * scale as f32,
-            y: y * scale as f32,
-            width: viewport_width * scale as f32,
-            height: viewport_height * scale as f32,
-            min_depth: depth_range.0,
-            max_depth: depth_range.1,
-        };
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
-        let test = r[REG_STENCIL_TEST];
-        let op = r[REG_STENCIL_OP];
+        let (test, op) = r.stencil;
         let stencil_op = |raw: u32| vk::StencilOp::from_raw((raw & 7) as i32);
-        let constant = r[REG_BLEND_COLOR].to_le_bytes().map(|c| c as f32 / 255.0);
         // SAFETY: recording inside rendering, with everything the draw
         // reads staged in the ring and every image in the general layout
         unsafe {
             let device = &self.device;
-            device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_set_viewport(commands, 0, &[viewport]);
-            device.cmd_set_cull_mode(commands, cull);
-            device.cmd_set_scissor(
-                commands,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D { x: left * scale as i32, y: bottom * scale as i32 },
-                    extent: vk::Extent2D { width: (right - left) as u32 * scale, height: (top - bottom) as u32 * scale },
-                }],
-            );
-            // with the test off the PICA still writes depth, which Vulkan
-            // only does while testing
-            device.cmd_set_depth_test_enable(commands, depth.is_some() && (depth_test || depth_write));
-            device.cmd_set_depth_compare_op(
-                commands,
-                if depth_test { COMPARES[((mask >> 4) & 7) as usize] } else { vk::CompareOp::ALWAYS },
-            );
-            device.cmd_set_depth_write_enable(commands, depth.is_some() && depth_write);
-            device.cmd_set_stencil_test_enable(commands, stencil_test);
+            device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
+            device.cmd_set_viewport(commands, 0, &[r.viewport]);
+            device.cmd_set_cull_mode(commands, r.cull);
+            device.cmd_set_scissor(commands, 0, &[r.scissor]);
+            device.cmd_set_depth_test_enable(commands, r.depth_test);
+            device.cmd_set_depth_compare_op(commands, r.depth_compare);
+            device.cmd_set_depth_write_enable(commands, r.depth_write);
+            device.cmd_set_stencil_test_enable(commands, r.stencil_test);
             device.cmd_set_stencil_op(
                 commands,
                 face,
@@ -3502,16 +3810,16 @@ impl Hardware {
                 COMPARES[((test >> 4) & 7) as usize],
             );
             device.cmd_set_stencil_compare_mask(commands, face, (test >> 24) & 0xFF);
-            device.cmd_set_stencil_write_mask(commands, face, if writable { (test >> 8) & 0xFF } else { 0 });
+            device.cmd_set_stencil_write_mask(commands, face, if r.writable { (test >> 8) & 0xFF } else { 0 });
             device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
-            device.cmd_set_blend_constants(commands, &constant);
+            device.cmd_set_blend_constants(commands, &r.blend_constants);
             if let Some(state) = &self.blend_state {
-                state.cmd_set_color_blend_enable(commands, 0, &[blend.is_some().into()]);
-                state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(blend.unwrap_or(0))]);
-                state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(color_mask)]);
+                state.cmd_set_color_blend_enable(commands, 0, &[r.blend.is_some().into()]);
+                state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(r.blend.unwrap_or(0))]);
+                state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(r.color_mask)]);
                 if let Some(ops) = &self.logic_op_state {
-                    state.cmd_set_logic_op_enable(commands, logic_op.is_some());
-                    ops.cmd_set_logic_op(commands, logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
+                    state.cmd_set_logic_op_enable(commands, r.logic_op.is_some());
+                    ops.cmd_set_logic_op(commands, r.logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
                 }
             }
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
@@ -3519,19 +3827,26 @@ impl Hardware {
             match vertex_infos {
                 Some(infos) => {
                     device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, vk::IndexType::UINT32);
-                    device.cmd_draw_indexed(commands, vertex_count as u32, 1, 0, 0, 0);
+                    device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
                 }
                 None => {
-                    device.cmd_bind_vertex_buffers(commands, 0, &[self.ring.buffer], &[vertex_offset]);
-                    device.cmd_bind_index_buffer(commands, self.ring.buffer, index_offset, vk::IndexType::UINT32);
-                    device.cmd_draw_indexed(commands, vertex_count as u32, 1, 0, 0, 0);
+                    device.cmd_bind_vertex_buffers(commands, 0, &[self.ring.buffer], &[r.placed.0]);
+                    device.cmd_bind_index_buffer(commands, self.ring.buffer, r.placed.1, vk::IndexType::UINT32);
+                    device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
                 }
             }
         }
-        Ok(())
     }
 
     fn begin_rendering(&mut self, color: usize, depth: Option<usize>) {
+        let views = (self.surfaces[color].image.view, depth.map(|d| self.surfaces[d].image.view));
+        self.begin_rendering_into(color, views.0, views.1);
+        self.rendering = Some((color, depth));
+    }
+
+    /// begins rendering into views the size of a color surface, its own
+    /// image and its depth surface's or their twins.
+    fn begin_rendering_into(&mut self, color: usize, color_view: vk::ImageView, depth_view: Option<vk::ImageView>) {
         self.renderings += 1;
         let surface = &self.surfaces[color];
         let area = vk::Rect2D {
@@ -3545,8 +3860,8 @@ impl Hardware {
                 .load_op(vk::AttachmentLoadOp::LOAD)
                 .store_op(vk::AttachmentStoreOp::STORE)
         };
-        let colors = [attachment(surface.image.view)];
-        let depth_attachment = depth.map(|d| attachment(self.surfaces[d].image.view));
+        let colors = [attachment(color_view)];
+        let depth_attachment = depth_view.map(attachment);
         let mut info = vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors);
         if let Some(depth_attachment) = &depth_attachment {
             info = info.depth_attachment(depth_attachment).stencil_attachment(depth_attachment);
@@ -3555,7 +3870,6 @@ impl Hardware {
         // layout
         self.unfenced = true;
         unsafe { self.device.cmd_begin_rendering(self.commands, &info) };
-        self.rendering = Some((color, depth));
     }
 
     /// runs what the batch recorded and writes everything it drew back to
@@ -3676,8 +3990,25 @@ impl Hardware {
             row as i32 * n,
             input_size.1 as i32 * n,
         ];
+        // and in between, from the input's twin into the output's, which
+        // holds what the output did before
+        let twinned = self.twins && (self.surfaces[source].twinned || self.surfaces[target].twinned);
+        let twinned = twinned
+            && match self.make_twin(target) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!("the GPU could not transfer the picture in between, {error}");
+                    self.set_twins(false);
+                    false
+                }
+            };
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
-        self.dispatch_transfer(views, constants, (t.copy.0 * self.scale, t.copy.1 * self.scale))?;
+        let size = (t.copy.0 * self.scale, t.copy.1 * self.scale);
+        self.dispatch_transfer(views, constants, size)?;
+        if twinned {
+            self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), constants, size)?;
+            self.surfaces[target].twin_changed();
+        }
         self.surfaces[target].changed();
         self.surfaces[target].guard_writes(memory);
         self.overdrawn(target, (0, self.surfaces[target].height), None);
@@ -3685,6 +4016,9 @@ impl Hardware {
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer
         self.capture_screen(target)?;
+        if twinned && self.direct {
+            self.upright_image(target, true)?;
+        }
         self.submit()?;
         Ok(true)
     }
@@ -3780,11 +4114,16 @@ impl Hardware {
 
     /// the image of a texture copied from the surface it is part of, copied
     /// again whenever the surface changed. a texture reaching past the
-    /// surface's last row has the rows past it as memory holds them.
-    fn copy_texture(&mut self, texture: &DrawnTexture, bound: &BoundTexture) -> Result<vk::ImageView, String> {
+    /// surface's last row has the rows past it as memory holds them. a twin
+    /// one is copied from the surface's twin, when it has one.
+    fn copy_texture(&mut self, texture: &DrawnTexture, bound: &BoundTexture, twin: bool) -> Result<vk::ImageView, String> {
         self.mark(Work::Copy, false);
         let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
-        let generation = self.surfaces[source].generation;
+        let twin = twin && self.surfaces[source].twinned;
+        let generation = match twin {
+            true => self.surfaces[source].twin_generation,
+            false => self.surfaces[source].generation,
+        };
         let rows = (self.surfaces[source].height - row).min(texture.height);
         let memory = if rows < texture.height {
             if bound.texels.len() != (texture.width * texture.height) as usize {
@@ -3795,7 +4134,7 @@ impl Hardware {
             None
         };
         let batch = self.batch;
-        if let Some(copy) = self.copies.get_mut(texture) {
+        if let Some(copy) = self.copies(twin).get_mut(texture) {
             let same_memory = match (&copy.memory, &memory) {
                 (Some(kept), Some(now)) => Arc::ptr_eq(kept, now),
                 (kept, now) => kept.is_none() && now.is_none(),
@@ -3805,12 +4144,13 @@ impl Hardware {
                 return Ok(copy.image.view);
             }
         }
-        if !self.copies.contains_key(texture) {
+        if !self.copies(twin).contains_key(texture) {
             let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST;
+            self.end_rendering();
             let image = self.image(texture.width * self.scale, texture.height * self.scale, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
-            self.copies.insert(*texture, Copied { image, surface: source, generation, memory: None, used: batch });
+            self.copies(twin).insert(*texture, Copied { image, surface: source, generation, memory: None, used: batch });
         }
-        let (view, image) = (self.copies[texture].image.view, self.copies[texture].image.image);
+        let (view, image) = (self.copies(twin)[texture].image.view, self.copies(twin)[texture].image.image);
         if memory.is_some() {
             // the rows past the surface as memory has them, scaled up, the
             // copy's rows run as memory's do
@@ -3842,7 +4182,7 @@ impl Hardware {
             };
         }
         if let Kind::Depth(bytes) = self.surfaces[source].kind {
-            self.copy_depth(source, row, bytes, view, texture)?;
+            self.copy_depth(source, row, bytes, view, texture, twin)?;
         } else {
             // the texture's rows run top first, the surface's bottom first,
             // so the copy flips them, and its pixels round to the format as
@@ -3852,10 +4192,11 @@ impl Hardware {
             let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
             let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
             let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height];
-            self.dispatch_transfer((self.surfaces[source].image.view, view), constants, (texture.width * n, rows * n))?;
+            let from = self.surface_view(source, twin);
+            self.dispatch_transfer((from, view), constants, (texture.width * n, rows * n))?;
         }
         self.uploads = true;
-        if let Some(copy) = self.copies.get_mut(texture) {
+        if let Some(copy) = self.copies(twin).get_mut(texture) {
             copy.surface = source;
             copy.generation = generation;
             copy.memory = memory;
@@ -3864,10 +4205,28 @@ impl Hardware {
         Ok(view)
     }
 
+    /// the textures copied from surfaces, or from their twins.
+    fn copies(&mut self, twin: bool) -> &mut HashMap<DrawnTexture, Copied> {
+        match twin {
+            true => &mut self.twin_copies,
+            false => &mut self.copies,
+        }
+    }
+
+    /// a surface's image, or its twin's.
+    fn surface_view(&self, index: usize, twin: bool) -> vk::ImageView {
+        let surface = &self.surfaces[index];
+        match &surface.twin {
+            Some(image) if twin && surface.twinned => image.view,
+            _ => surface.image.view,
+        }
+    }
+
     /// records a texture read out of a depth surface, its depth and stencil
     /// copied into a buffer and then made into the colors their bytes read
-    /// as.
-    fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture) -> Result<(), String> {
+    /// as, or out of its twin.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture, twin: bool) -> Result<(), String> {
         let n = self.scale;
         let (width, height) = (self.surfaces[source].width * n, self.surfaces[source].height * n);
         let pixels = (width * height) as u64;
@@ -3907,7 +4266,11 @@ impl Hardware {
         // general layout into a buffer big enough for both aspects, then a
         // barrier before the shader reads it
         unsafe {
-            let image = self.surfaces[source].image.image;
+            let surface = &self.surfaces[source];
+            let image = match &surface.twin {
+                Some(image) if twin && surface.twinned => image.image,
+                _ => surface.image.image,
+            };
             self.unfenced = true;
             self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, samples, &regions);
             self.barrier();
@@ -3962,7 +4325,7 @@ impl Hardware {
     /// records a copy of a scaled surface turned upright, for showing it.
     fn capture_screen(&mut self, index: usize) -> Result<(), String> {
         if self.direct {
-            return self.upright_image(index);
+            return self.upright_image(index, false);
         }
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
@@ -4013,26 +4376,41 @@ impl Hardware {
     }
 
     /// records a surface turned upright into the image a presenter sharing
-    /// the device draws it from. the batch's first barrier waits for the
-    /// presents submitted before, which may still read the image.
-    fn upright_image(&mut self, index: usize) -> Result<(), String> {
+    /// the device draws it from, or its twin into the twin's. the batch's
+    /// first barrier waits for the presents submitted before, which may
+    /// still read the image.
+    fn upright_image(&mut self, index: usize, twin: bool) -> Result<(), String> {
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
         let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
-        if self.surfaces[index].upright.is_none() {
+        let made = match twin {
+            true => self.surfaces[index].twin_upright.is_some(),
+            false => self.surfaces[index].upright.is_some(),
+        };
+        if !made {
             let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+            self.end_rendering();
             let image = self.image(width, height, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
-            self.surfaces[index].upright = Some(Upright { image, batch: 0, current: false });
+            let upright = Some(Upright { image, batch: 0, current: false });
+            match twin {
+                true => self.surfaces[index].twin_upright = upright,
+                false => self.surfaces[index].upright = upright,
+            }
         }
         let (layout, pipeline) = self.upright_image_pipeline()?;
         self.end_rendering();
         self.barrier();
         let batch = self.batch;
+        let from = self.surface_view(index, twin);
         let surface = &mut self.surfaces[index];
-        let Some(upright) = surface.upright.as_mut() else { unreachable!("made above") };
+        let upright = match twin {
+            true => surface.twin_upright.as_mut(),
+            false => surface.upright.as_mut(),
+        };
+        let Some(upright) = upright else { unreachable!("made above") };
         upright.batch = batch;
         upright.current = true;
-        let source = [vk::DescriptorImageInfo::default().image_view(surface.image.view).image_layout(vk::ImageLayout::GENERAL)];
+        let source = [vk::DescriptorImageInfo::default().image_view(from).image_layout(vk::ImageLayout::GENERAL)];
         let target = [vk::DescriptorImageInfo::default().image_view(upright.image.view).image_layout(vk::ImageLayout::GENERAL)];
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -4063,12 +4441,16 @@ impl Hardware {
         self.direct
     }
 
-    /// the image a screen's picture is upright in, read back, and its width.
-    #[cfg(test)]
-    pub(crate) fn upright_pixels(&mut self, screen: ScreenRef) -> Result<(Vec<u8>, u32), String> {
+    /// the image a screen's picture, or the picture in between, is upright
+    /// in, read back, and its width. it waits for the GPU.
+    pub(crate) fn upright_pixels(&mut self, screen: ScreenRef, twin: bool) -> Result<(Vec<u8>, u32), String> {
         let (row_pixels, rows) = screen.size;
         let index = self.surfaces.iter().position(|s| s.addr == screen.addr && s.width == row_pixels && s.height == rows).ok_or("no surface")?;
-        let image = self.surfaces[index].upright.as_ref().ok_or("nothing upright")?.image.image;
+        let upright = match twin {
+            true => self.surfaces[index].twin_upright.as_ref().filter(|upright| upright.batch == screen.batch),
+            false => self.surfaces[index].upright.as_ref(),
+        };
+        let image = upright.ok_or("nothing upright")?.image.image;
         let (width, height) = (rows * self.scale, row_pixels * self.scale);
         let buffer = self.buffer(u64::from(width * height * 4), vk::BufferUsageFlags::TRANSFER_DST, true)?;
         self.begin()?;
@@ -4109,6 +4491,25 @@ impl Hardware {
     /// picture took its image. the batch that drew it goes to the GPU first,
     /// so it runs before whatever the presenter submits next.
     pub(crate) fn screen_image(&mut self, screen: ScreenRef) -> Result<Option<crate::GpuScreen>, String> {
+        self.upright_screen(screen, false)
+    }
+
+    /// a screen's picture or the picture in between, upright RGBA the way
+    /// the screen shows it, and the scale it is at, read back from the GPU,
+    /// which it waits for.
+    pub(crate) fn upright_picture(&mut self, screen: ScreenRef, between: bool) -> Option<Picture> {
+        let (pixels, _) = self.upright_pixels(screen, between).ok()?;
+        Some((crop(Arc::new(pixels), screen, self.scale), self.scale))
+    }
+
+    /// the image the picture in between a screen's picture and the one
+    /// before is upright in, as screen_image has the screen's own, none
+    /// when the transfer that left it left none.
+    pub(crate) fn between_image(&mut self, screen: ScreenRef) -> Result<Option<crate::GpuScreen>, String> {
+        self.upright_screen(screen, true)
+    }
+
+    fn upright_screen(&mut self, screen: ScreenRef, twin: bool) -> Result<Option<crate::GpuScreen>, String> {
         if !self.direct {
             return Ok(None);
         }
@@ -4117,7 +4518,11 @@ impl Hardware {
             s.addr == screen.addr && s.width == row_pixels && s.height == rows && s.kind == Kind::Color(screen.format) && !s.tiled
         });
         let Some(index) = found else { return Ok(None) };
-        let Some(upright) = self.surfaces[index].upright.as_ref().filter(|upright| upright.batch == screen.batch) else {
+        let upright = match twin {
+            true => self.surfaces[index].twin_upright.as_ref(),
+            false => self.surfaces[index].upright.as_ref(),
+        };
+        let Some(upright) = upright.filter(|upright| upright.batch == screen.batch) else {
             return Ok(None);
         };
         let view = upright.image.view;
@@ -4409,10 +4814,12 @@ impl Hardware {
                 self.destroy_image(&texture.image);
             }
         }
-        let stale: Vec<DrawnTexture> = self.copies.iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
-        for key in stale {
-            if let Some(copy) = self.copies.remove(&key) {
-                self.destroy_image(&copy.image);
+        for twin in [false, true] {
+            let stale: Vec<DrawnTexture> = self.copies(twin).iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
+            for key in stale {
+                if let Some(copy) = self.copies(twin).remove(&key) {
+                    self.destroy_image(&copy.image);
+                }
             }
         }
         self.replacing = (std::time::Duration::ZERO, 0);
@@ -4794,7 +5201,7 @@ impl Drop for Hardware {
             for texture in self.textures.values() {
                 self.destroy_image(&texture.image);
             }
-            for copy in self.copies.values() {
+            for copy in self.copies.values().chain(self.twin_copies.values()) {
                 self.destroy_image(&copy.image);
             }
             for replaced in self.replaced.values() {
@@ -4805,11 +5212,9 @@ impl Drop for Hardware {
             }
             for surface in &self.surfaces {
                 self.destroy_image(&surface.image);
-                if let Some(native) = &surface.native {
-                    self.destroy_image(native);
-                }
-                if let Some(upright) = &surface.upright {
-                    self.destroy_image(&upright.image);
+                let uprights = [&surface.upright, &surface.twin_upright].into_iter().flatten().map(|upright| &upright.image);
+                for image in [&surface.native, &surface.twin].into_iter().flatten().chain(uprights) {
+                    self.destroy_image(image);
                 }
             }
             self.destroy_image(&self.blank);
@@ -5134,6 +5539,10 @@ mod tests {
                 screen: None,
                 upright: None,
                 generation: 0,
+                twin: None,
+                twinned: false,
+                twin_generation: 0,
+                twin_upright: None,
             };
             let (size, bpp, row) = (surface.size() as usize, kind.bytes() as usize, surface.row_bytes() as usize);
             // the bytes the shadow stands for, none before the first upload

@@ -627,6 +627,22 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
     semantics
 }
 
+/// the output registers that place a vertex, its position, and the normal
+/// and the view the lighting takes, and those of its textures'
+/// coordinates, one bit each.
+pub(crate) fn placing_outputs(registers: &[u32]) -> (u16, u16) {
+    let map = read_output_map(registers);
+    let mask = registers[REG_VS_OUTPUT_MASK] & 0xFFFF;
+    // the output register behind an attribute, as pack_outputs packs them
+    let register = |attribute: usize| (0..shader::OUTPUT_REGISTERS).filter(|r| mask == 0 || mask & (1 << r) != 0).nth(attribute);
+    let outputs = |slots: &mut dyn Iterator<Item = (usize, usize)>| {
+        slots.filter_map(|(attribute, _)| register(attribute)).fold(0, |outputs, register| outputs | 1 << register)
+    };
+    let placing = outputs(&mut map.position.into_iter().chain(map.quaternion.into_iter().flatten()).chain(map.view.into_iter().flatten()));
+    let coordinates = outputs(&mut map.texcoords.into_iter().flatten().flatten());
+    (placing, coordinates)
+}
+
 /// the semantics output_semantics worked out for the last draw, and the
 /// registers they came from, the output map and mask, which draws mostly
 /// keep.
@@ -871,6 +887,20 @@ struct BoundTexture {
     replacement: Option<Arc<crate::pack::Material>>,
 }
 
+/// what a draw does for frame interpolation, see crate::interpolation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// the title's draw, which also goes into the twins of the buffers it
+    /// draws into or reads, where they have any.
+    #[default]
+    Real,
+    /// the title's draw, which a draw of its own in between follows, its
+    /// buffers get twins before it.
+    Twinned,
+    /// the draw in between, into the twins alone.
+    Twin,
+}
+
 /// what draws keep from one to the next.
 #[derive(Default)]
 pub struct Resources {
@@ -896,6 +926,28 @@ pub struct Resources {
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
+}
+
+impl Resources {
+    /// what the next draws do for frame interpolation.
+    pub(crate) fn set_pass(&mut self, pass: Pass) {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.hardware.as_mut() {
+            hardware.pass = pass;
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = pass;
+    }
+
+    /// whether draws go into twins, frame interpolation drawing the
+    /// pictures in between.
+    pub(crate) fn twins(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.hardware.as_ref() {
+            return hardware.twins();
+        }
+        false
+    }
 }
 
 /// the buffers a draw fills, kept from one draw to the next. allocating
@@ -2479,6 +2531,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 Ok(()) => return Some(triangle_count as u32),
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
             }
+        }
+        // the draw in between goes into twins alone, which the software
+        // path has none of
+        if hardware.pass == Pass::Twin {
+            return Some(0);
         }
         // the software path works on guest memory, which has to hold what
         // the GPU drew
@@ -5251,7 +5308,7 @@ mod tests {
                 let screen = hardware.screen(OUTPUT + 4 * SIZE * 4, (24, 20), SIZE, Rgba8, &[]).expect("drawn on the GPU");
                 let picture = match hardware.screen_image(screen).unwrap() {
                     Some(image) => {
-                        let (pixels, width) = hardware.upright_pixels(screen).unwrap();
+                        let (pixels, width) = hardware.upright_pixels(screen, false).unwrap();
                         let height = pixels.len() as u32 / 4 / width;
                         let [x, y, w, h] = image.area.map(f64::from);
                         let [left, top] = [(x * width as f64).round() as usize, (y * height as f64).round() as usize];
@@ -5273,5 +5330,76 @@ mod tests {
             assert!(colors.len() > 8, "something worth comparing");
             assert!(pictures[0] == pictures[1], "at {scale}x");
         }
+    }
+
+    /// a draw in between goes into twins of the buffers it draws into, which
+    /// start as the buffers were, after the title's own draw, and a transfer
+    /// turns the twin's picture upright beside the screen's. a draw that did
+    /// not move goes into both.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn pictures_in_between_go_into_twins() {
+        use crate::format::ColorFormat::Rgba8;
+        const SIZE: u32 = 32;
+        const OUTPUT: u32 = 0x10_0000;
+        // a band over x from left, half the target wide
+        let band = |left: f32, color: Vec4| -> Vec<Vertex> {
+            [[left, -1.0], [left + 1.0, -1.0], [left, 1.0], [left + 1.0, -1.0], [left + 1.0, 1.0], [left, 1.0]]
+                .into_iter()
+                .map(|[x, y]| Vertex { clip: [x, y, 0.0, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] })
+                .collect()
+        };
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        let transfer = hardware::Transfer {
+            input: COLOR,
+            output: OUTPUT,
+            input_width: SIZE,
+            output_width: SIZE,
+            output_height: SIZE,
+            copy: (SIZE, SIZE),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: Rgba8,
+            output_format: Rgba8,
+        };
+        // each scene drawn plainly, and with what moved in between
+        let scene = |red: f32, between: Option<f32>| -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+            let device = hardware::own_device().ok()?;
+            let mut hardware = hardware::Hardware::with_device(std::sync::Arc::new(device), true, None).unwrap();
+            hardware.set_twins(between.is_some());
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            let mut memory = ConsoleMemory::default();
+            let pass = |resources: &mut Resources, pass| resources.hardware.as_mut().unwrap().pass = pass;
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(0.0, BLUE));
+            if let Some(between) = between {
+                pass(&mut resources, Pass::Twinned);
+                rasterize_shaded(&registers, &mut memory, &mut resources, &band(red, RED));
+                pass(&mut resources, Pass::Twin);
+                rasterize_shaded(&registers, &mut memory, &mut resources, &band(between, RED));
+                pass(&mut resources, Pass::Real);
+            } else {
+                rasterize_shaded(&registers, &mut memory, &mut resources, &band(red, RED));
+            }
+            rasterize_shaded(&registers, &mut memory, &mut resources, &band(0.5, GREEN));
+            let hardware = resources.hardware.as_mut().unwrap();
+            assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+            let screen = hardware.screen(OUTPUT, (SIZE, SIZE), SIZE, Rgba8, &[]).expect("drawn on the GPU");
+            let (own, _) = hardware.upright_pixels(screen, false).unwrap();
+            let twin = between.map(|_| hardware.upright_pixels(screen, true).unwrap().0);
+            Some((own, twin))
+        };
+        let Some((own, Some(between))) = scene(-1.0, Some(-0.5)) else { return };
+        let (plain, _) = scene(-1.0, None).unwrap();
+        let (halfway, _) = scene(-0.5, None).unwrap();
+        let colors: std::collections::HashSet<&[u8]> = own.chunks(4).collect();
+        assert_eq!(colors.len(), 3, "the background and both bands");
+        assert!(own == plain, "the title's own picture");
+        assert!(between == halfway, "the picture in between");
+        assert!(own != between);
     }
 }

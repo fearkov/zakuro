@@ -8,6 +8,7 @@ mod pattern;
 pub mod proctex;
 pub mod fog;
 pub mod format;
+mod interpolation;
 pub mod lighting;
 pub mod pack;
 pub mod raster;
@@ -18,6 +19,7 @@ pub mod tev;
 pub mod texture;
 
 use format::ColorFormat;
+pub use interpolation::Matches;
 use registers::*;
 pub use backend::{layout, GpuScreen, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Viewport};
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
@@ -169,6 +171,8 @@ pub struct Gpu {
     pub busy: std::time::Duration,
     /// decoded textures and the lighting tables, kept across draws.
     resources: raster::Resources,
+    /// frame interpolation's record of the draws, none while it is off.
+    interpolation: Option<interpolation::Interpolation>,
 }
 
 /// number of external register words we track (0x1EF00000..0x1EF04000).
@@ -202,6 +206,7 @@ impl Gpu {
             vertices_drawn: 0,
             busy: std::time::Duration::ZERO,
             resources: raster::Resources::default(),
+            interpolation: None,
         }
     }
 
@@ -652,6 +657,69 @@ impl Gpu {
         None
     }
 
+    /// draws a picture in between each two of the title's own from now on,
+    /// see interpolation, or stops, and says whether it does. the pictures
+    /// in between are shown straight from the host's GPU, by a presenter
+    /// sharing its device.
+    pub fn set_interpolation(&mut self, on: bool) -> bool {
+        let on = on && self.shows_directly();
+        if !on {
+            self.set_twins(false);
+        }
+        self.interpolation = on.then(Default::default);
+        on
+    }
+
+    /// whether frame interpolation is on.
+    pub fn interpolates(&self) -> bool {
+        self.interpolation.is_some()
+    }
+
+    /// draws the pictures in between from the next draw on, while the
+    /// title keeps drawing a picture every other refresh, or stops.
+    pub fn set_twins(&mut self, twins: bool) {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            hardware.set_twins(twins && self.interpolation.is_some());
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = twins;
+    }
+
+    /// the title's frame is done, its draws are the ones the next frame's
+    /// match, and how they matched the frame before's.
+    pub fn frame_done(&mut self) -> Option<Matches> {
+        self.interpolation.as_mut().map(interpolation::Interpolation::frame_done)
+    }
+
+    /// where the picture in between a screen's picture and the one before
+    /// is, as screen_image has the screen's, none when there is none.
+    pub fn between_image(&mut self, screen: ScreenRef) -> Option<GpuScreen> {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            match hardware.between_image(screen) {
+                Ok(image) => return image,
+                Err(error) => log::error!("the GPU could not show a picture in between, {error}"),
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = screen;
+        None
+    }
+
+    /// a screen's picture or the picture in between, upright RGBA the way
+    /// the screen shows it, and the scale it is at, read back from the GPU
+    /// showing the screens for saving it. it waits for the GPU.
+    pub fn upright_picture(&mut self, screen: ScreenRef, between: bool) -> Option<Picture> {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            return hardware.upright_picture(screen, between);
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (screen, between);
+        None
+    }
+
     /// how many times the console's resolution the host's GPU draws at, 1
     /// when drawing in software.
     pub fn scale(&self) -> u32 {
@@ -981,6 +1049,14 @@ impl Gpu {
             registers: &self.internal,
         });
         self.prepare_shaders();
+        // frame interpolation draws it again in between, where it moved
+        let geometry = self.internal[REG_GEOSTAGE_CONFIG] & 0x3 == 2;
+        let twins = self.resources.twins();
+        let between = match self.interpolation.as_mut() {
+            Some(interpolation) => interpolation.draw(&self.internal, &self.vertex_shader, geometry.then_some(&self.geometry_shader), twins),
+            None => None,
+        };
+        self.resources.set_pass(if between.is_some() { raster::Pass::Twinned } else { raster::Pass::Real });
         let vertices = raster::draw(
             &self.internal,
             &self.vertex_shader,
@@ -990,7 +1066,31 @@ impl Gpu {
             &mut self.resources,
             indexed,
         );
+        if let Some(mut between) = between {
+            self.swap_uniforms(&mut between);
+            self.resources.set_pass(raster::Pass::Twin);
+            raster::draw(
+                &self.internal,
+                &self.vertex_shader,
+                &self.geometry_shader,
+                &self.fixed_attributes,
+                memory,
+                &mut self.resources,
+                indexed,
+            );
+            self.swap_uniforms(&mut between);
+            if let Some(interpolation) = &mut self.interpolation {
+                interpolation.give_back(between);
+            }
+        }
+        self.resources.set_pass(raster::Pass::Real);
         self.vertices_drawn += vertices as u64;
+    }
+
+    /// trades the vertex shader's float uniforms for the ones given, the
+    /// draw in between's, and back.
+    fn swap_uniforms(&mut self, uniforms: &mut interpolation::Uniforms) {
+        std::mem::swap(&mut *self.vertex_shader.float_uniforms, uniforms);
     }
 
     /// draws the immediate-mode vertices waiting, see flush_immediate.

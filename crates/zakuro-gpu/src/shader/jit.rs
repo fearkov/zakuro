@@ -21,7 +21,7 @@ use cranelift_module::{Linkage, Module};
 
 use super::batch::Triangle;
 use super::isa::OpCode;
-use super::{Op, Operand, Program, ShaderUnit, Vec4, FLOAT_UNIFORMS, INPUT_REGISTERS, OUTPUT_REGISTERS, PROGRAM_SIZE, TEMP_REGISTERS};
+use super::{if_ranges, Op, Operand, Program, ShaderUnit, Vec4, FLOAT_UNIFORMS, INPUT_REGISTERS, OUTPUT_REGISTERS, PROGRAM_SIZE, TEMP_REGISTERS};
 
 /// how many vertices a compiled program shades together, a vector of the
 /// host's each.
@@ -1136,13 +1136,6 @@ impl<'a, 'b, 'c> Compiler<'a, 'b, 'c> {
         };
         self.write(op, result);
     }
-}
-
-/// an if's body when it is taken, its else when it is not, and where both
-/// come back to, as the interpreter's blocks have them.
-fn if_ranges(pc: u32, destination: u32, count: u32) -> ((u32, u32), (u32, u32), u32) {
-    let then_end = (pc + 1) + (destination - (pc + 1).min(destination));
-    ((pc + 1, then_end), (destination, destination + count), destination + count)
 }
 
 /// how deep ifs inside a branch the lanes parted at are compiled for both.
