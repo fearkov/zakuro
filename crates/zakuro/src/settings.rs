@@ -98,6 +98,78 @@ impl Filter {
     }
 }
 
+/// the console's system language, which a title reads from cfg:u and picks
+/// its localised text and files by, the codes the console numbers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Language {
+    Japanese,
+    #[default]
+    English,
+    French,
+    German,
+    Italian,
+    Spanish,
+    ChineseSimplified,
+    Korean,
+    Dutch,
+    Portuguese,
+    Russian,
+    ChineseTraditional,
+}
+
+impl Language {
+    pub const ALL: [Language; 12] = [
+        Language::Japanese,
+        Language::English,
+        Language::French,
+        Language::German,
+        Language::Italian,
+        Language::Spanish,
+        Language::ChineseSimplified,
+        Language::Korean,
+        Language::Dutch,
+        Language::Portuguese,
+        Language::Russian,
+        Language::ChineseTraditional,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Language::Japanese => "Japanese",
+            Language::English => "English",
+            Language::French => "French",
+            Language::German => "German",
+            Language::Italian => "Italian",
+            Language::Spanish => "Spanish",
+            Language::ChineseSimplified => "Chinese (Simplified)",
+            Language::Korean => "Korean",
+            Language::Dutch => "Dutch",
+            Language::Portuguese => "Portuguese",
+            Language::Russian => "Russian",
+            Language::ChineseTraditional => "Chinese (Traditional)",
+        }
+    }
+
+    /// the number the console's blocks give the language.
+    pub fn code(self) -> u8 {
+        match self {
+            Language::Japanese => 0,
+            Language::English => 1,
+            Language::French => 2,
+            Language::German => 3,
+            Language::Italian => 4,
+            Language::Spanish => 5,
+            Language::ChineseSimplified => 6,
+            Language::Korean => 7,
+            Language::Dutch => 8,
+            Language::Portuguese => 9,
+            Language::Russian => 10,
+            Language::ChineseTraditional => 11,
+        }
+    }
+}
+
 /// the keys the console's buttons and circle pad are on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -254,6 +326,10 @@ impl PadButtons {
 pub struct Settings {
     /// the folder the library lists games from.
     pub games: Option<PathBuf>,
+    /// the console's system language, which titles pick their localised
+    /// text and files by.
+    #[serde(deserialize_with = "or_default")]
+    pub language: Language,
     #[serde(deserialize_with = "or_default")]
     pub renderer: Renderer,
     /// draw the 3D on the GPU rather than in software.
@@ -294,6 +370,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             games: None,
+            language: Language::English,
             renderer: Renderer::Vulkan,
             hardware_rasterizer: true,
             resolution: 3,
@@ -382,7 +459,7 @@ mod tests {
     #[test]
     fn settings_come_back_as_they_were_saved() {
         let mut settings =
-            Settings { games: Some("/games".into()), show_fps: true, layout: Screens::TopOnly, ..Settings::default() };
+            Settings { games: Some("/games".into()), show_fps: true, layout: Screens::TopOnly, language: Language::German, ..Settings::default() };
         settings.keys.a = KeyCode::KeyK;
         settings.pad.a = Button::South;
         let text = toml::to_string_pretty(&settings).unwrap();

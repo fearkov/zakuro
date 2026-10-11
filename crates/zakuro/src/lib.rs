@@ -511,6 +511,7 @@ impl App {
         Config {
             new3ds: self.options.new3ds,
             data_dir: self.data_dir.clone(),
+            language: self.settings.language.code(),
             recompiled: self.options.recompiled.clone().filter(|_| !interpret).map(Into::into),
             linked: self.linked.filter(|_| !interpret),
             find_recompiled: !interpret,

@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{Filter, Keys, PadButtons, Renderer, Screens, Settings};
+use crate::settings::{Filter, Keys, Language, PadButtons, Renderer, Screens, Settings};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -491,6 +491,13 @@ impl Menus {
 
                 ui.separator();
                 ui.heading("Emulation");
+                egui::ComboBox::from_label("Language").selected_text(settings.language.name()).show_ui(ui, |ui| {
+                    for language in Language::ALL {
+                        ui.selectable_value(&mut settings.language, language, language.name());
+                    }
+                })
+                .response
+                .on_hover_text("The console's system language, which titles pick their localised text and files by. It changes with the next game started, or Reset.");
                 ui.radio_value(&mut settings.recompiled, true, "Recompiled code when there is some");
                 ui.radio_value(&mut settings.recompiled, false, "Interpreter only");
                 ui.label(RichText::new("It changes with the next game started, or Reset.").weak());
