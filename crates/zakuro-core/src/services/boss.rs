@@ -106,7 +106,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // GetTaskStatus, GetTaskError, GetTaskProperty0
         0x0019 | 0x001A | 0x001B | 0x0023 | 0x0024 | 0x0034 => reply_with_buffers(system, buffer, header, &[0]),
         // GetTaskState, GetTaskResult, GetTaskCommErrorCode
-        0x0020 | 0x0021 | 0x0022 => reply_with_buffers(system, buffer, header, &[0, 0, 0]),
+        0x0020..=0x0022 => reply_with_buffers(system, buffer, header, &[0, 0, 0]),
         // GetTaskFinishHandle, a handle of the title's own to the event
         // the service keeps
         0x001F => {
