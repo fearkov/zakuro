@@ -11,6 +11,22 @@ pub const REGION_EUROPE: u8 = 2;
 /// language codes.
 pub const LANGUAGE_ENGLISH: u8 = 1;
 
+/// the console region a title is for, from the last letter of its product
+/// code, which Nintendo gives the destination: J Japan, P Europe, and the
+/// Americas otherwise. a title that names no code is taken as a US one.
+///
+/// the region reaches a title through cfg:u, and a title picks the files it
+/// loads by it, NWTexture/USA_en_info.bin and the like, so a European or
+/// Japanese dump told it is a US one looks for files its RomFS does not
+/// hold and stops with a file-not-found.
+pub fn region_for_product_code(product_code: &str) -> u8 {
+    match product_code.trim_end_matches(['\0', ' ']).chars().last() {
+        Some('J') => REGION_JAPAN,
+        Some('P') => REGION_EUROPE,
+        _ => REGION_USA,
+    }
+}
+
 /// what GenHashConsoleUnique answers for every salt, this console's hash.
 pub const CONSOLE_HASH: u64 = 0x0000_5255_3341_5A55;
 
@@ -127,4 +143,21 @@ fn write_config_block(system: &mut System, block_id: u32, out: u32, size: u32) {
         other => log::debug!("cfg: block 0x{other:08X} is not implemented, returning zeroes"),
     }
     system.memory.write_bytes(out, &data);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_product_code_gives_the_region() {
+        // the destinations real dumps carry in their product code's last
+        // letter.
+        assert_eq!(region_for_product_code("CTR-P-AG5P"), REGION_EUROPE);
+        assert_eq!(region_for_product_code("CTR-P-AREE"), REGION_USA);
+        assert_eq!(region_for_product_code("CTR-P-A66J"), REGION_JAPAN);
+        // the trailing padding the header holds, and a title that names none.
+        assert_eq!(region_for_product_code("CTR-P-AG5P\0\0\0\0\0"), REGION_EUROPE);
+        assert_eq!(region_for_product_code(""), REGION_USA);
+    }
 }

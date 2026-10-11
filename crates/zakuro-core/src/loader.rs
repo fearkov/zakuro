@@ -85,6 +85,10 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         config.model = ConsoleModel::New3ds;
     }
 
+    // the console's region follows the title's own, so a European or
+    // Japanese dump finds its localised files instead of the Americas'.
+    config.region = crate::services::cfg::region_for_product_code(&title.ncch.product_code);
+
     let mut system = System::new(config);
     system.dlc = dlc;
     if let Some(data_dir) = &system.config.data_dir {
