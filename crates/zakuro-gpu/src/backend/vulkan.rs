@@ -749,15 +749,24 @@ impl Presenter for VulkanPresenter {
         bottom: ScreenImage<'_>,
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
-        if self.extent.width == 0 || self.extent.height == 0 {
-            self.defer(overlay);
-            return Ok(());
-        }
         if self.stale {
+            // the swapchain no longer matches the window. rebuilding it is
+            // what lets a minimized window come back: while minimized the
+            // surface has no size, nothing is built, and stale stays set
+            // until the window is restored to a size again, so the guard
+            // below for an empty extent must not come first.
             self.defer(overlay);
             unsafe { self.device.device_wait_idle() }.map_err(vk_fail("waiting for idle"))?;
             self.build_swapchain()?;
+            if self.extent.width == 0 || self.extent.height == 0 {
+                // still minimized, keep waiting for a size.
+                return Ok(());
+            }
             return Err(PresentError::OutOfDate);
+        }
+        if self.extent.width == 0 || self.extent.height == 0 {
+            self.defer(overlay);
+            return Ok(());
         }
 
         let frame = self.frame;
