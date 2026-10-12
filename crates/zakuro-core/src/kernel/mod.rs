@@ -419,15 +419,34 @@ impl Kernel {
     /// a timer only matters then to a thread waiting on it, the rest fire
     /// when the scheduler next looks or the title next touches them.
     pub fn next_event(&self) -> Option<u64> {
-        let blocked = || self.threads.iter().filter(|t| t.status.is_blocked());
-        let threads = blocked().filter_map(|t| t.wakeup_at);
-        let timers = self.timers.iter().filter(|&&id| blocked().any(|t| t.wait_objects.contains(&id))).filter_map(|&id| {
-            match self.objects.get(id) {
-                Some(KObject::Timer(timer)) => timer.fire_at,
-                _ => None,
+        // nothing blocked is the common case, and then no thread wants a tick
+        // and no timer can mean anything, so a run that asks at every stop
+        // pays almost nothing for the question.
+        let mut best: Option<u64> = None;
+        let mut any_blocked = false;
+        for thread in &self.threads {
+            if thread.status.is_blocked() {
+                any_blocked = true;
+                if let Some(at) = thread.wakeup_at {
+                    best = Some(best.map_or(at, |b: u64| b.min(at)));
+                }
             }
-        });
-        threads.chain(timers).min()
+        }
+        if !any_blocked {
+            return None;
+        }
+        for &id in &self.timers {
+            let waited = self.threads.iter().any(|t| t.status.is_blocked() && t.wait_objects.contains(&id));
+            if !waited {
+                continue;
+            }
+            if let Some(KObject::Timer(timer)) = self.objects.get(id) {
+                if let Some(at) = timer.fire_at {
+                    best = Some(best.map_or(at, |b: u64| b.min(at)));
+                }
+            }
+        }
+        best
     }
 
     /// checks one blocked thread's condition and unblocks it if satisfied.
