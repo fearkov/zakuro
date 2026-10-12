@@ -1296,6 +1296,39 @@ mod tests {
         assert_eq!(system.cpu.regs[0], 0, "the wait's result, not the handle");
     }
 
+    /// a zero sleep with nobody else ready to run is a no-op: the calling
+    /// thread keeps the core, and no scheduling pass is due. titles poll a
+    /// worker in a tight svcSleepThread(0) loop, and paying a full pass per
+    /// iteration there was most of what one such title spent.
+    #[test]
+    fn a_zero_sleep_with_nobody_else_ready_does_not_schedule() {
+        let mut system = System::new(Config::default());
+        let id = one_spinning_thread(&mut system);
+        system.kernel.reschedule_pending = false;
+        system.cpu.regs[0] = 0;
+        system.cpu.regs[1] = 0;
+        kernel::svc::dispatch(&mut system, 0x0A);
+        assert_eq!(system.kernel.thread(id).status, ThreadStatus::Running, "it keeps the core");
+        assert!(!system.kernel.reschedule_pending, "no pass is due");
+        assert_eq!(system.cpu.regs[0], 0);
+    }
+
+    /// a zero sleep with another thread ready still steps aside, so a title
+    /// polling a worker keeps handing it the core.
+    #[test]
+    fn a_zero_sleep_with_another_ready_steps_aside() {
+        let mut system = System::new(Config::default());
+        let first = one_spinning_thread(&mut system);
+        let second = system.kernel.create_thread("second", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        system.map_tls_page(second);
+        system.kernel.thread_mut(second).status = ThreadStatus::Ready;
+        system.cpu.regs[0] = 0;
+        system.cpu.regs[1] = 0;
+        kernel::svc::dispatch(&mut system, 0x0A);
+        assert_eq!(system.kernel.thread(first).status, ThreadStatus::Sleeping, "it steps aside");
+        assert!(system.kernel.reschedule_pending, "the ready thread gets a pass");
+    }
+
     /// a timer fires at its tick, not at the next frame, and the thread on
     /// it wakes then. a pulse timer is gone once it woke a waiter, and comes
     /// again a period after it was due.

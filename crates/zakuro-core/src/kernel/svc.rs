@@ -454,7 +454,11 @@ fn sleep_thread(system: &mut System) {
     } else if system.kernel.others_ready() {
         YIELD_TICKS
     } else {
-        0
+        // nobody else can take the core, so a zero yield is a no-op: the
+        // thread keeps it, and no scheduling pass is due. titles that poll
+        // this way in a tight loop were paying a full pass per iteration.
+        system.cpu.regs[0] = 0;
+        return;
     };
     system.kernel.sleep_current(ticks, tick);
     system.cpu.regs[0] = 0;
