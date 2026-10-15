@@ -8,7 +8,8 @@
 # the 60 FPS codes come from the 60 FPS cheat thread on GBAtemp and Reshiban's
 # collection of them. most of these games count time in frames, so they run
 # faster too, which the note says where the code's author said so or where
-# it showed in testing.
+# it showed in testing. a 30 FPS entry next to a game's 60 FPS one writes the
+# game's own value back, where turning the 60 FPS code off leaves it fast.
 
 = 0004000000054000 Super Mario 3D Land (USA)
 60 FPS | rev0 | Hazerou | The whole game runs twice as fast with it.
@@ -31,8 +32,10 @@ D3000000 08000000
 D2000000 00000000
 
 = 00040000000E5C00 Shin Megami Tensei IV (USA)
-60 FPS | rev0 | lucky | The whole game runs twice as fast with it.
+60 FPS | rev0 | lucky | The whole game runs twice as fast with it. Turning it off leaves the game fast, and so does a state saved meanwhile: turn on 30 FPS to bring the normal speed back.
 204E3BA0 00000000
+30 FPS | rev0 | lucky | The game's own frame rate. Turn it on to undo 60 FPS, which stays in effect after it is turned off. Once the game runs at its normal speed again, this can be turned off.
+204E3BA0 00000001
 
 = 000400000011C400 Pokémon Omega Ruby (USA)
 60 FPS | rev3 | Reshiban | The whole game runs twice as fast with it.
