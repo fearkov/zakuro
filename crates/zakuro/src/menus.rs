@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d};
+use crate::settings::{CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -708,6 +708,13 @@ impl Menus {
                 .on_hover_text("How the screens' pixels look scaled up: smooth, sharp with soft edges, or plain squares.");
                 ui.checkbox(&mut settings.integer_scale, "Scale by whole numbers only")
                     .on_hover_text("Every pixel gets the same size, with a border around the screens.");
+                egui::ComboBox::from_label("Top screen shape").selected_text(settings.top_shape.name()).show_ui(ui, |ui| {
+                    for shape in TopShape::ALL {
+                        ui.selectable_value(&mut settings.top_shape, shape, shape.name());
+                    }
+                })
+                .response
+                .on_hover_text("Shows the top screen wider than the console's. Games still draw it at the console's shape, so only turn this on with a widescreen code for the game, which draws a wider scene to match.");
                 egui::ComboBox::from_label("3D").selected_text(settings.stereo.name()).show_ui(ui, |ui| {
                     for stereo in Stereo3d::ALL {
                         ui.selectable_value(&mut settings.stereo, stereo, stereo.name());

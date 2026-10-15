@@ -98,6 +98,39 @@ impl Filter {
     }
 }
 
+/// the top screen's shape. a game draws into 400x240 whatever this is, so
+/// anything but the console's own only looks right with a widescreen code
+/// on, which makes the game draw a wider scene into those pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopShape {
+    #[default]
+    Console,
+    Wide16x9,
+    Wide21x9,
+}
+
+impl TopShape {
+    pub const ALL: [TopShape; 3] = [TopShape::Console, TopShape::Wide16x9, TopShape::Wide21x9];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TopShape::Console => "The console's, 5:3",
+            TopShape::Wide16x9 => "16:9",
+            TopShape::Wide21x9 => "21:9",
+        }
+    }
+
+    /// the top screen's width at its height of 240.
+    pub fn width(self) -> f32 {
+        match self {
+            TopShape::Console => 400.0,
+            TopShape::Wide16x9 => 240.0 * 16.0 / 9.0,
+            TopShape::Wide21x9 => 560.0,
+        }
+    }
+}
+
 /// how the top screen's 3D shows, for games that draw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -439,6 +472,9 @@ pub struct Settings {
     pub filter: Filter,
     /// scale the screens by whole numbers only, leaving a border.
     pub integer_scale: bool,
+    /// how wide the top screen shows.
+    #[serde(deserialize_with = "or_default")]
+    pub top_shape: TopShape,
     /// how the 3D shows.
     #[serde(deserialize_with = "or_default")]
     pub stereo: Stereo3d,
@@ -488,6 +524,7 @@ impl Default for Settings {
             layout: Screens::Stacked,
             filter: Filter::Smooth,
             integer_scale: false,
+            top_shape: TopShape::Console,
             stereo: Stereo3d::Off,
             depth_3d: 50,
             swap_eyes: false,

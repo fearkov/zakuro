@@ -137,6 +137,7 @@ pub struct GlPresenter {
     sizes: [(u32, u32); 3],
     window: (u32, u32),
     arrangement: ScreenLayout,
+    top_width: f32,
     filter: ScreenFilter,
     integer: bool,
     stereo: Stereo,
@@ -206,6 +207,7 @@ impl GlPresenter {
             sizes: [(0, 0); 3],
             window,
             arrangement: ScreenLayout::default(),
+            top_width: super::TOP_WIDTH,
             filter: ScreenFilter::default(),
             integer: false,
             stereo: Stereo::default(),
@@ -334,7 +336,7 @@ impl Presenter for GlPresenter {
             gl.bind_vertex_array(Some(self.vertex_array));
         }
 
-        for (viewport, shown) in place(self.window.0, self.window.1, self.arrangement, self.integer, self.stereo, has_right) {
+        for (viewport, shown) in place(self.window.0, self.window.1, self.arrangement, self.top_width, self.integer, self.stereo, has_right) {
             match shown {
                 Shown::Top if !top.is_empty() => self.draw_screen(0, viewport),
                 Shown::Bottom if !bottom.is_empty() => self.draw_screen(1, viewport),
@@ -357,6 +359,10 @@ impl Presenter for GlPresenter {
 
     fn set_layout(&mut self, arrangement: ScreenLayout) {
         self.arrangement = arrangement;
+    }
+
+    fn set_top_width(&mut self, width: f32) {
+        self.top_width = width;
     }
 
     fn set_scaling(&mut self, filter: ScreenFilter, integer: bool) {

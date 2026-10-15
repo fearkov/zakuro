@@ -118,6 +118,14 @@ impl Backend {
         }
     }
 
+    pub fn set_top_width(&mut self, width: f32) {
+        match self {
+            Backend::OpenGl { presenter, .. } => presenter.set_top_width(width),
+            Backend::Vulkan(presenter) => presenter.set_top_width(width),
+            Backend::None => {}
+        }
+    }
+
     pub fn present(
         &mut self,
         top: ScreenImage<'_>,
