@@ -457,6 +457,11 @@ fn skips_showing(playing: bool, behind: bool, waits: bool, skipped: u32) -> bool
     playing && behind && waits && skipped < MAX_SKIPPED
 }
 
+/// what the player is told when the 3D can't be drawn on the GPU.
+const GPU_FALLBACK: &str = "The 3D can't be drawn on the GPU, as Vulkan isn't working on this computer, so it's drawn in software. \
+Games run much slower that way, and texture packs are left out. Updating the graphics driver usually fixes it; the log says \
+what went wrong. To draw in software without this message, turn off \"Draw the 3D on the GPU\" in Settings, Graphics.";
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -643,6 +648,9 @@ impl App {
         };
         let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
         let outdated = system.recompiled.as_ref().is_some_and(|code| code.outdated());
+        // the settings ask for the 3D on the GPU, but Vulkan didn't start:
+        // only the log said so, while the game ran slowly
+        let in_software = system.config.hardware_renderer && !system.gpu.draws_on_gpu();
         let name = self
             .library
             .games
@@ -668,6 +676,8 @@ impl App {
                 "{} was recompiled by an older version of Zakuro. Recompile it again from the library to get the newest improvements.",
                 game.name
             ));
+        } else if in_software {
+            self.menus.message = Some(GPU_FALLBACK.to_owned());
         }
         self.game = Some(game);
         // the new game's cameras see what the settings say, and it plays

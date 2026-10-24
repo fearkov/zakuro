@@ -633,6 +633,16 @@ impl Gpu {
         drawn
     }
 
+    /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer
+    /// having worked, rather than in software.
+    pub fn draws_on_gpu(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        if self.resources.hardware.is_some() {
+            return true;
+        }
+        false
+    }
+
     /// whether the screens the host's GPU draws are shown straight from it,
     /// by a presenter sharing its device, see screen_image.
     pub fn shows_directly(&self) -> bool {
