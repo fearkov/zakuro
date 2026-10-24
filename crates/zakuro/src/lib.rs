@@ -624,6 +624,12 @@ impl App {
             config.update = game.update.as_ref().map(|update| update.path.clone());
             config.dlc = game.dlc.iter().map(|dlc| dlc.path.clone()).collect();
             config.dlp_child = game.dlp_child.as_ref().map(|child| child.path.clone());
+        } else if let Some((update, dlc, dlp_child)) = library::addons_beside(path) {
+            // one from the command line starts before the library's scan is
+            // in, or isn't in its folder: what's next to it goes with it
+            config.update = update.map(|update| update.path);
+            config.dlc = dlc.into_iter().map(|dlc| dlc.path).collect();
+            config.dlp_child = dlp_child.map(|child| child.path);
         }
         // a recording starts the clock at a known time, for playing it back
         let record = std::env::var_os("ZAKURO_RECORD").map(PathBuf::from);

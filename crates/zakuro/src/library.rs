@@ -140,6 +140,33 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
     (games, children)
 }
 
+/// the update, DLC and Download Play child in the folder of the game at
+/// path, the way a scan pairs them, for a game started from the command
+/// line, which starts before the library's scan is in, or from outside the
+/// library's folder.
+pub fn addons_beside(path: &Path) -> Option<(Option<Addon>, Vec<Addon>, Option<Addon>)> {
+    let program_id = zakuro_fs::Title::load(path).ok()?.program_id();
+    let (mut update, mut dlc, mut dlp_child) = (None::<Addon>, Vec::new(), None);
+    for entry in std::fs::read_dir(path.parent()?).ok()?.flatten() {
+        let Some(Ok(found)) = addon(&entry.path()) else { continue };
+        if found.title_id & 0xFFFF_FFFF != program_id & 0xFFFF_FFFF {
+            continue;
+        }
+        match zakuro_fs::TitleKind::of(found.title_id) {
+            zakuro_fs::TitleKind::Update => {
+                if update.as_ref().is_none_or(|known| known.version < found.version) {
+                    update = Some(found);
+                }
+            }
+            zakuro_fs::TitleKind::Dlc => dlc.push(found),
+            zakuro_fs::TitleKind::DlpChild => dlp_child = Some(found),
+            zakuro_fs::TitleKind::Game => {}
+        }
+    }
+    dlc.sort_by(|a, b| a.path.cmp(&b.path));
+    Some((update, dlc, dlp_child))
+}
+
 /// the update or DLC in the file at path, none when it holds neither, and
 /// why it can't be used when it can't.
 fn addon(path: &Path) -> Option<Result<Addon, String>> {
@@ -390,6 +417,11 @@ mod tests {
             ]
         );
         assert_eq!(games.len(), 3);
+        // a game started from the command line gets the same from its folder
+        let (beside_update, beside_dlc, beside_child) = addons_beside(&folder.join("game.cxi")).unwrap();
+        assert_eq!(beside_update.map(|addon| addon.version), Some(0x0410));
+        assert_eq!(beside_dlc.iter().map(|addon| addon.title_id).collect::<Vec<_>>(), [dlc]);
+        assert_eq!(beside_child.map(|addon| addon.title_id), Some(child));
         std::fs::remove_dir_all(folder).unwrap();
     }
 }
