@@ -2452,7 +2452,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {
         for (unit, drawn) in drawn.iter_mut().enumerate() {
-            *drawn = drawn_texture(registers, memory, unit).filter(|texture| hardware.holds(texture));
+            *drawn = drawn_texture(registers, memory, unit)
+                .filter(|texture| hardware.holds(texture) || hardware.holds_unchanged(memory, texture));
             if let Some(texture) = drawn {
                 past[unit] = !hardware.covers(texture);
                 continue;
@@ -3723,6 +3724,32 @@ mod tests {
             assert_eq!(pixels.iter().filter(|&&p| p == [0, 255, 0, 255]).count(), 64, "the rows written are green");
             assert_eq!(pixels.iter().filter(|&&p| p == [255, 0, 0, 255]).count(), 64, "the rows drawn stay red");
         }
+    }
+
+    /// a buffer written back for a read that could not copy it on the GPU,
+    /// such as a texture of it narrower than it was drawn, is still copied
+    /// on the GPU for a texture of it, at the scale it was drawn, while
+    /// memory holds what it wrote, and comes from memory once the CPU writes
+    /// there.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_buffer_written_back_unchanged_is_still_copied_on_the_gpu() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut registers = target_registers();
+        sized(&mut registers, 8, 16);
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        let hardware = resources.hardware.as_mut().unwrap();
+        let texture = DrawnTexture { addr: COLOR, width: 8, height: 16, format: ColorFormat::Rgba8 };
+        assert!(hardware.holds(&texture));
+        hardware.sync(&mut memory, COLOR, 512).unwrap();
+        assert!(!hardware.holds(&texture), "memory has it");
+        assert!(hardware.holds_unchanged(&mut memory, &texture), "the image is still memory's");
+        let mut green = [0u8; 4];
+        ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+        memory.write(COLOR, &green);
+        assert!(!hardware.holds_unchanged(&mut memory, &texture), "the CPU wrote over it");
     }
 
     /// a narrower buffer drawn over rows a fill left of a wider one does not

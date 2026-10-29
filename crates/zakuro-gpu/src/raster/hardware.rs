@@ -4198,6 +4198,35 @@ impl Hardware {
         surface.dirty.is_some() && !changed && !stale
     }
 
+    /// whether a texture is rows of a color surface guest memory got back
+    /// and has not changed since, which draw then copies on the GPU as it
+    /// does one memory lacks, at the scale it was drawn. a game that reads
+    /// its frame as a texture narrower than it was drawn, which writes the
+    /// frame back, then draws the frame over itself as a texture its own
+    /// width, would otherwise have the console's resolution in memory take
+    /// the place of the scaled frame.
+    pub(crate) fn holds_unchanged<M: GpuMemory>(&self, memory: &mut M, texture: &DrawnTexture) -> bool {
+        let Some((index, row)) = self.texture_source(texture) else { return false };
+        let surface = &self.surfaces[index];
+        if !matches!(surface.kind, Kind::Color(_)) || surface.dirty.is_some() || surface.stale.is_some() {
+            return false;
+        }
+        let row_bytes = surface.row_bytes();
+        let rows = (surface.height - row).min(texture.height);
+        let (at, len) = (surface.addr + row * row_bytes, rows * row_bytes);
+        // memory behind another surface drawn over it says nothing of this one
+        if (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(at, len)) {
+            return false;
+        }
+        let range = (row * row_bytes) as usize..((row + rows) * row_bytes) as usize;
+        if let Some(now) = memory.slice(at, len as usize) {
+            return surface.shadows(range, now);
+        }
+        let mut now = vec![0u8; len as usize];
+        memory.read(at, &mut now);
+        surface.shadows(range, &now)
+    }
+
     /// the image of a texture copied from the surface it is part of, copied
     /// again whenever the surface changed. a texture reaching past the
     /// surface's last row has the rows past it as memory holds them. a twin
