@@ -49,6 +49,11 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 2, Descriptor::handles(1));
             buffer.set(&mut system.memory, 3, handle);
         }
+        // OpenAndRead, the title's streetpass inbox for this run: this
+        // console never meets another, so the box reads empty. the
+        // success-with-no-message is the offline box's own answer, a game
+        // like A Link Between Worlds asks at every boot.
+        0x0012 => reply(system, &[]),
         _ => return false,
     }
     true
@@ -68,4 +73,30 @@ fn events(system: &mut System) -> [ObjectId; 2] {
     });
     system.services.cecd.events = Some(events);
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::tests::system_with_thread;
+    use crate::services::{handle_request, Target};
+
+    /// a game like A Link Between Worlds opens the run's inbox at boot:
+    /// offline, it reads empty and nothing lands in the unimplemented log.
+    #[test]
+    fn the_inbox_reads_empty_offline() {
+        let (mut system, buffer) = system_with_thread();
+        // OpenAndRead(read size, title id, subtype, ???)
+        buffer.set(&mut system.memory, 0, Header::new(0x0012, 4, 0).0);
+        buffer.set(&mut system.memory, 1, 0x0000_0060);
+        buffer.set(&mut system.memory, 2, 0x000E_C300);
+        buffer.set(&mut system.memory, 3, 2);
+        buffer.set(&mut system.memory, 4, 0x0000_1012);
+
+        handle_request(&mut system, Target::service("cecd:u".into(), 0));
+
+        assert_eq!(buffer.header(&mut system.memory), Header::new(0x0012, 1, 0));
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        assert!(system.services.unimplemented.is_empty());
+    }
 }
