@@ -235,7 +235,12 @@ impl Library {
         recomp_abi::Library::linked(linked).map(Library::new)
     }
 
-    fn new(code: recomp_abi::Library) -> Library {
+    fn new(mut code: recomp_abi::Library) -> Library {
+        // ZAKURO_NATIVES=0 has the title's own code run for the C library
+        // functions the library does on the host
+        if std::env::var("ZAKURO_NATIVES").is_ok_and(|value| value == "0") && code.set_natives(false) {
+            log::info!("the library's natives are off, the title's own code runs for them");
+        }
         Library { code, fallbacks: Cell::new(0), in_place: Cell::new(0), found: Library::nothing_found() }
     }
 
