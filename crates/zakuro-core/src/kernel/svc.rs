@@ -30,6 +30,14 @@ fn invalid_handle(system: &mut System, handle: u32, what: &str) -> u32 {
     errors::INVALID_HANDLE.0
 }
 
+/// whether recompiled code can have an svc run in place, from inside the
+/// code. the ones that map memory, start or end threads or the process,
+/// reach services, which load code, or that nothing implements stop the
+/// code, and the step runs them.
+pub fn in_place(number: u32) -> bool {
+    matches!(number, 0x02 | 0x0A..=0x0C | 0x11 | 0x13..=0x1D | 0x21..=0x25 | 0x27 | 0x28 | 0x2A | 0x2B | 0x35 | 0x37..=0x3A | 0x3D | 0x54..=0x56)
+}
+
 /// runs one supervisor call.
 pub fn dispatch(system: &mut System, number: u32) {
     if log::log_enabled!(log::Level::Trace) {

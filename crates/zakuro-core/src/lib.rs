@@ -380,14 +380,7 @@ impl System {
         }
 
         if self.kernel.reschedule_pending || self.kernel.current_thread.is_none() {
-            self.kernel.reschedule_pending = false;
-            let tick = self.cpu.cycles;
-            if self.kernel.schedule(&mut self.cpu, tick) {
-                self.idle_interrupted(true);
-            }
-            // a thread released here that keeps the core gets its result
-            // too, before it runs on, not over whatever it does next
-            self.apply_wait_result();
+            self.reschedule();
         }
 
         if self.kernel.current_thread.is_none() {
@@ -455,20 +448,11 @@ impl System {
             return StepOutcome::Ran;
         }
 
-        self.history[self.history_index] = pc | self.cpu.cpsr.thumb as u32;
-        self.history_index = (self.history_index + 1) % HISTORY_LENGTH;
-
-        if self.profile.is_some() {
-            self.sample();
-        }
+        self.note(pc);
 
         let exit = match self.run_recompiled(deadline) {
             Some(exit) => {
-                // its writes do not go through the log a watch keeps
-                self.idle_interrupted(false);
-                if let Some(hints) = &mut self.hints {
-                    hints.library_ran();
-                }
+                self.ran_recompiled();
                 exit
             }
             None => {
@@ -480,17 +464,14 @@ impl System {
                     return StepOutcome::Ran;
                 }
                 self.interpreted_instructions += 1;
-                let thumb = self.cpu.cpsr.thumb;
+                // past the start of the step when the code ran svcs in place
+                let (pc, thumb) = (self.cpu.regs[15], self.cpu.cpsr.thumb);
                 if let (Some(hints), Some(library)) = (&mut self.hints, &self.recompiled) {
                     if !library.has_code(pc | thumb as u32) {
                         hints.interpreted(pc, thumb);
                     }
                 }
-                let gpu = &mut self.gpu as *mut Gpu as *mut ();
-                let linear_base = self.kernel.linear_base;
-                // SAFETY: the GPU stays where it is, and nothing but the CPU's
-                // reads and writes follow the pointer, until the step is over
-                unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
+                self.sync_gpu_for_cpu();
                 let exit = self.cpu.step(&mut self.memory);
                 self.memory.clear_gpu_sync();
                 exit
@@ -527,12 +508,7 @@ impl System {
         }
         let _ = pc;
 
-        // give the scheduler a chance on a regular cadence so that a thread
-        // which never makes a syscall cannot monopolise the core.
-        if self.cpu.cycles >= self.next_preempt {
-            self.next_preempt = self.cpu.cycles + PREEMPT_INTERVAL;
-            self.kernel.reschedule_pending = true;
-        }
+        self.preempt();
 
         if self.exited {
             StepOutcome::Exited
@@ -551,6 +527,40 @@ impl System {
         if !library.has_code(self.cpu.regs[15] | self.cpu.cpsr.thumb as u32) {
             return None;
         }
+        let Some((budget, event)) = self.recompiled_budget(deadline) else {
+            return Some(None);
+        };
+        // the library stays out of the system while its code runs, so that
+        // an svc the code runs in place gets the system to itself
+        let library = self.recompiled.take()?;
+        self.sync_gpu_for_cpu();
+        let (ran, stop, event) = library.run(self, budget, deadline, event);
+        self.memory.clear_gpu_sync();
+        self.recompiled = Some(library);
+        self.recompiled_instructions += ran;
+        if event.is_some_and(|tick| self.cpu.cycles >= tick) {
+            self.kernel.reschedule_pending = true;
+        }
+        if (ran == 0 && matches!(stop, recompiled::Stop::Left)) || matches!(stop, recompiled::Stop::Declined) {
+            // not enough budget left for a whole block, at the start or
+            // after an svc the code ran in place, whose step this is now
+            if let Some(hints) = &mut self.hints {
+                hints.library_declined();
+            }
+            return None;
+        }
+        Some(match stop {
+            recompiled::Stop::Svc(number) => Some(Exit::Supervisor(number)),
+            recompiled::Stop::Exit(exit) => Some(exit),
+            recompiled::Stop::Left | recompiled::Stop::Declined => None,
+        })
+    }
+
+    /// how many cycles recompiled code can run from here before the
+    /// scheduler has to look, and the tick of the next thing a thread waits
+    /// for. none when that is due already, which has the scheduler look
+    /// first.
+    fn recompiled_budget(&mut self, deadline: Option<u64>) -> Option<(u64, Option<u64>)> {
         let mut limit = self.next_frame_boundary.min(self.next_audio_frame);
         // a thread or a timer due wants the scheduler at its tick, a run
         // that reached it has it look first
@@ -558,7 +568,7 @@ impl System {
         if let Some(tick) = event {
             if tick <= self.cpu.cycles {
                 self.kernel.reschedule_pending = true;
-                return Some(None);
+                return None;
             }
             limit = limit.min(tick);
         }
@@ -571,31 +581,107 @@ impl System {
         if let Some(deadline) = deadline {
             limit = limit.min(deadline);
         }
-        let budget = limit.saturating_sub(self.cpu.cycles).max(1);
-        // a read of the CPU from where the GPU drew has that come down
-        // first, with nothing else holding the GPU until the run is over
-        let gpu = &mut self.gpu as *mut Gpu as *mut ();
-        let linear_base = self.kernel.linear_base;
-        // SAFETY: as in step, until the run is over
-        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
-        let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
+        Some((limit.saturating_sub(self.cpu.cycles).max(1), event))
+    }
+
+    /// runs an svc that recompiled code made, from inside the code, and
+    /// lets the code go on after it, for as long as the result says, when
+    /// the next step would only run that code on. it does what the rest of
+    /// this step and the start of the next would do, in the same order, and
+    /// gives none wherever they do more, end a frame or switch threads say,
+    /// which the code stops for, leaving the rest to the steps. the code
+    /// then charges what follows to the budget as the functions it is in cut
+    /// it, where a stop has it entered again through the function an entry
+    /// names, whose blocks can be cut otherwise.
+    pub(crate) fn svc_in_place(
+        &mut self,
+        number: u32,
+        event: Option<u64>,
+        deadline: Option<u64>,
+        library: &recompiled::Library,
+    ) -> Option<(u64, Option<u64>)> {
+        let thread = self.kernel.current_thread;
+        let resume = (self.cpu.regs[15], self.cpu.cpsr.thumb);
+        // what the step does once the code stopped at the svc
         self.memory.clear_gpu_sync();
-        self.recompiled_instructions += ran;
         if event.is_some_and(|tick| self.cpu.cycles >= tick) {
             self.kernel.reschedule_pending = true;
         }
-        if ran == 0 && matches!(stop, recompiled::Stop::Left) {
-            // not enough budget left for a whole block
-            if let Some(hints) = &mut self.hints {
-                hints.library_declined();
-            }
+        self.ran_recompiled();
+        self.idle_interrupted(true);
+        kernel::svc::dispatch(self, number);
+        self.preempt();
+        // and what the next one does before it runs code
+        let cycles = self.cpu.cycles;
+        if self.exited || self.broke || deadline.is_some_and(|deadline| cycles >= deadline) {
             return None;
         }
-        Some(match stop {
-            recompiled::Stop::Svc(number) => Some(Exit::Supervisor(number)),
-            recompiled::Stop::Exit(exit) => Some(exit),
-            recompiled::Stop::Left => None,
-        })
+        if cycles >= self.next_frame_boundary || cycles >= self.next_audio_frame {
+            return None;
+        }
+        if self.kernel.reschedule_pending || self.kernel.current_thread.is_none() {
+            self.reschedule();
+        }
+        // the same thread, still after the svc, which is code the library has
+        let (pc, thumb) = (self.cpu.regs[15], self.cpu.cpsr.thumb);
+        if self.kernel.current_thread != thread || (pc, thumb) != resume || !self.memory.is_executable(pc) || !library.has_code(pc | thumb as u32)
+        {
+            return None;
+        }
+        self.note(pc);
+        let budget = self.recompiled_budget(deadline)?;
+        self.sync_gpu_for_cpu();
+        Some(budget)
+    }
+
+    /// the scheduling pass a step makes first when it is due.
+    fn reschedule(&mut self) {
+        self.kernel.reschedule_pending = false;
+        let tick = self.cpu.cycles;
+        if self.kernel.schedule(&mut self.cpu, tick) {
+            self.idle_interrupted(true);
+        }
+        // a thread released here that keeps the core gets its result
+        // too, before it runs on, not over whatever it does next
+        self.apply_wait_result();
+    }
+
+    /// notes where a step runs the guest from, for fault reports and the
+    /// profiler.
+    fn note(&mut self, pc: u32) {
+        self.history[self.history_index] = pc | self.cpu.cpsr.thumb as u32;
+        self.history_index = (self.history_index + 1) % HISTORY_LENGTH;
+        if self.profile.is_some() {
+            self.sample();
+        }
+    }
+
+    /// what a step does after recompiled code ran.
+    fn ran_recompiled(&mut self) {
+        // its writes do not go through the log a watch keeps
+        self.idle_interrupted(false);
+        if let Some(hints) = &mut self.hints {
+            hints.library_ran();
+        }
+    }
+
+    /// gives the scheduler a chance on a regular cadence, so that a thread
+    /// which never makes a syscall cannot monopolise the core.
+    fn preempt(&mut self) {
+        if self.cpu.cycles >= self.next_preempt {
+            self.next_preempt = self.cpu.cycles + PREEMPT_INTERVAL;
+            self.kernel.reschedule_pending = true;
+        }
+    }
+
+    /// has a read of the CPU from where the GPU drew bring that down first,
+    /// until clear_gpu_sync.
+    fn sync_gpu_for_cpu(&mut self) {
+        let gpu = &mut self.gpu as *mut Gpu as *mut ();
+        let linear_base = self.kernel.linear_base;
+        // SAFETY: the GPU stays where it is, and nothing but the CPU's reads
+        // and writes follow the pointer until the sync is cleared
+        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
     }
 
     /// the instruction addresses executed most recently, oldest first.
@@ -1424,6 +1510,167 @@ mod tests {
         assert_eq!(system.kernel.current_thread, Some(id));
         system.cpu.regs[0] = 0x0010_0800;
         id
+    }
+
+    /// a loop of three svcs, the tick, a mutex's release and a sleep, the
+    /// way titles poll a clock, at 0x00100000.
+    const POLLING: [u32; 8] = [
+        0xEF00_0028, // svc 0x28, the tick in r0 and r1
+        0xE284_4001, // add r4, r4, #1
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14, releasing the mutex in r5
+        0xE1A0_0006, // mov r0, r6
+        0xE3A0_1000, // mov r1, #0
+        0xEF00_000A, // svc 0x0A, sleeping for r6 nanoseconds
+        0xEAFF_FFF7, // b 0x00100000
+    ];
+
+    /// a loop that only reads the tick, at 0x00100040.
+    const TICKING: [u32; 3] = [
+        0xEF00_0028, // svc 0x28
+        0xE284_4001, // add r4, r4, #1
+        0xEAFF_FFFC, // b 0x00100040
+    ];
+
+    /// the blocks of POLLING and TICKING the way 3dsrecomp cuts code, each
+    /// with its length, the svc it ends with and where it goes on.
+    fn block(at: u32) -> Option<(i32, Option<u32>, u32)> {
+        Some(match at {
+            0x0010_0000 => (1, Some(0x28), 0x0010_0004),
+            0x0010_0004 => (3, Some(0x14), 0x0010_0010),
+            0x0010_0010 => (3, Some(0x0A), 0x0010_001C),
+            0x0010_001C => (1, None, 0x0010_0000),
+            0x0010_0040 => (1, Some(0x28), 0x0010_0044),
+            0x0010_0044 => (2, None, 0x0010_0040),
+            _ => return None,
+        })
+    }
+
+    /// POLLING and TICKING as 3dsrecomp writes code, each block charged to
+    /// the budget as it starts. their svcs run in place, or leave for the
+    /// step, as in code made for version 4 of the interface.
+    unsafe extern "C" fn polling<const IN_PLACE: bool>(ctx: *mut recomp_abi::Context) {
+        unsafe {
+            let mut at = (*ctx).r[15];
+            loop {
+                let Some((size, svc, next)) = block(at) else {
+                    (*ctx).exit = recomp_abi::EXIT_UNWIND;
+                    return;
+                };
+                if (*ctx).budget < size {
+                    (*ctx).r[15] = at;
+                    (*ctx).exit = recomp_abi::EXIT_BUDGET;
+                    return;
+                }
+                (*ctx).budget -= size;
+                match at {
+                    0x0010_0004 => {
+                        (*ctx).r[4] = (*ctx).r[4].wrapping_add(1);
+                        (*ctx).r[0] = (*ctx).r[5];
+                    }
+                    0x0010_0010 => {
+                        (*ctx).r[0] = (*ctx).r[6];
+                        (*ctx).r[1] = 0;
+                    }
+                    0x0010_0044 => (*ctx).r[4] = (*ctx).r[4].wrapping_add(1),
+                    _ => {}
+                }
+                if let Some(number) = svc {
+                    (*ctx).r[15] = next;
+                    if !IN_PLACE {
+                        (*ctx).svc = number;
+                        (*ctx).exit = recomp_abi::EXIT_SVC;
+                        return;
+                    }
+                    ((*(*ctx).host).svc)(ctx, number);
+                    if (*ctx).exit != 0 {
+                        return;
+                    }
+                }
+                at = next;
+            }
+        }
+    }
+
+    /// threads on POLLING or TICKING as recompiled code, sharing a mutex,
+    /// each with where it starts, the nanoseconds it sleeps each time round
+    /// and its priority.
+    fn polling_system(in_place: bool, threads: &[(u32, u32, u32)]) -> System {
+        use memory::{MemoryState, Permission};
+        // the clock the host has would set the two apart
+        let mut system = System::new(Config { clock: Some(0), ..Config::default() });
+        let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
+        system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
+        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..])] {
+            for (index, word) in code.iter().enumerate() {
+                system.memory.write32(address + index as u32 * 4, *word);
+            }
+        }
+        system.cpu.regs[1] = 0;
+        kernel::svc::dispatch(&mut system, 0x13);
+        let mutex = system.cpu.regs[1];
+        for (index, &(entry, sleep, priority)) in threads.iter().enumerate() {
+            let stack = 0x0010_0F00 - index as u32 * 0x100;
+            let id = system.kernel.create_thread(format!("thread {index}"), entry, stack, 0, priority, 0);
+            system.map_tls_page(id);
+            let regs = &mut system.kernel.thread_mut(id).context.regs;
+            regs[5] = mutex;
+            regs[6] = sleep;
+        }
+        system.kernel.schedule(&mut system.cpu, 0);
+        let code: recomp_abi::Code = if in_place { polling::<true> } else { polling::<false> };
+        let addresses = [0x0010_0000, 0x0010_0004, 0x0010_0010, 0x0010_001C, 0x0010_0040, 0x0010_0044];
+        let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
+        let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
+        // SAFETY: a table that lives on, of code working on a context as
+        // 3dsrecomp's does
+        let linked = unsafe { recompiled::Linked::new(0, abi, entries.as_ptr().cast(), entries.len() as u32, std::ptr::null(), 0) };
+        system.recompiled = Some(recompiled::Library::linked(&linked).unwrap());
+        system
+    }
+
+    /// code that runs its svcs in place leaves the machine just as code
+    /// that leaves for the step at each does, through ticks, scheduling
+    /// passes, yields, sleeps, preemption and frames, only stopping far
+    /// less. the threads, their loops, sleeps and priorities vary, so that
+    /// the svcs fall on every kind of stop. one function runs every label
+    /// here, cutting the code the same way whether it is entered or goes on.
+    #[test]
+    fn svcs_run_in_place_leave_the_machine_as_steps_would() {
+        if !recompiled::svcs_in_place() {
+            eprintln!("ZAKURO_SVC_IN_PLACE=0 has svcs leave the code, nothing to compare");
+            return;
+        }
+        let mut seed = 0x2545_F491u32;
+        let mut pick = |choices: &[u32]| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            choices[(seed >> 16) as usize % choices.len()]
+        };
+        let mut ran_in_place = 0;
+        for case in 0..40 {
+            let threads: Vec<(u32, u32, u32)> = (0..1 + case % 3)
+                .map(|_| {
+                    let entry = pick(&[0x0010_0000, 0x0010_0000, 0x0010_0040]);
+                    (entry, pick(&[0, 0, 900, 13_000, 50_000, 400_000]), pick(&[0x2F, 0x30, 0x30, 0x31]))
+                })
+                .collect();
+            let mut systems = [polling_system(false, &threads), polling_system(true, &threads)];
+            for system in &mut systems {
+                for _ in 0..6 {
+                    assert_eq!(system.run_frame(), FrameOutcome::Completed);
+                }
+            }
+            let [steps, in_place] = &mut systems;
+            assert_eq!(in_place.cpu.cycles, steps.cpu.cycles, "{threads:x?}");
+            assert_eq!(in_place.history, steps.history, "{threads:x?}");
+            assert!(in_place.save_state().unwrap() == steps.save_state().unwrap(), "{threads:x?} ends elsewhere");
+            // the current thread's registers are the CPU's
+            let rounds = steps.kernel.threads.iter().map(|thread| thread.context.regs[4]).chain([steps.cpu.regs[4]]);
+            assert!(rounds.max().unwrap() > 100, "{threads:x?} went round");
+            assert_eq!(steps.recompiled.as_ref().unwrap().in_place(), 0);
+            ran_in_place += in_place.recompiled.as_ref().unwrap().in_place();
+        }
+        assert!(ran_in_place > 100_000, "{ran_in_place} svcs ran in place");
     }
 
     /// runs steps until the run gets to tick or steps runs out, how many it
