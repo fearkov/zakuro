@@ -709,13 +709,21 @@ impl App {
                 Err(error) => log::warn!("could not record to {}, {error}", record.display()),
             }
         }
-        if outdated {
-            self.menus.message = Some(format!(
-                "{} was recompiled by an older version of Zakuro. Recompile it again from the library to get the newest improvements.",
-                game.name
-            ));
-        } else if in_software {
-            self.menus.message = Some(GPU_FALLBACK.to_owned());
+        // both can be so, and the GPU's is what explains a slow game
+        let notes: Vec<String> = [
+            in_software.then(|| GPU_FALLBACK.to_owned()),
+            outdated.then(|| {
+                format!(
+                    "{} was recompiled by an older version of Zakuro. Recompile it again from the library to get the newest improvements.",
+                    game.name
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !notes.is_empty() {
+            self.menus.message = Some(notes.join("\n\n"));
         }
         self.game = Some(game);
         // the new game's cameras see what the settings say, and it plays
