@@ -22,7 +22,7 @@ This is a personal experimental project. You can use it to play games, but that 
 
 Builds for Windows and Linux are on the [releases page](https://github.com/fearkov/zakuro/releases): on Windows, unzip it and run zakuro.exe, and on Linux, extract it and run ./zakuro.
 
-To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA and udev development files (libasound2-dev and libudev-dev on Debian and Ubuntu, alsa-lib and systemd-libs on Arch). On Windows, nothing else is needed:
+To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA and udev development files (libasound2-dev and libudev-dev on Debian and Ubuntu, alsa-lib and systemd-libs on Arch). On macOS, the Xcode command line tools are needed (`xcode-select --install`), and for Vulkan, MoltenVK and the Vulkan loader (`brew install molten-vk vulkan-loader`); without them it presents with OpenGL and draws on the CPU. On Windows, nothing else is needed:
 
     cargo install --git https://github.com/fearkov/zakuro --locked zakuro
 
@@ -41,7 +41,7 @@ Games run faster with their code recompiled ahead of time by [3dsrecomp](https:/
 
 --recompiled points it at another library, and --interpreter runs everything in the interpreter.
 
-You can use mods too. I kept the same folders Luma3DS and Azahar use, so if a mod works there, it should work here as it is. Each game has its own folder, `mods/<title ID>/`, inside Zakuro's data folder (`~/.local/share/zakuro/mods/` on Linux, `%APPDATA%\zakuro\mods\` on Windows), and the Mods button next to the game in the library opens it for you:
+You can use mods too. I kept the same folders Luma3DS and Azahar use, so if a mod works there, it should work here as it is. Each game has its own folder, `mods/<title ID>/`, inside Zakuro's data folder (`~/.local/share/zakuro/mods/` on Linux, `~/Library/Application Support/zakuro/mods/` on macOS, `%APPDATA%\zakuro\mods\` on Windows), and the Mods button next to the game in the library opens it for you:
 
 - `romfs/` is for files that replace the game's own, or add new ones.
 - `romfs_ext/` is for .ips and .bps patches to the game's files, and .stub files to remove one.

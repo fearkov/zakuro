@@ -4,6 +4,8 @@ pub mod backend;
 pub mod blend;
 #[cfg(feature = "vulkan")]
 mod device;
+#[cfg(feature = "vulkan")]
+mod instance;
 mod pattern;
 pub mod proctex;
 pub mod fog;

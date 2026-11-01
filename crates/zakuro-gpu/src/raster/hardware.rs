@@ -53,8 +53,8 @@ const UPRIGHT_IMAGE_SPIRV: &[u8] = include_bytes!("../../shaders/upright_image.c
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
-/// the depth format on GPUs that can't draw into DEPTH_FORMAT, AMD's, its
-/// floats standing for the console's 24 bits, see float_depth.
+/// the depth format on GPUs that can't draw into DEPTH_FORMAT, AMD's and
+/// Apple's, its floats standing for the console's 24 bits, see float_depth.
 const FLOAT_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT_S8_UINT;
 
 /// where a batch keeps its vertices, uniforms and uploads.
@@ -5589,7 +5589,7 @@ fn renders_on(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
 
 /// the format a GPU draws depth buffers into, DEPTH_FORMAT, the console's
 /// 24 bits, or where it can't, FLOAT_DEPTH_FORMAT. Vulkan has every GPU do
-/// one of the two, AMD's only the floats. ZAKURO_FLOAT_DEPTH set has the
+/// one of the two, AMD's and Apple's only the floats. ZAKURO_FLOAT_DEPTH set has the
 /// floats wherever the GPU does them, to tell the two apart.
 fn depth_format(instance: &ash::Instance, device: vk::PhysicalDevice) -> Option<vk::Format> {
     let draws_into = |format| {
@@ -5627,6 +5627,7 @@ pub(crate) fn render_device(
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
     let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
     extensions.extend_from_slice(extra);
+    extensions.extend(crate::instance::portability_subset(instance, physical).map(std::ffi::CStr::as_ptr));
     // SAFETY: the physical device came from this instance
     let supported = unsafe { instance.get_physical_device_features(physical) };
     let logic_ops = supported.logic_op == vk::TRUE;
@@ -5711,13 +5712,9 @@ fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_o
 
 /// a device of the renderer's own, on the GPU pick chooses.
 pub(crate) fn own_device() -> Result<SharedDevice, String> {
-    // SAFETY: loads the system's Vulkan library, which has no other
-    // requirements
-    let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader, {e}"))?;
+    let entry = crate::instance::entry().map_err(|e| format!("no Vulkan loader, {e}"))?;
     let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
-    // SAFETY: a plain instance with no layers or extensions
-    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
-        .map_err(vk_error("create an instance"))?;
+    let instance = crate::instance::new(&entry, &app, &[]).map_err(vk_error("create an instance"))?;
     let made = pick(&instance).and_then(|(physical, family)| render_device(&entry, &instance, physical, family, &[]));
     if made.is_err() {
         // SAFETY: nothing made from the instance is left
