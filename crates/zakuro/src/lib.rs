@@ -27,7 +27,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage, ScreenOrientation};
 
 use gui::Gui;
 use input::Keyboard;
@@ -836,7 +836,7 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.top_shape.width(), self.settings.integer_scale);
+        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), ScreenOrientation::North, self.top_shape.width(), self.settings.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);

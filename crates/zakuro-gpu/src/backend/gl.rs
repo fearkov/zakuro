@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use glow::HasContext;
 
-use super::{place, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
+use super::{place, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport};
 
 const VERTEX_SHADER: &str = r#"#version 330 core
 // a single oversized triangle covers the viewport with no vertex buffer.
@@ -336,7 +336,7 @@ impl Presenter for GlPresenter {
             gl.bind_vertex_array(Some(self.vertex_array));
         }
 
-        for (viewport, shown) in place(self.window.0, self.window.1, self.arrangement, self.top_width, self.integer, self.stereo, has_right) {
+        for (viewport, shown) in place(self.window.0, self.window.1, self.arrangement, ScreenOrientation::North, self.top_width, self.integer, self.stereo, has_right) {
             match shown {
                 Shown::Top if !top.is_empty() => self.draw_screen(0, viewport),
                 Shown::Bottom if !bottom.is_empty() => self.draw_screen(1, viewport),
