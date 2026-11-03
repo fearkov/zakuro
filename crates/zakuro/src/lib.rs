@@ -27,7 +27,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage, ScreenOrientation};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
 
 use gui::Gui;
 use input::Keyboard;
@@ -39,6 +39,8 @@ use settings::{CameraSource, Renderer, Screens, Settings};
 
 pub use zakuro_core::memory::Memory;
 pub use zakuro_core::recompiled::Linked;
+
+use crate::settings::Orientation;
 
 /// what a program built on Zakuro shows over its game, worked out from the
 /// game's memory: a line kept in a corner, and a notice shown for a moment.
@@ -97,6 +99,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         gamepads: gamepad::Gamepads::new(settings.pad.clone()),
         scale: options.scale.unwrap_or(settings.scale).max(1),
         layout: settings.layout,
+        orientation: settings.orientation,
         top_shape: settings.top_shape,
         options,
         settings,
@@ -390,6 +393,7 @@ struct App {
     scale: u32,
     /// how the screens are arranged.
     layout: Screens,
+    orientation: Orientation,
     /// how wide the top screen shows.
     top_shape: settings::TopShape,
     /// the left button is down, and where the pointer is, in window pixels.
@@ -517,6 +521,7 @@ impl ApplicationHandler for App {
             Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
                 backend.set_layout(self.layout.screens());
+                backend.set_orientation(self.orientation.screen_orientation());
                 backend.set_top_width(self.settings.top_shape.width());
                 backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
                 backend.set_stereo(self.settings.stereo());
@@ -836,7 +841,7 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), ScreenOrientation::North, self.top_shape.width(), self.settings.integer_scale);
+        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.orientation.screen_orientation(), self.top_shape.width(), self.settings.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
@@ -947,12 +952,14 @@ impl App {
             backend.set_stereo(self.settings.stereo());
         }
         let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
-        if scale != self.scale || self.settings.layout != self.layout || self.settings.top_shape != self.top_shape {
+        if scale != self.scale || self.settings.layout != self.layout || self.settings.orientation != self.orientation || self.settings.top_shape != self.top_shape {
             self.scale = scale;
             self.layout = self.settings.layout;
+            self.orientation = self.settings.orientation;
             self.top_shape = self.settings.top_shape;
             if let Some(backend) = &mut self.backend {
                 backend.set_layout(self.layout.screens());
+                backend.set_orientation(self.orientation.screen_orientation());
             }
             // a full screen or maximized window keeps its size, resizing
             // it would take it out of that, full screen fits it on leaving
@@ -969,6 +976,10 @@ impl App {
     /// the window size that fits the screens at the chosen scale.
     fn window_size(&self) -> winit::dpi::Size {
         let (width, height) = self.layout.screens().size(self.top_shape.width());
+        let (width, height) = match self.orientation.screen_orientation().is_portrait() {
+            true => (height, width),
+            false => (width, height)
+        };
         // scaled by whole numbers, a desktop scaled by 125% say would leave a
         // border, so the window gets whole multiples of the screens' pixels
         if let (true, Some(window)) = (self.settings.integer_scale, &self.window) {

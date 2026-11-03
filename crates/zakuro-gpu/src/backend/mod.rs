@@ -115,6 +115,12 @@ pub enum ScreenOrientation {
     West,
 }
 
+impl ScreenOrientation {
+    pub fn is_portrait(&self) -> bool {
+        *self == Self::East || *self == Self::West
+    }
+}
+
 /// how the screens' pixels are drawn when scaled to the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreenFilter {
@@ -356,6 +362,8 @@ pub trait Presenter {
 
     /// how the screens are arranged from the next frame on.
     fn set_layout(&mut self, arrangement: ScreenLayout);
+
+    fn set_orientation(&mut self, orientation: ScreenOrientation);
 
     /// how wide the top screen shows, TOP_WIDTH for the console's shape.
     fn set_top_width(&mut self, width: f32);
