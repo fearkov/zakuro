@@ -8,7 +8,7 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::vulkan_overlay::OverlayPainter;
-use super::{place, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
+use super::{place, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport};
 use crate::raster::hardware::{can_render, render_device};
 use crate::SharedDevice;
 
@@ -776,7 +776,7 @@ impl VulkanPresenter {
                     Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
                 }
             };
-            let places = place(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, right);
+            let places = place(self.extent.width, self.extent.height, self.arrangement, ScreenOrientation::North, self.top_width, self.integer, self.stereo, right);
             for (viewport, shown) in places {
                 let index = match shown {
                     Shown::Top | Shown::Both => 0,
