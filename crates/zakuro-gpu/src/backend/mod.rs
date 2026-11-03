@@ -167,31 +167,24 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
     if integer && scale >= 1.0 {
         scale = scale.floor();
     }
-    let mut offset_x = (window_width as f32 - total_width * scale) / 2.0;
-    let mut offset_y = (window_height as f32 - total_height * scale) / 2.0;
-    if integer {
-        // whole pixels, or every texel would not get the same size
-        offset_x = offset_x.floor();
-        offset_y = offset_y.floor();
-    }
 
     let top = (arrangement != ScreenLayout::BottomOnly).then_some(Viewport {
-        x: offset_x,
-        y: offset_y,
+        x: 0.0,
+        y: 0.0,
         width: top_w * scale,
         height: 240.0 * scale,
     });
     let bottom = match arrangement {
         // the bottom screen is narrower, so it is centered under the top one.
         ScreenLayout::Stacked => Some(Viewport {
-            x: offset_x + (total_width - 320.0) / 2.0 * scale,
-            y: offset_y + 240.0 * scale,
+            x: (total_width - 320.0) / 2.0 * scale,
+            y: 240.0 * scale,
             width: 320.0 * scale,
             height: 240.0 * scale,
         }),
         ScreenLayout::SideBySide => Some(Viewport {
-            x: offset_x + top_w * scale,
-            y: offset_y,
+            x: top_w * scale,
+            y: 0.0,
             width: 320.0 * scale,
             height: 240.0 * scale,
         }),
@@ -201,21 +194,34 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
             let half = (LARGE_TOP_BOTTOM.0 as f32 / 320.0) * scale;
             let small = if integer && half >= 1.0 { half.floor() } else { half };
             Some(Viewport {
-                x: offset_x + top_w * scale,
-                y: offset_y + 240.0 * scale - 240.0 * small,
+                x: top_w * scale,
+                y: 240.0 * scale - 240.0 * small,
                 width: 320.0 * small,
                 height: 240.0 * small,
             })
         }
         ScreenLayout::TopOnly => None,
         ScreenLayout::BottomOnly => Some(Viewport {
-            x: offset_x,
-            y: offset_y,
+            x: 0.0,
+            y: 0.0,
             width: 320.0 * scale,
             height: 240.0 * scale,
         }),
     };
-    (top, bottom)
+
+    let mut offset_x = (window_width as f32 - total_width * scale) / 2.0;
+    let mut offset_y = (window_height as f32 - total_height * scale) / 2.0;
+    if integer {
+        // whole pixels, or every texel would not get the same size
+        offset_x = offset_x.floor();
+        offset_y = offset_y.floor();
+    }
+    let offset = |viewport: Viewport| Viewport {
+        x: offset_x + viewport.x,
+        y: offset_y + viewport.y,
+        ..viewport
+    };
+    (top.map(offset), bottom.map(offset))
 }
 
 /// how the top screen's two pictures, one for each eye, are shown when the
@@ -380,6 +386,21 @@ mod tests {
         assert!(top.is_none());
         let bottom = bottom.unwrap();
         assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (80.0, 0.0, 640.0, 480.0));
+    }
+
+    #[test]
+    fn all_layouts_center_the_visible_screens() {
+        let bounds = |viewport: Viewport| (viewport.x, viewport.y, viewport.width, viewport.height);
+        for (arrangement, expected) in [
+            (ScreenLayout::Stacked, (Some((100.0, 20.0, 800.0, 480.0)), Some((180.0, 500.0, 640.0, 480.0)))),
+            (ScreenLayout::SideBySide, (Some((140.0, 380.0, 400.0, 240.0)), Some((540.0, 380.0, 320.0, 240.0)))),
+            (ScreenLayout::LargeTop, (Some((220.0, 380.0, 400.0, 240.0)), Some((620.0, 500.0, 160.0, 120.0)))),
+            (ScreenLayout::TopOnly, (Some((100.0, 260.0, 800.0, 480.0)), None)),
+            (ScreenLayout::BottomOnly, (None, Some((20.0, 140.0, 960.0, 720.0)))),
+        ] {
+            let (top, bottom) = layout(1000, 1000, arrangement, TOP_WIDTH, true);
+            assert_eq!((top.map(bounds), bottom.map(bounds)), expected, "{arrangement:?}");
+        }
     }
 
     #[test]
