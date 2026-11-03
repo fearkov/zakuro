@@ -12,7 +12,7 @@ use winit::window::{Window, WindowAttributes};
 
 use zakuro_gpu::backend::gl::GlPresenter;
 use zakuro_gpu::backend::vulkan::VulkanPresenter;
-use zakuro_gpu::{Overlay, PresentError, Presenter, RendererKind, ScreenImage, ScreenLayout, SharedDevice};
+use zakuro_gpu::{Overlay, PresentError, Presenter, RendererKind, ScreenImage, ScreenLayout, ScreenOrientation, SharedDevice};
 
 // exactly one backend exists per process, so the size of the largest variant
 // is not worth an extra allocation to avoid.
@@ -115,6 +115,14 @@ impl Backend {
             Backend::OpenGl { presenter, .. } => presenter.set_layout(arrangement),
             Backend::Vulkan(presenter) => presenter.set_layout(arrangement),
             Backend::None => {}
+        }
+    }
+
+    pub fn set_orientation(&mut self, orientation: ScreenOrientation) {
+        match self {
+            Backend::OpenGl { presenter, .. } => presenter.set_orientation(orientation),
+            Backend::Vulkan(presenter) => presenter.set_orientation(orientation),
+            Backend::None => {},
         }
     }
 

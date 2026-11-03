@@ -7,7 +7,7 @@ use gilrs::Button;
 use serde::{Deserialize, Serialize};
 use winit::keyboard::KeyCode;
 use zakuro_core::services::hid::PadState;
-use zakuro_gpu::ScreenLayout;
+use zakuro_gpu::{ScreenLayout, ScreenOrientation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +64,38 @@ impl Screens {
             Screens::TopOnly => Screens::BottomOnly,
             Screens::BottomOnly => Screens::TopOnly,
             both => both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Orientation {
+    #[default]
+    North,
+    East,
+    South,
+    West,
+}
+
+impl Orientation {
+    pub const ALL: [Orientation; 4] = [Orientation::North, Orientation::East, Orientation::South, Orientation::West];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Orientation::North => "0 degree",
+            Orientation::East => "90 degree",
+            Orientation::South => "180 degree",
+            Orientation::West => "270 degree",
+        }
+    }
+
+    pub fn screen_orientation(self) -> ScreenOrientation {
+        match self {
+            Orientation::North => ScreenOrientation::North,
+            Orientation::East => ScreenOrientation::East,
+            Orientation::South => ScreenOrientation::South,
+            Orientation::West => ScreenOrientation::West,
         }
     }
 }
@@ -467,6 +499,8 @@ pub struct Settings {
     pub scale: u32,
     #[serde(deserialize_with = "or_default")]
     pub layout: Screens,
+    #[serde(deserialize_with = "or_default")]
+    pub orientation: Orientation,
     /// how the screens' pixels look scaled up.
     #[serde(deserialize_with = "or_default")]
     pub filter: Filter,
@@ -522,6 +556,7 @@ impl Default for Settings {
             recompiled: true,
             scale: 2,
             layout: Screens::Stacked,
+            orientation: Orientation::North,
             filter: Filter::Smooth,
             integer_scale: false,
             top_shape: TopShape::Console,

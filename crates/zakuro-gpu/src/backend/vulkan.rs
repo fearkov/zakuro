@@ -121,6 +121,7 @@ pub struct VulkanPresenter {
     overlay: Option<OverlayPainter>,
     window: (u32, u32),
     arrangement: ScreenLayout,
+    orientation: ScreenOrientation,
     top_width: f32,
     filter: ScreenFilter,
     integer: bool,
@@ -403,6 +404,7 @@ impl VulkanPresenter {
             overlay: Some(overlay),
             window: size,
             arrangement: ScreenLayout::default(),
+            orientation: ScreenOrientation::default(),
             top_width: super::TOP_WIDTH,
             filter: ScreenFilter::default(),
             integer: false,
@@ -773,7 +775,7 @@ impl VulkanPresenter {
                     Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
                 }
             };
-            let places = place(self.extent.width, self.extent.height, self.arrangement, ScreenOrientation::North, self.top_width, self.integer, self.stereo, right);
+            let places = place(self.extent.width, self.extent.height, self.arrangement, self.orientation, self.top_width, self.integer, self.stereo, right);
             for (viewport, shown) in places {
                 let index = match shown {
                     Shown::Top | Shown::Both => 0,
@@ -955,6 +957,10 @@ impl Presenter for VulkanPresenter {
 
     fn set_layout(&mut self, arrangement: ScreenLayout) {
         self.arrangement = arrangement;
+    }
+
+    fn set_orientation(&mut self, orientation: ScreenOrientation) {
+        self.orientation = orientation;
     }
 
     fn set_top_width(&mut self, width: f32) {
