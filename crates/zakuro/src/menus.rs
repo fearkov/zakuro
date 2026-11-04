@@ -699,7 +699,7 @@ impl Menus {
                         ui.selectable_value(&mut settings.layout, layout, layout.name());
                     }
                 });
-                egui::ComboBox::from_label("Orientation").selected_text(settings.orientation.name()).show_ui(ui, |ui| {
+                egui::ComboBox::from_label("Rotation").selected_text(settings.orientation.name()).show_ui(ui, |ui| {
                     for orientation in Orientation::ALL {
                         ui.selectable_value(&mut settings.orientation, orientation, orientation.name());
                     }
