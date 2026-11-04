@@ -15,7 +15,7 @@ layout(set = 0, binding = 1) uniform sampler2D right_eye;
 // holds just the screen. then how a screen drawn bigger than its pixels is
 // filtered: 0 smooth, 1 pixels, 2 sharp.
 layout(push_constant) uniform Crop {
-    vec4 area;
+    layout(offset = 16) vec4 area;
     vec4 bounds;
     int mode;
 #ifdef STEREO

@@ -9,9 +9,17 @@ use super::{place, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter
 const VERTEX_SHADER: &str = r#"#version 330 core
 // a single oversized triangle covers the viewport with no vertex buffer.
 out vec2 uv;
+uniform int orientation;
 void main() {
     vec2 position = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
     uv = vec2(position.x, 1.0 - position.y);
+    if (orientation == 90) {
+        uv = vec2(uv.y, 1.0 - uv.x);
+    } else if (orientation == 180) {
+        uv = vec2(1.0 - uv.x, 1.0 - uv.y);
+    } else if (orientation == 270) {
+        uv = vec2(1.0 - uv.y, uv.x);
+    }
     gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
 }
 "#;
@@ -259,6 +267,9 @@ impl GlPresenter {
             }
             if let Some(location) = gl.get_uniform_location(program, "mode") {
                 gl.uniform_1_i32(Some(&location), self.filter.mode());
+            }
+            if let Some(location) = gl.get_uniform_location(program, "orientation") {
+                gl.uniform_1_i32(Some(&location), self.orientation.clockwise_angle());
             }
         }
     }

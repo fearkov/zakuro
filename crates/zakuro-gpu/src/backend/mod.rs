@@ -119,6 +119,15 @@ impl ScreenOrientation {
     pub fn is_portrait(&self) -> bool {
         *self == Self::East || *self == Self::West
     }
+
+    pub(crate) fn clockwise_angle(&self) -> i32 {
+        match self {
+            ScreenOrientation::North => 0,
+            ScreenOrientation::East => 90,
+            ScreenOrientation::South => 180,
+            ScreenOrientation::West => 270,
+        }
+    }
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
