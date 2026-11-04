@@ -16,6 +16,9 @@ const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
 
+const VERT_CONSTANTS_OFFSET: u32 = 0;
+const FRAG_CONSTANTS_OFFSET: u32 = 16;
+
 /// the bytes of push constants the fragment shader reads: where the screen
 /// lies in its image, the bounds its samples keep in and the filter, and
 /// for 3D how the eyes show and the right eye's place in its image.
@@ -800,7 +803,8 @@ impl VulkanPresenter {
                 set_viewport(device, command_buffer, viewport, self.extent);
                 device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
-                device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
+                device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::VERTEX, VERT_CONSTANTS_OFFSET, &self.orientation.clockwise_angle().to_le_bytes());
+                device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, FRAG_CONSTANTS_OFFSET, &constants);
                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
 
@@ -1172,8 +1176,14 @@ fn create_pipeline(
     let fragment = create_shader_module(device, fragment_spirv)?;
 
     let layouts = [descriptor_layout];
-    let constants = [vk::PushConstantRange::default()
+    let constants = [
+        vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(VERT_CONSTANTS_OFFSET)
+        .size(4),
+        vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(FRAG_CONSTANTS_OFFSET)
         .size(constants_size)];
     let pipeline_layout = unsafe {
         device.create_pipeline_layout(
