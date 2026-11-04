@@ -105,7 +105,7 @@ pub enum ScreenLayout {
     LargeTop,
 }
 
-/// the direction the tops of both screens point when the layout is rotated.
+/// the Orientation of both screens. north is up
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreenOrientation {
     #[default]
@@ -120,6 +120,7 @@ impl ScreenOrientation {
         *self == Self::East || *self == Self::West
     }
 
+    /// clockwise rotation in degrees
     pub(crate) fn clockwise_angle(&self) -> i32 {
         match self {
             ScreenOrientation::North => 0,
@@ -182,7 +183,7 @@ pub const TOP_WIDTH: f32 = 400.0;
 const LARGE_TOP_BOTTOM: (u32, u32) = (160, 120);
 
 /// works out where the screens go inside a window, keeping the 3DS's
-/// aspect ratio, or the top screen top_w wide, and centring them, scaled by
+/// aspect ratio, or the top screen top_w wide, rotating and centring them, scaled by
 /// a whole number when integer asks and the window has room. a screen that
 /// does not show has no place.
 pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, orientation: ScreenOrientation, top_w: f32, integer: bool) -> (Option<Viewport>, Option<Viewport>) {
@@ -372,6 +373,7 @@ pub trait Presenter {
     /// how the screens are arranged from the next frame on.
     fn set_layout(&mut self, arrangement: ScreenLayout);
 
+    /// sets the orientation of both screens.
     fn set_orientation(&mut self, orientation: ScreenOrientation);
 
     /// how wide the top screen shows, TOP_WIDTH for the console's shape.

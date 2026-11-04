@@ -16,7 +16,10 @@ const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
 
+/// byte offset of the vertex shader's push constants
 const VERT_CONSTANTS_OFFSET: u32 = 0;
+
+/// byte offset of the fragment shader's push constants
 const FRAG_CONSTANTS_OFFSET: u32 = 16;
 
 /// the bytes of push constants the fragment shader reads: where the screen
