@@ -851,7 +851,14 @@ impl App {
         let y = self.cursor.1 - bottom.y;
         let inside = x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height;
         self.keyboard.touch((self.mouse_down && inside).then(|| {
-            ((x / bottom.width * 320.0) as u16, (y / bottom.height * 240.0) as u16)
+            let (u, v) = (x / bottom.width, y / bottom.height);
+            let (u, v) = match self.orientation {
+                Orientation::North => (u, v),
+                Orientation::East => (v, 1.0 - u),
+                Orientation::South => (1.0 - u, 1.0 - v),
+                Orientation::West => (1.0 - v, u),
+            };
+            (((u * 320.0) as u16).min(319), ((v * 240.0) as u16).min(239))
         }));
     }
 
