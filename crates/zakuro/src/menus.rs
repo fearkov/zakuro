@@ -8,8 +8,8 @@ use egui::{Align, Color32, Layout, RichText, Vec2};
 use winit::keyboard::KeyCode;
 use zakuro_core::services::keyboard::Request;
 
-use crate::library::{Library, ICON_SIZE};
-use crate::recompile::{Job, Stage};
+use crate::library::{Game, Library, ICON_SIZE};
+use crate::recompile::{Job, Stage, Wanted};
 use crate::gamepad::button_name;
 use crate::settings::{game_key, CameraSource, Filter, GameSettings, Keys, Language, Orientation, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
 
@@ -17,14 +17,17 @@ use crate::settings::{game_key, CameraSource, Filter, GameSettings, Keys, Langua
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Play(PathBuf),
-    /// recompile the library's game at this index.
-    Recompile(usize),
-    /// download a compiler, then recompile the library's game at this
-    /// index with it.
-    DownloadCompiler(usize),
+    /// recompile these games of the library, one after the other.
+    Recompile(Vec<Wanted>),
+    /// download a compiler, then recompile these games of the library with
+    /// it.
+    DownloadCompiler(Vec<Wanted>),
     /// show the mods folder of the game with this program id.
     Mods(u64),
+    /// stop recompiling the game with this id, or waiting to.
     CancelRecompile(u64),
+    /// leave only the game recompiling now, none of those waiting.
+    CancelWaiting,
     ChooseFolder,
     ChooseBackground,
     /// pick the picture the cameras see.
@@ -95,9 +98,9 @@ pub struct Menus {
     pub report: Option<(String, String)>,
     /// what is being typed into the game's keyboard, and what it asked for.
     typing: Option<(Request, String)>,
-    /// the library's game to recompile once the player agrees to download a
-    /// compiler for it.
-    pub compiler_offer: Option<usize>,
+    /// the library's games to recompile once the player agrees to download
+    /// a compiler for them.
+    pub compiler_offer: Option<Vec<Wanted>>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
     background: Background,
 }
@@ -207,8 +210,9 @@ impl Menus {
         self.menu_open || self.settings_open || self.game_settings.is_some()
     }
 
-    /// the library, filling the window.
-    pub fn library(&mut self, ui: &mut egui::Ui, library: &Library, settings: &Settings, jobs: &[Job]) -> Vec<Action> {
+    /// the library, filling the window. waiting are the games waiting for
+    /// their turn to recompile.
+    pub fn library(&mut self, ui: &mut egui::Ui, library: &Library, settings: &Settings, jobs: &[Job], waiting: &[Wanted]) -> Vec<Action> {
         let mut actions = Vec::new();
         if library.changed {
             self.icons.clear();
@@ -234,6 +238,18 @@ impl Menus {
                     }
                     if ui.button("Choose folder…").clicked() {
                         actions.push(Action::ChooseFolder);
+                    }
+                    let outdated = idle(library.games.iter().filter(|game| game.outdated).map(Game::wanted), jobs, waiting);
+                    if !outdated.is_empty() {
+                        let recompile = ui.button(format!("Recompile outdated ({})", outdated.len())).on_hover_text(
+                            "These games were recompiled by an older version of Zakuro. Recompiling them again gives them its improvements. They go one at a time, around ten minutes each, and games can be played meanwhile.",
+                        );
+                        if recompile.clicked() {
+                            actions.push(Action::Recompile(outdated));
+                        }
+                    }
+                    if !waiting.is_empty() && ui.button(format!("Cancel the {} waiting", waiting.len())).on_hover_text("The game recompiling now carries on.").clicked() {
+                        actions.push(Action::CancelWaiting);
                     }
                 });
             });
@@ -274,7 +290,7 @@ impl Menus {
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (index, game) in library.games.iter().enumerate() {
+                for game in &library.games {
                     let job = jobs.iter().find(|job| job.program_id == game.program_id);
                     // over a picture, each game gets a backing to keep it
                     // readable
@@ -310,7 +326,9 @@ impl Menus {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(format!("{:016X}", game.program_id)).weak().monospace());
-                                    if game.recompiled {
+                                    if game.outdated {
+                                        ui.label(RichText::new("recompiled by an older version").color(Color32::from_rgb(220, 180, 100)));
+                                    } else if game.recompiled {
                                         ui.label(RichText::new("recompiled").color(Color32::from_rgb(110, 200, 120)));
                                     }
                                     if game.modded {
@@ -342,10 +360,16 @@ impl Menus {
                                         }
                                         progress(ui, job);
                                     }
+                                    _ if waiting.iter().any(|wanted| wanted.program_id == game.program_id) => {
+                                        if ui.button("Cancel").clicked() {
+                                            actions.push(Action::CancelRecompile(game.program_id));
+                                        }
+                                        ui.label(RichText::new("waiting to recompile").weak());
+                                    }
                                     _ => {
                                         let label = if game.recompiled { "Recompile again" } else { "Recompile" };
                                         if ui.button(label).on_hover_text("Turn the game's code into native code with 3dsrecomp, which makes it run faster. It takes around ten minutes and needs a C compiler, gcc or clang, or Zig, which Zakuro offers to download when the computer has neither.").clicked() {
-                                            actions.push(Action::Recompile(index));
+                                            actions.push(Action::Recompile(vec![game.wanted()]));
                                         }
                                         if let Some(Stage::Failed(error)) = job.map(Job::stage) {
                                             ui.label(RichText::new(format!("failed, {error}")).color(Color32::LIGHT_RED));
@@ -379,6 +403,7 @@ impl Menus {
         recompiled: bool,
         fast: bool,
         jobs: &[Job],
+        waiting: usize,
         saved: Option<&str>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -483,10 +508,13 @@ impl Menus {
                 if wide(ui, "Quit") {
                     actions.push(Action::Quit);
                 }
-                for job in jobs {
+                for job in jobs.iter().filter(|job| !job.stage().finished()) {
                     ui.separator();
                     ui.label(&job.name);
                     progress(ui, job);
+                }
+                if waiting > 0 {
+                    ui.label(RichText::new(format!("{waiting} more waiting to recompile")).weak());
                 }
             });
         actions
@@ -848,7 +876,7 @@ impl Menus {
             .id(egui::Id::new("game settings"))
             .open(&mut open)
             .vscroll(true)
-            .default_width(420.0)
+            .default_size([420.0, room.min(540.0)])
             .max_height(room)
             .show(ctx, |ui| {
                 ui.label(RichText::new("Tick what this game is to have of its own. The rest follows the general settings.").weak());
@@ -936,7 +964,7 @@ impl Menus {
     /// asks whether to download a compiler, there being none to recompile
     /// with.
     pub fn compiler_offer(&mut self, ctx: &egui::Context) -> Option<Action> {
-        let index = self.compiler_offer?;
+        let games = self.compiler_offer.clone()?;
         let size = crate::zig::download_size().map_or_else(String::new, |size| format!(", {} MB to download and around 400 MB once unpacked", size / 1_000_000));
         let mut action = None;
         egui::Window::new("Recompile")
@@ -949,7 +977,7 @@ impl Menus {
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Download it and recompile").clicked() {
-                        action = Some(Action::DownloadCompiler(index));
+                        action = Some(Action::DownloadCompiler(games));
                         self.compiler_offer = None;
                     }
                     if ui.button("Not now").clicked() {
@@ -962,12 +990,16 @@ impl Menus {
 
     pub fn message(&mut self, ctx: &egui::Context) {
         let Some(text) = self.message.clone() else { return };
+        // a line of recompiles that all fail makes it long, and it scrolls
+        // to keep the OK that closes it on the screen
+        let room = (ctx.content_rect().height() - 120.0).max(60.0);
         egui::Window::new("Zakuro")
+            .id(egui::Id::new("message"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(text.as_str());
+                egui::ScrollArea::vertical().max_height(room).show(ui, |ui| ui.label(text.as_str()));
                 ui.horizontal(|ui| {
                     if let Some((_, report)) = self.report.as_ref().filter(|(about, _)| *about == text) {
                         if ui.button("Copy info for a report").clicked() {
@@ -1113,6 +1145,19 @@ pub fn corner(ctx: &egui::Context, text: &str) {
         });
 }
 
+/// the games that aren't recompiling or waiting to, each once, the same
+/// game being in the folder twice as a .3ds and a .cci say.
+fn idle(games: impl Iterator<Item = Wanted>, jobs: &[Job], waiting: &[Wanted]) -> Vec<Wanted> {
+    let busy = |id: u64| waiting.iter().any(|wanted| wanted.program_id == id) || jobs.iter().any(|job| job.program_id == id && !job.stage().finished());
+    let mut idle: Vec<Wanted> = Vec::new();
+    for game in games {
+        if !busy(game.program_id) && !idle.iter().any(|wanted| wanted.program_id == game.program_id) {
+            idle.push(game);
+        }
+    }
+    idle
+}
+
 /// a recompile's progress bar with where it is.
 fn progress(ui: &mut egui::Ui, job: &Job) {
     let stage = job.stage();
@@ -1233,6 +1278,36 @@ mod tests {
         let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("game settings"))).unwrap();
         assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
         assert!(settings.per_game.is_empty(), "opening the window gives the game nothing");
+    }
+
+    /// however long a message gets, its OK stays on the screen.
+    #[test]
+    fn a_long_message_can_still_be_closed() {
+        let ctx = egui::Context::default();
+        let mut menus = Menus { message: Some("Recompiling a game failed, it did.\n\n".repeat(200)), ..Menus::default() };
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 480.0));
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            ctx.run_ui(input, |ui| menus.message(ui.ctx())).drop_without_applying_deltas();
+        }
+        let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("message"))).unwrap();
+        assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
+    }
+
+    /// a game in line, or having its turn, isn't offered again.
+    #[test]
+    fn games_already_in_line_are_left_out() {
+        let wanted = |program_id, path: &str| Wanted { program_id, path: path.into() };
+        let games = || [wanted(1, "a"), wanted(2, "b"), wanted(3, "c")].into_iter();
+        let ids = |games: Vec<Wanted>| games.into_iter().map(|game| game.program_id).collect::<Vec<_>>();
+        assert_eq!(ids(idle(games(), &[], &[])), [1, 2, 3]);
+        let twice = idle([wanted(1, "a.3ds"), wanted(2, "b"), wanted(1, "a.cci")].into_iter(), &[], &[]);
+        assert_eq!(twice, [wanted(1, "a.3ds"), wanted(2, "b")], "the same game twice in the folder");
+        assert_eq!(ids(idle(games(), &[], &[wanted(2, "b")])), [1, 3]);
+        let job = Job::at_stage(1, Stage::Compiling { done: 1, total: 2 });
+        assert_eq!(ids(idle(games(), std::slice::from_ref(&job), &[wanted(2, "b")])), [3]);
+        let job = Job::at_stage(1, Stage::Failed("no".to_owned()));
+        assert_eq!(ids(idle(games(), std::slice::from_ref(&job), &[])), [1, 2, 3]);
     }
 
     #[test]

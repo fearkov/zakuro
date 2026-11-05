@@ -21,6 +21,12 @@ pub fn installed(program_id: u64) -> Option<std::path::PathBuf> {
     recomp_abi::installed(program_id)
 }
 
+/// whether the library at path is worth building again, having come from
+/// an older 3dsrecomp than this build has, or not running at all.
+pub fn outdated(path: &Path) -> bool {
+    !recomp_abi::Library::open(path).is_ok_and(|code| code.generation() >= recomp_abi::GENERATION)
+}
+
 /// recompiled code, and how much of its work it handed back.
 pub struct Library {
     code: recomp_abi::Library,
@@ -410,6 +416,13 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a library that doesn't open has nothing to run, recompiling is what
+    /// mends it.
+    #[test]
+    fn a_library_that_cant_be_opened_is_outdated() {
+        assert!(outdated(Path::new("/nowhere/at/all.so")));
+    }
 
     #[test]
     fn arm_and_thumb_code_use_every_slot() {

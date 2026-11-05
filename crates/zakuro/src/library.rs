@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
+use crate::recompile::Wanted;
+
 /// file endings of games Zakuro opens.
 const GAME_FILES: [&str; 4] = ["3ds", "cci", "cxi", "cia"];
 /// the icon's side, in pixels.
@@ -17,6 +19,9 @@ pub struct Game {
     pub icon: Option<Vec<u8>>,
     /// 3dsrecomp installed code for it.
     pub recompiled: bool,
+    /// that code came from an older 3dsrecomp, and recompiling the game
+    /// makes it run better.
+    pub outdated: bool,
     /// its mods folder has something in it.
     pub modded: bool,
     /// why it can't be played, when it can't, an encrypted dump say.
@@ -27,6 +32,13 @@ pub struct Game {
     pub dlc: Vec<Addon>,
     /// its Download Play child, decrypted, which it sends guests.
     pub dlp_child: Option<Addon>,
+}
+
+impl Game {
+    /// the game as a recompile wants it.
+    pub fn wanted(&self) -> Wanted {
+        Wanted { program_id: self.program_id, path: self.path.clone() }
+    }
 }
 
 /// an update or DLC in the folder, which goes with the game of its id.
@@ -45,6 +57,12 @@ pub struct Library {
     /// guest play along without the host sending one.
     pub children: Vec<Addon>,
     scanning: Option<Receiver<(Vec<Game>, Vec<Addon>)>>,
+    /// the games found to have outdated code, which comes in after a scan,
+    /// each library having to be opened to tell.
+    checking: Option<Receiver<Vec<u64>>>,
+    /// the games recompiled since that started, which it may have seen as
+    /// they were before.
+    rebuilt: Vec<u64>,
     /// set when the games changed and their icons need uploading.
     pub changed: bool,
     /// where the games' mods folders are.
@@ -72,25 +90,55 @@ impl Library {
         self.scanning.is_some()
     }
 
-    /// takes in what a scan found, once it is done.
+    /// takes in what a scan found, and which games' code is outdated, once
+    /// each is done.
     pub fn poll(&mut self) {
-        let Some(receive) = &self.scanning else { return };
-        match receive.try_recv() {
-            Ok((games, children)) => {
-                self.games = games;
-                self.children = children;
-                self.scanning = None;
-                self.changed = true;
+        if let Some(receive) = &self.scanning {
+            match receive.try_recv() {
+                Ok((games, children)) => {
+                    self.games = games;
+                    self.children = children;
+                    self.scanning = None;
+                    self.changed = true;
+                    self.check_outdated();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.scanning = None,
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.scanning = None,
+        }
+        if let Some(receive) = &self.checking {
+            match receive.try_recv() {
+                Ok(outdated) => {
+                    for game in &mut self.games {
+                        game.outdated = outdated.contains(&game.program_id) && !self.rebuilt.contains(&game.program_id);
+                    }
+                    self.checking = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.checking = None,
+            }
         }
     }
 
-    /// looks again at which games have recompiled code.
-    pub fn refresh_recompiled(&mut self) {
-        for game in &mut self.games {
-            game.recompiled = zakuro_core::recompiled::installed(game.program_id).is_some();
+    /// starts looking through the games' recompiled code, away from the
+    /// list, which opening every library would hold up.
+    fn check_outdated(&mut self) {
+        let recompiled: Vec<u64> = self.games.iter().filter(|game| game.recompiled).map(|game| game.program_id).collect();
+        self.rebuilt.clear();
+        let (send, receive) = channel();
+        std::thread::spawn(move || {
+            let outdated = |id: &u64| zakuro_core::recompiled::installed(*id).is_some_and(|path| zakuro_core::recompiled::outdated(&path));
+            let _ = send.send(recompiled.into_iter().filter(outdated).collect::<Vec<u64>>());
+        });
+        self.checking = Some(receive);
+    }
+
+    /// the game just got code from this build's 3dsrecomp.
+    pub fn recompiled(&mut self, program_id: u64) {
+        self.rebuilt.push(program_id);
+        for game in self.games.iter_mut().filter(|game| game.program_id == program_id) {
+            game.recompiled = zakuro_core::recompiled::installed(program_id).is_some();
+            game.outdated = false;
         }
     }
 }
@@ -212,6 +260,7 @@ fn unplayable(path: &Path, problem: String) -> Game {
         program_id: 0,
         icon: None,
         recompiled: false,
+        outdated: false,
         modded: false,
         problem: Some(problem),
         update: None,
@@ -244,6 +293,7 @@ fn read_game(path: &Path, data_dir: Option<&Path>) -> Game {
         program_id,
         icon: smdh.map(|s| s.icon),
         recompiled: zakuro_core::recompiled::installed(program_id).is_some(),
+        outdated: false,
         modded: data_dir.is_some_and(|data_dir| zakuro_core::mods::present(data_dir, program_id)),
         problem: None,
         update: None,
@@ -437,6 +487,21 @@ mod tests {
         assert!(zakuro_fs::Title::load(folder.join("child.cia")).is_ok());
         assert!(addons_beside(&folder.join("child.cia")).is_none());
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// a game recompiled while the check for outdated code ran isn't marked
+    /// outdated by what the check saw before that.
+    #[test]
+    fn a_check_from_before_a_recompile_leaves_the_game_alone() {
+        let game = |program_id| Game { program_id, recompiled: true, ..unplayable(Path::new("game.3ds"), String::new()) };
+        let (send, receive) = channel();
+        let mut library = Library { games: vec![game(1), game(2)], checking: Some(receive), ..Library::default() };
+        library.recompiled(1);
+        send.send(vec![1, 2]).unwrap();
+        library.poll();
+        assert!(library.checking.is_none());
+        assert!(!library.games[0].outdated, "recompiled since");
+        assert!(library.games[1].outdated);
     }
 
     /// a bare file name is in the folder Zakuro runs in.

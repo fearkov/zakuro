@@ -1,6 +1,9 @@
 //! recompiling a game with 3dsrecomp, on a thread of its own while the rest
-//! carries on, with the code and the modules its mods change.
+//! carries on, with the code and the modules its mods change. one game
+//! recompiles at a time, the others wait for their turn, as one already has
+//! the computer's cores and the memory it can spare.
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +18,15 @@ use recomp3ds::compile::Compiler;
 pub enum Toolchain {
     Ready(Compiler),
     Download(PathBuf),
+}
+
+/// a game to recompile: the file to read, the same game being in a folder
+/// twice sometimes, and its id, which goes for either, as there is one
+/// library for both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wanted {
+    pub program_id: u64,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,8 +116,12 @@ impl Job {
                     downloaded
                 }
             };
-            let result =
-                compiler.and_then(|compiler| recompile(&rom, update.as_deref(), program_id, &game, data_dir.as_deref(), compiler, &stop, &events));
+            // a bug on the way fails this game, and the ones waiting get
+            // their turn, rather than this one never ending
+            let result = compiler.and_then(|compiler| {
+                let build = AssertUnwindSafe(|| recompile(&rom, update.as_deref(), program_id, &game, data_dir.as_deref(), compiler, &stop, &events));
+                std::panic::catch_unwind(build).unwrap_or_else(|_| Err("Zakuro hit a bug recompiling it, please report it".to_owned()))
+            });
             if let Ok(mut state) = progress.lock() {
                 state.stage = match result {
                     Ok(_) => Stage::Done,
@@ -116,6 +132,13 @@ impl Job {
             }
         });
         Job { program_id, name: name.to_owned(), announced: false, started: Instant::now(), state, cancel }
+    }
+
+    /// a job at a stage, with no build behind it.
+    #[cfg(test)]
+    pub fn at_stage(program_id: u64, stage: Stage) -> Job {
+        let state = Arc::new(Mutex::new(State { stage, finished_at: None }));
+        Job { program_id, name: String::new(), announced: false, started: Instant::now(), state, cancel: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn stage(&self) -> Stage {
