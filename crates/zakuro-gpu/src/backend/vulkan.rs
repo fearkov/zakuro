@@ -134,9 +134,7 @@ impl VulkanPresenter {
         window: &(impl HasDisplayHandle + HasWindowHandle),
         size: (u32, u32),
     ) -> Result<VulkanPresenter, PresentError> {
-        // SAFETY: the loader reads the system's Vulkan library, which is the
-        // documented way to start.
-        let entry = unsafe { ash::Entry::load() }
+        let entry = crate::instance::entry()
             .map_err(|e| fail(format!("no Vulkan loader: {e}")))?;
 
         let display = window
@@ -157,10 +155,7 @@ impl VulkanPresenter {
             .map_err(vk_fail("querying surface extensions"))?
             .to_vec();
 
-        let instance_info = vk::InstanceCreateInfo::default()
-            .application_info(&application)
-            .enabled_extension_names(&extensions);
-        let instance = unsafe { entry.create_instance(&instance_info, None) }
+        let instance = crate::instance::new(&entry, &application, &extensions)
             .map_err(vk_fail("creating the instance"))?;
 
         let surface_instance = ash::khr::surface::Instance::new(&entry, &instance);
@@ -207,9 +202,11 @@ impl VulkanPresenter {
                 let queue_info = [vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(queue_family)
                     .queue_priorities(&priorities)];
+                let mut extensions = swapchain_extension.to_vec();
+                extensions.extend(crate::instance::portability_subset(&instance, physical_device).map(CStr::as_ptr));
                 let device_info = vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queue_info)
-                    .enabled_extension_names(&swapchain_extension);
+                    .enabled_extension_names(&extensions);
                 unsafe { instance.create_device(physical_device, &device_info, None) }
                     .map_err(vk_fail("creating the device"))?
             }
