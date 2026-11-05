@@ -473,6 +473,33 @@ impl PadButtons {
     }
 }
 
+/// what a game has of its own, over the general settings. each one left
+/// out follows them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameSettings {
+    pub hardware_rasterizer: Option<bool>,
+    pub resolution: Option<u32>,
+    pub texture_packs: Option<bool>,
+    pub frame_interpolation: Option<bool>,
+    pub scale: Option<u32>,
+    #[serde(deserialize_with = "or_default")]
+    pub layout: Option<Screens>,
+    #[serde(deserialize_with = "or_default")]
+    pub orientation: Option<Orientation>,
+    #[serde(deserialize_with = "or_default")]
+    pub filter: Option<Filter>,
+    pub integer_scale: Option<bool>,
+    #[serde(deserialize_with = "or_default")]
+    pub top_shape: Option<TopShape>,
+    #[serde(deserialize_with = "or_default")]
+    pub stereo: Option<Stereo3d>,
+    pub depth_3d: Option<u32>,
+    #[serde(deserialize_with = "or_default")]
+    pub language: Option<Language>,
+    pub recompiled: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -528,6 +555,8 @@ pub struct Settings {
     pub pad: PadButtons,
     /// the enhancements turned on, by name, for each game by its title id.
     pub enhancements: std::collections::BTreeMap<String, Vec<String>>,
+    /// what each game has of its own, by its title id.
+    pub per_game: std::collections::BTreeMap<String, GameSettings>,
     /// what the console's cameras see, and the picture when it is one.
     #[serde(deserialize_with = "or_default")]
     pub camera: CameraSource,
@@ -571,6 +600,7 @@ impl Default for Settings {
             keys: Keys::default(),
             pad: PadButtons::default(),
             enhancements: std::collections::BTreeMap::new(),
+            per_game: std::collections::BTreeMap::new(),
             camera: CameraSource::Webcam,
             camera_picture: None,
             nickname: String::new(),
@@ -594,7 +624,46 @@ where
     Ok(T::deserialize(value).unwrap_or_default())
 }
 
+impl GameSettings {
+    /// the settings with these over them.
+    fn over(&self, settings: &mut Settings) {
+        settings.hardware_rasterizer = self.hardware_rasterizer.unwrap_or(settings.hardware_rasterizer);
+        settings.resolution = self.resolution.unwrap_or(settings.resolution);
+        settings.texture_packs = self.texture_packs.unwrap_or(settings.texture_packs);
+        settings.frame_interpolation = self.frame_interpolation.unwrap_or(settings.frame_interpolation);
+        settings.scale = self.scale.unwrap_or(settings.scale);
+        settings.layout = self.layout.unwrap_or(settings.layout);
+        settings.orientation = self.orientation.unwrap_or(settings.orientation);
+        settings.filter = self.filter.unwrap_or(settings.filter);
+        settings.integer_scale = self.integer_scale.unwrap_or(settings.integer_scale);
+        settings.top_shape = self.top_shape.unwrap_or(settings.top_shape);
+        settings.stereo = self.stereo.unwrap_or(settings.stereo);
+        settings.depth_3d = self.depth_3d.unwrap_or(settings.depth_3d);
+        settings.language = self.language.unwrap_or(settings.language);
+        settings.recompiled = self.recompiled.unwrap_or(settings.recompiled);
+    }
+}
+
+/// what a game goes by in the settings file, its title id.
+pub fn game_key(program_id: u64) -> String {
+    format!("{program_id:016X}")
+}
+
 impl Settings {
+    /// the settings a game plays with, or the general ones without a game.
+    pub fn for_game(&self, program_id: Option<u64>) -> Settings {
+        let mut settings = self.clone();
+        if let Some(own) = program_id.and_then(|id| self.per_game.get(&game_key(id))) {
+            own.over(&mut settings);
+        }
+        settings
+    }
+
+    /// whether a game has anything of its own.
+    pub fn has_own(&self, program_id: u64) -> bool {
+        self.per_game.contains_key(&game_key(program_id))
+    }
+
     /// where the console's 3D slider is, down while the 3D is off, so games
     /// do not draw a picture nobody sees.
     pub fn slider_3d(&self) -> f32 {
@@ -686,6 +755,52 @@ mod tests {
         assert_eq!(settings.keys.b, Keys::default().b);
         assert_eq!(settings.scale, 2);
         assert_eq!(settings.layout, Screens::Stacked);
+    }
+
+    /// a game plays with what it has of its own, and with the general
+    /// settings in everything else, and no other game is touched.
+    #[test]
+    fn a_game_has_its_own_settings_over_the_general_ones() {
+        let mut settings = Settings { resolution: 2, layout: Screens::SideBySide, ..Settings::default() };
+        settings.per_game.insert(
+            game_key(0x0004_0000_0012_3400),
+            GameSettings { orientation: Some(Orientation::East), resolution: Some(5), recompiled: Some(false), ..GameSettings::default() },
+        );
+        let game = settings.for_game(Some(0x0004_0000_0012_3400));
+        assert_eq!(game.orientation, Orientation::East);
+        assert_eq!(game.resolution, 5);
+        assert!(!game.recompiled);
+        assert_eq!(game.layout, Screens::SideBySide);
+        for other in [Some(0x0004_0000_0012_3500), None] {
+            let general = settings.for_game(other);
+            assert_eq!(general, settings);
+        }
+        assert!(settings.has_own(0x0004_0000_0012_3400));
+        assert!(!settings.has_own(0x0004_0000_0012_3500));
+    }
+
+    #[test]
+    fn a_games_settings_come_back_as_they_were_saved() {
+        let mut settings = Settings::default();
+        settings.per_game.insert(
+            game_key(0x0004_0000_0012_3400),
+            GameSettings { orientation: Some(Orientation::West), language: Some(Language::Japanese), texture_packs: Some(false), ..GameSettings::default() },
+        );
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let own = text.split("[per_game.").nth(1).unwrap();
+        assert!(!own.contains("resolution"), "only what it has of its own is written for a game");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    /// a value of a newer Zakuro leaves the game following the general
+    /// setting, and takes nothing else with it.
+    #[test]
+    fn a_value_this_build_does_not_know_follows_the_general_setting() {
+        let text = "[per_game.0004000000123400]\nlayout = \"three_screens\"\nresolution = 4\n";
+        let settings: Settings = toml::from_str(text).unwrap();
+        let own = &settings.per_game[&game_key(0x0004_0000_0012_3400)];
+        assert_eq!(own.layout, None);
+        assert_eq!(own.resolution, Some(4));
     }
 
     #[test]

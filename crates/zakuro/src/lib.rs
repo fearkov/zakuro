@@ -102,6 +102,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         orientation: settings.orientation,
         top_shape: settings.top_shape,
         options,
+        active: settings.clone(),
         settings,
         linked,
         overlay,
@@ -368,7 +369,11 @@ impl Running {
 
 struct App {
     options: cli::Options,
+    /// the settings as the user left them, which get saved.
     settings: Settings,
+    /// the settings in force, what the running game has of its own over
+    /// the general ones, which is all there is without a game.
+    active: Settings,
     linked: Option<Linked>,
     /// what the program built on Zakuro shows over the game, and the line it
     /// keeps in the corner now.
@@ -522,9 +527,9 @@ impl ApplicationHandler for App {
                 log::info!("presenting with the {} backend", backend.name());
                 backend.set_layout(self.layout.screens());
                 backend.set_orientation(self.orientation.screen_orientation());
-                backend.set_top_width(self.settings.top_shape.width());
-                backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
-                backend.set_stereo(self.settings.stereo());
+                backend.set_top_width(self.active.top_shape.width());
+                backend.set_scaling(self.active.filter.screens(), self.active.integer_scale);
+                backend.set_stereo(self.active.stereo());
                 self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
@@ -547,8 +552,7 @@ impl ApplicationHandler for App {
             _ => (false, false),
         };
         let in_game = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_none())
-            && !self.menus.menu_open
-            && !self.menus.settings_open;
+            && !self.menus.over_game();
         // a Tab held down keeps repeating over a message too
         let withheld = tab && (in_game || (repeat && self.game.is_some()));
         let consumed = match (&mut self.gui, &self.window) {
@@ -597,31 +601,36 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// the id of the running game, none without one, or with the test
+    /// pattern.
+    fn program_id(&self) -> Option<u64> {
+        Some(self.game.as_ref()?.system.title.as_ref()?.program_id())
+    }
+
     /// the console's settings for a game, from the command line and the
-    /// settings.
-    fn config(&self) -> Config {
-        let interpret = self.options.interpreter || !self.settings.recompiled;
+    /// settings it plays with.
+    fn config(&self, settings: &Settings) -> Config {
+        let interpret = self.options.interpreter || !settings.recompiled;
         Config {
             new3ds: self.options.new3ds,
             data_dir: self.data_dir.clone(),
-            language: self.settings.language.code(),
+            language: settings.language.code(),
             recompiled: self.options.recompiled.clone().filter(|_| !interpret).map(Into::into),
             linked: self.linked.filter(|_| !interpret),
             find_recompiled: !interpret,
-            hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
-            texture_packs: self.settings.texture_packs,
-            interpolate: self.settings.frame_interpolation,
-            enhancements: self
-                .settings
+            hardware_renderer: self.options.hardware_rasterizer.unwrap_or(settings.hardware_rasterizer),
+            texture_packs: settings.texture_packs,
+            interpolate: settings.frame_interpolation,
+            enhancements: settings
                 .enhancements
                 .iter()
                 .filter_map(|(id, names)| Some((u64::from_str_radix(id, 16).ok()?, names.clone())))
                 .collect(),
-            resolution: self.settings.resolution,
+            resolution: settings.resolution,
             device: self.backend.as_ref().and_then(Backend::shared_device),
             username: self.nickname(),
-            console_id: self.settings.console_id,
-            slider_3d: self.settings.slider_3d(),
+            console_id: settings.console_id,
+            slider_3d: settings.slider_3d(),
             ..Config::default()
         }
     }
@@ -631,7 +640,7 @@ impl App {
         if self.options.test_pattern {
             // the test pattern has no CPU program to run, paused keeps just
             // presenting what is there
-            let system = paint_test_pattern(self.config());
+            let system = paint_test_pattern(self.config(&self.settings));
             self.game = Some(Running::new(system, PathBuf::new(), "test pattern".to_owned()));
             self.paused = true;
         } else if let Some(rom) = self.options.rom.clone() {
@@ -647,7 +656,8 @@ impl App {
         }
     }
 
-    /// starts the game at path, in place of any other.
+    /// starts the game at path, in place of any other, with what it has of
+    /// its own in the settings.
     fn play(&mut self, path: &Path) -> Result<(), String> {
         // the old game and what it holds on the GPU go first, its sound too,
         // and the overlay's line about it
@@ -658,7 +668,22 @@ impl App {
         }
         // a Download Play guest goes with the game
         self.dlp_guest = None;
-        let mut config = self.config();
+        // one from the command line isn't in the library, or not yet, and
+        // a Download Play child listed apart from its game is there with no id
+        let known = self.library.games.iter().find(|game| game.path == path && game.problem.is_none()).map(|game| game.program_id);
+        let program_id = known.or_else(|| Some(zakuro_fs::Title::load(path).ok()?.program_id()));
+        self.active = self.settings.for_game(program_id);
+        let started = self.start_game(path);
+        if started.is_err() {
+            self.active = self.settings.clone();
+        }
+        self.apply_layout();
+        started
+    }
+
+    /// loads the game at path, which the settings in force are for.
+    fn start_game(&mut self, path: &Path) -> Result<(), String> {
+        let mut config = self.config(&self.active);
         config.wireless_reboot = self.wireless_reboot.take();
         // the update, DLC and Download Play child found with the game in
         // the library
@@ -736,7 +761,10 @@ impl App {
         self.camera = None;
         self.apply_camera();
         self.link_room();
+        // nothing left open holds the game back
         self.menus.menu_open = false;
+        self.menus.settings_open = false;
+        self.menus.game_settings = None;
         self.keyboard.release();
         self.paused = false;
         self.next_frame = Instant::now();
@@ -754,6 +782,20 @@ impl App {
         }
         self.menus.menu_open = false;
         self.keyboard.release();
+        // what the game had of its own goes with it
+        self.active = self.settings.clone();
+        self.apply_layout();
+    }
+
+    /// arranges the screens another way, for the running game alone when it
+    /// has an arrangement of its own.
+    fn set_layout(&mut self, layout: Screens) {
+        let own = self.program_id().and_then(|id| self.settings.per_game.get_mut(&settings::game_key(id)));
+        match own.filter(|own| own.layout.is_some()) {
+            Some(own) => own.layout = Some(layout),
+            None => self.settings.layout = layout,
+        }
+        self.apply_settings();
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {
@@ -789,16 +831,8 @@ impl App {
                     self.paused = !self.paused;
                     log::info!("{}", if self.paused { "paused" } else { "resumed" });
                 }
-                KeyCode::F9 => {
-                    self.settings.layout = self.settings.layout.next();
-                    self.settings.save();
-                    self.apply_layout();
-                }
-                KeyCode::F10 if self.settings.layout.other_screen() != self.settings.layout => {
-                    self.settings.layout = self.settings.layout.other_screen();
-                    self.settings.save();
-                    self.apply_layout();
-                }
+                KeyCode::F9 => self.set_layout(self.active.layout.next()),
+                KeyCode::F10 if self.active.layout.other_screen() != self.active.layout => self.set_layout(self.active.layout.other_screen()),
                 KeyCode::F11 => self.toggle_fullscreen(),
                 KeyCode::F5 if self.game.is_some() => self.save_state(),
                 KeyCode::F8 if self.game.is_some() => self.load_state(),
@@ -806,8 +840,7 @@ impl App {
             }
         }
         let to_game = self.game.is_some()
-            && !self.menus.menu_open
-            && !self.menus.settings_open
+            && !self.menus.over_game()
             && !consumed
             && !self.gui.as_ref().is_some_and(Gui::wants_keyboard);
         // letting go always gets through, so that no button stays held
@@ -841,7 +874,7 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.orientation.screen_orientation(), self.top_shape.width(), self.settings.integer_scale);
+        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.orientation.screen_orientation(), self.top_shape.width(), self.active.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
@@ -907,13 +940,14 @@ impl App {
     /// saves the settings and puts to use what can change right away.
     fn apply_settings(&mut self) {
         self.settings.save();
+        self.active = self.settings.for_game(self.program_id());
         if let Some(game) = &mut self.game {
-            if game.system.gpu.interpolates() != self.settings.frame_interpolation {
-                let on = game.system.set_interpolation(self.settings.frame_interpolation);
+            if game.system.gpu.interpolates() != self.active.frame_interpolation {
+                let on = game.system.set_interpolation(self.active.frame_interpolation);
                 log::info!("frame interpolation {}", if on { "on" } else { "off" });
             }
             // games read the 3D slider every frame
-            let slider = self.settings.slider_3d();
+            let slider = self.active.slider_3d();
             if game.system.config.slider_3d != slider {
                 game.system.set_slider_3d(slider);
             }
@@ -954,16 +988,16 @@ impl App {
     /// the window to them.
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
-            backend.set_top_width(self.settings.top_shape.width());
-            backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
-            backend.set_stereo(self.settings.stereo());
+            backend.set_top_width(self.active.top_shape.width());
+            backend.set_scaling(self.active.filter.screens(), self.active.integer_scale);
+            backend.set_stereo(self.active.stereo());
         }
-        let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
-        if scale != self.scale || self.settings.layout != self.layout || self.settings.orientation != self.orientation || self.settings.top_shape != self.top_shape {
+        let scale = if self.options.scale.is_none() { self.active.scale.max(1) } else { self.scale };
+        if scale != self.scale || self.active.layout != self.layout || self.active.orientation != self.orientation || self.active.top_shape != self.top_shape {
             self.scale = scale;
-            self.layout = self.settings.layout;
-            self.orientation = self.settings.orientation;
-            self.top_shape = self.settings.top_shape;
+            self.layout = self.active.layout;
+            self.orientation = self.active.orientation;
+            self.top_shape = self.active.top_shape;
             if let Some(backend) = &mut self.backend {
                 backend.set_layout(self.layout.screens());
                 backend.set_orientation(self.orientation.screen_orientation());
@@ -989,7 +1023,7 @@ impl App {
         };
         // scaled by whole numbers, a desktop scaled by 125% say would leave a
         // border, so the window gets whole multiples of the screens' pixels
-        if let (true, Some(window)) = (self.settings.integer_scale, &self.window) {
+        if let (true, Some(window)) = (self.active.integer_scale, &self.window) {
             let times = (self.scale as f64 * window.scale_factor()).round().max(1.0) as u32;
             return winit::dpi::PhysicalSize::new(width * times, height * times).into();
         }
@@ -1238,8 +1272,7 @@ impl App {
 
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
-        let playing =
-            self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open && !typing;
+        let playing = self.game.is_some() && !self.paused && !self.menus.over_game() && !typing;
         // Tab or a controller's right trigger, or the right stick's click
         // while ZR has the trigger, whichever no button of the console's is on
         let free = |button: gilrs::Button| self.settings.pad.map().iter().all(|&(_, bound)| bound != button);
@@ -1572,6 +1605,7 @@ impl App {
             .flatten()
             .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
             .map(ago);
+        let program_id = self.program_id();
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
@@ -1595,14 +1629,16 @@ impl App {
         let overlay = gui.frame(window, |ui| {
             match &game {
                 Some((name, fps, recompiled)) => {
-                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()));
+                    actions.extend(menus.game(ui, name, program_id, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()));
                     if let Some(text) = &corner {
                         menus::corner(ui.ctx(), text);
                     }
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
-            actions.extend(menus.settings(ui.ctx(), settings));
+            let own = program_id.is_some_and(|id| settings.has_own(id));
+            actions.extend(menus.settings(ui.ctx(), settings, own));
+            actions.extend(menus.game_settings(ui.ctx(), settings));
             if menus.multiplayer_open {
                 actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));
             }
@@ -1626,7 +1662,7 @@ impl App {
         let overlay = self.interface(event_loop);
         let blank = |screen: Screen| ((std::sync::Arc::new(Vec::new()), screen.width(), screen.height()), None);
         // the right eye's picture only while the 3D shows
-        let stereo = self.settings.stereo != settings::Stereo3d::Off;
+        let stereo = self.active.stereo != settings::Stereo3d::Off;
         let (top, bottom, right) = match &mut self.game {
             Some(game) => (
                 shown(&mut game.system, Screen::Top),
