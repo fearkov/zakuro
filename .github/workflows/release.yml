@@ -33,8 +33,11 @@ jobs:
             archive: zakuro-linux-x86_64.tar.gz
           - os: macos-latest
             archive: zakuro-macos-arm64.zip
+          # MoltenVK aborts inside Metal on this runner's virtual GPU, which
+          # has no driver of its own for what it asks
           - os: macos-15-intel
             archive: zakuro-macos-x86_64.zip
+            try: --rasterizer software
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     steps:
@@ -70,7 +73,7 @@ jobs:
         run: |
           packaging/macos-app.sh target/release/zakuro "${VERSION#v}" ${{ matrix.archive }}
           ditto -x -k ${{ matrix.archive }} unpacked
-          RUST_LOG=info unpacked/Zakuro.app/Contents/MacOS/zakuro --test-pattern --headless 1 --mute
+          RUST_LOG=info unpacked/Zakuro.app/Contents/MacOS/zakuro --test-pattern --headless 1 --mute ${{ matrix.try }}
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
