@@ -42,26 +42,35 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           apt-get update
-          apt-get install -y build-essential ca-certificates clang curl git libasound2-dev libudev-dev pkg-config zsync
+          apt-get install -y build-essential ca-certificates clang curl file git libasound2-dev libudev-dev pkg-config zsync
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
       - run: cargo build --release --locked -p zakuro
+      # each one is started as packed, which tells in the log whether the GPU
+      # starts, and stops the release when the program doesn't
       - name: Pack for Windows
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/release/zakuro.exe, README.md, LICENSE -DestinationPath ${{ matrix.archive }}
+        run: |
+          Compress-Archive -Path target/release/zakuro.exe, README.md, LICENSE -DestinationPath ${{ matrix.archive }}
+          $env:RUST_LOG = 'info'
+          target/release/zakuro.exe --test-pattern --headless 1 --mute
       - name: Pack for Linux
         if: runner.os == 'Linux'
         run: |
           tar czf ${{ matrix.archive }} README.md LICENSE -C target/release zakuro
           packaging/appimage.sh target/release/zakuro Zakuro-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 RUST_LOG=info ./Zakuro-x86_64.AppImage --test-pattern --headless 1 --mute
       - name: Pack for macOS
         if: runner.os == 'macOS'
         env:
           VERSION: ${{ inputs.tag || github.ref_name }}
-        run: packaging/macos-app.sh target/release/zakuro "${VERSION#v}" ${{ matrix.archive }}
+        run: |
+          packaging/macos-app.sh target/release/zakuro "${VERSION#v}" ${{ matrix.archive }}
+          ditto -x -k ${{ matrix.archive }} unpacked
+          RUST_LOG=info unpacked/Zakuro.app/Contents/MacOS/zakuro --test-pattern --headless 1 --mute
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}

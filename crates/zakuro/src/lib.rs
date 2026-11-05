@@ -248,11 +248,18 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// builds a System with no title loaded and both screens filled with a
 /// solid color, to check the presentation path (framebuffer config -> guest
-/// memory -> window) in isolation from any title's boot logic.
+/// memory -> window) in isolation from any title's boot logic, and that the
+/// GPU starts, which a packed release is tried with.
 fn paint_test_pattern(config: Config) -> System {
     use zakuro_core::memory::{MemoryRegion, MemoryState, Permission};
 
     let mut system = System::new(config);
+    if system.config.hardware_renderer {
+        match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone(), None) {
+            Ok(name) => log::info!("the 3D draws on {name}"),
+            Err(error) => log::warn!("the 3D can't draw on the GPU, {error}"),
+        }
+    }
 
     // ABGR in memory for format 0 (Rgba8), red = 00 00 00 FF?
     let paint = |system: &mut System, screen: Screen, rgba: [u8; 4]| {
