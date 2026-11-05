@@ -16,10 +16,26 @@ const MACOS_LIBRARIES: [&str; 4] = [
     "/usr/local/lib/libMoltenVK.dylib",
 ];
 
-/// the system's Vulkan library, by the loader's name, or on macOS from where
-/// Homebrew and the Vulkan SDK put it. the error is the one for the loader's
-/// name, which says where it looked.
+/// the MoltenVK Zakuro.app comes with, in its Frameworks folder, which asks
+/// nothing of the computer.
+#[cfg(target_os = "macos")]
+fn bundled() -> Option<std::path::PathBuf> {
+    let program = std::env::current_exe().ok()?;
+    Some(program.parent()?.parent()?.join("Frameworks/libMoltenVK.dylib"))
+}
+
+/// the system's Vulkan library, by the loader's name, or on macOS the one
+/// Zakuro.app comes with first, and after it from where Homebrew and the
+/// Vulkan SDK put it. the error is the one for the loader's name, which says
+/// where it looked.
 pub(crate) fn entry() -> Result<ash::Entry, ash::LoadingError> {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = bundled().filter(|path| path.is_file()) {
+        // SAFETY: a Vulkan library at a path of its own
+        if let Ok(entry) = unsafe { ash::Entry::load_from(path) } {
+            return Ok(entry);
+        }
+    }
     // SAFETY: loads the system's Vulkan library, which is the documented way
     // to start
     let error = match unsafe { ash::Entry::load() } {

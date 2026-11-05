@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Zakuro
+Comment=A Nintendo 3DS emulator
+Exec=zakuro %f
+Icon=zakuro
+Terminal=false
+Categories=Game;Emulator;

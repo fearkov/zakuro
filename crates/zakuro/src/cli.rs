@@ -131,6 +131,8 @@ pub fn parse() -> Result<Options, String> {
             "--mute" => options.mute = true,
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
+            // macOS hands an app it hasn't run before a process number
+            other if cfg!(target_os = "macos") && other.starts_with("-psn_") => {}
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}'"));
             }

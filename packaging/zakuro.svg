@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="skin" cx="38%" cy="32%" r="78%">
+      <stop offset="0" stop-color="#f0504a"/>
+      <stop offset="0.55" stop-color="#c81e33"/>
+      <stop offset="1" stop-color="#7c0f24"/>
+    </radialGradient>
+    <radialGradient id="seed" cx="38%" cy="30%" r="80%">
+      <stop offset="0" stop-color="#ff8e96"/>
+      <stop offset="0.5" stop-color="#e22a4a"/>
+      <stop offset="1" stop-color="#9c1030"/>
+    </radialGradient>
+  </defs>
+  <path fill="#a81a30" d="M210 118 186 42l52 30 18-48 18 48 52-30-24 76z"/>
+  <circle cx="256" cy="284" r="200" fill="url(#skin)"/>
+  <path fill="#fbe7d0" d="M256 150c52 0 96 40 112 88 16 50 2 102-38 134-22 18-48 28-74 28s-52-10-74-28c-40-32-54-84-38-134 16-48 60-88 112-88z"/>
+  <path fill="#f4cfa8" d="M252 156h8v240h-8zM150 284l212-6 1 8-212 6z"/>
+  <g fill="url(#seed)">
+    <path id="s" d="M204 196c14-8 34 2 34 22 0 18-16 36-26 36-12 0-24-16-24-32 0-12 6-22 16-26z"/>
+    <use href="#s" transform="translate(102 0) rotate(8 214 224)"/>
+    <use href="#s" transform="translate(-34 74) rotate(-8 214 224)"/>
+    <use href="#s" transform="translate(46 70) rotate(4 214 224)"/>
+    <use href="#s" transform="translate(126 76) rotate(10 214 224)"/>
+    <use href="#s" transform="translate(4 142) rotate(-4 214 224)"/>
+    <use href="#s" transform="translate(88 142) rotate(6 214 224)"/>
+  </g>
+</svg>

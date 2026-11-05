@@ -1,5 +1,5 @@
-# on a version tag, builds Zakuro for Windows and Linux and publishes both
-# as a GitHub release
+# on a version tag, builds Zakuro for Windows, Linux and macOS and publishes
+# them as a GitHub release
 name: Release
 
 on:
@@ -8,8 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: an existing tag to release
+        description: an existing tag to release, or with publish off any branch to only build
         required: true
+      publish:
+        description: publish a release, rather than only building
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -17,34 +21,57 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             archive: zakuro-windows-x86_64.zip
+          # built on an old system, as a program runs on systems as new as
+          # the one it was built on or newer
           - os: ubuntu-latest
+            container: ubuntu:22.04
             archive: zakuro-linux-x86_64.tar.gz
+          - os: macos-latest
+            archive: zakuro-macos-arm64.zip
+          - os: macos-15-intel
+            archive: zakuro-macos-x86_64.zip
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     steps:
+      - name: Tools and sound library headers
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y build-essential ca-certificates clang curl git libasound2-dev libudev-dev pkg-config zsync
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - name: Sound library headers
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - run: cargo build --release --locked -p zakuro
       - name: Pack for Windows
         if: runner.os == 'Windows'
         run: Compress-Archive -Path target/release/zakuro.exe, README.md, LICENSE -DestinationPath ${{ matrix.archive }}
       - name: Pack for Linux
         if: runner.os == 'Linux'
-        run: tar czf ${{ matrix.archive }} README.md LICENSE -C target/release zakuro
+        run: |
+          tar czf ${{ matrix.archive }} README.md LICENSE -C target/release zakuro
+          packaging/appimage.sh target/release/zakuro Zakuro-x86_64.AppImage
+      - name: Pack for macOS
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: packaging/macos-app.sh target/release/zakuro "${VERSION#v}" ${{ matrix.archive }}
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            Zakuro-x86_64.AppImage*
 
   release:
     needs: build
+    if: ${{ github.event_name == 'push' || inputs.publish }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -57,8 +84,8 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           cat > notes.md <<'NOTES'
-          On Windows, unzip zakuro-windows-x86_64.zip and run zakuro.exe. On Linux, extract zakuro-linux-x86_64.tar.gz and run ./zakuro, which needs the ALSA library (libasound2 on Debian and Ubuntu, alsa-lib on Arch).
+          On Windows, unzip zakuro-windows-x86_64.zip and run zakuro.exe. On Linux, make Zakuro-x86_64.AppImage executable and run it, or extract zakuro-linux-x86_64.tar.gz and run ./zakuro, either of which needs the ALSA library (libasound2 on Debian and Ubuntu, alsa-lib on Arch). On macOS, unzip zakuro-macos-arm64.zip on Apple silicon or zakuro-macos-x86_64.zip on Intel and open Zakuro.app. It isn't notarized, so macOS refuses it the first time: allow it in System Settings, Privacy & Security, Open Anyway.
 
           Games need to be decrypted ROMs. Recompiling a game, which makes it run much faster, needs a C compiler. Zakuro uses gcc or clang when the computer has one, and otherwise offers to download Zig, which needs no installing, into its own folder.
           NOTES
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Zakuro $TAG" --notes-file notes.md --generate-notes
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Zakuro $TAG" --notes-file notes.md --generate-notes
