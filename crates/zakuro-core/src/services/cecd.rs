@@ -52,8 +52,10 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // OpenAndRead, the title's streetpass inbox for this run: this
         // console never meets another, so the box reads empty. the
         // success-with-no-message is the offline box's own answer, a game
-        // like A Link Between Worlds asks at every boot.
-        0x0012 => reply(system, &[]),
+        // like A Link Between Worlds asks at every boot. the word after the
+        // result is how many bytes were read, the request's title id if it
+        // is left as it came.
+        0x0012 => reply(system, &[0]),
         _ => return false,
     }
     true
@@ -95,8 +97,9 @@ mod tests {
 
         handle_request(&mut system, Target::service("cecd:u".into(), 0));
 
-        assert_eq!(buffer.header(&mut system.memory), Header::new(0x0012, 1, 0));
+        assert_eq!(buffer.header(&mut system.memory), Header::new(0x0012, 2, 0));
         assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        assert_eq!(buffer.get(&mut system.memory, 2), 0);
         assert!(system.services.unimplemented.is_empty());
     }
 }
