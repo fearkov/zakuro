@@ -3088,7 +3088,7 @@ dependencies = [
 [[package]]
 name = "recomp-abi"
 version = "0.1.0"
-source = "git+https://github.com/fearkov/3dsrecomp#73b8f9caf3700991c290dd84bccffb92294d6b15"
+source = "git+https://github.com/fearkov/3dsrecomp#df82e6e3c1231606c38e0f2786dd07f6067979ab"
 dependencies = [
  "libloading",
 ]
@@ -3096,7 +3096,7 @@ dependencies = [
 [[package]]
 name = "recomp3ds"
 version = "0.1.0"
-source = "git+https://github.com/fearkov/3dsrecomp#73b8f9caf3700991c290dd84bccffb92294d6b15"
+source = "git+https://github.com/fearkov/3dsrecomp#df82e6e3c1231606c38e0f2786dd07f6067979ab"
 dependencies = [
  "libc",
  "recomp-abi",
@@ -4633,7 +4633,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "zakuro"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "ab_glyph",
  "cpal",
@@ -4661,7 +4661,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-common"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-core"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "ab_glyph",
  "bitflags 2.13.2",
@@ -4694,7 +4694,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-cpu"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "log",
  "serde",
@@ -4703,7 +4703,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-fs"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "crc32fast",
  "log",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-gpu"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "ash",
  "ash-window",
