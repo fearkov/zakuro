@@ -20,7 +20,7 @@ I first wrote it in C++, but I was learning Rust at the time and noticed there w
 
 This is a personal experimental project. You can use it to play games, but that was never the main goal. Some games boot. Instead of translating code while the game runs, like a JIT does, Zakuro runs code recompiled ahead of time by [3dsrecomp](https://github.com/fearkov/3dsrecomp), and tested games run at full speed that way. On the interpreter alone they run below full speed.
 
-Builds for Windows and Linux are on the [releases page](https://github.com/fearkov/zakuro/releases): on Windows, unzip it and run zakuro.exe, and on Linux, extract it and run ./zakuro.
+Builds for Windows, Linux and macOS are on the [releases page](https://github.com/fearkov/zakuro/releases). On Windows, unzip it and run zakuro.exe. On Linux, make the AppImage executable and run it, or extract the tar.gz and run ./zakuro. On macOS, unzip the one for your Mac (arm64 for Apple silicon, x86_64 for Intel) and open Zakuro.app. It isn't notarized, so macOS refuses it the first time: allow it in System Settings, Privacy & Security, Open Anyway. The macOS builds are new and haven't been tried on a real Mac yet, so they may have problems.
 
 To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA and udev development files (libasound2-dev and libudev-dev on Debian and Ubuntu, alsa-lib and systemd-libs on Arch). On macOS, the Xcode command line tools are needed (`xcode-select --install`), and for Vulkan, MoltenVK and the Vulkan loader (`brew install molten-vk vulkan-loader`); without them it presents with OpenGL and draws on the CPU. On Windows, nothing else is needed:
 
@@ -30,9 +30,9 @@ Cargo puts it in ~/.cargo/bin, which has to be on your PATH. Then `zakuro` in a 
 
     zakuro path/to/rom.3ds
 
-Without a ROM it opens a library with the games in a folder you pick, where you can also recompile them. Esc brings up a menu over the game, and the settings (controls, sound, graphics, a background for the library) are in there too.
+Without a ROM it opens a library with the games in a folder you pick, where you can also recompile them. Esc brings up a menu over the game, and the settings (controls, sound, graphics, a background for the library) are in there too. A game can also have settings of its own, like its resolution, screen layout or language: use the Settings button next to it in the library, or Settings for this game in the menu. Anything you don't set there follows the general settings.
 
-Games run faster with their code recompiled ahead of time by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which comes with Zakuro: press Recompile next to a game in the library, once per game. It takes around ten minutes and needs a C compiler. If your computer has gcc or clang, Zakuro uses it, and if it has neither, Zakuro offers to download Zig, which comes with one and needs no installing, into its own folder. From then on Zakuro runs the recompiled code on its own, and anything it doesn't cover still goes through the interpreter.
+Games run faster with their code recompiled ahead of time by [3dsrecomp](https://github.com/fearkov/3dsrecomp), which comes with Zakuro: press Recompile next to a game in the library, once per game. It takes around ten minutes and needs a C compiler. If your computer has gcc or clang, Zakuro uses it, and if it has neither, Zakuro offers to download Zig, which comes with one and needs no installing, into its own folder. From then on Zakuro runs the recompiled code on its own, and anything it doesn't cover still goes through the interpreter. When a new version of Zakuro improves the recompiled code, the library shows a Recompile outdated button, which recompiles those games one after the other while you keep playing.
 
 3dsrecomp also works on its own, from the terminal:
 
