@@ -12,6 +12,7 @@ mod library;
 mod menus;
 mod microphone;
 mod present;
+mod pro_controller;
 mod recompile;
 mod report;
 mod settings;

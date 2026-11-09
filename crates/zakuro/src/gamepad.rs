@@ -1,8 +1,11 @@
-//! game controllers, any the system knows, read through gilrs.
+//! game controllers, any the system knows, read through gilrs, and the
+//! Switch's Pro Controller on macOS read from its reports, see
+//! pro_controller.
 
-use gilrs::{Axis, Button, EventType, Gilrs};
+use gilrs::{Axis, Button, EventType, Gamepad, Gilrs};
 use zakuro_core::services::hid::{InputState, PadState};
 
+use crate::pro_controller::{is_pro_controller, Controllers, Report};
 use crate::settings::PadButtons;
 
 /// how far a stick has to lean before it counts, some rest a little off
@@ -13,6 +16,17 @@ pub struct Gamepads {
     /// none when the system could not be asked for controllers.
     gilrs: Option<Gilrs>,
     buttons: PadButtons,
+    /// Pro Controllers read from their own reports, on macOS.
+    pro: Controllers,
+    /// the buttons they held at the last poll, to tell the ones pressed
+    /// since.
+    pro_held: Vec<Button>,
+}
+
+/// whether gilrs's reading of a controller is left out, a Pro Controller's
+/// while one is read from its reports.
+fn left_out(pad: &Gamepad, reports: &[Report]) -> bool {
+    !reports.is_empty() && is_pro_controller(pad.vendor_id(), pad.product_id(), pad.name())
 }
 
 impl Gamepads {
@@ -20,7 +34,7 @@ impl Gamepads {
         let gilrs = Gilrs::new()
             .inspect_err(|error| log::warn!("controllers are not available, {error}"))
             .ok();
-        Gamepads { gilrs, buttons }
+        Gamepads { gilrs, buttons, pro: Controllers::new(), pro_held: Vec::new() }
     }
 
     pub fn set_buttons(&mut self, buttons: PadButtons) {
@@ -31,29 +45,50 @@ impl Gamepads {
     /// buttons pressed meanwhile.
     pub fn poll(&mut self) -> Vec<Button> {
         let mut pressed = Vec::new();
-        let Some(gilrs) = &mut self.gilrs else { return pressed };
-        while let Some(event) = gilrs.next_event() {
-            match event.event {
-                EventType::ButtonPressed(button, _) => pressed.push(button),
-                EventType::Connected => {
-                    log::info!("controller connected, {}", gilrs.gamepad(event.id).name());
+        let reports = self.pro.reports();
+        if let Some(gilrs) = &mut self.gilrs {
+            while let Some(event) = gilrs.next_event() {
+                match event.event {
+                    EventType::ButtonPressed(button, _) if !left_out(&gilrs.gamepad(event.id), &reports) => pressed.push(button),
+                    EventType::Connected => {
+                        log::info!("controller connected, {}", gilrs.gamepad(event.id).name());
+                    }
+                    EventType::Disconnected => log::info!("controller disconnected"),
+                    _ => {}
                 }
-                EventType::Disconnected => log::info!("controller disconnected"),
-                _ => {}
             }
         }
+        let held: Vec<Button> = reports.iter().flat_map(|report| report.buttons.iter().copied()).collect();
+        pressed.extend(held.iter().filter(|button| !self.pro_held.contains(button)));
+        self.pro_held = held;
         pressed
     }
 
     /// whether a controller holds button down.
     pub fn holding(&self, button: Button) -> bool {
-        self.gilrs.as_ref().is_some_and(|gilrs| gilrs.gamepads().any(|(_, pad)| pad.is_pressed(button)))
+        let reports = self.pro.reports();
+        reports.iter().any(|report| report.buttons.contains(&button))
+            || self.gilrs.as_ref().is_some_and(|gilrs| {
+                gilrs.gamepads().any(|(_, pad)| !left_out(&pad, &reports) && pad.is_pressed(button))
+            })
     }
 
     /// what the controllers hold down, over what the keyboard does.
     pub fn apply(&self, mut state: InputState) -> InputState {
+        let reports = self.pro.reports();
+        for report in &reports {
+            for (button, bound) in self.buttons.map() {
+                if report.buttons.contains(&bound) {
+                    state.buttons.set(button, true);
+                }
+            }
+            sticks(&mut state, report.left, report.right);
+        }
         let Some(gilrs) = &self.gilrs else { return state };
         for (_, pad) in gilrs.gamepads() {
+            if left_out(&pad, &reports) {
+                continue;
+            }
             for (button, bound) in self.buttons.map() {
                 if pad.is_pressed(bound) {
                     state.buttons.set(button, true);
@@ -71,20 +106,24 @@ impl Gamepads {
                     state.buttons.set(button, true);
                 }
             }
-            // the left stick is the circle pad and the right one the
-            // C-stick, up positive as the console has it
-            let (x, y) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
-            if x.hypot(y) > DEADZONE {
-                state.circle_x = x.clamp(-1.0, 1.0);
-                state.circle_y = y.clamp(-1.0, 1.0);
-            }
-            let (x, y) = (pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
-            if x.hypot(y) > DEADZONE {
-                state.c_stick_x = x.clamp(-1.0, 1.0);
-                state.c_stick_y = y.clamp(-1.0, 1.0);
-            }
+            let left = [pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY)];
+            let right = [pad.value(Axis::RightStickX), pad.value(Axis::RightStickY)];
+            sticks(&mut state, left, right);
         }
         state
+    }
+}
+
+/// the left stick is the circle pad and the right one the C-stick, up
+/// positive as the console has it, each once it leans past the deadzone.
+fn sticks(state: &mut InputState, [x, y]: [f32; 2], [cx, cy]: [f32; 2]) {
+    if x.hypot(y) > DEADZONE {
+        state.circle_x = x.clamp(-1.0, 1.0);
+        state.circle_y = y.clamp(-1.0, 1.0);
+    }
+    if cx.hypot(cy) > DEADZONE {
+        state.c_stick_x = cx.clamp(-1.0, 1.0);
+        state.c_stick_y = cy.clamp(-1.0, 1.0);
     }
 }
 

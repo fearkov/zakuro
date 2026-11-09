@@ -47,4 +47,7 @@ nokhwa = { version = "0.10.11", default-features = false, features = ["input-v4l
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-msmf"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# the Switch's Pro Controller read from its own reports, opened shared with
+# the system, which puts it in a mode gilrs reads wrong
+hidapi = { version = "2.6.7", default-features = false, features = ["macos-shared-device"] }
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-avfoundation"] }
