@@ -26,5 +26,7 @@
   <true/>
   <key>NSCameraUsageDescription</key>
   <string>Games that take pictures see through the computer's camera.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Games that listen hear through the computer's microphone.</string>
 </dict>
 </plist>

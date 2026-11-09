@@ -296,6 +296,29 @@ impl CameraSource {
     }
 }
 
+/// what the console's microphone hears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MicrophoneSource {
+    /// the computer's microphone, open only while a game listens.
+    Computer,
+    /// nothing, but for the blowing key. the default, as some games listen
+    /// all the time, Super Mario 3D Land from its start, and the computer's
+    /// microphone would stay open with them.
+    #[default]
+    Nothing,
+}
+
+impl MicrophoneSource {
+    pub const ALL: [MicrophoneSource; 2] = [MicrophoneSource::Computer, MicrophoneSource::Nothing];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MicrophoneSource::Computer => "The computer's microphone",
+            MicrophoneSource::Nothing => "Nothing",
+        }
+    }
+}
+
 /// the keys the console's buttons, circle pad and C-stick are on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -561,6 +584,9 @@ pub struct Settings {
     #[serde(deserialize_with = "or_default")]
     pub camera: CameraSource,
     pub camera_picture: Option<PathBuf>,
+    /// what the console's microphone hears.
+    #[serde(deserialize_with = "or_default")]
+    pub microphone: MicrophoneSource,
     /// the name the player goes by in rooms, the console's own too.
     pub nickname: String,
     /// the number that tells this console apart over local wireless, made
@@ -603,6 +629,7 @@ impl Default for Settings {
             per_game: std::collections::BTreeMap::new(),
             camera: CameraSource::Webcam,
             camera_picture: None,
+            microphone: MicrophoneSource::Nothing,
             nickname: String::new(),
             console_id: 0,
             room_address: String::new(),

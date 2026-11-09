@@ -11,7 +11,9 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Game, Library, ICON_SIZE};
 use crate::recompile::{Job, Stage, Wanted};
 use crate::gamepad::button_name;
-use crate::settings::{game_key, CameraSource, Filter, GameSettings, Keys, Language, Orientation, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
+use crate::settings::{
+    game_key, CameraSource, Filter, GameSettings, Keys, Language, MicrophoneSource, Orientation, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape,
+};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -777,6 +779,13 @@ impl Menus {
                         }
                     });
                 }
+                egui::ComboBox::from_label("Microphone").selected_text(settings.microphone.name()).show_ui(ui, |ui| {
+                    for source in MicrophoneSource::ALL {
+                        ui.selectable_value(&mut settings.microphone, source, source.name());
+                    }
+                })
+                .response
+                .on_hover_text("What the console's microphone hears. The computer's microphone is open only while a game listens, which some do all the time, Super Mario 3D Land among them. Holding M blows into it either way, for games that ask you to.");
                 code(ui, &mut settings.recompiled);
                 ui.label(RichText::new("It changes with the next game started, or Reset.").weak());
 

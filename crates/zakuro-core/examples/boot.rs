@@ -126,6 +126,31 @@ fn main() {
         }
     }
 
+    // ZAKURO_MIC=noise is what the microphone hears, blowing into it say,
+    // or ZAKURO_MIC=sound.wav, a WAV of 16-bit samples over and over, and
+    // ZAKURO_MIC_FRAMES=900-1200 hears it only between those frames
+    let mic_frame = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if let Some(source) = std::env::var_os("ZAKURO_MIC") {
+        let heard: Option<Box<dyn zakuro_core::microphone::Microphone>> = if source == "noise" {
+            Some(Box::new(zakuro_core::microphone::Noise::new(0.8)))
+        } else {
+            std::fs::read(&source)
+                .ok()
+                .and_then(|bytes| zakuro_core::microphone::Recording::from_wav(&bytes))
+                .map(|recording| Box::new(recording) as Box<dyn zakuro_core::microphone::Microphone>)
+        };
+        match heard {
+            Some(heard) => {
+                let frames = std::env::var("ZAKURO_MIC_FRAMES").ok().and_then(|spec| {
+                    let (from, to) = spec.split_once('-')?;
+                    Some(from.parse().ok()?..to.parse().ok()?)
+                });
+                system.microphone = Some(Box::new(Between { heard, frames, frame: mic_frame.clone() }));
+            }
+            None => eprintln!("could not read {} as a WAV of 16-bit samples", source.to_string_lossy()),
+        }
+    }
+
     println!("--- booting for {frames} frames ---");
     let start = std::time::Instant::now();
     // how long each frame took, which shows the stutter an average hides
@@ -310,6 +335,7 @@ fn main() {
                 ..InputState::default()
             });
         }
+        mic_frame.store(frame, std::sync::atomic::Ordering::Relaxed);
         let frame_start = std::time::Instant::now();
         let faults = system.memory.fault_summary().len();
         outcome = system.run_frame();
@@ -722,4 +748,29 @@ fn write_wav(path: &str, samples: &[[i16; 2]]) -> std::io::Result<()> {
         bytes.extend_from_slice(&right.to_le_bytes());
     }
     std::fs::write(path, bytes)
+}
+
+/// a microphone that hears its sound only between some frames and silence
+/// otherwise, and says when the title starts and stops sampling.
+struct Between {
+    heard: Box<dyn zakuro_core::microphone::Microphone>,
+    frames: Option<std::ops::Range<u64>>,
+    frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl zakuro_core::microphone::Microphone for Between {
+    fn sampling(&mut self, on: bool) {
+        let frame = self.frame.load(std::sync::atomic::Ordering::Relaxed);
+        println!("frame {frame}: the title {} sampling", if on { "starts" } else { "stops" });
+        self.heard.sampling(on);
+    }
+
+    fn read(&mut self, rate: f64, out: &mut [f32]) {
+        let frame = self.frame.load(std::sync::atomic::Ordering::Relaxed);
+        if self.frames.as_ref().is_none_or(|frames| frames.contains(&frame)) {
+            self.heard.read(rate, out);
+        } else {
+            out.fill(0.0);
+        }
+    }
 }

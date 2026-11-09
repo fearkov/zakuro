@@ -20,6 +20,7 @@ pub mod ir;
 pub mod ir_rst;
 pub mod keyboard;
 pub mod ldr_ro;
+pub mod mic;
 pub mod mii_selector;
 pub mod misc;
 pub mod nfc;
@@ -77,6 +78,7 @@ pub struct ServiceState {
     pub cecd: cecd::CecdState,
     pub boss: boss::BossState,
     pub cam: cam::CamState,
+    pub mic: mic::MicState,
     pub uds: uds::UdsState,
     pub dlp: dlp::DlpState,
     /// commands we logged as unimplemented, so the log stays readable and the
@@ -118,6 +120,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "cecd:u" | "cecd:s" => cecd::handle(system, &buffer, header),
         "boss:U" | "boss:P" => boss::handle(system, &buffer, header),
         "cam:u" | "cam:s" => cam::handle(system, &buffer, header),
+        "mic:u" => mic::handle(system, &buffer, header),
         "nwm::UDS" => uds::handle(system, &buffer, header),
         "dlp:SRVR" => dlp::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),

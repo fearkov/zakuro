@@ -195,6 +195,8 @@ impl System {
         self.services.fs.files = files;
         // the computer's camera on while the state has a camera capturing
         crate::services::cam::capturing(self);
+        // and the microphone while it has a title sampling
+        crate::services::mic::sampling(self);
         // the recompiled code of the modules goes where the state has them
         if let Some(library) = &mut self.recompiled {
             for module in &self.cro.modules {

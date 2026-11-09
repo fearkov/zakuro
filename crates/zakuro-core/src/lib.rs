@@ -11,6 +11,7 @@ pub mod idle;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
+pub mod microphone;
 pub mod mods;
 pub mod replay;
 pub mod room;
@@ -184,6 +185,8 @@ pub struct System {
     pub cro: cro::CroManager,
     /// what the cameras see, from the frontend.
     pub camera: Option<Box<dyn camera::Camera>>,
+    /// what the microphone hears, from the frontend.
+    pub microphone: Option<Box<dyn microphone::Microphone>>,
     /// the room local wireless goes through, none with wireless off.
     pub room: Option<room::Link>,
     /// errors the title reported through err:f, newest last.
@@ -281,6 +284,7 @@ impl System {
             pacing: Pacing::default(),
             cro: cro::CroManager::default(),
             camera: None,
+            microphone: None,
             room: None,
             fatal_errors: Vec::new(),
             undefined_seen: BTreeMap::new(),
@@ -883,6 +887,7 @@ impl System {
         services::ir_rst::tick(self);
         services::ir::tick(self);
         services::cam::tick(self);
+        services::mic::tick(self);
         services::uds::tick(self);
         services::dlp::tick(self);
     }

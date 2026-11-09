@@ -10,6 +10,7 @@ mod gui;
 mod input;
 mod library;
 mod menus;
+mod microphone;
 mod present;
 mod recompile;
 mod report;
@@ -35,7 +36,7 @@ use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
 use recompile::{Job, Stage, Toolchain, Wanted};
-use settings::{CameraSource, Renderer, Screens, Settings};
+use settings::{CameraSource, MicrophoneSource, Renderer, Screens, Settings};
 
 pub use zakuro_core::memory::Memory;
 pub use zakuro_core::recompiled::Linked;
@@ -136,6 +137,8 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         next_shown: Instant::now(),
         stop: false,
         camera: None,
+        microphone: None,
+        blowing: std::sync::Arc::default(),
         room_server: None,
         room: None,
         dlp_guest: None,
@@ -445,6 +448,10 @@ struct App {
     /// what the running game's cameras were given to see, to give them
     /// another only when the settings change it.
     camera: Option<(CameraSource, Option<PathBuf>)>,
+    /// what the running game's microphone was given to hear, the same way.
+    microphone: Option<MicrophoneSource>,
+    /// set while the blowing key is held, which the microphone hears.
+    blowing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// the room this program holds open, and the one it is in.
     room_server: Option<zakuro_core::room::Server>,
     room: Option<zakuro_core::room::Connection>,
@@ -577,6 +584,7 @@ impl ApplicationHandler for App {
             // keys let go while another window has the keyboard never come
             WindowEvent::Focused(false) => {
                 self.fast_forward_key = false;
+                self.blow(false);
                 self.keyboard.release();
             }
             WindowEvent::Resized(size) => {
@@ -773,6 +781,8 @@ impl App {
         // in the room the player is in
         self.camera = None;
         self.apply_camera();
+        self.microphone = None;
+        self.apply_microphone();
         self.link_room();
         // nothing left open holds the game back
         self.menus.menu_open = false;
@@ -858,6 +868,10 @@ impl App {
             && !self.menus.over_game()
             && !consumed
             && !self.gui.as_ref().is_some_and(Gui::wants_keyboard);
+        // blowing into the microphone while M is held
+        if code == KeyCode::KeyM && !event.repeat && !self.settings.keys.binds(KeyCode::KeyM) && (to_game || !pressed) {
+            self.blow(pressed);
+        }
         // letting go always gets through, so that no button stays held
         if to_game || !pressed {
             self.keyboard.key(event.physical_key, pressed);
@@ -968,6 +982,7 @@ impl App {
             }
         }
         self.apply_camera();
+        self.apply_microphone();
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
         self.apply_volume();
@@ -997,6 +1012,31 @@ impl App {
             _ => None,
         };
         self.camera = Some(wanted);
+    }
+
+    /// gives the running game's microphone what the settings say it hears,
+    /// when it is not what it has.
+    fn apply_microphone(&mut self) {
+        let wanted = self.settings.microphone;
+        let Some(game) = &mut self.game else { return };
+        if self.microphone == Some(wanted) {
+            return;
+        }
+        let device = wanted == MicrophoneSource::Computer;
+        let mut microphone = microphone::HostMicrophone::new(device, self.blowing.clone());
+        // a game listening already goes on listening to the new one
+        if game.system.services.mic.is_sampling() {
+            zakuro_core::microphone::Microphone::sampling(&mut microphone, true);
+        }
+        game.system.microphone = Some(Box::new(microphone));
+        self.microphone = Some(wanted);
+    }
+
+    /// starts or stops blowing into the microphone.
+    fn blow(&mut self, on: bool) {
+        if self.blowing.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            log::debug!("{} into the microphone", if on { "blowing" } else { "no longer blowing" });
+        }
     }
 
     /// puts the screens' arrangement and the window scale to use, sizing
