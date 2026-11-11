@@ -711,6 +711,8 @@ pub(super) fn compile(program: &Program, entry: u32, tier: Tier) -> Result<Compi
         ("is_pic", "false"),
         ("enable_verifier", verify),
         ("regalloc_algorithm", allocator),
+        ("enable_probestack", "true"),
+        ("probestack_strategy", "inline"),
     ];
     for (name, value) in flagged {
         flags.set(name, value).map_err(|error| format!("{name}, {error}"))?;
