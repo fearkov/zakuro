@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -609,6 +609,19 @@ impl ApplicationHandler for App {
                 self.cursor = (position.x as f32, position.y as f32);
                 self.touch();
                 self.tilt();
+            }
+            WindowEvent::Touch(touch) => {
+                self.cursor = (touch.location.x as f32, touch.location.y as f32);
+                match touch.phase {
+                    TouchPhase::Started | TouchPhase::Moved => {
+                        self.mouse_down = !self.pointer_taken(consumed);
+                        self.touch();
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        self.mouse_down = false;
+                        self.touch();
+                    }
+                }
             }
             WindowEvent::RedrawRequested => self.step(event_loop),
             _ => {}
