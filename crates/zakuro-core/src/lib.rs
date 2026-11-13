@@ -1553,19 +1553,20 @@ mod tests {
 
     /// POLLING and TICKING as 3dsrecomp writes code, each block charged to
     /// the budget as it starts. their svcs run in place, or leave for the
-    /// step, as in code made for version 4 of the interface.
-    unsafe extern "C" fn polling<const IN_PLACE: bool>(ctx: *mut recomp_abi::Context) {
+    /// step, as in code made for version 4 of the interface. they never
+    /// return, only stop.
+    unsafe extern "C" fn polling<const IN_PLACE: bool>(ctx: *mut recomp_abi::Context) -> u32 {
         unsafe {
             let mut at = (*ctx).r[15];
             loop {
                 let Some((size, svc, next)) = block(at) else {
                     (*ctx).exit = recomp_abi::EXIT_UNWIND;
-                    return;
+                    return recomp_abi::STOPPED;
                 };
                 if (*ctx).budget < size {
                     (*ctx).r[15] = at;
                     (*ctx).exit = recomp_abi::EXIT_BUDGET;
-                    return;
+                    return recomp_abi::STOPPED;
                 }
                 (*ctx).budget -= size;
                 match at {
@@ -1585,11 +1586,11 @@ mod tests {
                     if !IN_PLACE {
                         (*ctx).svc = number;
                         (*ctx).exit = recomp_abi::EXIT_SVC;
-                        return;
+                        return recomp_abi::STOPPED;
                     }
                     ((*(*ctx).host).svc)(ctx, number);
                     if (*ctx).exit != 0 {
-                        return;
+                        return recomp_abi::STOPPED;
                     }
                 }
                 at = next;

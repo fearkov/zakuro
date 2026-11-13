@@ -368,6 +368,7 @@ impl Library {
             fpscr,
             host: &HOST,
             user: std::ptr::null_mut(),
+            stack_limit: 0,
         };
         // SAFETY: as above
         store(unsafe { &(*system).cpu }, &mut ctx);
@@ -384,8 +385,10 @@ impl Library {
             };
             ctx.exit = 0;
             ctx.depth = 0;
+            ctx.stack_limit = recomp_abi::stack_limit();
             // SAFETY: the code came from the library and ctx is set up the
-            // way it expects, with user pointing at machine
+            // way it expects, with user pointing at machine. where it went
+            // is in the context, what it gives back is only for other code
             unsafe { code(&mut ctx) };
             if let Some(exit) = machine.pending.take() {
                 break Stop::Exit(exit);
