@@ -1,7 +1,6 @@
 //! kernel objects and the per-process handle table.
 
-use std::collections::HashMap;
-
+use zakuro_common::hash::IntMap;
 use zakuro_common::VAddr;
 
 use super::sync::{AddressArbiter, Event, Mutex, Semaphore, Timer};
@@ -153,21 +152,21 @@ impl ObjectStore {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct HandleTable {
-    entries: HashMap<Handle, ObjectId>,
+    entries: IntMap<Handle, ObjectId>,
     next: Handle,
     /// names, kept only for logs, a handle leak is far easier to find when the
     /// log can say what leaked.
-    labels: HashMap<Handle, String>,
+    labels: IntMap<Handle, String>,
 }
 
 impl Default for HandleTable {
     fn default() -> Self {
         HandleTable {
-            entries: HashMap::new(),
+            entries: IntMap::default(),
             // real handles start well above zero so that a zeroed variable
             // used as a handle fails loudly.
             next: 0x0001_0000,
-            labels: HashMap::new(),
+            labels: IntMap::default(),
         }
     }
 }

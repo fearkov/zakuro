@@ -61,7 +61,7 @@ pub struct Kernel {
 
     /// cached objects backing the pseudo-handles, so that duplicating
     /// CUR_THREAD_HANDLE twice yields the same object.
-    thread_objects: std::collections::HashMap<ThreadId, ObjectId>,
+    thread_objects: zakuro_common::hash::IntMap<ThreadId, ObjectId>,
     process_object: Option<ObjectId>,
 
     /// the timers, gone through for the next one due instead of every
@@ -92,7 +92,7 @@ impl Kernel {
             reschedule_pending: false,
             all_blocked: false,
             relief: false,
-            thread_objects: std::collections::HashMap::new(),
+            thread_objects: zakuro_common::hash::IntMap::default(),
             process_object: None,
             timers: Vec::new(),
             pulsed: Vec::new(),

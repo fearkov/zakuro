@@ -104,7 +104,7 @@ pub struct Memory {
     /// since, unwritten. the CPU writes them the slow way, through any
     /// address that maps them, and the first write of anything ends the
     /// watch, see watch_physical.
-    watched: HashMap<u32, u64>,
+    watched: zakuro_common::hash::IntMap<u32, u64>,
     /// the watches so far.
     watches: u64,
 }
@@ -222,7 +222,7 @@ impl Memory {
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
             write_log: None,
-            watched: HashMap::new(),
+            watched: zakuro_common::hash::IntMap::default(),
             watches: 0,
         }
     }

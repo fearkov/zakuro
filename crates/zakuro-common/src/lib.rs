@@ -1,6 +1,7 @@
 //! types and constants shared by every Zakuro crate.
 
 pub mod bits;
+pub mod hash;
 pub mod memory_map;
 pub mod result;
 
