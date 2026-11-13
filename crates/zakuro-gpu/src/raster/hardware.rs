@@ -310,6 +310,10 @@ struct Surface {
     /// nothing else, standing in for them. a frame's fills would copy
     /// megabytes into shadows, and memory compares faster with a pixel.
     pixel: Option<[u8; 4]>,
+    /// what memory gave to watch the buffer's bytes when they last held
+    /// what the shadow does. while nothing wrote over them since, a lookup
+    /// takes them as unchanged rather than comparing them again.
+    watch: Option<u64>,
     /// the image is known to match guest memory in this batch.
     checked: bool,
     /// the rows drawn into since guest memory last got the image, rows of
@@ -380,6 +384,7 @@ impl Surface {
     /// pixel they all are when they are, as memory under a buffer the GPU
     /// draws often is.
     fn keep(&mut self, bytes: &[u8]) {
+        self.watch = None;
         let bpp = self.kind.bytes() as usize;
         let size = self.size() as usize;
         match bytes.get(..bpp).filter(|pixel| bytes.len() == size && crate::pattern::holds(bytes, pixel)) {
@@ -395,6 +400,7 @@ impl Surface {
 
     /// has the shadow hold the pixel all over the buffer.
     fn keep_pixel(&mut self, pixel: &[u8]) {
+        self.watch = None;
         let mut kept = [0; 4];
         kept[..pixel.len()].copy_from_slice(pixel);
         self.pixel = Some(kept);
@@ -413,6 +419,8 @@ impl Surface {
 
     /// the shadow's bytes, written out where a pixel stood in for them.
     fn shadow(&mut self) -> &mut Vec<u8> {
+        // whatever is done with it, memory is to be compared with it again
+        self.watch = None;
         if let Some(pixel) = self.pixel.take() {
             self.shadow.resize(self.size() as usize, 0);
             crate::pattern::fill(&mut self.shadow, &pixel[..self.kind.bytes() as usize]);
@@ -2408,6 +2416,7 @@ impl Hardware {
                     tiled,
                     shadow: Vec::new(),
                     pixel: None,
+                    watch: None,
                     checked: false,
                     dirty: None,
                     guarded: None,
@@ -2450,7 +2459,11 @@ impl Hardware {
         // bytes a fill wrote can hold what the shadow does, and still be
         // newer than the image
         let stale = self.surfaces[index].stale.is_some();
-        let same = !stale && memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now));
+        // and none at all where nothing wrote over them since memory last
+        // held what the shadow does, a frame's buffers are megabytes
+        let unchanged = !stale && self.surfaces[index].watch.is_some_and(|watch| memory.unchanged(addr, size, watch));
+        let same = unchanged
+            || (!stale && memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now)));
         if !same {
             bytes.resize(size as usize, 0);
             memory.read(addr, &mut bytes);
@@ -2468,6 +2481,11 @@ impl Hardware {
             self.surfaces[index].keep(&bytes);
         }
         self.scratch = bytes;
+        if !unchanged {
+            // memory holds what the shadow does now, until something writes
+            // over it
+            self.surfaces[index].watch = memory.watch(addr, size);
+        }
         self.surfaces[index].checked = true;
         Ok(index)
     }
@@ -3107,6 +3125,7 @@ impl Hardware {
                 surface.untwin();
                 surface.shadow.clear();
                 surface.pixel = None;
+                surface.watch = None;
                 surface.dirty = None;
                 surface.guarded = None;
                 surface.write_guarded = None;
@@ -4040,6 +4059,7 @@ impl Hardware {
             surface.untwin();
             surface.shadow.clear();
             surface.pixel = None;
+            surface.watch = None;
             surface.dirty = None;
             surface.guarded = None;
             surface.write_guarded = None;
@@ -5371,6 +5391,7 @@ impl Hardware {
         if surface.stale.take().is_some() {
             surface.shadow.clear();
             surface.pixel = None;
+            surface.watch = None;
             surface.checked = false;
         }
     }
@@ -5805,6 +5826,7 @@ mod tests {
                 tiled: true,
                 shadow: Vec::new(),
                 pixel: None,
+                watch: None,
                 checked: false,
                 dirty: None,
                 guarded: None,
