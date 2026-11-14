@@ -82,22 +82,40 @@ impl Tables {
     /// takes a write to the table data registers, into the table and entry
     /// the index register names, which then moves on to the next entry.
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
+        self.write_all(registers, [value]);
+    }
+
+    /// takes writes to the table data registers one after another, as
+    /// write does, the index register read and moved on once for all of
+    /// them. titles send whole tables, thousands of entries a frame.
+    pub fn write_all(&mut self, registers: &mut [u32], values: impl IntoIterator<Item = u32>) {
         let index = registers[REG_TABLE_INDEX];
-        let entry = (index & 0xFF) as usize;
         let number = ((index >> 8) & 0x1F) as usize;
-        if let Some(table) = self.entries.get_mut(number) {
-            // a 0.12 value and the step to the next one, an 11-bit magnitude
-            // with the sign above it
-            let step = ((value >> 12) & 0x7FF) as f32 / 2047.0;
-            let step = if value & (1 << 23) != 0 { -step } else { step };
-            let decoded = [(value & 0xFFF) as f32 / 4095.0, step];
-            if table[entry].map(f32::to_bits) != decoded.map(f32::to_bits) {
-                table[entry] = decoded;
-                self.generation += 1;
-                self.changed[number] = self.generation;
+        let mut entry = index as u8;
+        match self.entries.get_mut(number) {
+            Some(table) => {
+                let mut changes = 0;
+                // inside the iterator, so that a chain of them runs as a loop
+                // over each
+                values.into_iter().for_each(|value| {
+                    // a 0.12 value and the step to the next one, an 11-bit
+                    // magnitude with the sign above it
+                    let step = STEPS[((value >> 12) & 0x7FF) as usize];
+                    let step = if value & (1 << 23) != 0 { -step } else { step };
+                    let decoded = [VALUES[(value & 0xFFF) as usize], step];
+                    let slot = &mut table[entry as usize];
+                    changes += (slot.map(f32::to_bits) != decoded.map(f32::to_bits)) as u64;
+                    *slot = decoded;
+                    entry = entry.wrapping_add(1);
+                });
+                if changes > 0 {
+                    self.generation += changes;
+                    self.changed[number] = self.generation;
+                }
             }
+            None => entry = entry.wrapping_add(values.into_iter().count() as u8),
         }
-        registers[REG_TABLE_INDEX] = (index & !0xFF) | ((entry as u32 + 1) & 0xFF);
+        registers[REG_TABLE_INDEX] = (index & !0xFF) | entry as u32;
     }
 
     /// every entry as a value and a step, table after table.
@@ -124,6 +142,28 @@ impl Tables {
         value + step * delta
     }
 }
+
+/// each 0.12 value of a table entry, as a float.
+static VALUES: [f32; 4096] = {
+    let mut values = [0.0; 4096];
+    let mut i = 0;
+    while i < values.len() {
+        values[i] = i as f32 / 4095.0;
+        i += 1;
+    }
+    values
+};
+
+/// each magnitude of a step to the next entry, as a float.
+static STEPS: [f32; 2048] = {
+    let mut steps = [0.0; 2048];
+    let mut i = 0;
+    while i < steps.len() {
+        steps[i] = i as f32 / 2047.0;
+        i += 1;
+    }
+    steps
+};
 
 /// a PICA float with the given mantissa and exponent widths, where a zero
 /// exponent is not denormal but just the smallest one.
@@ -636,6 +676,40 @@ mod tests {
 
     /// titles send the same tables again and again, which leaves what the
     /// GPU has of them as it is, and only a changed entry makes it stale.
+    #[test]
+    fn writes_in_one_go_leave_what_writes_one_at_a_time_do() {
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            seed
+        };
+        let (mut one, mut all) = (Tables::default(), Tables::default());
+        let (mut ones, mut alls) = (vec![0u32; 0x200], vec![0u32; 0x200]);
+        for round in 0..200 {
+            // past the end of a table, into one there is not, and the same
+            // entries again
+            let index = (random() >> 8) & 0x1FFF;
+            let values: Vec<u32> = (0..random() % 300).map(|i| if round % 3 == 0 { i * 0x1001 } else { random() }).collect();
+            ones[REG_TABLE_INDEX] = index | 0xABC0_0000;
+            alls[REG_TABLE_INDEX] = index | 0xABC0_0000;
+            values.iter().for_each(|&value| one.write_all(&mut ones, [value]));
+            all.write_all(&mut alls, values.iter().copied());
+            assert_eq!(alls[REG_TABLE_INDEX], ones[REG_TABLE_INDEX], "round {round}");
+            assert_eq!((all.generation(), all.changed()), (one.generation(), one.changed()), "round {round}");
+            assert!(all.saved().iter().zip(one.saved()).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits)), "round {round}");
+        }
+        // and the table decodes as it did with divisions
+        let mut registers = vec![0u32; 0x200];
+        for value in [0, 1, 0xFFF, 0x7FF000, 0x800000, 0xFFFFFF, 0x123456, 0xABCDEF] {
+            registers[REG_TABLE_INDEX] = 2 << 8;
+            one.write(&mut registers, value);
+            let step = ((value >> 12) & 0x7FF) as f32 / 2047.0;
+            let step = if value & (1 << 23) != 0 { -step } else { step };
+            let expected = [(value & 0xFFF) as f32 / 4095.0, step];
+            assert_eq!(one.entries()[2][0].map(f32::to_bits), expected.map(f32::to_bits), "{value:06X}");
+        }
+    }
+
     #[test]
     fn only_a_changed_entry_makes_the_tables_stale() {
         let mut registers = vec![0u32; 0x200];
