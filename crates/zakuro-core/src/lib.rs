@@ -531,14 +531,14 @@ impl System {
         if !library.has_code(self.cpu.regs[15] | self.cpu.cpsr.thumb as u32) {
             return None;
         }
-        let Some((budget, event)) = self.recompiled_budget(deadline) else {
+        let Some((budget, event, limit)) = self.recompiled_budget(deadline) else {
             return Some(None);
         };
         // the library stays out of the system while its code runs, so that
         // an svc the code runs in place gets the system to itself
         let library = self.recompiled.take()?;
         self.sync_gpu_for_cpu();
-        let (ran, stop, event) = library.run(self, budget, deadline, event);
+        let (ran, stop, event) = library.run(self, budget, deadline, event, limit);
         self.memory.clear_gpu_sync();
         self.recompiled = Some(library);
         self.recompiled_instructions += ran;
@@ -561,10 +561,11 @@ impl System {
     }
 
     /// how many cycles recompiled code can run from here before the
-    /// scheduler has to look, and the tick of the next thing a thread waits
-    /// for. none when that is due already, which has the scheduler look
-    /// first.
-    fn recompiled_budget(&mut self, deadline: Option<u64>) -> Option<(u64, Option<u64>)> {
+    /// scheduler has to look, the tick of the next thing a thread waits for,
+    /// and the cycle count the budget runs out at, which only the kernel and
+    /// the boundaries move. none when that is due already, which has the
+    /// scheduler look first.
+    fn recompiled_budget(&mut self, deadline: Option<u64>) -> Option<(u64, Option<u64>, u64)> {
         let mut limit = self.next_frame_boundary.min(self.next_audio_frame);
         // a thread or a timer due wants the scheduler at its tick, a run
         // that reached it has it look first
@@ -585,7 +586,7 @@ impl System {
         if let Some(deadline) = deadline {
             limit = limit.min(deadline);
         }
-        Some((limit.saturating_sub(self.cpu.cycles).max(1), event))
+        Some((limit.saturating_sub(self.cpu.cycles).max(1), event, limit))
     }
 
     /// runs an svc that recompiled code made, from inside the code, and
@@ -603,7 +604,7 @@ impl System {
         event: Option<u64>,
         deadline: Option<u64>,
         library: &recompiled::Library,
-    ) -> Option<(u64, Option<u64>)> {
+    ) -> Option<(u64, Option<u64>, u64)> {
         let thread = self.kernel.current_thread;
         let resume = (self.cpu.regs[15], self.cpu.cpsr.thumb);
         // what the step does once the code stopped at the svc
@@ -636,6 +637,51 @@ impl System {
         let budget = self.recompiled_budget(deadline)?;
         self.sync_gpu_for_cpu();
         Some(budget)
+    }
+
+    /// GetSystemTick from recompiled code, where svc_in_place would do no
+    /// more than read the clock: the event, the preempt, the deadline and
+    /// the frame and audio boundaries all still ahead of the tick after it,
+    /// nothing pending for the scheduler, and code at at, the pc with bit 0
+    /// set for Thumb. limit is what recompiled_budget last gave, which still
+    /// holds because only the kernel moves it, and nothing but the code ran
+    /// since. it does what svc_in_place would, in the same order, leaving
+    /// the registers to the caller, and gives the budget the code goes on
+    /// with. none, having done nothing, for svc_in_place to run it.
+    pub(crate) fn tick_in_place(
+        &mut self,
+        cycles: u64,
+        at: u32,
+        event: Option<u64>,
+        deadline: Option<u64>,
+        limit: u64,
+        library: &recompiled::Library,
+    ) -> Option<u64> {
+        let after = cycles + kernel::svc::SYSTEM_TICK_COST;
+        let ahead = |tick: u64| after < tick;
+        let plain = !self.exited
+            && !self.broke
+            && !self.kernel.reschedule_pending
+            && self.kernel.current_thread.is_some()
+            && self.profile.is_none()
+            && !log::log_enabled!(log::Level::Trace)
+            && event.is_none_or(ahead)
+            && deadline.is_none_or(ahead)
+            && ahead(self.next_preempt)
+            && ahead(self.next_frame_boundary)
+            && ahead(self.next_audio_frame)
+            && self.memory.is_executable(at & !1)
+            && library.has_code(at);
+        if !plain {
+            return None;
+        }
+        self.cpu.cycles = cycles;
+        self.ran_recompiled();
+        self.idle_interrupted(true);
+        self.cpu.cycles = after;
+        self.history[self.history_index] = at;
+        self.history_index = (self.history_index + 1) % HISTORY_LENGTH;
+        Some(limit.saturating_sub(after).max(1))
     }
 
     /// the scheduling pass a step makes first when it is due.
@@ -1530,11 +1576,13 @@ mod tests {
         0xEAFF_FFF7, // b 0x00100000
     ];
 
-    /// a loop that only reads the tick, at 0x00100040.
-    const TICKING: [u32; 3] = [
+    /// a loop that only reads the tick, adding up what it reads, so that
+    /// every read shows in the end, at 0x00100040.
+    const TICKING: [u32; 4] = [
         0xEF00_0028, // svc 0x28
         0xE284_4001, // add r4, r4, #1
-        0xEAFF_FFFC, // b 0x00100040
+        0xE087_7000, // add r7, r7, r0
+        0xEAFF_FFFB, // b 0x00100040
     ];
 
     /// the blocks of POLLING and TICKING the way 3dsrecomp cuts code, each
@@ -1546,7 +1594,7 @@ mod tests {
             0x0010_0010 => (3, Some(0x0A), 0x0010_001C),
             0x0010_001C => (1, None, 0x0010_0000),
             0x0010_0040 => (1, Some(0x28), 0x0010_0044),
-            0x0010_0044 => (2, None, 0x0010_0040),
+            0x0010_0044 => (3, None, 0x0010_0040),
             _ => return None,
         })
     }
@@ -1578,7 +1626,10 @@ mod tests {
                         (*ctx).r[0] = (*ctx).r[6];
                         (*ctx).r[1] = 0;
                     }
-                    0x0010_0044 => (*ctx).r[4] = (*ctx).r[4].wrapping_add(1),
+                    0x0010_0044 => {
+                        (*ctx).r[4] = (*ctx).r[4].wrapping_add(1);
+                        (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]);
+                    }
                     _ => {}
                 }
                 if let Some(number) = svc {

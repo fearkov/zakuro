@@ -1006,7 +1006,7 @@ fn get_system_tick(system: &mut System) {
 }
 
 /// ticks between two svcGetSystemTick calls in a row on the console.
-const SYSTEM_TICK_COST: u64 = 150;
+pub(crate) const SYSTEM_TICK_COST: u64 = 150;
 
 /// svcGetSystemInfo, r1 = type, r2 = parameter.
 fn get_system_info(system: &mut System) {

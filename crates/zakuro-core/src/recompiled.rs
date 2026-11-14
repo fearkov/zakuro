@@ -85,6 +85,8 @@ struct Machine<'a> {
     /// budget stops at.
     deadline: Option<u64>,
     event: Option<u64>,
+    /// the cycle count the budget runs out at, as last worked out.
+    limit: u64,
     /// an svc the code ran had the step do more, which the code left for.
     left: bool,
     /// the code went on after an svc it ran.
@@ -178,15 +180,32 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         // as far as the step goes, the code stopped at the svc
         let ran = machine.budget.saturating_sub(ctx.budget).max(0) as u64;
         machine.ran += ran;
+        // the clock, which titles poll more than anything, without the
+        // rest of a step around it when that would change nothing
+        if number == 0x28 {
+            let cycles = machine.cycles + ran;
+            let at = ctx.r[15] | ctx.thumb as u32;
+            if let Some(budget) = system.tick_in_place(cycles, at, machine.event, machine.deadline, machine.limit, machine.library) {
+                ctx.r[0] = cycles as u32;
+                ctx.r[1] = (cycles >> 32) as u32;
+                machine.cycles = system.cpu.cycles;
+                ctx.budget = budget.min(i32::MAX as u64) as i32;
+                machine.went_on = true;
+                machine.library.in_place.set(machine.library.in_place.get() + 1);
+                machine.budget = ctx.budget;
+                return;
+            }
+        }
         load(ctx, &mut system.cpu);
         system.cpu.cycles = machine.cycles + ran;
         let next = system.svc_in_place(number, machine.event, machine.deadline, machine.library);
         store(&system.cpu, ctx);
         machine.cycles = system.cpu.cycles;
         match next {
-            Some((budget, event)) => {
+            Some((budget, event, limit)) => {
                 ctx.budget = budget.min(i32::MAX as u64) as i32;
                 machine.event = event;
+                machine.limit = limit;
                 machine.went_on = true;
                 machine.library.in_place.set(machine.library.in_place.get() + 1);
             }
@@ -330,10 +349,10 @@ impl Library {
     /// runs recompiled code from the cpu's pc for about budget instructions,
     /// returning how many ran, why it stopped and the tick of the event its
     /// budget last stopped at. the code runs the svcs it can in place, going
-    /// on after them, and deadline and event are what the step had, for
-    /// those. the library has to be out of the system, which the code has
-    /// to itself.
-    pub fn run(&self, system: &mut System, budget: u64, deadline: Option<u64>, event: Option<u64>) -> (u64, Stop, Option<u64>) {
+    /// on after them, and deadline, event and limit are what the step had,
+    /// for those. the library has to be out of the system, which the code
+    /// has to itself.
+    pub fn run(&self, system: &mut System, budget: u64, deadline: Option<u64>, event: Option<u64>, limit: u64) -> (u64, Stop, Option<u64>) {
         let system: *mut System = system;
         let budget = budget.min(i32::MAX as u64) as i32;
         // SAFETY: everything the code reaches of the system comes from this
@@ -373,7 +392,7 @@ impl Library {
         // SAFETY: as above
         store(unsafe { &(*system).cpu }, &mut ctx);
         let mut machine =
-            Machine { system, library: self, pending: None, cycles, budget, ran: 0, deadline, event, left: false, went_on: false };
+            Machine { system, library: self, pending: None, cycles, budget, ran: 0, deadline, event, limit, left: false, went_on: false };
         ctx.user = &mut machine as *mut Machine as *mut c_void;
 
         let stop = loop {
