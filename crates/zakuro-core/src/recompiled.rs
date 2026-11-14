@@ -34,6 +34,9 @@ pub struct Library {
     fallbacks: Cell<u64>,
     /// svcs the code ran in place and went on after.
     in_place: Cell<u64>,
+    /// where the code reads the clock itself, see recomp_abi::Context, the
+    /// last place tick_in_place answered GetSystemTick at.
+    tick_at: Cell<u32>,
     /// the code found for addresses lately, each in a slot its address
     /// picks. a jump through a register looks its target up, which is a
     /// search through every function otherwise.
@@ -91,6 +94,46 @@ struct Machine<'a> {
     left: bool,
     /// the code went on after an svc it ran.
     went_on: bool,
+    /// the cycle count a GetSystemTick the code reads itself has to come
+    /// before, its cost included, or none when the code reads none.
+    due: Option<u64>,
+}
+
+impl Machine<'_> {
+    /// what tick_in_place would have done for the GetSystemTicks the code
+    /// answered itself since the host last looked, see recomp_abi::Context.
+    /// they all came from tick_at, one after another, the last at tick_last.
+    ///
+    /// # Safety
+    ///
+    /// as for machine, and nothing else may hold the system.
+    unsafe fn caught_up(&mut self, ctx: &mut Context) {
+        let ticks = std::mem::take(&mut ctx.ticks);
+        if ticks == 0 {
+            return;
+        }
+        let cost = ctx.tick_cost as u64;
+        let after = ctx.tick_last + cost;
+        let budget = ctx.tick_end.saturating_sub(after).min(i32::MAX as u64) as i32;
+        // what ran before the last tick, the ticks aside
+        self.ran += (self.budget.saturating_sub(budget).max(0) as u64).saturating_sub(cost * ticks as u64);
+        self.cycles = after;
+        self.budget = budget;
+        self.went_on = true;
+        self.library.in_place.set(self.library.in_place.get() + ticks as u64);
+        unsafe { (*self.system).ticks_in_place(ctx.tick_at, ticks, ctx.tick_last) };
+    }
+
+    /// where the code may answer GetSystemTick itself from here, with the
+    /// cycle count and budget the host just gave it: a tick at t is clear
+    /// of due when t + cost < due, where t is tick_end less the budget.
+    fn ticks_from(&self, ctx: &mut Context) {
+        ctx.tick_end = self.cycles + self.budget.max(0) as u64;
+        ctx.tick_floor = self.due.map_or(i32::MAX, |due| {
+            let floor = ctx.tick_end as i64 + ctx.tick_cost as i64 - due as i64;
+            floor.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        });
+    }
 }
 
 /// # Safety
@@ -140,6 +183,7 @@ unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
         let machine = machine(ctx);
         machine.library.fallbacks.set(machine.library.fallbacks.get() + 1);
         let ctx = &mut *ctx;
+        machine.caught_up(ctx);
         let system = &mut *machine.system;
         load(ctx, &mut system.cpu);
         system.cpu.regs[15] = address;
@@ -171,6 +215,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
     unsafe {
         let machine = machine(ctx);
         let ctx = &mut *ctx;
+        machine.caught_up(ctx);
         if !svcs_in_place() || !crate::kernel::svc::in_place(number) {
             ctx.svc = number;
             ctx.exit = EXIT_SVC;
@@ -186,10 +231,13 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         let cycles = machine.cycles + ran;
         let at = ctx.r[15] | ctx.thumb as u32;
         let (event, deadline, limit, library) = (machine.event, machine.deadline, machine.limit, machine.library);
+        let mut tick_at = None;
         let done = match number {
             0x28 => system.tick_in_place(cycles, at, event, deadline, limit, library).inspect(|_| {
                 ctx.r[0] = cycles as u32;
                 ctx.r[1] = (cycles >> 32) as u32;
+                // the code reads the clock here itself from now on
+                tick_at = Some(at);
             }),
             0x25 => {
                 let regs = [ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3], ctx.r[4]];
@@ -208,6 +256,14 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             machine.went_on = true;
             library.in_place.set(library.in_place.get() + 1);
             machine.budget = ctx.budget;
+            // nothing it looks at changed, unless the budget was cut short
+            if machine.cycles + machine.budget as u64 != ctx.tick_end {
+                machine.ticks_from(ctx);
+            }
+            if let Some(at) = tick_at {
+                ctx.tick_at = at;
+                library.tick_at.set(at);
+            }
             return;
         }
         load(ctx, &mut system.cpu);
@@ -222,6 +278,9 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                 machine.limit = limit;
                 machine.went_on = true;
                 machine.library.in_place.set(machine.library.in_place.get() + 1);
+                machine.budget = ctx.budget;
+                machine.due = (*machine.system).tick_due(event, machine.deadline);
+                machine.ticks_from(ctx);
             }
             None => {
                 // nothing is left of the run but the unwinding, its event
@@ -280,7 +339,7 @@ impl Library {
         if std::env::var("ZAKURO_NATIVES").is_ok_and(|value| value == "0") && code.set_natives(false) {
             log::info!("the library's natives are off, the title's own code runs for them");
         }
-        Library { code, fallbacks: Cell::new(0), in_place: Cell::new(0), found: Library::nothing_found() }
+        Library { code, fallbacks: Cell::new(0), in_place: Cell::new(0), tick_at: Cell::new(recomp_abi::NO_TICKS), found: Library::nothing_found() }
     }
 
     /// every slot of found empty, an address no code starts at in each.
@@ -402,12 +461,28 @@ impl Library {
             host: &HOST,
             user: std::ptr::null_mut(),
             stack_limit: 0,
+            tick_end: 0,
+            tick_last: 0,
+            tick_floor: i32::MAX,
+            tick_cost: crate::kernel::svc::SYSTEM_TICK_COST as i32,
+            tick_at: recomp_abi::NO_TICKS,
+            ticks: 0,
         };
         // SAFETY: as above
         store(unsafe { &(*system).cpu }, &mut ctx);
+        // the code reads the clock itself where it last did, while that is
+        // still code to run, which nothing but the step changes
+        let at = self.tick_at.get();
+        // SAFETY: as above
+        if at != recomp_abi::NO_TICKS && unsafe { (*system).memory.is_executable(at & !1) } && self.has_code(at) {
+            ctx.tick_at = at;
+        }
+        // SAFETY: as above
+        let due = unsafe { (*system).tick_due(event, deadline) };
         let mut machine =
-            Machine { system, library: self, pending: None, cycles, budget, ran: 0, deadline, event, limit, left: false, went_on: false };
+            Machine { system, library: self, pending: None, cycles, budget, ran: 0, deadline, event, limit, left: false, went_on: false, due };
         ctx.user = &mut machine as *mut Machine as *mut c_void;
+        machine.ticks_from(&mut ctx);
 
         let stop = loop {
             if ctx.budget <= 0 {
@@ -423,6 +498,8 @@ impl Library {
             // way it expects, with user pointing at machine. where it went
             // is in the context, what it gives back is only for other code
             unsafe { code(&mut ctx) };
+            // SAFETY: as above, the code returned
+            unsafe { machine.caught_up(&mut ctx) };
             if let Some(exit) = machine.pending.take() {
                 break Stop::Exit(exit);
             }

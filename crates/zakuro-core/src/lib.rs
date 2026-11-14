@@ -667,6 +667,39 @@ impl System {
         Some(limit.saturating_sub(after).max(1))
     }
 
+    /// what tick_in_place did for count ticks that recompiled code read
+    /// itself at at, one after another with nothing in between, the last at
+    /// tick last, see recomp_abi::Context.
+    pub(crate) fn ticks_in_place(&mut self, at: u32, count: u32, last: u64) {
+        self.cpu.cycles = last;
+        self.ran_recompiled();
+        // the last one moves the next idle check furthest
+        self.idle_interrupted(true);
+        self.cpu.cycles = last + kernel::svc::SYSTEM_TICK_COST;
+        // the history holds the last HISTORY_LENGTH of them at most
+        let count = count as usize;
+        let noted = count.min(HISTORY_LENGTH);
+        self.history_index = (self.history_index + count - noted) % HISTORY_LENGTH;
+        for _ in 0..noted {
+            self.note_plain(at);
+        }
+    }
+
+    /// what a GetSystemTick that recompiled code reads itself has to end
+    /// before, see recomp_abi::Context: the first thing plain_in_place has
+    /// tick_in_place leave for the step at, none when plain_in_place fails
+    /// whatever the tick, which only the step and svcs change.
+    pub(crate) fn tick_due(&self, event: Option<u64>, deadline: Option<u64>) -> Option<u64> {
+        let plain = !self.exited
+            && !self.broke
+            && !self.kernel.reschedule_pending
+            && self.kernel.current_thread.is_some()
+            && self.profile.is_none()
+            && !log::log_enabled!(log::Level::Trace);
+        let first = self.next_preempt.min(self.next_frame_boundary).min(self.next_audio_frame);
+        plain.then(|| [event, deadline].into_iter().flatten().fold(first, u64::min))
+    }
+
     /// WaitSynchronizationN from recompiled code, regs its r0 to r4, the
     /// way tick_in_place reads the clock, when the wait is satisfied right
     /// away and so changes no thread, which keeps limit. the budget and the
@@ -1726,6 +1759,33 @@ mod tests {
         0xEAFF_FFED, // b 0x00100100
     ];
 
+    /// a loop that sets a one-shot timer r6 nanoseconds ahead and reads the
+    /// tick twice, adding it up, at 0x00100180. r9 counts the rounds.
+    const TIMING: [u32; 12] = [
+        0xE1A0_000A, // mov r0, r10, the timer's handle
+        0xE3A0_1000, // mov r1, #0, no interval
+        0xE1A0_2006, // mov r2, r6, the delay
+        0xE3A0_3000, // mov r3, #0
+        0xE3A0_4000, // mov r4, #0
+        0xEF00_001B, // svc 0x1B, setting the timer
+        0xEF00_0028, // svc 0x28
+        0xE087_7000, // add r7, r7, r0
+        0xEF00_0028, // svc 0x28
+        0xE087_7000, // add r7, r7, r0
+        0xE289_9001, // add r9, r9, #1
+        0xEAFF_FFF3, // b 0x00100180
+    ];
+
+    /// a loop that waits on that timer, at 0x00100200. r9 counts the rounds.
+    const WAITING: [u32; 6] = [
+        0xE1A0_000A, // mov r0, r10
+        0xE3E0_2000, // mvn r2, #0, no timeout
+        0xE3E0_3000, // mvn r3, #0
+        0xEF00_0024, // svc 0x24
+        0xE289_9001, // add r9, r9, #1
+        0xEAFF_FFF9, // b 0x00100200
+    ];
+
     /// where the threads find the mutex's handle.
     const MUTEX_HANDLE_AT: u32 = 0x0010_0800;
 
@@ -1753,14 +1813,24 @@ mod tests {
             0x0010_0130 => (3, Some(0x0A), 0x0010_013C),
             0x0010_013C => (2, Some(0x14), 0x0010_0144),
             0x0010_0144 => (1, None, 0x0010_0100),
+            0x0010_0180 => (6, Some(0x1B), 0x0010_0198),
+            0x0010_0198 => (1, Some(0x28), 0x0010_019C),
+            0x0010_019C => (2, Some(0x28), 0x0010_01A4),
+            0x0010_01A4 => (3, None, 0x0010_0180),
+            0x0010_0200 => (4, Some(0x24), 0x0010_0210),
+            0x0010_0210 => (2, None, 0x0010_0200),
             _ => return None,
         })
     }
 
+    /// the ticks the code below read itself.
+    static TICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     /// the loops above as 3dsrecomp writes code, each block charged to
-    /// the budget as it starts. their svcs run in place, or leave for the
-    /// step, as in code made for version 4 of the interface. they never
-    /// return, only stop.
+    /// the budget as it starts. their svcs run in place, reading the clock
+    /// themselves where the host lets them, or leave for the step, as in
+    /// code made for version 4 of the interface. they never return, only
+    /// stop.
     unsafe extern "C" fn polling<const IN_PLACE: bool>(ctx: *mut recomp_abi::Context) -> u32 {
         unsafe {
             let mut at = (*ctx).r[15];
@@ -1802,6 +1872,20 @@ mod tests {
                         (*ctx).r[0] = (*ctx).r[5];
                     }
                     0x0010_0098 => (*ctx).r[0] = (*ctx).r[5],
+                    0x0010_0180 => {
+                        let r = &mut (*ctx).r;
+                        (r[0], r[1], r[2], r[3], r[4]) = (r[10], 0, r[6], 0, 0);
+                    }
+                    0x0010_019C => (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]),
+                    0x0010_01A4 => {
+                        (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]);
+                        (*ctx).r[9] = (*ctx).r[9].wrapping_add(1);
+                    }
+                    0x0010_0200 => {
+                        let r = &mut (*ctx).r;
+                        (r[0], r[2], r[3]) = (r[10], u32::MAX, u32::MAX);
+                    }
+                    0x0010_0210 => (*ctx).r[9] = (*ctx).r[9].wrapping_add(1),
                     _ => {}
                 }
                 if let Some(number) = svc {
@@ -1811,9 +1895,21 @@ mod tests {
                         (*ctx).exit = recomp_abi::EXIT_SVC;
                         return recomp_abi::STOPPED;
                     }
-                    ((*(*ctx).host).svc)(ctx, number);
-                    if (*ctx).exit != 0 {
-                        return recomp_abi::STOPPED;
+                    // the tick read where the host lets the code, as
+                    // SVC_TICK reads it
+                    if number == 0x28 && (*ctx).tick_at == next && (*ctx).budget > (*ctx).tick_floor {
+                        let tick = (*ctx).tick_end - (*ctx).budget as i64 as u64;
+                        (*ctx).budget -= (*ctx).tick_cost;
+                        (*ctx).tick_last = tick;
+                        (*ctx).ticks += 1;
+                        (*ctx).r[0] = tick as u32;
+                        (*ctx).r[1] = (tick >> 32) as u32;
+                        TICKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        ((*(*ctx).host).svc)(ctx, number);
+                        if (*ctx).exit != 0 {
+                            return recomp_abi::STOPPED;
+                        }
                     }
                 }
                 at = next;
@@ -1831,7 +1927,7 @@ mod tests {
         let mut system = System::new(Config { clock: Some(0), ..Config::default() });
         let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
         system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
-        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..])] {
+        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..])] {
             for (index, word) in code.iter().enumerate() {
                 system.memory.write32(address + index as u32 * 4, *word);
             }
@@ -1847,6 +1943,10 @@ mod tests {
             (regs[0], regs[2], regs[3], regs[1], regs[4]) = (regs[1], interval, 0, interval, 0);
             kernel::svc::dispatch(&mut system, 0x1B);
         }
+        // the one TIMING sets and WAITING waits on
+        system.cpu.regs[1] = 0; // one-shot
+        kernel::svc::dispatch(&mut system, 0x1A);
+        let set = system.cpu.regs[1];
         for (index, &(entry, sleep, priority)) in threads.iter().enumerate() {
             let stack = 0x0010_0F00 - index as u32 * 0x100;
             let id = system.kernel.create_thread(format!("thread {index}"), entry, stack, 0, priority, 0);
@@ -1855,13 +1955,14 @@ mod tests {
             regs[5] = mutex;
             regs[6] = sleep;
             regs[8] = MUTEX_HANDLE_AT;
+            regs[10] = set;
         }
         system.kernel.schedule(&mut system.cpu, 0);
         let code: recomp_abi::Code = if in_place { polling::<true> } else { polling::<false> };
         let addresses = [
             0x0010_0000, 0x0010_0004, 0x0010_0020, 0x0010_0024, 0x0010_002C, 0x0010_0038, 0x0010_0040, 0x0010_0044, 0x0010_0060,
             0x0010_007C, 0x0010_0088, 0x0010_008C, 0x0010_0098, 0x0010_00A0, 0x0010_0100, 0x0010_011C, 0x0010_0128, 0x0010_0130,
-            0x0010_013C, 0x0010_0144,
+            0x0010_013C, 0x0010_0144, 0x0010_0180, 0x0010_0198, 0x0010_019C, 0x0010_01A4, 0x0010_0200, 0x0010_0210,
         ];
         let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
         let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
@@ -1891,12 +1992,18 @@ mod tests {
         };
         let mut ran_in_place = 0;
         for case in 0..60 {
-            let threads: Vec<(u32, u32, u32)> = (0..1 + case % 3)
+            let mut threads: Vec<(u32, u32, u32)> = (0..1 + case % 3)
                 .map(|_| {
                     let entry = pick(&[0x0010_0000, 0x0010_0000, 0x0010_0040, 0x0010_0060, 0x0010_0100]);
                     (entry, pick(&[0, 0, 900, 13_000, 50_000, 400_000]), pick(&[0x2F, 0x30, 0x30, 0x31]))
                 })
                 .collect();
+            // a thread waiting on a timer the one setting it reads the
+            // clock just ahead of, which then comes due in the code
+            if case % 5 == 4 {
+                threads.push((0x0010_0200, 0, pick(&[0x2F, 0x30, 0x31])));
+                threads.push((0x0010_0180, pick(&[2_000, 20_000, 60_000]), pick(&[0x30, 0x31])));
+            }
             let timer = (case % 4 == 3).then(|| pick(&[70_000, 300_000, 2_000_000]));
             let mut systems = [polling_system(false, &threads, timer), polling_system(true, &threads, timer)];
             for system in &mut systems {
@@ -1915,6 +2022,8 @@ mod tests {
             ran_in_place += in_place.recompiled.as_ref().unwrap().in_place();
         }
         assert!(ran_in_place > 100_000, "{ran_in_place} svcs ran in place");
+        let ticked = TICKED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ticked > 50_000, "the code read {ticked} ticks itself");
     }
 
     /// runs steps until the run gets to tick or steps runs out, how many it
