@@ -180,21 +180,34 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         // as far as the step goes, the code stopped at the svc
         let ran = machine.budget.saturating_sub(ctx.budget).max(0) as u64;
         machine.ran += ran;
-        // the clock, which titles poll more than anything, without the
-        // rest of a step around it when that would change nothing
-        if number == 0x28 {
-            let cycles = machine.cycles + ran;
-            let at = ctx.r[15] | ctx.thumb as u32;
-            if let Some(budget) = system.tick_in_place(cycles, at, machine.event, machine.deadline, machine.limit, machine.library) {
+        // the clock and a wait that is over at once, which titles poll more
+        // than anything, without the rest of a step around them when that
+        // would change nothing
+        let cycles = machine.cycles + ran;
+        let at = ctx.r[15] | ctx.thumb as u32;
+        let (event, deadline, limit, library) = (machine.event, machine.deadline, machine.limit, machine.library);
+        let done = match number {
+            0x28 => system.tick_in_place(cycles, at, event, deadline, limit, library).inspect(|_| {
                 ctx.r[0] = cycles as u32;
                 ctx.r[1] = (cycles >> 32) as u32;
-                machine.cycles = system.cpu.cycles;
-                ctx.budget = budget.min(i32::MAX as u64) as i32;
-                machine.went_on = true;
-                machine.library.in_place.set(machine.library.in_place.get() + 1);
-                machine.budget = ctx.budget;
-                return;
+            }),
+            0x25 => {
+                let regs = [ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3], ctx.r[4]];
+                system.wait_in_place(cycles, at, regs, event, deadline, limit, library).map(|(budget, index)| {
+                    ctx.r[0] = 0;
+                    ctx.r[1] = index;
+                    budget
+                })
             }
+            _ => None,
+        };
+        if let Some(budget) = done {
+            machine.cycles = system.cpu.cycles;
+            ctx.budget = budget.min(i32::MAX as u64) as i32;
+            machine.went_on = true;
+            library.in_place.set(library.in_place.get() + 1);
+            machine.budget = ctx.budget;
+            return;
         }
         load(ctx, &mut system.cpu);
         system.cpu.cycles = machine.cycles + ran;

@@ -775,6 +775,19 @@ impl Memory {
         }
     }
 
+    /// the word at addr when a read of the CPU there would do nothing but
+    /// read it, the word on one page and nothing guarding that.
+    pub fn plain_read32(&self, addr: VAddr) -> Option<u32> {
+        let offset = (addr & PAGE_MASK) as usize;
+        let ptr = self.cpu_read_table[(addr >> PAGE_BITS) as usize];
+        if offset > PAGE_SIZE as usize - 4 || ptr.is_null() {
+            return None;
+        }
+        // SAFETY: as cpu_page_read, a non-null entry is a whole page
+        let page = unsafe { std::slice::from_raw_parts(ptr, PAGE_SIZE as usize) };
+        Some(u32::from_le_bytes([page[offset], page[offset + 1], page[offset + 2], page[offset + 3]]))
+    }
+
     /// a word of guest memory as anything but the CPU reads it, what the GPU
     /// drew there or not.
     pub fn peek32(&mut self, addr: VAddr) -> u32 {

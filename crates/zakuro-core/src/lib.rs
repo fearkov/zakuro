@@ -640,14 +640,12 @@ impl System {
     }
 
     /// GetSystemTick from recompiled code, where svc_in_place would do no
-    /// more than read the clock: the event, the preempt, the deadline and
-    /// the frame and audio boundaries all still ahead of the tick after it,
-    /// nothing pending for the scheduler, and code at at, the pc with bit 0
-    /// set for Thumb. limit is what recompiled_budget last gave, which still
-    /// holds because only the kernel moves it, and nothing but the code ran
-    /// since. it does what svc_in_place would, in the same order, leaving
-    /// the registers to the caller, and gives the budget the code goes on
-    /// with. none, having done nothing, for svc_in_place to run it.
+    /// more than read the clock, see plain_in_place. limit is what
+    /// recompiled_budget last gave, which still holds because only the
+    /// kernel moves it, and nothing but the code ran since. it does what
+    /// svc_in_place would, in the same order, leaving the registers to the
+    /// caller, and gives the budget the code goes on with. none, having done
+    /// nothing, for svc_in_place to run it.
     pub(crate) fn tick_in_place(
         &mut self,
         cycles: u64,
@@ -658,8 +656,64 @@ impl System {
         library: &recompiled::Library,
     ) -> Option<u64> {
         let after = cycles + kernel::svc::SYSTEM_TICK_COST;
+        if !self.plain_in_place(after, at, event, deadline, library) {
+            return None;
+        }
+        self.cpu.cycles = cycles;
+        self.ran_recompiled();
+        self.idle_interrupted(true);
+        self.cpu.cycles = after;
+        self.note_plain(at);
+        Some(limit.saturating_sub(after).max(1))
+    }
+
+    /// WaitSynchronizationN from recompiled code, regs its r0 to r4, the
+    /// way tick_in_place reads the clock, when the wait is satisfied right
+    /// away and so changes no thread, which keeps limit. the budget and the
+    /// index the wait gives.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wait_in_place(
+        &mut self,
+        cycles: u64,
+        at: u32,
+        regs: [u32; 5],
+        event: Option<u64>,
+        deadline: Option<u64>,
+        limit: u64,
+        library: &recompiled::Library,
+    ) -> Option<(u64, u32)> {
+        let (pointer, count, wait_all) = (regs[1], regs[2] as usize, regs[3] != 0);
+        if count == 0 || count > kernel::WAIT_AT_ONCE || !self.plain_in_place(cycles, at, event, deadline, library) {
+            return None;
+        }
+        let mut handles = [0; kernel::WAIT_AT_ONCE];
+        for (i, handle) in handles[..count].iter_mut().enumerate() {
+            *handle = self.memory.plain_read32(pointer.wrapping_add(4 * i as u32))?;
+        }
+        let (objects, index) = self.kernel.satisfied_now(&handles[..count], wait_all, cycles)?;
+        let thread = self.kernel.current_thread?;
+        self.cpu.cycles = cycles;
+        self.ran_recompiled();
+        self.idle_interrupted(true);
+        if wait_all {
+            for &object in &objects[..count] {
+                self.kernel.acquire_public(object, thread);
+            }
+        } else {
+            self.kernel.acquire_public(objects[index as usize], thread);
+        }
+        self.note_plain(at);
+        Some((limit.saturating_sub(cycles).max(1), index))
+    }
+
+    /// whether svc_in_place, for an svc that changes no thread and leaves
+    /// the clock at after, would do nothing around it but note at: the
+    /// event, the preempt, the deadline and the frame and audio boundaries
+    /// all ahead of after, nothing pending for the scheduler, and code at
+    /// at, the pc with bit 0 set for Thumb.
+    fn plain_in_place(&self, after: u64, at: u32, event: Option<u64>, deadline: Option<u64>, library: &recompiled::Library) -> bool {
         let ahead = |tick: u64| after < tick;
-        let plain = !self.exited
+        !self.exited
             && !self.broke
             && !self.kernel.reschedule_pending
             && self.kernel.current_thread.is_some()
@@ -671,17 +725,14 @@ impl System {
             && ahead(self.next_frame_boundary)
             && ahead(self.next_audio_frame)
             && self.memory.is_executable(at & !1)
-            && library.has_code(at);
-        if !plain {
-            return None;
-        }
-        self.cpu.cycles = cycles;
-        self.ran_recompiled();
-        self.idle_interrupted(true);
-        self.cpu.cycles = after;
+            && library.has_code(at)
+    }
+
+    /// what note does without a profile, for at, the pc with bit 0 set for
+    /// Thumb.
+    fn note_plain(&mut self, at: u32) {
         self.history[self.history_index] = at;
         self.history_index = (self.history_index + 1) % HISTORY_LENGTH;
-        Some(limit.saturating_sub(after).max(1))
     }
 
     /// the scheduling pass a step makes first when it is due.
@@ -1563,36 +1614,49 @@ mod tests {
         id
     }
 
-    /// a loop of three svcs, the tick, a mutex's release and a sleep, the
-    /// way titles poll a clock, at 0x00100000.
-    const POLLING: [u32; 8] = [
+    /// a loop of svcs, the tick, taking a mutex, the tick again while it
+    /// holds it, letting it go and a sleep, the way titles poll a clock, at
+    /// 0x00100000. r9 counts the rounds.
+    const POLLING: [u32; 15] = [
         0xEF00_0028, // svc 0x28, the tick in r0 and r1
-        0xE284_4001, // add r4, r4, #1
+        0xE289_9001, // add r9, r9, #1
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0, no timeout
+        0xE1A0_1008, // mov r1, r8, where the mutex's handle is
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25, waiting for the mutex
+        0xEF00_0028, // svc 0x28
         0xE1A0_0005, // mov r0, r5
         0xEF00_0014, // svc 0x14, releasing the mutex in r5
         0xE1A0_0006, // mov r0, r6
         0xE3A0_1000, // mov r1, #0
         0xEF00_000A, // svc 0x0A, sleeping for r6 nanoseconds
-        0xEAFF_FFF7, // b 0x00100000
+        0xEAFF_FFF0, // b 0x00100000
     ];
 
     /// a loop that only reads the tick, adding up what it reads, so that
-    /// every read shows in the end, at 0x00100040.
+    /// every read shows in the end, at 0x00100040. r9 counts the rounds.
     const TICKING: [u32; 4] = [
         0xEF00_0028, // svc 0x28
-        0xE284_4001, // add r4, r4, #1
+        0xE289_9001, // add r9, r9, #1
         0xE087_7000, // add r7, r7, r0
         0xEAFF_FFFB, // b 0x00100040
     ];
+
+    /// where the threads find the mutex's handle.
+    const MUTEX_HANDLE_AT: u32 = 0x0010_0800;
 
     /// the blocks of POLLING and TICKING the way 3dsrecomp cuts code, each
     /// with its length, the svc it ends with and where it goes on.
     fn block(at: u32) -> Option<(i32, Option<u32>, u32)> {
         Some(match at {
             0x0010_0000 => (1, Some(0x28), 0x0010_0004),
-            0x0010_0004 => (3, Some(0x14), 0x0010_0010),
-            0x0010_0010 => (3, Some(0x0A), 0x0010_001C),
-            0x0010_001C => (1, None, 0x0010_0000),
+            0x0010_0004 => (7, Some(0x25), 0x0010_0020),
+            0x0010_0020 => (1, Some(0x28), 0x0010_0024),
+            0x0010_0024 => (2, Some(0x14), 0x0010_002C),
+            0x0010_002C => (3, Some(0x0A), 0x0010_0038),
+            0x0010_0038 => (1, None, 0x0010_0000),
             0x0010_0040 => (1, Some(0x28), 0x0010_0044),
             0x0010_0044 => (3, None, 0x0010_0040),
             _ => return None,
@@ -1619,15 +1683,20 @@ mod tests {
                 (*ctx).budget -= size;
                 match at {
                     0x0010_0004 => {
-                        (*ctx).r[4] = (*ctx).r[4].wrapping_add(1);
-                        (*ctx).r[0] = (*ctx).r[5];
+                        (*ctx).r[9] = (*ctx).r[9].wrapping_add(1);
+                        (*ctx).r[0] = u32::MAX;
+                        (*ctx).r[4] = u32::MAX;
+                        (*ctx).r[1] = (*ctx).r[8];
+                        (*ctx).r[2] = 1;
+                        (*ctx).r[3] = 0;
                     }
-                    0x0010_0010 => {
+                    0x0010_0024 => (*ctx).r[0] = (*ctx).r[5],
+                    0x0010_002C => {
                         (*ctx).r[0] = (*ctx).r[6];
                         (*ctx).r[1] = 0;
                     }
                     0x0010_0044 => {
-                        (*ctx).r[4] = (*ctx).r[4].wrapping_add(1);
+                        (*ctx).r[9] = (*ctx).r[9].wrapping_add(1);
                         (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]);
                     }
                     _ => {}
@@ -1666,6 +1735,7 @@ mod tests {
         system.cpu.regs[1] = 0;
         kernel::svc::dispatch(&mut system, 0x13);
         let mutex = system.cpu.regs[1];
+        system.memory.write32(MUTEX_HANDLE_AT, mutex);
         for (index, &(entry, sleep, priority)) in threads.iter().enumerate() {
             let stack = 0x0010_0F00 - index as u32 * 0x100;
             let id = system.kernel.create_thread(format!("thread {index}"), entry, stack, 0, priority, 0);
@@ -1673,10 +1743,11 @@ mod tests {
             let regs = &mut system.kernel.thread_mut(id).context.regs;
             regs[5] = mutex;
             regs[6] = sleep;
+            regs[8] = MUTEX_HANDLE_AT;
         }
         system.kernel.schedule(&mut system.cpu, 0);
         let code: recomp_abi::Code = if in_place { polling::<true> } else { polling::<false> };
-        let addresses = [0x0010_0000, 0x0010_0004, 0x0010_0010, 0x0010_001C, 0x0010_0040, 0x0010_0044];
+        let addresses = [0x0010_0000, 0x0010_0004, 0x0010_0020, 0x0010_0024, 0x0010_002C, 0x0010_0038, 0x0010_0040, 0x0010_0044];
         let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
         let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
         // SAFETY: a table that lives on, of code working on a context as
@@ -1722,7 +1793,7 @@ mod tests {
             assert_eq!(in_place.history, steps.history, "{threads:x?}");
             assert!(in_place.save_state().unwrap() == steps.save_state().unwrap(), "{threads:x?} ends elsewhere");
             // the current thread's registers are the CPU's
-            let rounds = steps.kernel.threads.iter().map(|thread| thread.context.regs[4]).chain([steps.cpu.regs[4]]);
+            let rounds = steps.kernel.threads.iter().map(|thread| thread.context.regs[9]).chain([steps.cpu.regs[9]]);
             assert!(rounds.max().unwrap() > 100, "{threads:x?} went round");
             assert_eq!(steps.recompiled.as_ref().unwrap().in_place(), 0);
             ran_in_place += in_place.recompiled.as_ref().unwrap().in_place();

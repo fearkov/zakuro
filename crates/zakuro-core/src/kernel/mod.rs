@@ -18,6 +18,9 @@ use thread::{Thread, ThreadId, ThreadStatus, WaitResult};
 /// lowest (numerically highest) priority a thread can have.
 pub const LOWEST_PRIORITY: u32 = 0x3F;
 
+/// the most handles satisfied_now looks at.
+pub(crate) const WAIT_AT_ONCE: usize = 8;
+
 /// how long a thread may run without waiting before the threads below it
 /// get a share, four frames.
 const STARVATION_TICKS: u64 = 4 * crate::CYCLES_PER_FRAME;
@@ -514,6 +517,32 @@ impl Kernel {
             _ => {}
         }
         false
+    }
+
+    /// what WaitSynchronizationN on handles would find at tick when it has
+    /// nothing else to do first: no timer due, every handle naming an
+    /// object, and the wait satisfied right away for the current thread. the
+    /// objects, as many as handles, and the index the wait gives.
+    pub(crate) fn satisfied_now(&self, handles: &[Handle], wait_all: bool, tick: u64) -> Option<([ObjectId; WAIT_AT_ONCE], u32)> {
+        let thread = self.current_thread?;
+        if handles.len() > WAIT_AT_ONCE {
+            return None;
+        }
+        let due = |id: &ObjectId| matches!(self.objects.get(*id), Some(KObject::Timer(timer)) if timer.fire_at.is_some_and(|at| at <= tick));
+        if self.timers.iter().any(due) {
+            return None;
+        }
+        let mut objects = [ObjectId(0); WAIT_AT_ONCE];
+        for (object, &handle) in objects.iter_mut().zip(handles) {
+            if handle == CURRENT_THREAD || handle == CURRENT_PROCESS {
+                return None;
+            }
+            *object = self.handles.resolve(handle)?;
+        }
+        let waited = &objects[..handles.len()];
+        let signaled = |object: &ObjectId| self.is_signaled(*object, thread);
+        let index = if wait_all { waited.iter().all(signaled).then_some(0) } else { waited.iter().position(signaled) }?;
+        Some((objects, index as u32))
     }
 
     /// whether waiting on object would succeed right now for waiter.
