@@ -214,6 +214,11 @@ struct Set {
     logic_op: Option<Option<LogicOp>>,
 }
 
+/// the bindings of the draws' descriptor set, three textures, the
+/// uniforms, the tables, then the program, its uniforms and the inputs of
+/// a draw the GPU shades.
+const BINDINGS: usize = 8;
+
 /// a vertex array a draw read, what memory gave to tell whether something
 /// wrote over it since, and where the heap has it once it was seen the
 /// same twice.
@@ -1637,6 +1642,11 @@ pub struct Hardware {
     arrays: QuickMap<u64, Seen>,
     /// what the command buffer was last set to draw with.
     set: Set,
+    /// what each binding of the draws' descriptor set was last pushed
+    /// with in the command buffer, a view and a sampler or a buffer, where
+    /// in it and how much. the rest keep theirs when a draw pushes some,
+    /// the layout being the same for every draw.
+    pushed: [Option<[u64; 3]>; BINDINGS],
     readback: Option<Buffer>,
     surfaces: Vec<Surface>,
     /// by the address of the decoded texels.
@@ -1902,6 +1912,7 @@ impl Hardware {
                 heap_used: 0,
                 arrays: QuickMap::default(),
                 set: Set::default(),
+                pushed: [None; BINDINGS],
                 readback: None,
                 surfaces: Vec::new(),
                 textures: HashMap::new(),
@@ -2188,6 +2199,7 @@ impl Hardware {
             }
             self.recording = true;
             self.set = Set::default();
+            self.pushed = [None; BINDINGS];
             self.start_timing()?;
             // the batch before may still be running
             self.unfenced = true;
@@ -4235,39 +4247,35 @@ impl Hardware {
             }
             infos
         });
-        let mut writes = [vk::WriteDescriptorSet::default(); 8];
-        let fixed = [
-            vk::WriteDescriptorSet::default()
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&image_infos[0]),
-            vk::WriteDescriptorSet::default()
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&image_infos[1]),
-            vk::WriteDescriptorSet::default()
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&image_infos[2]),
-            vk::WriteDescriptorSet::default()
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&uniform_info),
-            vk::WriteDescriptorSet::default()
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&tables_info),
-        ];
-        writes[..fixed.len()].copy_from_slice(&fixed);
-        let mut count = fixed.len();
+        // what each binding takes, the ones a draw the CPU placed lacks
+        // left as they were
+        let mut bound: [Option<[u64; 3]>; BINDINGS] = [None; BINDINGS];
+        for unit in 0..3 {
+            bound[unit] = Some([vk::Handle::as_raw(r.views[unit]), vk::Handle::as_raw(r.samplers[unit]), 0]);
+        }
+        bound[3] = Some([vk::Handle::as_raw(self.ring.buffer), r.uniforms, UNIFORM_SIZE]);
+        bound[4] = Some([vk::Handle::as_raw(self.ring.buffer), r.tables, TABLES_SIZE]);
         if let Some(infos) = &vertex_infos {
-            for (binding, info) in (5..).zip(&infos[..3]) {
-                writes[count] = vk::WriteDescriptorSet::default()
-                    .dst_binding(binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(info);
-                count += 1;
+            for (slot, [info]) in bound[5..].iter_mut().zip(&infos[..3]) {
+                *slot = Some([vk::Handle::as_raw(info.buffer), info.offset, info.range]);
             }
+        }
+        let mut writes = [vk::WriteDescriptorSet::default(); BINDINGS];
+        let mut count = 0;
+        for (binding, (key, pushed)) in bound.into_iter().zip(self.pushed.iter_mut()).enumerate() {
+            if key.is_none() || key == *pushed {
+                continue;
+            }
+            *pushed = key;
+            let write = vk::WriteDescriptorSet::default().dst_binding(binding as u32);
+            writes[count] = match (binding, &vertex_infos) {
+                (0..=2, _) => write.descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&image_infos[binding]),
+                (3, _) => write.descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uniform_info),
+                (4, _) => write.descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&tables_info),
+                (_, Some(infos)) => write.descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&infos[binding - 5]),
+                (_, None) => unreachable!("bound only for a draw the GPU shades"),
+            };
+            count += 1;
         }
         let writes = &writes[..count];
         let commands = self.commands;
@@ -4347,7 +4355,9 @@ impl Hardware {
                     ops.cmd_set_logic_op(commands, r.logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
                 }
             }
-            self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
+            if !writes.is_empty() {
+                self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
+            }
             self.draws += 1;
             match vertex_infos {
                 Some(infos) => match r.shaded.and_then(|staged| staged.index_type) {
