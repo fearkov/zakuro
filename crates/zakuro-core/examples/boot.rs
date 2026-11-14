@@ -357,8 +357,11 @@ fn main() {
             }
         }
         frame_times.push(frame_start.elapsed());
+        // taken each frame as the app takes it, the samples piling up
+        // otherwise cost each audio frame a move of the whole queue
+        let sound = system.take_audio();
         if wav.is_some() {
-            audio.extend(system.take_audio());
+            audio.extend(sound);
         }
         if dump_at.contains(&executed) {
             if let Some(right) = system.read_right_eye_scaled() {
