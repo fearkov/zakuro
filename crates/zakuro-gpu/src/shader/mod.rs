@@ -15,8 +15,13 @@ use isa::{Instruction, OpCode, OperandDescriptor};
 pub const PROGRAM_SIZE: usize = 4096;
 pub const DESCRIPTOR_SIZE: usize = 128;
 
-// fingerprint hashes both four words at a time
-const _: () = assert!(PROGRAM_SIZE.is_multiple_of(4) && DESCRIPTOR_SIZE.is_multiple_of(4));
+/// the words fingerprint hashes on their own, the runs' hashes then going
+/// together, so that preparing a program hashes again only the runs an
+/// upload changed, rather than the 4224 words a title switching shaders
+/// uploads a few of.
+const RUN: usize = 64;
+const RUNS: usize = (PROGRAM_SIZE + DESCRIPTOR_SIZE) / RUN;
+const _: () = assert!(PROGRAM_SIZE.is_multiple_of(RUN) && DESCRIPTOR_SIZE.is_multiple_of(RUN));
 pub const FLOAT_UNIFORMS: usize = 96;
 pub const INPUT_REGISTERS: usize = 16;
 pub const OUTPUT_REGISTERS: usize = 16;
@@ -57,6 +62,31 @@ pub struct ShaderUnit {
     /// programs decoded before, by fingerprint. titles upload the program
     /// again each time they switch shaders, often the same few.
     decoded_before: HashMap<u64, Arc<Program>>,
+    /// the runs of words the unit's fingerprint last went over, and their
+    /// hashes.
+    hashed: Option<Box<Hashed>>,
+}
+
+#[derive(Clone)]
+struct Hashed {
+    runs: [[u32; RUN]; RUNS],
+    hashes: [u64; RUNS],
+}
+
+/// takes a word into a hash, as fingerprint's lanes do.
+fn mix(hash: u64, word: u64) -> u64 {
+    (hash.rotate_left(5) ^ word).wrapping_mul(0x517C_C1B7_2722_0A95)
+}
+
+/// a run's hash, in four lanes the CPU works on side by side.
+fn run_hash(run: &[u32; RUN]) -> u64 {
+    let mut lanes = [0u64; 4];
+    for chunk in run.as_chunks::<4>().0 {
+        for (lane, &word) in lanes.iter_mut().zip(chunk) {
+            *lane = mix(*lane, word as u64);
+        }
+    }
+    lanes.into_iter().fold(0, mix)
 }
 
 impl Default for ShaderUnit {
@@ -82,6 +112,7 @@ impl ShaderUnit {
             float_uniform_staging: [0; 4],
             decoded: None,
             decoded_before: HashMap::new(),
+            hashed: None,
         }
     }
 
@@ -151,11 +182,11 @@ impl ShaderUnit {
         if self.decoded.is_some() {
             return;
         }
-        let fingerprint = self.fingerprint();
+        let fingerprint = self.fingerprint_again();
         let program = match self.decoded_before.get(&fingerprint) {
             Some(program) => program.clone(),
             None => {
-                let program = Arc::new(Program::decode(self));
+                let program = Arc::new(Program::decode_as(self, fingerprint));
                 if self.decoded_before.len() >= DECODED_KEPT {
                     self.decoded_before.clear();
                 }
@@ -184,6 +215,7 @@ impl ShaderUnit {
             float_uniform_staging: self.float_uniform_staging,
             decoded: self.decoded.clone(),
             decoded_before: HashMap::new(),
+            hashed: None,
         }
     }
 
@@ -209,17 +241,27 @@ impl ShaderUnit {
         if let Some(program) = &self.decoded {
             return program.fingerprint;
         }
-        // four lanes the CPU works on side by side, titles switch programs
-        // often enough for one chain through every word to show
-        let mix = |hash: u64, word: u64| (hash.rotate_left(5) ^ word).wrapping_mul(0x517C_C1B7_2722_0A95);
-        let mut lanes = [0u64; 4];
-        let words = self.program.as_chunks::<4>().0.iter().chain(self.descriptors.as_chunks::<4>().0);
-        for chunk in words {
-            for (lane, &word) in lanes.iter_mut().zip(chunk) {
-                *lane = mix(*lane, word as u64);
+        self.runs().map(run_hash).fold(0, mix)
+    }
+
+    /// the program's runs of words, then the descriptors'.
+    fn runs(&self) -> impl Iterator<Item = &[u32; RUN]> {
+        self.program.as_chunks::<RUN>().0.iter().chain(self.descriptors.as_chunks::<RUN>().0)
+    }
+
+    /// the fingerprint, hashing again only the runs that differ from the
+    /// last time.
+    fn fingerprint_again(&mut self) -> u64 {
+        let mut hashed = self.hashed.take().unwrap_or_else(|| Box::new(Hashed { runs: [[0; RUN]; RUNS], hashes: [run_hash(&[0; RUN]); RUNS] }));
+        for ((run, kept), hash) in self.runs().zip(hashed.runs.iter_mut()).zip(hashed.hashes.iter_mut()) {
+            if run != kept {
+                *kept = *run;
+                *hash = run_hash(run);
             }
         }
-        lanes.into_iter().fold(0, mix)
+        let fingerprint = hashed.hashes.iter().fold(0, |all, &hash| mix(all, hash));
+        self.hashed = Some(hashed);
+        fingerprint
     }
 
     /// starts a float uniform upload at the register the raw value names.
@@ -503,6 +545,10 @@ pub struct Program {
 
 impl Program {
     fn decode(unit: &ShaderUnit) -> Program {
+        Program::decode_as(unit, unit.fingerprint())
+    }
+
+    fn decode_as(unit: &ShaderUnit, fingerprint: u64) -> Program {
         let ops: Box<[Op]> = unit.program.iter().map(|&word| Op::decode(Instruction(word), &unit.descriptors)).collect();
         let (mut inputs, mut outputs) = (0u16, 0u16);
         for op in ops.iter() {
@@ -521,7 +567,7 @@ impl Program {
                 outputs |= 1 << op.destination;
             }
         }
-        Program { ops, inputs, outputs, fingerprint: unit.fingerprint() }
+        Program { ops, inputs, outputs, fingerprint }
     }
 }
 
@@ -1119,6 +1165,52 @@ mod tests {
 
     /// descriptor 0, write every component, identity swizzle on both sources.
     const IDENTITY: u32 = 0xF | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
+
+    /// the fingerprint prepare works out run by run is the one worked out
+    /// over every word, after uploads anywhere in the program and the
+    /// descriptors, words written straight in, and the same words again.
+    #[test]
+    fn fingerprints_hashed_again_by_runs_are_whole_ones() {
+        let mut unit = ShaderUnit::new();
+        let mut seed = 3u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut seen = std::collections::HashSet::new();
+        for round in 0..60 {
+            match round % 4 {
+                0 => {
+                    unit.program_write_offset = random() as usize % PROGRAM_SIZE;
+                    for _ in 0..random() % 300 {
+                        unit.upload_program(random());
+                    }
+                }
+                1 => {
+                    unit.descriptor_write_offset = random() as usize % DESCRIPTOR_SIZE;
+                    for _ in 0..1 + random() % 20 {
+                        unit.upload_descriptor(random());
+                    }
+                }
+                2 => unit.program[random() as usize % PROGRAM_SIZE] ^= 1 << (random() % 32),
+                // a title uploading the program it has
+                _ => {
+                    unit.program_write_offset = 0;
+                    for i in 0..64 {
+                        let word = unit.program[i];
+                        unit.upload_program(word);
+                    }
+                }
+            }
+            unit.decoded = None;
+            let whole = unit.fingerprint();
+            unit.prepare();
+            assert_eq!(unit.fingerprint(), whole, "round {round}");
+            seen.insert(whole);
+        }
+        // every round but the fifteen uploading the same words changed it
+        assert_eq!(seen.len(), 45);
+    }
 
     /// a little random number generator, the same numbers every run.
     struct Random(u64);
