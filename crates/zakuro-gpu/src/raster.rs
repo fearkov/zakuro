@@ -1653,8 +1653,12 @@ pub struct TextureCache {
     /// runs, so a texture checked during it is not checked again unless a
     /// draw writes over it.
     list: u64,
-    /// where the draws of this list wrote, as address and length.
-    written: Vec<(u32, u32)>,
+    /// where the draws of this list wrote, as address and length, each with
+    /// how many writes the list had made when it was last written, and how
+    /// many it made. titles draw into a few buffers in turn, which stay a
+    /// few entries rather than one a draw to look through.
+    written: Vec<(u32, u32, usize)>,
+    writes: usize,
     /// the texture pack whose pictures replace textures, and where a
     /// texture is laid out to hash it as Citra did.
     pack: Option<Arc<crate::pack::Pack>>,
@@ -1704,12 +1708,15 @@ impl TextureCache {
     pub fn begin_list(&mut self) {
         self.list += 1;
         self.written.clear();
+        self.writes = 0;
     }
 
     /// a draw writes to size bytes at addr.
     fn wrote(&mut self, addr: u32, size: u32) {
-        if self.written.last() != Some(&(addr, size)) {
-            self.written.push((addr, size));
+        self.writes += 1;
+        match self.written.iter_mut().find(|(start, length, _)| (*start, *length) == (addr, size)) {
+            Some(entry) => entry.2 = self.writes,
+            None => self.written.push((addr, size, self.writes)),
         }
     }
 
@@ -1719,9 +1726,10 @@ impl TextureCache {
         let decoded = self.entries.get(&key)?;
         let (list, writes) = decoded.checked;
         let addr = key.0;
-        let overwritten = self.written[writes.min(self.written.len())..]
+        let overwritten = self
+            .written
             .iter()
-            .any(|&(start, length)| start < addr.saturating_add(size) && addr < start.saturating_add(length));
+            .any(|&(start, length, at)| at > writes && start < addr.saturating_add(size) && addr < start.saturating_add(length));
         (list == self.list && !overwritten).then(|| (decoded.texels.clone(), decoded.replacement.clone()))
     }
 
@@ -1733,7 +1741,7 @@ impl TextureCache {
         if !memory.unchanged(key.0, size, watch) {
             return None;
         }
-        decoded.checked = (self.list, self.written.len());
+        decoded.checked = (self.list, self.writes);
         Some((decoded.texels.clone(), decoded.replacement.clone()))
     }
 
@@ -1747,7 +1755,7 @@ impl TextureCache {
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
         let (_, format, width, height, levels) = key;
         let hash = fingerprint(data);
-        let checked = (self.list, self.written.len());
+        let checked = (self.list, self.writes);
         if let Some(decoded) = self.entries.get_mut(&key) {
             if decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
@@ -3974,6 +3982,11 @@ mod tests {
         assert!(cache.checked(key, 256).is_none(), "a draw over it");
         cache.decoded(key, &[0x11; 256]);
         assert!(cache.checked(key, 256).is_some(), "checked again after the draw");
+        // buffers drawn into in turn, the one over it again after
+        cache.wrote(0x5000, 0x100);
+        assert!(cache.checked(key, 256).is_some(), "drawn over before it was checked");
+        cache.wrote(0x1080, 0x10);
+        assert!(cache.checked(key, 256).is_none(), "drawn over again");
         cache.begin_list();
         assert!(cache.checked(key, 256).is_none(), "a new list");
     }
