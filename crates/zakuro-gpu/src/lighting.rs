@@ -82,38 +82,42 @@ impl Tables {
     /// takes a write to the table data registers, into the table and entry
     /// the index register names, which then moves on to the next entry.
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
-        self.write_all(registers, [value]);
+        self.write_all(registers, [&[value], &[]]);
     }
 
     /// takes writes to the table data registers one after another, as
     /// write does, the index register read and moved on once for all of
-    /// them. titles send whole tables, thousands of entries a frame.
-    pub fn write_all(&mut self, registers: &mut [u32], values: impl IntoIterator<Item = u32>) {
+    /// them. titles send whole tables, thousands of entries a frame, a
+    /// command's first word and the burst after it, plain loops over each,
+    /// whose count and entry stay in registers. an iterator's fold the
+    /// compiler sometimes left out of line kept them in memory, each entry
+    /// waiting on the last one's store.
+    pub fn write_all(&mut self, registers: &mut [u32], parts: [&[u32]; 2]) {
         let index = registers[REG_TABLE_INDEX];
         let number = ((index >> 8) & 0x1F) as usize;
         let mut entry = index as u8;
         match self.entries.get_mut(number) {
             Some(table) => {
                 let mut changes = 0;
-                // inside the iterator, so that a chain of them runs as a loop
-                // over each
-                values.into_iter().for_each(|value| {
-                    // a 0.12 value and the step to the next one, an 11-bit
-                    // magnitude with the sign above it
-                    let step = STEPS[((value >> 12) & 0x7FF) as usize];
-                    let step = if value & (1 << 23) != 0 { -step } else { step };
-                    let decoded = [VALUES[(value & 0xFFF) as usize], step];
-                    let slot = &mut table[entry as usize];
-                    changes += (slot.map(f32::to_bits) != decoded.map(f32::to_bits)) as u64;
-                    *slot = decoded;
-                    entry = entry.wrapping_add(1);
-                });
+                for part in parts {
+                    for &value in part {
+                        // a 0.12 value and the step to the next one, an
+                        // 11-bit magnitude with the sign above it
+                        let step = STEPS[((value >> 12) & 0x7FF) as usize];
+                        let step = if value & (1 << 23) != 0 { -step } else { step };
+                        let decoded = [VALUES[(value & 0xFFF) as usize], step];
+                        let slot = &mut table[entry as usize];
+                        changes += (slot.map(f32::to_bits) != decoded.map(f32::to_bits)) as u64;
+                        *slot = decoded;
+                        entry = entry.wrapping_add(1);
+                    }
+                }
                 if changes > 0 {
                     self.generation += changes;
                     self.changed[number] = self.generation;
                 }
             }
-            None => entry = entry.wrapping_add(values.into_iter().count() as u8),
+            None => entry = entry.wrapping_add((parts[0].len() + parts[1].len()) as u8),
         }
         registers[REG_TABLE_INDEX] = (index & !0xFF) | entry as u32;
     }
@@ -736,8 +740,9 @@ mod tests {
             let values: Vec<u32> = (0..random() % 300).map(|i| if round % 3 == 0 { i * 0x1001 } else { random() }).collect();
             ones[REG_TABLE_INDEX] = index | 0xABC0_0000;
             alls[REG_TABLE_INDEX] = index | 0xABC0_0000;
-            values.iter().for_each(|&value| one.write_all(&mut ones, [value]));
-            all.write_all(&mut alls, values.iter().copied());
+            values.iter().for_each(|&value| one.write(&mut ones, value));
+            let split = values.len().min(1 + round % 3);
+            all.write_all(&mut alls, [&values[..split], &values[split..]]);
             assert_eq!(alls[REG_TABLE_INDEX], ones[REG_TABLE_INDEX], "round {round}");
             assert_eq!((all.generation(), all.changed()), (one.generation(), one.changed()), "round {round}");
             assert!(all.saved().iter().zip(one.saved()).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits)), "round {round}");

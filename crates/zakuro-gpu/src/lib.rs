@@ -1055,7 +1055,7 @@ impl Gpu {
             }
             lighting::REG_TABLE_DATA..=lighting::REG_TABLE_DATA_END if last <= lighting::REG_TABLE_DATA_END => {
                 self.flush_immediate(memory);
-                self.resources.light_tables.write_all(&mut self.internal, words().copied());
+                self.resources.light_tables.write_all(&mut self.internal, [std::slice::from_ref(&first), burst]);
             }
             proctex::REG_TABLE_DATA..=proctex::REG_TABLE_DATA_END if last <= proctex::REG_TABLE_DATA_END => {
                 self.flush_immediate(memory);
