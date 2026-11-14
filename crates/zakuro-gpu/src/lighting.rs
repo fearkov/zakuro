@@ -4,6 +4,8 @@
 //! and secondary (specular) fragment colors. how each term comes out of the
 //! lookup tables follows what Citra worked out.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub const REG_ENABLE: usize = 0x08F;
 const REG_LIGHTS: usize = 0x140;
 const REG_GLOBAL_AMBIENT: usize = 0x1C0;
@@ -29,7 +31,7 @@ const REFLECT_GREEN: usize = 5;
 const REFLECT_RED: usize = 6;
 const SPOTLIGHT: usize = 8;
 const DISTANCE: usize = 16;
-const TABLES: usize = 24;
+pub(crate) const TABLES: usize = 24;
 
 /// the lookup tables, each entry decoded as it arrives into its value and
 /// the step to the next entry, which interpolates between them.
@@ -38,11 +40,23 @@ pub struct Tables {
     /// goes up with every write that changes an entry, so a copy elsewhere
     /// knows it is stale. titles send the same tables over and over.
     generation: u64,
+    /// the generation each table last changed at, so a copy elsewhere can
+    /// tell which of its tables to look at again.
+    changed: [u64; TABLES],
+    /// which tables these are, so that a generation noted for these is
+    /// never taken for one of another set's.
+    id: u64,
 }
 
 impl Default for Tables {
     fn default() -> Self {
-        Tables { entries: Box::new([[[0.0; 2]; 256]; TABLES]), generation: 0 }
+        static IDS: AtomicU64 = AtomicU64::new(0);
+        Tables {
+            entries: Box::new([[[0.0; 2]; 256]; TABLES]),
+            generation: 0,
+            changed: [0; TABLES],
+            id: IDS.fetch_add(1, Ordering::Relaxed),
+        }
     }
 }
 
@@ -61,6 +75,7 @@ impl Tables {
             table.copy_from_slice(saved);
         }
         self.generation += 1;
+        self.changed = [self.generation; TABLES];
         true
     }
 
@@ -69,7 +84,8 @@ impl Tables {
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
         let index = registers[REG_TABLE_INDEX];
         let entry = (index & 0xFF) as usize;
-        if let Some(table) = self.entries.get_mut(((index >> 8) & 0x1F) as usize) {
+        let number = ((index >> 8) & 0x1F) as usize;
+        if let Some(table) = self.entries.get_mut(number) {
             // a 0.12 value and the step to the next one, an 11-bit magnitude
             // with the sign above it
             let step = ((value >> 12) & 0x7FF) as f32 / 2047.0;
@@ -78,6 +94,7 @@ impl Tables {
             if table[entry].map(f32::to_bits) != decoded.map(f32::to_bits) {
                 table[entry] = decoded;
                 self.generation += 1;
+                self.changed[number] = self.generation;
             }
         }
         registers[REG_TABLE_INDEX] = (index & !0xFF) | ((entry as u32 + 1) & 0xFF);
@@ -90,6 +107,16 @@ impl Tables {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// the generation each table last changed at.
+    pub(crate) fn changed(&self) -> &[u64; TABLES] {
+        &self.changed
+    }
+
+    /// which tables these are.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     fn lookup(&self, table: usize, entry: u8, delta: f32) -> f32 {
@@ -621,8 +648,16 @@ mod tests {
         values.iter().for_each(|&value| tables.write(&mut registers, value));
         assert_eq!(tables.generation(), sent);
         registers[REG_TABLE_INDEX] = (5 << 8) | 1;
+        let changed = *tables.changed();
         tables.write(&mut registers, 2048);
         assert_ne!(tables.generation(), sent);
+        // and only its own table is noted as changed
+        let mut expected = changed;
+        expected[5] = tables.generation();
+        assert_eq!(*tables.changed(), expected);
+        assert!(tables.restore(&tables.saved()));
+        assert_eq!(*tables.changed(), [tables.generation(); TABLES], "a restore changes every table");
+        assert_ne!(Tables::default().id(), tables.id());
     }
 
     /// the lighting kept from the last draw is the one the registers set

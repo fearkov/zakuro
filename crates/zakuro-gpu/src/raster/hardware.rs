@@ -29,7 +29,7 @@ use crate::pack::Material;
 use crate::proctex;
 use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
-use crate::lighting::{Lighting, Tables};
+use crate::lighting::{self, Lighting, Tables};
 use crate::registers::*;
 use crate::device::SharedDevice;
 use crate::shader::glsl::{self, SEMANTICS};
@@ -82,6 +82,34 @@ const UNIFORM_SIZE: u64 = (UNIFORM_WORDS * 4) as u64;
 /// map and alpha map as values and steps and its colors and their steps as
 /// two pairs each, then the fog's, a value and a step an entry.
 const TABLES_SIZE: u64 = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES + fog::ENTRIES) as u64 * 8;
+/// a set of tables as the batch copied it, the hashes of the lighting
+/// tables and the generations of the procedural texture's and the fog's,
+/// which titles seldom change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TablesKey {
+    light: [u64; lighting::TABLES],
+    procedural: u64,
+    fog: u64,
+}
+
+/// a hash of a lighting table's entries. every step is one to one, so two
+/// tables apart in a single entry never share it. eight lanes, so that
+/// the multiplies overlap.
+fn table_hash(table: &[[f32; 2]; 256]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mix = |hash: u64, word: u64| {
+        let mixed = (hash ^ word).wrapping_mul(K);
+        mixed ^ (mixed >> 29)
+    };
+    let mut lanes: [u64; 8] = std::array::from_fn(|lane| (lane as u64 + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+    for chunk in table.as_chunks::<8>().0 {
+        for (lane, &[value, step]) in lanes.iter_mut().zip(chunk) {
+            *lane = mix(*lane, u64::from(value.to_bits()) | u64::from(step.to_bits()) << 32);
+        }
+    }
+    lanes.into_iter().fold(0, mix)
+}
+
 /// a shader program and its operand descriptors.
 const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
 /// the words of what a vertex shader reads besides its program, the float
@@ -1525,6 +1553,12 @@ pub struct Hardware {
     blank: Image,
     /// the tables' generation and where the batch copied them.
     tables: Option<((u64, u64, u64), u64)>,
+    /// a hash of each lighting table, with the generation it was taken
+    /// at, and which tables those were.
+    light_hashes: (u64, [(u64, u64); lighting::TABLES]),
+    /// the sets of tables the batch copied and where, by the hashes of
+    /// the lighting tables and the generations of the others.
+    copied_tables: Vec<(TablesKey, u64)>,
     recording: bool,
     /// uploads waiting for a barrier before anything reads them.
     uploads: bool,
@@ -1773,6 +1807,8 @@ impl Hardware {
                 replacing_from: 0,
                 max_image_size: properties.limits.max_image_dimension2_d,
                 tables: None,
+                light_hashes: (u64::MAX, [(0, 0); lighting::TABLES]),
+                copied_tables: Vec::new(),
                 recording: false,
                 uploads: false,
                 rendering: None,
@@ -2937,6 +2973,25 @@ impl Hardware {
                 return Ok(offset);
             }
         }
+        // titles switch between a few sets of lighting tables, sending a
+        // set again each time it comes back, and a set the batch already
+        // copied is found by the hashes of its tables, each taken again
+        // only once its table changed. copying is what costs, the ring
+        // being memory the CPU writes past its caches
+        let (id, hashes) = &mut self.light_hashes;
+        let other = *id != tables.id();
+        *id = tables.id();
+        for ((taken, hash), (&changed, table)) in hashes.iter_mut().zip(tables.changed().iter().zip(tables.entries())) {
+            if other || *taken != changed {
+                *taken = changed;
+                *hash = table_hash(table);
+            }
+        }
+        let key = TablesKey { light: hashes.map(|(_, hash)| hash), procedural: procedural.generation(), fog: fog.generation() };
+        if let Some(&(_, offset)) = self.copied_tables.iter().find(|(copied, _)| *copied == key) {
+            self.tables = Some((generation, offset));
+            return Ok(offset);
+        }
         let offset = self.stage(TABLES_SIZE, self.storage_alignment)?;
         let staging = self.ring(offset, TABLES_SIZE);
         let (colors, steps) = procedural.colors();
@@ -2957,6 +3012,7 @@ impl Hardware {
             }
             out = rest;
         }
+        self.copied_tables.push((key, offset));
         self.tables = Some((generation, offset));
         Ok(offset)
     }
@@ -5019,6 +5075,7 @@ impl Hardware {
         }
         self.used = 0;
         self.tables = None;
+        self.copied_tables.clear();
         self.programs.clear();
         self.uniforms.at = None;
         self.shading.at = None;
@@ -5774,6 +5831,25 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tables apart in any one entry, in its value or its step, by any
+    /// one bit, never share a hash, and the same entries always do.
+    #[test]
+    fn tables_apart_in_an_entry_hash_apart() {
+        let table: [[f32; 2]; 256] = std::array::from_fn(|i| [i as f32 / 4095.0, -(i as f32) / 2047.0]);
+        let hash = table_hash(&table);
+        assert_eq!(table_hash(&table.clone()), hash);
+        let mut seen = std::collections::HashSet::from([hash]);
+        for entry in 0..256 {
+            for half in 0..2 {
+                for bit in [0, 1, 11, 22, 23, 31] {
+                    let mut other = table;
+                    other[entry][half] = f32::from_bits(other[entry][half].to_bits() ^ 1 << bit);
+                    assert!(seen.insert(table_hash(&other)), "entry {entry}, half {half}, bit {bit}");
+                }
+            }
+        }
+    }
 
     /// a block gathered with the words of the last one staged is read from
     /// where that went, any other is staged anew, and nothing is read from
