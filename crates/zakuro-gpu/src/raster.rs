@@ -5164,6 +5164,10 @@ mod tests {
         /// how long each slice handed out was, a whole array's for the GPU
         /// among them, a vertex's when the CPU decodes them.
         sliced: Vec<usize>,
+        /// the writes so far, and the one each 256 bytes of the arrays last
+        /// had, which watches go by as the console's pages.
+        writes: u64,
+        written: Vec<u64>,
     }
 
     #[cfg(feature = "vulkan")]
@@ -5171,7 +5175,7 @@ mod tests {
         const START: u32 = 0x1400_0000;
 
         fn new() -> ArrayMemory {
-            ArrayMemory { rest: ConsoleMemory::default(), arrays: vec![0; 0x1_0000], sliced: Vec::new() }
+            ArrayMemory { rest: ConsoleMemory::default(), arrays: vec![0; 0x1_0000], sliced: Vec::new(), writes: 0, written: vec![0; 0x100] }
         }
 
         fn at(&self, addr: u32) -> Option<usize> {
@@ -5196,10 +5200,14 @@ mod tests {
         }
 
         fn write(&mut self, addr: u32, data: &[u8]) {
+            self.writes += 1;
             for (i, &byte) in data.iter().enumerate() {
                 let addr = addr + i as u32;
                 match self.at(addr) {
-                    Some(at) => self.arrays[at] = byte,
+                    Some(at) => {
+                        self.arrays[at] = byte;
+                        self.written[at >> 8] = self.writes;
+                    }
                     None => self.rest.write(addr, &[byte]),
                 }
             }
@@ -5215,6 +5223,110 @@ mod tests {
             self.sliced.push(len);
             Some(&self.arrays[at..end])
         }
+
+        fn watch(&mut self, addr: u32, len: u32) -> Option<u64> {
+            let at = self.at(addr)?;
+            (at + len as usize <= self.arrays.len()).then_some(self.writes)
+        }
+
+        fn unchanged(&mut self, addr: u32, len: u32, watch: u64) -> bool {
+            self.at(addr).is_some_and(|at| self.written[at >> 8..(at + len as usize).div_ceil(0x100)].iter().all(|&write| write <= watch))
+        }
+    }
+
+    /// a draw's arrays, once they stayed the same, go to the GPU once and
+    /// are drawn from there in later batches, until a title writes over
+    /// them, the draws coming out as those whose vertices the CPU decodes.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn arrays_kept_on_the_gpu_draw_what_memory_has() {
+        const SIZE: u32 = 32;
+        const BASE: u32 = 0x2000_0000;
+        const INDICES: u32 = 0x6000;
+        const VERTICES: u32 = 24;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut unit = ShaderUnit::new();
+        unit.descriptors[0] = 0xF | IDENTITY;
+        let op = |opcode: u32, destination: u32, src1: u32, src2: u32| opcode << 26 | destination << 21 | src1 << 12 | src2 << 7;
+        // o0 = c0 * v0, o1 = c1 * v1
+        let program = [op(0x08, 0x00, 0x20, 0x00), op(0x08, 0x01, 0x21, 0x01), 0x22 << 26];
+        unit.program[..program.len()].copy_from_slice(&program);
+        unit.float_uniforms[0] = [0.9, 0.9, 1.0, 1.0];
+        unit.float_uniforms[1] = [1.0 / 255.0; 4];
+        unit.prepare();
+        let fixed = [shader::ZERO; 16];
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        registers[REG_VS_OUTPUT_MASK] = 0b11;
+        registers[REG_ATTRIBUTE_BASE] = BASE >> 3;
+        registers[REG_VS_NUM_INPUT_ATTRIBUTES] = 1;
+        registers[REG_VS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x10;
+        // two floats of position from one array, four bytes of color from
+        // another, drawn as a strip
+        registers[REG_ATTRIBUTE_FORMAT_LOW] = (1 << 2 | 3) | (3 << 2 | 1) << 4;
+        registers[REG_ATTRIBUTE_FORMAT_HIGH] = 1 << 28;
+        for (i, (offset, stride, id)) in [(0x100u32, 8u32, 0u32), (0x800, 4, 1)].into_iter().enumerate() {
+            let at = REG_ATTRIBUTE_LOADER + i * 3;
+            registers[at] = offset;
+            registers[at + 1] = id;
+            registers[at + 2] = stride << 16 | 1 << 28;
+        }
+        registers[REG_PRIMITIVE_CONFIG] = 1 << 8;
+        registers[REG_VERTEX_COUNT] = VERTICES;
+        registers[REG_INDEX_ARRAY] = INDICES | 1 << 31;
+
+        let mut seed = 5u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut positions = || -> Vec<u8> {
+            (0..VERTICES * 2).flat_map(|_| ((random() & 0xFFFF) as f32 / 65536.0 * 1.8 - 0.9).to_le_bytes()).collect()
+        };
+        let first = positions();
+        let moved = positions();
+        let colors: Vec<u8> = (0..VERTICES * 4).map(|i| (i * 37 % 251) as u8).collect();
+        let indices: Vec<u8> = (0..VERTICES as u16).flat_map(|i| (i * 7 % VERTICES as u16).to_le_bytes()).collect();
+        let (mut decoded, mut raw) = (ConsoleMemory::default(), ArrayMemory::new());
+        for (at, bytes) in [(0x100, &first), (0x800, &colors), (INDICES, &indices)] {
+            decoded.write(0x1400_0000 + at, bytes);
+            raw.write(0x1400_0000 + at, bytes);
+        }
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut kept = Vec::new();
+        for round in 0..6 {
+            // a title moving what it draws writes over the arrays
+            if round == 3 {
+                decoded.write(0x1400_0000 + 0x100, &moved);
+                raw.write(0x1400_0000 + 0x100, &moved);
+            }
+            decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+            raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+            draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, true, None);
+            resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
+            draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, true, None);
+            resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
+            let (mut a, mut b) = (vec![0u8; (SIZE * SIZE * 4) as usize], vec![0u8; (SIZE * SIZE * 4) as usize]);
+            decoded.read(COLOR, &mut a);
+            raw.read(COLOR, &mut b);
+            let drawn = a.chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+            assert!(drawn > 50, "round {round}, only {drawn} pixels drawn");
+            assert!(a == b, "round {round}: the kept arrays draw differently");
+            kept.push(resources.hardware.as_ref().unwrap().heap_used());
+        }
+        // new, then the same twice and kept, then written over and new,
+        // then kept again where the heap goes on
+        assert_eq!(kept[0], 0);
+        assert!(kept[1] > 0);
+        assert_eq!((kept[2], kept[3]), (kept[1], kept[1]));
+        assert!(kept[4] > kept[3]);
+        assert_eq!(kept[5], kept[4]);
     }
 
     /// draws from vertex arrays the GPU decodes itself come out as those

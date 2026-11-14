@@ -65,6 +65,16 @@ const IN_FLIGHT: usize = 3;
 /// a batch past this much is run before the next draw, so a draw always
 /// finds room.
 const RING_FLUSH: u64 = RING_SIZE / 2;
+/// where vertex arrays that stay the same go once and stay, rather than
+/// into each batch's ring again, see Hardware::kept.
+const HEAP_SIZE: u64 = 32 << 20;
+/// the heap starts over before a draw once this much is in it, each draw
+/// finding room for the 4 MiB of arrays raw_inputs hands over at most.
+const HEAP_FLUSH: u64 = HEAP_SIZE - (8 << 20);
+/// how many arrays are looked out for, past which those seen once go,
+/// titles putting what they write each frame somewhere else each time,
+/// and past half of which in the heap it starts over.
+const MOST_ARRAYS: usize = 1 << 14;
 
 /// a vertex is six vectors, position, color, texture coordinates 0 and 1,
 /// coordinate 2 with the mapped depth, the quaternion and the view vector.
@@ -170,6 +180,25 @@ pub(super) struct Draw<'a> {
 /// where something is staged in the ring, and its bytes.
 type Staged = (u64, u64);
 
+/// where stage_shading put what the vertex shader reads.
+#[derive(Clone, Copy)]
+struct ShadingStaged {
+    /// the program, its uniforms, the inputs and the indices.
+    ranges: [Staged; 4],
+    /// how wide the indices are, none for vertices in a row.
+    index_type: Option<vk::IndexType>,
+    /// whether the inputs are the heap's rather than the ring's.
+    kept: bool,
+}
+
+/// a vertex array a draw read, what memory gave to tell whether something
+/// wrote over it since, and where the heap has it once it was seen the
+/// same twice.
+struct Seen {
+    watch: u64,
+    at: Option<u32>,
+}
+
 /// a draw as recorded, once what it reads is staged, so the same draw can
 /// go into the twins of its buffers later.
 #[derive(Clone, Copy)]
@@ -195,14 +224,11 @@ struct Recorded {
     samplers: [vk::Sampler; 3],
     uniforms: u64,
     tables: u64,
-    /// where the program, its uniforms, the inputs and the indices are
-    /// staged, for a draw the GPU shades.
-    shaded: Option<[(u64, u64); 4]>,
+    /// what the vertex shader reads, for a draw the GPU shades.
+    shaded: Option<ShadingStaged>,
     /// where the vertices and the indices are, for one the CPU placed.
     placed: (u64, u64),
     count: u32,
-    /// how wide the indices are, none for vertices in a row.
-    index_type: Option<vk::IndexType>,
     topology: vk::PrimitiveTopology,
 }
 
@@ -1581,6 +1607,11 @@ pub struct Hardware {
     max_bias: f32,
     ring: Buffer,
     used: u64,
+    /// vertex arrays kept across batches, how much of it they take, and
+    /// the arrays draws read, by address and length, see kept.
+    heap: Buffer,
+    heap_used: u64,
+    arrays: QuickMap<u64, Seen>,
     readback: Option<Buffer>,
     surfaces: Vec<Surface>,
     /// by the address of the decoded texels.
@@ -1636,7 +1667,7 @@ pub struct Hardware {
     twin_copies: HashMap<DrawnTexture, Copied>,
     /// the batch the draw a draw in between follows staged its vertices
     /// and its indices in, and where, which the one in between reads too.
-    twinned_inputs: Option<(u64, Staged, Staged)>,
+    twinned_inputs: Option<(u64, Staged, Staged, bool)>,
     batch: u64,
     name: String,
     /// how many times the console's resolution surfaces are drawn at.
@@ -1842,6 +1873,9 @@ impl Hardware {
                 samplers: QuickMap::default(),
                 max_bias: properties.limits.max_sampler_lod_bias,
                 used: 0,
+                heap: unmade(),
+                heap_used: 0,
+                arrays: QuickMap::default(),
                 readback: None,
                 surfaces: Vec::new(),
                 textures: HashMap::new(),
@@ -1912,6 +1946,7 @@ impl Hardware {
             for i in 0..hardware.free.len() {
                 hardware.free[i].ring = hardware.buffer(RING_SIZE, ring_usage, false)?;
             }
+            hardware.heap = hardware.buffer(HEAP_SIZE, vk::BufferUsageFlags::STORAGE_BUFFER, false)?;
             hardware.begin()?;
             hardware.blank = hardware.image(
                 1,
@@ -3401,6 +3436,12 @@ impl Hardware {
         self.waits = waits;
     }
 
+    /// how much of the heap kept arrays take.
+    #[cfg(test)]
+    pub(super) fn heap_used(&self) -> u64 {
+        self.heap_used
+    }
+
     /// whether draws always go through the generic fragment shader.
     #[cfg(test)]
     pub(super) fn set_generic(&mut self, generic: bool) {
@@ -3558,7 +3599,7 @@ impl Hardware {
         memory: &mut M,
         shading: &Shading,
         depth_map: DepthMap,
-    ) -> Result<([Staged; 4], Option<vk::IndexType>), String> {
+    ) -> Result<ShadingStaged, String> {
         let unit = shading.unit;
         let fingerprint = unit.fingerprint();
         let program = match self.programs.get(&fingerprint) {
@@ -3594,6 +3635,8 @@ impl Hardware {
         let mut attributes = [[0u32; 4]; INPUT_REGISTERS];
         let mut defaults = [crate::shader::ZERO; INPUT_REGISTERS];
         let mut starts = [0u32; 12];
+        // whether the arrays are read from the heap
+        let mut kept = false;
         let input_bytes = match shading.inputs {
             Inputs::Decoded(decoded) => {
                 // the registers a vertex reads in turn, four floats each
@@ -3604,13 +3647,22 @@ impl Hardware {
                 ((decoded.len() * registers.len()).max(1) * 16) as u64
             }
             Inputs::Raw(raw) => {
-                // each array from a word on, and a word after the last, a
-                // value can run into the word after its own
-                let mut total = 0;
-                for (start, &(_, len)) in starts.iter_mut().zip(&raw.arrays) {
-                    *start = total;
-                    total += len.div_ceil(4) * 4;
-                }
+                let bytes = match self.kept(memory, raw) {
+                    Some(at) => {
+                        (starts, kept) = (at, true);
+                        HEAP_SIZE
+                    }
+                    None => {
+                        // each array from a word on, and a word after the
+                        // last, a value can run into the word after its own
+                        let mut total = 0;
+                        for (start, &(_, len)) in starts.iter_mut().zip(&raw.arrays) {
+                            *start = total;
+                            total += len.div_ceil(4) * 4;
+                        }
+                        total as u64 + 4
+                    }
+                };
                 for &register in registers {
                     defaults[register] = raw.defaults[register];
                     if let Some(field) = raw.fields[register] {
@@ -3618,7 +3670,7 @@ impl Hardware {
                         attributes[register] = [starts[field.array], field.stride, format, 0];
                     }
                 }
-                total as u64 + 4
+                bytes
             }
         };
         // the arrays go in as slices, a flattened iterator has no length to
@@ -3661,14 +3713,19 @@ impl Hardware {
         // the draw in between reads the vertices its own draw staged just
         // before, only its uniforms differ
         let index_bytes = (count * index_size) as u64;
-        if let Some((batch, inputs, indices)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
-            if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes {
-                return Ok(([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices], index_type));
+        if let Some((batch, inputs, indices, were_kept)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
+            if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes && were_kept == kept {
+                let ranges = [(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices];
+                return Ok(ShadingStaged { ranges, index_type, kept });
             }
         }
 
-        let inputs = self.stage(input_bytes, self.storage_alignment)?;
+        let inputs = match kept {
+            true => 0,
+            false => self.stage(input_bytes, self.storage_alignment)?,
+        };
         match shading.inputs {
+            _ if kept => {}
             Inputs::Decoded(decoded) => {
                 let staging = self.ring(inputs, input_bytes);
                 // the inner loop copies a register at a time, simple enough to
@@ -3717,9 +3774,58 @@ impl Hardware {
             Primitives::Raw { order: RawOrder::InARow(_), .. } => {}
         }
         if self.pass == Pass::Twinned {
-            self.twinned_inputs = Some((self.batch, (inputs, input_bytes), (indices, index_bytes)));
+            self.twinned_inputs = Some((self.batch, (inputs, input_bytes), (indices, index_bytes), kept));
         }
-        Ok(([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)], index_type))
+        let ranges = [(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)];
+        Ok(ShadingStaged { ranges, index_type, kept })
+    }
+
+    /// where the heap has each of a draw's arrays, none when one of them is
+    /// new or something wrote over it since it was last seen, the draw then
+    /// staging them all in the ring. an array seen twice the same goes to
+    /// the heap, which later batches read it from while memory has nothing
+    /// written over it, as most of a title's models are, and the ring takes
+    /// those a title writes each frame.
+    fn kept<M: GpuMemory>(&mut self, memory: &mut M, raw: &RawInputs) -> Option<[u32; 12]> {
+        let mut starts = [0u32; 12];
+        let mut kept = true;
+        for (start, &(addr, len)) in starts.iter_mut().zip(&raw.arrays) {
+            let key = (addr as u64) << 32 | len as u64;
+            match self.arrays.get_mut(&key) {
+                Some(seen) if memory.unchanged(addr, len, seen.watch) => match seen.at {
+                    Some(at) => *start = at,
+                    None => {
+                        // from a word on and with a word after it, as in
+                        // the ring
+                        let (at, room) = (self.heap_used, (len.div_ceil(4) * 4 + 4) as u64);
+                        let bytes = memory.slice(addr, len as usize).filter(|_| at + room <= HEAP_SIZE);
+                        let Some(bytes) = bytes else {
+                            kept = false;
+                            continue;
+                        };
+                        // SAFETY: the heap is mapped for its whole size and
+                        // the range is inside it, past what any batch reads
+                        unsafe { std::slice::from_raw_parts_mut(self.heap.mapped.add(at as usize), len as usize) }.copy_from_slice(bytes);
+                        self.heap_used = at + room;
+                        seen.at = Some(at as u32);
+                        *start = at as u32;
+                    }
+                },
+                _ => {
+                    // new or written over, watched from now on
+                    match memory.watch(addr, len) {
+                        Some(watch) => {
+                            self.arrays.insert(key, Seen { watch, at: None });
+                        }
+                        None => {
+                            self.arrays.remove(&key);
+                        }
+                    }
+                    kept = false;
+                }
+            }
+        }
+        kept.then_some(starts)
     }
 
     pub(super) fn draw<M: GpuMemory>(&mut self, memory: &mut M, draw: &Draw) -> Result<(), String> {
@@ -3745,6 +3851,17 @@ impl Hardware {
         // happens but not what is drawn
         if self.used > RING_FLUSH {
             self.submit()?;
+        }
+        if self.arrays.len() > MOST_ARRAYS {
+            self.arrays.retain(|_, seen| seen.at.is_some());
+        }
+        // the batches reading the heap finish before it starts over, which
+        // takes far more frames than are in flight
+        if self.heap_used > HEAP_FLUSH || self.arrays.len() > MOST_ARRAYS / 2 {
+            self.submit()?;
+            self.wait()?;
+            self.heap_used = 0;
+            self.arrays.clear();
         }
         self.begin()?;
 
@@ -3845,14 +3962,14 @@ impl Hardware {
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
         self.collect();
-        let (vertex_count, (vertex_offset, index_offset), (shaded, index_type), (vertex, translating)) = match draw.geometry {
+        let (vertex_count, (vertex_offset, index_offset), shaded, (vertex, translating)) = match draw.geometry {
             Geometry::Placed { vertices, indices } => {
                 let offsets = self.place(vertices, indices, (width, height), depth_map)?;
-                (indices.len(), offsets, (None, Some(vk::IndexType::UINT32)), (VertexStage::Placed, false))
+                (indices.len(), offsets, None, (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
-                let (staged, index_type) = self.stage_shading(memory, shading, depth_map)?;
-                (shading.primitives.count(), (0, 0), (Some(staged), index_type), self.vertex_stage(shading))
+                let staged = self.stage_shading(memory, shading, depth_map)?;
+                (shading.primitives.count(), (0, 0), Some(staged), self.vertex_stage(shading))
             }
         };
         let topology = match draw.geometry {
@@ -4059,7 +4176,6 @@ impl Hardware {
             shaded,
             placed: (vertex_offset, index_offset),
             count: vertex_count as u32,
-            index_type,
             topology,
         };
         if real {
@@ -4083,7 +4199,14 @@ impl Hardware {
         let uniform_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(r.uniforms).range(UNIFORM_SIZE)];
         let tables_info = [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(r.tables).range(TABLES_SIZE)];
         let vertex_infos = r.shaded.map(|staged| {
-            staged.map(|(offset, range)| [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(offset).range(range)])
+            let mut infos = staged
+                .ranges
+                .map(|(offset, range)| [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(offset).range(range)]);
+            // the inputs, the heap's or the ring's
+            if staged.kept {
+                infos[2][0] = infos[2][0].buffer(self.heap.buffer);
+            }
+            infos
         });
         let mut writes = [vk::WriteDescriptorSet::default(); 8];
         let fixed = [
@@ -4161,7 +4284,7 @@ impl Hardware {
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
             self.draws += 1;
             match vertex_infos {
-                Some(infos) => match r.index_type {
+                Some(infos) => match r.shaded.and_then(|staged| staged.index_type) {
                     Some(index_type) => {
                         device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, index_type);
                         device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
@@ -4224,6 +4347,9 @@ impl Hardware {
     /// been put back as a saved state had it. each buffer takes memory's
     /// bytes at its next use.
     pub(crate) fn forget(&mut self) {
+        // the heap starts over before the next draw
+        self.arrays.clear();
+        self.heap_used = HEAP_SIZE;
         for surface in &mut self.surfaces {
             surface.untwin();
             surface.shadow.clear();
@@ -5624,7 +5750,7 @@ impl Drop for Hardware {
             self.destroy_image(&self.blank);
             let captures = self.surfaces.iter().flat_map(|s| [&s.capture, &s.screen]).filter_map(|c| c.as_ref().map(|c| &c.buffer));
             let rings = self.free.iter().chain(&self.in_flight).map(|frame| &frame.ring);
-            let buffers = [Some(&self.ring), self.readback.as_ref()].into_iter().flatten().chain(rings);
+            let buffers = [Some(&self.ring), Some(&self.heap), self.readback.as_ref()].into_iter().flatten().chain(rings);
             for buffer in buffers.chain(captures) {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
