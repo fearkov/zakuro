@@ -525,11 +525,7 @@ impl Kernel {
     /// objects, as many as handles, and the index the wait gives.
     pub(crate) fn satisfied_now(&self, handles: &[Handle], wait_all: bool, tick: u64) -> Option<([ObjectId; WAIT_AT_ONCE], u32)> {
         let thread = self.current_thread?;
-        if handles.len() > WAIT_AT_ONCE {
-            return None;
-        }
-        let due = |id: &ObjectId| matches!(self.objects.get(*id), Some(KObject::Timer(timer)) if timer.fire_at.is_some_and(|at| at <= tick));
-        if self.timers.iter().any(due) {
+        if handles.len() > WAIT_AT_ONCE || self.timer_due(tick) {
             return None;
         }
         let mut objects = [ObjectId(0); WAIT_AT_ONCE];
@@ -543,6 +539,52 @@ impl Kernel {
         let signaled = |object: &ObjectId| self.is_signaled(*object, thread);
         let index = if wait_all { waited.iter().all(signaled).then_some(0) } else { waited.iter().position(signaled) }?;
         Some((objects, index as u32))
+    }
+
+    /// whether a timer comes due by tick, which the next pass fires.
+    fn timer_due(&self, tick: u64) -> bool {
+        let due = |id: &ObjectId| matches!(self.objects.get(*id), Some(KObject::Timer(timer)) if timer.fire_at.is_some_and(|at| at <= tick));
+        self.timers.iter().any(due)
+    }
+
+    /// the mutex ReleaseMutex on handle lets go of at tick, and whether it
+    /// frees it, when the pass a mutex freed has due would change nothing,
+    /// the way satisfied_now finds a wait over at once: no timer due and
+    /// nothing pulsed, no thread waiting on the mutex, none ready more
+    /// urgent than the current one, which runs on, not long enough for the
+    /// threads below it to get a share, with no wait result left for it.
+    /// whatever else could wake a thread has a pass due, and a pass leaves
+    /// no wait it could satisfy, so the mutex is all that is new to it. a
+    /// thread waiting until a tick wakes on its own, which the caller has
+    /// ahead of tick.
+    pub(crate) fn quiet_release(&self, handle: Handle, tick: u64) -> Option<(ObjectId, bool)> {
+        if handle == CURRENT_THREAD || handle == CURRENT_PROCESS {
+            return None;
+        }
+        let object = self.handles.resolve(handle)?;
+        let Some(KObject::Mutex(mutex)) = self.objects.get(object) else { return None };
+        // held more than once it only counts down
+        if mutex.lock_count > 1 {
+            return Some((object, false));
+        }
+        let current = self.current_thread?;
+        let running = &self.threads[current as usize];
+        if running.status != ThreadStatus::Running
+            || running.waited
+            || tick.saturating_sub(running.running_since) > STARVATION_TICKS
+            || running.wait_result.is_some()
+            || running.wait_syscall.is_some()
+            || !self.pulsed.is_empty()
+            || self.timer_due(tick)
+        {
+            return None;
+        }
+        let quiet = self.threads.iter().enumerate().all(|(id, thread)| match thread.status {
+            ThreadStatus::WaitSync => !thread.wait_objects.contains(&object),
+            ThreadStatus::Ready | ThreadStatus::Running => id as ThreadId == current || thread.priority >= running.priority,
+            _ => true,
+        });
+        quiet.then_some((object, true))
     }
 
     /// whether waiting on object would succeed right now for waiter.

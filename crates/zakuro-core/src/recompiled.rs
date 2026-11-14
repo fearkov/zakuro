@@ -180,9 +180,9 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         // as far as the step goes, the code stopped at the svc
         let ran = machine.budget.saturating_sub(ctx.budget).max(0) as u64;
         machine.ran += ran;
-        // the clock and a wait that is over at once, which titles poll more
-        // than anything, without the rest of a step around them when that
-        // would change nothing
+        // the clock, a wait that is over at once and a mutex let go of,
+        // which titles call more than anything, without the rest of a step
+        // around them when that would change nothing
         let cycles = machine.cycles + ran;
         let at = ctx.r[15] | ctx.thumb as u32;
         let (event, deadline, limit, library) = (machine.event, machine.deadline, machine.limit, machine.library);
@@ -199,6 +199,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                     budget
                 })
             }
+            0x14 => system.release_in_place(cycles, at, ctx.r[0], event, deadline, limit, library).inspect(|_| ctx.r[0] = 0),
             _ => None,
         };
         if let Some(budget) = done {

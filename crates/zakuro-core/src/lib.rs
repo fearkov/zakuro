@@ -706,6 +706,41 @@ impl System {
         Some((limit.saturating_sub(cycles).max(1), index))
     }
 
+    /// ReleaseMutex from recompiled code on handle, its r0, the way
+    /// tick_in_place reads the clock, when the mutex stays held, or the pass
+    /// that freeing it has due would change nothing, see
+    /// Kernel::quiet_release, which keeps limit. the budget the code goes on
+    /// with.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn release_in_place(
+        &mut self,
+        cycles: u64,
+        at: u32,
+        handle: u32,
+        event: Option<u64>,
+        deadline: Option<u64>,
+        limit: u64,
+        library: &recompiled::Library,
+    ) -> Option<u64> {
+        if !self.plain_in_place(cycles, at, event, deadline, library) {
+            return None;
+        }
+        let (object, frees) = self.kernel.quiet_release(handle, cycles)?;
+        self.cpu.cycles = cycles;
+        self.ran_recompiled();
+        self.idle_interrupted(true);
+        if let Some(kernel::object::KObject::Mutex(mutex)) = self.kernel.objects.get_mut(object) {
+            mutex.lock_count = mutex.lock_count.saturating_sub(1);
+            if frees {
+                mutex.owner = None;
+                // what the pass says, with the current thread kept
+                self.kernel.all_blocked = false;
+            }
+        }
+        self.note_plain(at);
+        Some(limit.saturating_sub(cycles).max(1))
+    }
+
     /// whether svc_in_place, for an svc that changes no thread and leaves
     /// the clock at after, would do nothing around it but note at: the
     /// event, the preempt, the deadline and the frame and audio boundaries
@@ -1644,10 +1679,57 @@ mod tests {
         0xEAFF_FFFB, // b 0x00100040
     ];
 
+    /// a loop that takes the mutex twice, reads the tick, adding it up as
+    /// TICKING does, and lets the mutex go twice, never sleeping, at
+    /// 0x00100060. r9 counts the rounds.
+    const LOCKING: [u32; 17] = [
+        0xE289_9001, // add r9, r9, #1
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0
+        0xE1A0_1008, // mov r1, r8
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25
+        0xE3E0_0000, // mvn r0, #0
+        0xE1A0_1008, // mov r1, r8
+        0xEF00_0025, // svc 0x25, taking it again
+        0xEF00_0028, // svc 0x28
+        0xE087_7000, // add r7, r7, r0
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14, still held
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14, free
+        0xEAFF_FFEE, // b 0x00100060
+    ];
+
+    /// a loop that takes the mutex twice, lets it go once, sleeps for r6
+    /// nanoseconds still holding it and lets it go again, at 0x00100100. r9
+    /// counts the rounds.
+    const HOLDING: [u32; 18] = [
+        0xE289_9001, // add r9, r9, #1
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0
+        0xE1A0_1008, // mov r1, r8
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25
+        0xE3E0_0000, // mvn r0, #0
+        0xE1A0_1008, // mov r1, r8
+        0xEF00_0025, // svc 0x25, taking it again
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14, still held
+        0xE1A0_0006, // mov r0, r6
+        0xE3A0_1000, // mov r1, #0
+        0xEF00_000A, // svc 0x0A, sleeping with it
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14, free
+        0xEAFF_FFED, // b 0x00100100
+    ];
+
     /// where the threads find the mutex's handle.
     const MUTEX_HANDLE_AT: u32 = 0x0010_0800;
 
-    /// the blocks of POLLING and TICKING the way 3dsrecomp cuts code, each
+    /// the blocks of the loops above the way 3dsrecomp cuts code, each
     /// with its length, the svc it ends with and where it goes on.
     fn block(at: u32) -> Option<(i32, Option<u32>, u32)> {
         Some(match at {
@@ -1659,11 +1741,23 @@ mod tests {
             0x0010_0038 => (1, None, 0x0010_0000),
             0x0010_0040 => (1, Some(0x28), 0x0010_0044),
             0x0010_0044 => (3, None, 0x0010_0040),
+            0x0010_0060 => (7, Some(0x25), 0x0010_007C),
+            0x0010_007C => (3, Some(0x25), 0x0010_0088),
+            0x0010_0088 => (1, Some(0x28), 0x0010_008C),
+            0x0010_008C => (3, Some(0x14), 0x0010_0098),
+            0x0010_0098 => (2, Some(0x14), 0x0010_00A0),
+            0x0010_00A0 => (1, None, 0x0010_0060),
+            0x0010_0100 => (7, Some(0x25), 0x0010_011C),
+            0x0010_011C => (3, Some(0x25), 0x0010_0128),
+            0x0010_0128 => (2, Some(0x14), 0x0010_0130),
+            0x0010_0130 => (3, Some(0x0A), 0x0010_013C),
+            0x0010_013C => (2, Some(0x14), 0x0010_0144),
+            0x0010_0144 => (1, None, 0x0010_0100),
             _ => return None,
         })
     }
 
-    /// POLLING and TICKING as 3dsrecomp writes code, each block charged to
+    /// the loops above as 3dsrecomp writes code, each block charged to
     /// the budget as it starts. their svcs run in place, or leave for the
     /// step, as in code made for version 4 of the interface. they never
     /// return, only stop.
@@ -1682,7 +1776,7 @@ mod tests {
                 }
                 (*ctx).budget -= size;
                 match at {
-                    0x0010_0004 => {
+                    0x0010_0004 | 0x0010_0060 | 0x0010_0100 => {
                         (*ctx).r[9] = (*ctx).r[9].wrapping_add(1);
                         (*ctx).r[0] = u32::MAX;
                         (*ctx).r[4] = u32::MAX;
@@ -1690,8 +1784,8 @@ mod tests {
                         (*ctx).r[2] = 1;
                         (*ctx).r[3] = 0;
                     }
-                    0x0010_0024 => (*ctx).r[0] = (*ctx).r[5],
-                    0x0010_002C => {
+                    0x0010_0024 | 0x0010_0128 | 0x0010_013C => (*ctx).r[0] = (*ctx).r[5],
+                    0x0010_002C | 0x0010_0130 => {
                         (*ctx).r[0] = (*ctx).r[6];
                         (*ctx).r[1] = 0;
                     }
@@ -1699,6 +1793,15 @@ mod tests {
                         (*ctx).r[9] = (*ctx).r[9].wrapping_add(1);
                         (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]);
                     }
+                    0x0010_007C | 0x0010_011C => {
+                        (*ctx).r[0] = u32::MAX;
+                        (*ctx).r[1] = (*ctx).r[8];
+                    }
+                    0x0010_008C => {
+                        (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]);
+                        (*ctx).r[0] = (*ctx).r[5];
+                    }
+                    0x0010_0098 => (*ctx).r[0] = (*ctx).r[5],
                     _ => {}
                 }
                 if let Some(number) = svc {
@@ -1718,16 +1821,17 @@ mod tests {
         }
     }
 
-    /// threads on POLLING or TICKING as recompiled code, sharing a mutex,
-    /// each with where it starts, the nanoseconds it sleeps each time round
-    /// and its priority.
-    fn polling_system(in_place: bool, threads: &[(u32, u32, u32)]) -> System {
+    /// threads on the loops above as recompiled code, sharing a mutex, each
+    /// with where it starts, the nanoseconds it sleeps each time round and
+    /// its priority, and a timer nobody waits on firing every so many
+    /// nanoseconds, if any.
+    fn polling_system(in_place: bool, threads: &[(u32, u32, u32)], timer: Option<u32>) -> System {
         use memory::{MemoryState, Permission};
         // the clock the host has would set the two apart
         let mut system = System::new(Config { clock: Some(0), ..Config::default() });
         let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
         system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
-        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..])] {
+        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..])] {
             for (index, word) in code.iter().enumerate() {
                 system.memory.write32(address + index as u32 * 4, *word);
             }
@@ -1736,6 +1840,13 @@ mod tests {
         kernel::svc::dispatch(&mut system, 0x13);
         let mutex = system.cpu.regs[1];
         system.memory.write32(MUTEX_HANDLE_AT, mutex);
+        if let Some(interval) = timer {
+            system.cpu.regs[1] = 1; // sticky
+            kernel::svc::dispatch(&mut system, 0x1A);
+            let regs = &mut system.cpu.regs;
+            (regs[0], regs[2], regs[3], regs[1], regs[4]) = (regs[1], interval, 0, interval, 0);
+            kernel::svc::dispatch(&mut system, 0x1B);
+        }
         for (index, &(entry, sleep, priority)) in threads.iter().enumerate() {
             let stack = 0x0010_0F00 - index as u32 * 0x100;
             let id = system.kernel.create_thread(format!("thread {index}"), entry, stack, 0, priority, 0);
@@ -1747,7 +1858,11 @@ mod tests {
         }
         system.kernel.schedule(&mut system.cpu, 0);
         let code: recomp_abi::Code = if in_place { polling::<true> } else { polling::<false> };
-        let addresses = [0x0010_0000, 0x0010_0004, 0x0010_0020, 0x0010_0024, 0x0010_002C, 0x0010_0038, 0x0010_0040, 0x0010_0044];
+        let addresses = [
+            0x0010_0000, 0x0010_0004, 0x0010_0020, 0x0010_0024, 0x0010_002C, 0x0010_0038, 0x0010_0040, 0x0010_0044, 0x0010_0060,
+            0x0010_007C, 0x0010_0088, 0x0010_008C, 0x0010_0098, 0x0010_00A0, 0x0010_0100, 0x0010_011C, 0x0010_0128, 0x0010_0130,
+            0x0010_013C, 0x0010_0144,
+        ];
         let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
         let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
         // SAFETY: a table that lives on, of code working on a context as
@@ -1775,23 +1890,24 @@ mod tests {
             choices[(seed >> 16) as usize % choices.len()]
         };
         let mut ran_in_place = 0;
-        for case in 0..40 {
+        for case in 0..60 {
             let threads: Vec<(u32, u32, u32)> = (0..1 + case % 3)
                 .map(|_| {
-                    let entry = pick(&[0x0010_0000, 0x0010_0000, 0x0010_0040]);
+                    let entry = pick(&[0x0010_0000, 0x0010_0000, 0x0010_0040, 0x0010_0060, 0x0010_0100]);
                     (entry, pick(&[0, 0, 900, 13_000, 50_000, 400_000]), pick(&[0x2F, 0x30, 0x30, 0x31]))
                 })
                 .collect();
-            let mut systems = [polling_system(false, &threads), polling_system(true, &threads)];
+            let timer = (case % 4 == 3).then(|| pick(&[70_000, 300_000, 2_000_000]));
+            let mut systems = [polling_system(false, &threads, timer), polling_system(true, &threads, timer)];
             for system in &mut systems {
                 for _ in 0..6 {
                     assert_eq!(system.run_frame(), FrameOutcome::Completed);
                 }
             }
             let [steps, in_place] = &mut systems;
-            assert_eq!(in_place.cpu.cycles, steps.cpu.cycles, "{threads:x?}");
-            assert_eq!(in_place.history, steps.history, "{threads:x?}");
-            assert!(in_place.save_state().unwrap() == steps.save_state().unwrap(), "{threads:x?} ends elsewhere");
+            assert_eq!(in_place.cpu.cycles, steps.cpu.cycles, "{threads:x?} {timer:?}");
+            assert_eq!(in_place.history, steps.history, "{threads:x?} {timer:?}");
+            assert!(in_place.save_state().unwrap() == steps.save_state().unwrap(), "{threads:x?} {timer:?} ends elsewhere");
             // the current thread's registers are the CPU's
             let rounds = steps.kernel.threads.iter().map(|thread| thread.context.regs[9]).chain([steps.cpu.regs[9]]);
             assert!(rounds.max().unwrap() > 100, "{threads:x?} went round");
