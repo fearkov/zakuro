@@ -285,14 +285,15 @@ pub(crate) struct LastLighting {
 }
 
 impl LastLighting {
-    /// the lighting set up in the registers, or None when it is off.
-    pub(crate) fn read(&mut self, registers: &[u32]) -> Option<Lighting> {
+    /// the lighting set up in the registers, or None when it is off, the
+    /// one kept rather than a copy.
+    pub(crate) fn read(&mut self, registers: &[u32]) -> Option<&Lighting> {
         let read = Lighting::registers_read(registers);
         if self.read != Some(read) {
             self.lighting = Lighting::read(registers);
             self.read = Some(read);
         }
-        self.lighting.clone()
+        self.lighting.as_ref()
     }
 }
 

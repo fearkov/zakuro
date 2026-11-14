@@ -269,17 +269,15 @@ pub(crate) struct LastTexEnv {
 }
 
 impl LastTexEnv {
-    /// the texture environment the registers set up.
-    pub(crate) fn read(&mut self, registers: &[u32]) -> TexEnv {
+    /// the texture environment the registers set up, the one kept rather
+    /// than a copy, which is a thousand bytes.
+    pub(crate) fn read(&mut self, registers: &[u32]) -> &TexEnv {
         let read = TexEnv::registers_read(registers);
-        match self.tex_env {
-            Some(tex_env) if self.read == read => tex_env,
-            _ => {
-                let tex_env = TexEnv::decode(&read);
-                *self = LastTexEnv { read, tex_env: Some(tex_env) };
-                tex_env
-            }
+        if self.tex_env.is_none() || self.read != read {
+            self.tex_env = Some(TexEnv::decode(&read));
+            self.read = read;
         }
+        self.tex_env.as_ref().expect("decoded above")
     }
 }
 
@@ -540,7 +538,7 @@ mod tests {
             }
             let old = old_read(&registers);
             assert_eq!(TexEnv::read(&registers), old, "step {step}");
-            assert_eq!(kept.read(&registers), old, "step {step}, kept");
+            assert_eq!(*kept.read(&registers), old, "step {step}, kept");
             assert_eq!(kept.read(&registers).reads_lighting(), old.reads_lighting(), "step {step}");
         }
     }
@@ -567,9 +565,9 @@ mod tests {
                 _ => read[(random() as usize) % read.len()],
             };
             registers[register] ^= 1 << (random() % 32);
-            assert_eq!(kept.read(&registers), TexEnv::read(&registers), "step {step}, register {register:#X}");
+            assert_eq!(*kept.read(&registers), TexEnv::read(&registers), "step {step}, register {register:#X}");
             if step % 3 == 0 {
-                assert_eq!(kept.read(&registers), TexEnv::read(&registers), "step {step} again");
+                assert_eq!(*kept.read(&registers), TexEnv::read(&registers), "step {step} again");
             }
         }
     }

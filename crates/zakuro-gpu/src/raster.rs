@@ -886,7 +886,7 @@ pub(crate) fn hand_out<M: GpuMemory>(
         return None;
     }
     let writes = memory.writes();
-    let scratch = &mut resources.scratch;
+    let scratch = resources.scratch.get_or_insert_with(Box::default);
     read_indices(registers, memory, scratch, indexed);
     let plan = scratch.plans.update(registers, fixed_attributes);
     // the vertices the draw names, from the first to the last
@@ -1522,7 +1522,9 @@ pub struct Resources {
     pub light_tables: Tables,
     pub proctex_tables: crate::proctex::Tables,
     pub fog_table: crate::fog::Table,
-    scratch: Scratch,
+    /// boxed, a draw takes it for itself and puts it back, which moved a
+    /// thousand bytes each way.
+    scratch: Option<Box<Scratch>>,
     /// the bytes of the last memory fill, the next one's buffer.
     pub(crate) fill: Vec<u8>,
     /// the words of the last command list, the next one's buffer.
@@ -2452,7 +2454,7 @@ struct DrawState<'a> {
     target: ColorTarget,
     depth_map: DepthMap,
     depth_stencil: Option<DepthStencil>,
-    tex_env: crate::tev::TexEnv,
+    tex_env: &'a crate::tev::TexEnv,
     alpha_test: Option<AlphaTest>,
     blend: Option<crate::blend::Blend>,
     logic_op: Option<crate::blend::LogicOp>,
@@ -2461,7 +2463,7 @@ struct DrawState<'a> {
     texture2_uses_coord1: bool,
     /// texture unit 0 is projected, see projected.
     texture0_projected: bool,
-    lighting: Option<Lighting>,
+    lighting: Option<&'a Lighting>,
     tables: &'a Tables,
     /// texture 3, made up from its coordinates, and its tables.
     proctex: Option<crate::proctex::ProcTex<'a>>,
@@ -2486,7 +2488,7 @@ impl DrawState<'_> {
             depth_map: self.depth_map,
             geometry,
             textures: self.textures,
-            lighting: self.lighting.as_ref(),
+            lighting: self.lighting,
             tables: self.tables,
             proctex: self.proctex.is_some(),
             proctex_tables: self.proctex_tables,
@@ -2658,7 +2660,7 @@ fn fill_triangle(
                 }
             }
 
-            let fragment = state.lighting.as_ref().map(|lighting| {
+            let fragment = state.lighting.map(|lighting| {
                 let quaternion = std::array::from_fn(|i| {
                     interpolate([a.quaternion_over_w[i], b.quaternion_over_w[i], c.quaternion_over_w[i]])
                 });
@@ -2880,7 +2882,7 @@ pub fn draw<M: GpuMemory>(
 
     // an index buffer names most vertices several times, fetch and shade
     // each of them once.
-    let mut scratch = std::mem::take(&mut resources.scratch);
+    let mut scratch = resources.scratch.take().unwrap_or_default();
     read_indices(registers, memory, &mut scratch, indexed);
     let plan = scratch.plans.update(registers, fixed_attributes);
     log::trace!(
@@ -2921,7 +2923,7 @@ pub fn draw<M: GpuMemory>(
             };
             let vertices = Vertices::Raw { vertex_shader, raw: &scratch.raw, order };
             if rasterize(registers, memory, resources, vertices).is_some() {
-                resources.scratch = scratch;
+                resources.scratch = Some(scratch);
                 return vertex_count;
             }
         }
@@ -2930,7 +2932,7 @@ pub fn draw<M: GpuMemory>(
     let order = indexed.then_some(&scratch.order[..]);
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
     rasterize(registers, memory, resources, vertices);
-    resources.scratch = scratch;
+    resources.scratch = Some(scratch);
     vertex_count
 }
 
@@ -2950,10 +2952,13 @@ fn read_indices<M: GpuMemory>(registers: &[u32], memory: &mut M, scratch: &mut S
     let size = if index_short { 2 } else { 1 };
     let len = (registers[REG_VERTEX_COUNT] * size) as usize;
     let bytes = &mut scratch.bytes;
-    bytes.resize(len, 0);
+    bytes.clear();
     match memory.slice(index_base, len) {
-        Some(slice) => bytes.copy_from_slice(slice),
-        None => memory.read(index_base, bytes),
+        Some(slice) => bytes.extend_from_slice(slice),
+        None => {
+            bytes.resize(len, 0);
+            memory.read(index_base, bytes);
+        }
     }
 }
 
