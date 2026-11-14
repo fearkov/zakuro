@@ -705,7 +705,7 @@ enum Vertices<'a> {
         vertex_shader: &'a ShaderUnit,
         raw: &'a hardware::RawInputs,
         /// each vertex of the draw, counted from the first of the arrays.
-        vertices: &'a [u32],
+        order: hardware::RawOrder<'a>,
     },
     Shaded(&'a [Vertex]),
     /// through the shaders and placed on the screen by another thread, see
@@ -718,7 +718,7 @@ impl Vertices<'_> {
         match self {
             Vertices::Unshaded { inputs, order, .. } => order.map_or(inputs.len(), <[usize]>::len),
             #[cfg(feature = "vulkan")]
-            Vertices::Raw { vertices, .. } => vertices.len(),
+            Vertices::Raw { order, .. } => order.len(),
             Vertices::Shaded(shaded) => shaded.len(),
             Vertices::Prepared(prepared) => prepared.order.as_ref().map_or(prepared.shaded.len(), Vec::len),
         }
@@ -1606,8 +1606,6 @@ struct Scratch {
     unique: Vec<u32>,
     order: Vec<usize>,
     inputs: Vec<[Vec4; shader::INPUT_REGISTERS]>,
-    /// each vertex of a draw counted from the first one it uses.
-    relative: Vec<u32>,
     plans: Plans,
     /// the arrays a draw hands the GPU to decode.
     #[cfg(feature = "vulkan")]
@@ -2907,20 +2905,13 @@ pub fn draw<M: GpuMemory>(
             (first_vertex, vertex_count)
         };
         if raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
-            scratch.relative.clear();
-            if indexed {
-                // straight from the index buffer, the draw needs its indices
-                // as words only when the CPU decodes its arrays
-                if index_short {
-                    let halves = scratch.bytes.as_chunks::<2>().0.iter();
-                    scratch.relative.extend(halves.map(|b| u16::from_le_bytes(*b) as u32 - first));
-                } else {
-                    scratch.relative.extend(scratch.bytes.iter().map(|&b| b as u32 - first));
-                }
-            } else {
-                scratch.relative.extend(0..vertex_count);
-            }
-            let vertices = Vertices::Raw { vertex_shader, raw: &scratch.raw, vertices: &scratch.relative };
+            // straight from the index buffer, the draw needs its indices
+            // as words only when the CPU decodes its arrays
+            let order = match indexed {
+                true => hardware::RawOrder::Indexed { bytes: &scratch.bytes, short: index_short, first },
+                false => hardware::RawOrder::InARow(vertex_count as usize),
+            };
+            let vertices = Vertices::Raw { vertex_shader, raw: &scratch.raw, order };
             if rasterize(registers, memory, resources, vertices).is_some() {
                 resources.scratch = scratch;
                 return vertex_count;
@@ -3074,31 +3065,36 @@ fn assemble_into(topology: u32, count: usize, vertex: impl Fn(usize) -> u32, ind
     }
 }
 
-/// the triangles of a draw of count vertices as the GPU takes them, three
-/// vertices each, numbered as the raw arrays number them, or by their place
-/// among the vertices order gives, or by their place in the draw. a list of
-/// raw vertices is its own triangles, which go as they are rather than
-/// copied.
+/// the triangles of a draw of count vertices as the GPU takes them. a list
+/// or a strip of raw vertices goes as the guest's index buffer has it, or
+/// with none for vertices in a row, rather than three indices a triangle,
+/// which a strip has three times the vertices of. the rest go three
+/// vertices a triangle, numbered as the raw arrays number them, or by their
+/// place among the vertices order gives, or by their place in the draw. not
+/// every GPU draws fans (MoltenVK), they stay triangles.
 #[cfg(feature = "vulkan")]
-fn triangle_indices<'a>(
+fn primitives<'a>(
     topology: u32,
     count: usize,
-    raw: Option<&'a [u32]>,
+    raw: Option<hardware::RawOrder<'a>>,
     order: Option<&[usize]>,
     assembled: &'a mut Vec<u32>,
-) -> &'a [u32] {
+) -> hardware::Primitives<'a> {
+    use hardware::RawOrder;
     match raw {
-        Some(vertices) if !matches!(topology, 1 | 2) => &vertices[..count / 3 * 3],
-        Some(vertices) => {
-            let vertices = &vertices[..count];
-            assemble_into(topology, count, |i| vertices[i], assembled);
-            assembled
+        Some(order) if topology != 2 => return hardware::Primitives::Raw { strip: topology == 1, order },
+        Some(RawOrder::InARow(_)) => assemble_into(topology, count, |i| i as u32, assembled),
+        Some(RawOrder::Indexed { bytes, short: true, first }) => {
+            let halves = &bytes.as_chunks::<2>().0[..count];
+            assemble_into(topology, count, |i| u16::from_le_bytes(halves[i]) as u32 - first, assembled);
         }
-        None => {
-            assemble_into(topology, count, |i| order.map_or(i, |order| order[i]) as u32, assembled);
-            assembled
+        Some(RawOrder::Indexed { bytes, short: false, first }) => {
+            let bytes = &bytes[..count];
+            assemble_into(topology, count, |i| bytes[i] as u32 - first, assembled);
         }
+        None => assemble_into(topology, count, |i| order.map_or(i, |order| order[i]) as u32, assembled),
     }
+    hardware::Primitives::Triangles(assembled)
 }
 
 /// the vertices of each triangle out of count of them, for a list, a strip
@@ -3236,7 +3232,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             Vertices::Unshaded { vertex_shader, inputs, order, .. } => {
                 Some((vertex_shader, hardware::Inputs::Decoded(inputs), order, None))
             }
-            Vertices::Raw { vertex_shader, raw, vertices } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(vertices))),
+            Vertices::Raw { vertex_shader, raw, order } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(order))),
             Vertices::Shaded(_) | Vertices::Prepared(_) => None,
         };
         if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
@@ -3249,17 +3245,17 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             // with y pointing up.
             let cull_mode = registers[REG_FACE_CULLING] & 0x3;
             let mut assembled = std::mem::take(&mut resources.triangles);
-            let indices = triangle_indices(topology, vertex_count, raw, order, &mut assembled);
+            let primitives = primitives(topology, vertex_count, raw, order, &mut assembled);
             let shading = hardware::Shading {
                 unit,
                 inputs,
-                indices,
+                primitives,
                 semantics: resources.semantics.get(registers),
                 viewport,
                 cull: cull_mode,
             };
             let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
-            let triangles = (indices.len() / 3) as u32;
+            let triangles = primitives.triangles() as u32;
             resources.triangles = assembled;
             match drawn {
                 Ok(()) => return Some(triangles),
@@ -6238,24 +6234,62 @@ mod tests {
         }
     }
 
-    /// the triangles the GPU takes are the ones assemble_into puts down, for
-    /// raw arrays as they number the vertices, a list's going as they are,
-    /// for vertices in an order and for vertices in a row.
+    /// the triangles the GPU takes are the ones assemble_into puts down, the
+    /// same three vertices wound the same way, for lists and strips of raw
+    /// arrays as Vulkan puts them together from the guest's indices or
+    /// from vertices in a row, and as they are for fans, vertices in an
+    /// order and vertices in a row.
     #[cfg(feature = "vulkan")]
     #[test]
     fn the_gpu_takes_the_triangles_the_assembler_makes() {
+        use hardware::{Primitives, RawOrder};
+        // as Vulkan takes them, a strip's triangle k the vertices k,
+        // k + 1 + k % 2 and k + 2 - k % 2
+        fn taken(primitives: Primitives) -> Vec<[u32; 3]> {
+            let Primitives::Raw { strip, order } = primitives else {
+                let Primitives::Triangles(indices) = primitives else { unreachable!() };
+                return indices.as_chunks::<3>().0.to_vec();
+            };
+            let vertex = |i: usize| match order {
+                RawOrder::InARow(_) => i as u32,
+                RawOrder::Indexed { bytes, short: true, first } => u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as u32 - first,
+                RawOrder::Indexed { bytes, short: false, first } => bytes[i] as u32 - first,
+            };
+            match strip {
+                true => (0..order.len().saturating_sub(2)).map(|k| [vertex(k), vertex(k + 1 + k % 2), vertex(k + 2 - k % 2)]).collect(),
+                false => (0..order.len() / 3).map(|t| [vertex(3 * t), vertex(3 * t + 1), vertex(3 * t + 2)]).collect(),
+            }
+        }
+        let turned = |[a, b, c]: [u32; 3]| [[a, b, c], [b, c, a], [c, a, b]];
         for topology in 0..4 {
             for count in 0..14 {
-                let raw: Vec<u32> = (0..count as u32).map(|i| 1000 + i * 7 % 5).collect();
+                let relative: Vec<u32> = (0..count as u32).map(|i| i * 7 % 5).collect();
+                let halves: Vec<u8> = relative.iter().flat_map(|&i| (1000 + i as u16).to_le_bytes()).collect();
+                let bytes: Vec<u8> = relative.iter().map(|&i| 100 + i as u8).collect();
                 let order: Vec<usize> = (0..count).map(|i| (i * 3) % 4).collect();
-                let mut assembled = vec![99];
-                let mut expected = Vec::new();
-                assemble_into(topology, count, |i| raw[i], &mut expected);
-                assert_eq!(triangle_indices(topology, count, Some(&raw), None, &mut assembled), expected, "raw, topology {topology}, {count} vertices");
-                assemble_into(topology, count, |i| order[i] as u32, &mut expected);
-                assert_eq!(triangle_indices(topology, count, None, Some(&order), &mut assembled), expected, "ordered, topology {topology}, {count} vertices");
-                assemble_into(topology, count, |i| i as u32, &mut expected);
-                assert_eq!(triangle_indices(topology, count, None, None, &mut assembled), expected, "in a row, topology {topology}, {count} vertices");
+                let cases = [
+                    ("halfwords", Some(RawOrder::Indexed { bytes: &halves, short: true, first: 1000 }), None, &relative),
+                    ("bytes", Some(RawOrder::Indexed { bytes: &bytes, short: false, first: 100 }), None, &relative),
+                    ("raw in a row", Some(RawOrder::InARow(count)), None, &(0..count as u32).collect()),
+                    ("ordered", None, Some(&order[..]), &order.iter().map(|&i| i as u32).collect()),
+                    ("in a row", None, None, &(0..count as u32).collect()),
+                ];
+                for (name, raw, order, vertices) in cases {
+                    let mut expected = Vec::new();
+                    assemble_into(topology, count, |i| vertices[i], &mut expected);
+                    let mut assembled = vec![99];
+                    let primitives = primitives(topology, count, raw, order, &mut assembled);
+                    let triangles = taken(primitives);
+                    let what = format!("{name}, topology {topology}, {count} vertices");
+                    assert_eq!(primitives.triangles(), expected.len() / 3, "{what}");
+                    assert_eq!(triangles.len(), expected.len() / 3, "{what}");
+                    for (&triangle, &wanted) in triangles.iter().zip(expected.as_chunks::<3>().0) {
+                        assert!(turned(triangle).contains(&wanted), "{what}, {triangle:?} for {wanted:?}");
+                    }
+                    // raw lists and strips go as the guest has them
+                    let raw_kept = raw.is_some() && topology != 2;
+                    assert_eq!(matches!(primitives, Primitives::Raw { .. }), raw_kept, "{what}");
+                }
             }
         }
     }

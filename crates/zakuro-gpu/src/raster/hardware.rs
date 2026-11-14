@@ -201,8 +201,9 @@ struct Recorded {
     /// where the vertices and the indices are, for one the CPU placed.
     placed: (u64, u64),
     count: u32,
-    /// how wide the indices are.
-    index_type: vk::IndexType,
+    /// how wide the indices are, none for vertices in a row.
+    index_type: Option<vk::IndexType>,
+    topology: vk::PrimitiveTopology,
 }
 
 /// the triangles of a draw.
@@ -219,14 +220,69 @@ pub(super) enum Geometry<'a> {
 pub(super) struct Shading<'a> {
     pub(super) unit: &'a ShaderUnit,
     pub(super) inputs: Inputs<'a>,
-    /// three inputs a triangle.
-    pub(super) indices: &'a [u32],
+    /// how the inputs go together into triangles.
+    pub(super) primitives: Primitives<'a>,
     /// where each varying is in the output registers.
     pub(super) semantics: [u32; 24],
     /// left, bottom, width and height.
     pub(super) viewport: (f32, f32, f32, f32),
     /// the face culling register.
     pub(super) cull: u32,
+}
+
+/// the inputs of each triangle of a draw, as the GPU puts them together.
+#[derive(Clone, Copy)]
+pub(super) enum Primitives<'a> {
+    /// three inputs a triangle.
+    Triangles(&'a [u32]),
+    /// a list or a strip of the inputs, in a row or in the order the
+    /// guest's own index buffer has them, which goes to the GPU nearly as it
+    /// is rather than three indices a triangle.
+    Raw { strip: bool, order: RawOrder<'a> },
+}
+
+/// which input each vertex of a draw from raw arrays is.
+#[derive(Clone, Copy)]
+pub(super) enum RawOrder<'a> {
+    /// that many, the first input on.
+    InARow(usize),
+    /// the guest's index buffer, a byte an index or a halfword when short,
+    /// less the first index, which the arrays start at.
+    Indexed { bytes: &'a [u8], short: bool, first: u32 },
+}
+
+impl RawOrder<'_> {
+    pub(super) fn len(&self) -> usize {
+        match *self {
+            RawOrder::InARow(count) => count,
+            RawOrder::Indexed { bytes, short, .. } => bytes.len() >> short as u32,
+        }
+    }
+}
+
+impl Primitives<'_> {
+    /// the vertices the GPU takes, a list's last triangle whole.
+    fn count(&self) -> usize {
+        match *self {
+            Primitives::Triangles(indices) => indices.len(),
+            Primitives::Raw { strip: true, order } => order.len(),
+            Primitives::Raw { strip: false, order } => order.len() / 3 * 3,
+        }
+    }
+
+    pub(super) fn triangles(&self) -> usize {
+        match *self {
+            Primitives::Raw { strip: true, order } => order.len().saturating_sub(2),
+            _ => self.count() / 3,
+        }
+    }
+
+    fn topology(&self) -> vk::PrimitiveTopology {
+        match *self {
+            Primitives::Raw { strip: true, .. } => vk::PrimitiveTopology::TRIANGLE_STRIP,
+            _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+        }
+    }
 }
 
 /// a draw's input registers, as the vertex shader gets them.
@@ -1408,6 +1464,7 @@ fn compile_pipeline(
         vk::DynamicState::STENCIL_REFERENCE,
         vk::DynamicState::BLEND_CONSTANTS,
         vk::DynamicState::CULL_MODE,
+        vk::DynamicState::PRIMITIVE_TOPOLOGY,
     ];
     if dynamic.blend {
         dynamic_states.extend([
@@ -3501,7 +3558,7 @@ impl Hardware {
         memory: &mut M,
         shading: &Shading,
         depth_map: DepthMap,
-    ) -> Result<([(u64, u64); 4], vk::IndexType), String> {
+    ) -> Result<([Staged; 4], Option<vk::IndexType>), String> {
         let unit = shading.unit;
         let fingerprint = unit.fingerprint();
         let program = match self.programs.get(&fingerprint) {
@@ -3586,15 +3643,24 @@ impl Hardware {
 
         // indices from the guest's arrays have 8 or 16 bits, and draws
         // seldom have more vertices, so they mostly go in at half the size,
-        // the ring being memory the CPU writes past its caches
-        let narrow = shading.indices.iter().fold(0, |all, &index| all | index) <= 0xFFFF;
-        let (index_type, index_size) = match narrow {
-            true => (vk::IndexType::UINT16, 2),
-            false => (vk::IndexType::UINT32, 4),
+        // the ring being memory the CPU writes past its caches. vertices in
+        // a row need none
+        let count = shading.primitives.count();
+        let index_type = match shading.primitives {
+            Primitives::Triangles(indices) if indices.iter().fold(0, |all, &index| all | index) > 0xFFFF => {
+                Some(vk::IndexType::UINT32)
+            }
+            Primitives::Raw { order: RawOrder::InARow(_), .. } => None,
+            _ => Some(vk::IndexType::UINT16),
+        };
+        let index_size = match index_type {
+            Some(vk::IndexType::UINT32) => 4,
+            Some(_) => 2,
+            None => 0,
         };
         // the draw in between reads the vertices its own draw staged just
         // before, only its uniforms differ
-        let index_bytes = (shading.indices.len() * index_size) as u64;
+        let index_bytes = (count * index_size) as u64;
         if let Some((batch, inputs, indices)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
             if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes {
                 return Ok(([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices], index_type));
@@ -3626,17 +3692,29 @@ impl Hardware {
 
         let indices = self.stage(index_bytes, 4)?;
         let staging = self.ring(indices, index_bytes);
-        match narrow {
-            true => {
-                for (out, &index) in staging.as_chunks_mut::<2>().0.iter_mut().zip(shading.indices) {
-                    *out = (index as u16).to_le_bytes();
-                }
-            }
-            false => {
-                for (out, index) in staging.as_chunks_mut::<4>().0.iter_mut().zip(shading.indices) {
+        match shading.primitives {
+            Primitives::Triangles(triangles) if index_size == 4 => {
+                for (out, index) in staging.as_chunks_mut::<4>().0.iter_mut().zip(triangles) {
                     *out = index.to_le_bytes();
                 }
             }
+            Primitives::Triangles(triangles) => {
+                for (out, &index) in staging.as_chunks_mut::<2>().0.iter_mut().zip(triangles) {
+                    *out = (index as u16).to_le_bytes();
+                }
+            }
+            // the guest's indices less the first, which none is below
+            Primitives::Raw { order: RawOrder::Indexed { bytes, short: true, first }, .. } => {
+                for (out, index) in staging.as_chunks_mut::<2>().0.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                    *out = u16::from_le_bytes(*index).wrapping_sub(first as u16).to_le_bytes();
+                }
+            }
+            Primitives::Raw { order: RawOrder::Indexed { bytes, short: false, first }, .. } => {
+                for (out, &index) in staging.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
+                    *out = (index as u16).wrapping_sub(first as u16).to_le_bytes();
+                }
+            }
+            Primitives::Raw { order: RawOrder::InARow(_), .. } => {}
         }
         if self.pass == Pass::Twinned {
             self.twinned_inputs = Some((self.batch, (inputs, input_bytes), (indices, index_bytes)));
@@ -3657,7 +3735,7 @@ impl Hardware {
         let (right, top) = (right.min(draw.width as i32), top.min(draw.height as i32));
         let empty = match draw.geometry {
             Geometry::Placed { indices, .. } => indices.is_empty(),
-            Geometry::Shaded(shading) => shading.indices.is_empty(),
+            Geometry::Shaded(shading) => shading.primitives.triangles() == 0,
         };
         if empty || right <= left || top <= bottom {
             return Ok(());
@@ -3770,12 +3848,16 @@ impl Hardware {
         let (vertex_count, (vertex_offset, index_offset), (shaded, index_type), (vertex, translating)) = match draw.geometry {
             Geometry::Placed { vertices, indices } => {
                 let offsets = self.place(vertices, indices, (width, height), depth_map)?;
-                (indices.len(), offsets, (None, vk::IndexType::UINT32), (VertexStage::Placed, false))
+                (indices.len(), offsets, (None, Some(vk::IndexType::UINT32)), (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
                 let (staged, index_type) = self.stage_shading(memory, shading, depth_map)?;
-                (shading.indices.len(), (0, 0), (Some(staged), index_type), self.vertex_stage(shading))
+                (shading.primitives.count(), (0, 0), (Some(staged), index_type), self.vertex_stage(shading))
             }
+        };
+        let topology = match draw.geometry {
+            Geometry::Shaded(shading) => shading.primitives.topology(),
+            Geometry::Placed { .. } => vk::PrimitiveTopology::TRIANGLE_LIST,
         };
 
 
@@ -3978,6 +4060,7 @@ impl Hardware {
             placed: (vertex_offset, index_offset),
             count: vertex_count as u32,
             index_type,
+            topology,
         };
         if real {
             self.record(&recorded);
@@ -4048,6 +4131,7 @@ impl Hardware {
             device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
             device.cmd_set_viewport(commands, 0, &[r.viewport]);
             device.cmd_set_cull_mode(commands, r.cull);
+            device.cmd_set_primitive_topology(commands, r.topology);
             device.cmd_set_scissor(commands, 0, &[r.scissor]);
             device.cmd_set_depth_test_enable(commands, r.depth_test);
             device.cmd_set_depth_compare_op(commands, r.depth_compare);
@@ -4077,10 +4161,13 @@ impl Hardware {
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
             self.draws += 1;
             match vertex_infos {
-                Some(infos) => {
-                    device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, r.index_type);
-                    device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
-                }
+                Some(infos) => match r.index_type {
+                    Some(index_type) => {
+                        device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, index_type);
+                        device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
+                    }
+                    None => device.cmd_draw(commands, r.count, 1, 0, 0),
+                },
                 None => {
                     device.cmd_bind_vertex_buffers(commands, 0, &[self.ring.buffer], &[r.placed.0]);
                     device.cmd_bind_index_buffer(commands, self.ring.buffer, r.placed.1, vk::IndexType::UINT32);
