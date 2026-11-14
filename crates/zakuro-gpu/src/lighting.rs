@@ -452,6 +452,30 @@ impl Lighting {
         read
     }
 
+    /// the tables the GPU reads for the lighting, a bit each, as the shader
+    /// goes through them: the lookups on, and each light's spotlight and
+    /// distance tables where it has them. the rest the ring need not hold.
+    pub(crate) fn tables_read(&self) -> u32 {
+        let lookups = [
+            (self.distribution0, DISTRIBUTION0),
+            (self.distribution1, DISTRIBUTION1),
+            (self.fresnel, FRESNEL),
+            (self.reflect[0], REFLECT_RED),
+            (self.reflect[1], REFLECT_GREEN),
+            (self.reflect[2], REFLECT_BLUE),
+        ];
+        let mut read = lookups.iter().filter(|(lookup, _)| lookup.is_some()).fold(0, |read, &(_, table)| read | 1 << table);
+        for light in self.lights() {
+            if light.spotlight {
+                read |= 1 << (SPOTLIGHT + light.number);
+            }
+            if light.distance.is_some() {
+                read |= 1 << (DISTANCE + light.number);
+            }
+        }
+        read
+    }
+
     /// the lighting as the words of the hardware renderer's uniform block,
     /// in the order its shader declares them.
     pub(crate) fn pack(&self, words: &mut Vec<u32>) {
@@ -654,6 +678,25 @@ impl Lighting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the tables the GPU reads for a draw are the lookups it has on and
+    /// the spotlight and distance tables of the lights it lights with.
+    #[test]
+    fn a_draw_reads_the_tables_of_its_lookups_and_lights() {
+        let mut registers = vec![0u32; 0x200];
+        registers[REG_ENABLE] = 1;
+        // the configuration with every lookup
+        registers[REG_CONFIG0] = 8 << 4;
+        // two lights, 5 and 2, of the eight
+        registers[REG_LIGHT_COUNT] = 1;
+        registers[REG_LIGHT_SLOTS] = 0x25;
+        // the second distribution, fresnel and blue off, light 5's
+        // spotlight off and light 2's distance
+        registers[REG_CONFIG1] = 1 << 17 | 1 << 19 | 1 << 22 | 1 << (8 + 5) | 1 << (24 + 2);
+        let lighting = Lighting::read(&registers).expect("lighting on");
+        let expected = 1 << DISTRIBUTION0 | 1 << REFLECT_RED | 1 << REFLECT_GREEN | 1 << (SPOTLIGHT + 2) | 1 << (DISTANCE + 5);
+        assert_eq!(lighting.tables_read(), expected);
+    }
 
     #[test]
     fn half_floats_decode() {

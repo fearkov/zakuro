@@ -100,6 +100,16 @@ struct TablesKey {
     light: [u64; lighting::TABLES],
     procedural: u64,
     fog: u64,
+    read: Read,
+}
+
+/// the tables a draw reads, the lighting ones a bit each, and whether the
+/// procedural texture's and the fog's.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Read {
+    light: u32,
+    procedural: bool,
+    fog: bool,
 }
 
 /// a hash of a lighting table's entries. every step is one to one, so two
@@ -1677,7 +1687,7 @@ pub struct Hardware {
     /// what unused texture units sample.
     blank: Image,
     /// the tables' generation and where the batch copied them.
-    tables: Option<((u64, u64, u64), u64)>,
+    tables: Option<((u64, u64, u64, Read), u64)>,
     /// a hash of each lighting table, with the generation it was taken
     /// at, and which tables those were.
     light_hashes: (u64, [(u64, u64); lighting::TABLES]),
@@ -3098,9 +3108,10 @@ impl Hardware {
         Ok(sampler)
     }
 
-    /// where the batch holds the current lighting tables.
-    fn tables(&mut self, tables: &Tables, procedural: &proctex::Tables, fog: &fog::Table) -> Result<u64, String> {
-        let generation = (tables.generation(), procedural.generation(), fog.generation());
+    /// where the batch holds the current lighting tables, the ones a draw
+    /// reads, which the rest of what is staged for it lacks.
+    fn tables(&mut self, tables: &Tables, procedural: &proctex::Tables, fog: &fog::Table, read: Read) -> Result<u64, String> {
+        let generation = (tables.generation(), procedural.generation(), fog.generation(), read);
         if let Some((staged, offset)) = self.tables {
             if staged == generation {
                 return Ok(offset);
@@ -3120,7 +3131,18 @@ impl Hardware {
                 *hash = table_hash(table);
             }
         }
-        let key = TablesKey { light: hashes.map(|(_, hash)| hash), procedural: procedural.generation(), fog: fog.generation() };
+        let mut light = [0; lighting::TABLES];
+        for (number, (out, &(_, hash))) in light.iter_mut().zip(hashes.iter()).enumerate() {
+            if read.light & (1 << number) != 0 {
+                *out = hash;
+            }
+        }
+        let key = TablesKey {
+            light,
+            procedural: if read.procedural { procedural.generation() } else { 0 },
+            fog: if read.fog { fog.generation() } else { 0 },
+            read,
+        };
         if let Some(&(_, offset)) = self.copied_tables.iter().find(|(copied, _)| *copied == key) {
             self.tables = Some((generation, offset));
             return Ok(offset);
@@ -3128,20 +3150,25 @@ impl Hardware {
         let offset = self.stage(TABLES_SIZE, self.storage_alignment)?;
         let staging = self.ring(offset, TABLES_SIZE);
         let (colors, steps) = procedural.colors();
-        // a plain loop over each, which goes as fast as copying, a chain of
-        // flattened iterators took a quarter of a frame
+        // each lighting table, then the others, in the places the shader
+        // reads them from, only the ones the draw reads being copied, a
+        // draw reading a few of the 24. a plain loop over each, which goes
+        // as fast as copying, a chain of flattened iterators took a
+        // quarter of a frame
+        let lights = tables.entries().iter().enumerate().map(|(number, table)| (table.as_flattened(), read.light & (1 << number) != 0));
         let parts = [
-            tables.entries().as_flattened().as_flattened(),
-            procedural.maps().as_flattened().as_flattened(),
-            colors.as_flattened(),
-            steps.as_flattened(),
-            fog.entries().as_flattened(),
+            (procedural.maps().as_flattened().as_flattened(), read.procedural),
+            (colors.as_flattened(), read.procedural),
+            (steps.as_flattened(), read.procedural),
+            (fog.entries().as_flattened(), read.fog),
         ];
         let mut out = staging.as_chunks_mut::<4>().0;
-        for part in parts {
+        for (part, wanted) in lights.chain(parts) {
             let (here, rest) = out.split_at_mut(part.len());
-            for (bytes, value) in here.iter_mut().zip(part) {
-                *bytes = value.to_le_bytes();
+            if wanted {
+                for (bytes, value) in here.iter_mut().zip(part) {
+                    *bytes = value.to_le_bytes();
+                }
             }
             out = rest;
         }
@@ -3993,8 +4020,9 @@ impl Hardware {
                 None => samplers[unit] = self.sampler(Filtering::OFF)?,
             }
         }
+        let read = Read { light: draw.lighting.map_or(0, Lighting::tables_read), procedural: draw.proctex, fog: draw.fog };
         let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
-            true => self.tables(draw.tables, draw.proctex_tables, draw.fog_table)?,
+            true => self.tables(draw.tables, draw.proctex_tables, draw.fog_table, read)?,
             false => 0,
         };
 
