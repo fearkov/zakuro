@@ -3052,24 +3052,25 @@ fn raw_inputs<M: GpuMemory>(
 /// them, each the vertex it names, into indices.
 fn assemble_into(topology: u32, count: usize, vertex: impl Fn(usize) -> u32, indices: &mut Vec<u32>) {
     indices.clear();
-    // a strip or a fan a triangle at a time, a flattened iterator has no
-    // length to reserve by and pushes a vertex at a time
-    if matches!(topology, 1 | 2) {
-        indices.reserve(count.saturating_sub(2) * 3);
+    if !matches!(topology, 1 | 2) {
+        indices.extend((0..count / 3 * 3).map(vertex));
+        return;
     }
-    match topology {
-        1 => {
-            for i in 2..count {
-                let (a, b) = if i % 2 == 0 { (i - 2, i - 1) } else { (i - 1, i - 2) };
-                indices.extend([vertex(a), vertex(b), vertex(i)]);
-            }
+    // a strip or a fan a triangle at a time, written in place. pushing
+    // kept the length in memory, each push waiting on the last one's
+    indices.resize(count.saturating_sub(2) * 3, 0);
+    let triangles = indices.as_chunks_mut::<3>().0;
+    if topology == 1 {
+        for (i, triangle) in (2..count).zip(triangles) {
+            *triangle = match i % 2 {
+                0 => [vertex(i - 2), vertex(i - 1), vertex(i)],
+                _ => [vertex(i - 1), vertex(i - 2), vertex(i)],
+            };
         }
-        2 => {
-            for i in 2..count {
-                indices.extend([vertex(0), vertex(i - 1), vertex(i)]);
-            }
+    } else {
+        for (i, triangle) in (2..count).zip(triangles) {
+            *triangle = [vertex(0), vertex(i - 1), vertex(i)];
         }
-        _ => indices.extend((0..count / 3 * 3).map(vertex)),
     }
 }
 
@@ -3089,6 +3090,7 @@ fn triangle_indices<'a>(
     match raw {
         Some(vertices) if !matches!(topology, 1 | 2) => &vertices[..count / 3 * 3],
         Some(vertices) => {
+            let vertices = &vertices[..count];
             assemble_into(topology, count, |i| vertices[i], assembled);
             assembled
         }

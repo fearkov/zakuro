@@ -201,6 +201,8 @@ struct Recorded {
     /// where the vertices and the indices are, for one the CPU placed.
     placed: (u64, u64),
     count: u32,
+    /// how wide the indices are.
+    index_type: vk::IndexType,
 }
 
 /// the triangles of a draw.
@@ -3494,7 +3496,12 @@ impl Hardware {
     /// copies what the vertex shader reads into the batch, and says where
     /// the program, the rest of what it reads, the inputs and the indices
     /// went.
-    fn stage_shading<M: GpuMemory>(&mut self, memory: &mut M, shading: &Shading, depth_map: DepthMap) -> Result<[(u64, u64); 4], String> {
+    fn stage_shading<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        shading: &Shading,
+        depth_map: DepthMap,
+    ) -> Result<([(u64, u64); 4], vk::IndexType), String> {
         let unit = shading.unit;
         let fingerprint = unit.fingerprint();
         let program = match self.programs.get(&fingerprint) {
@@ -3577,12 +3584,20 @@ impl Hardware {
         self.shading = block;
         let uniforms = uniforms?;
 
+        // indices from the guest's arrays have 8 or 16 bits, and draws
+        // seldom have more vertices, so they mostly go in at half the size,
+        // the ring being memory the CPU writes past its caches
+        let narrow = shading.indices.iter().fold(0, |all, &index| all | index) <= 0xFFFF;
+        let (index_type, index_size) = match narrow {
+            true => (vk::IndexType::UINT16, 2),
+            false => (vk::IndexType::UINT32, 4),
+        };
         // the draw in between reads the vertices its own draw staged just
         // before, only its uniforms differ
-        let index_bytes = (shading.indices.len() * 4) as u64;
+        let index_bytes = (shading.indices.len() * index_size) as u64;
         if let Some((batch, inputs, indices)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
             if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes {
-                return Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices]);
+                return Ok(([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices], index_type));
             }
         }
 
@@ -3610,13 +3625,23 @@ impl Hardware {
         }
 
         let indices = self.stage(index_bytes, 4)?;
-        for (out, index) in self.ring(indices, index_bytes).as_chunks_mut::<4>().0.iter_mut().zip(shading.indices) {
-            *out = index.to_le_bytes();
+        let staging = self.ring(indices, index_bytes);
+        match narrow {
+            true => {
+                for (out, &index) in staging.as_chunks_mut::<2>().0.iter_mut().zip(shading.indices) {
+                    *out = (index as u16).to_le_bytes();
+                }
+            }
+            false => {
+                for (out, index) in staging.as_chunks_mut::<4>().0.iter_mut().zip(shading.indices) {
+                    *out = index.to_le_bytes();
+                }
+            }
         }
         if self.pass == Pass::Twinned {
             self.twinned_inputs = Some((self.batch, (inputs, input_bytes), (indices, index_bytes)));
         }
-        Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)])
+        Ok(([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)], index_type))
     }
 
     pub(super) fn draw<M: GpuMemory>(&mut self, memory: &mut M, draw: &Draw) -> Result<(), String> {
@@ -3742,14 +3767,14 @@ impl Hardware {
         let (width, height) = (draw.width as f32, draw.height as f32);
         let depth_map = draw.depth_map;
         self.collect();
-        let (vertex_count, (vertex_offset, index_offset), shaded, (vertex, translating)) = match draw.geometry {
+        let (vertex_count, (vertex_offset, index_offset), (shaded, index_type), (vertex, translating)) = match draw.geometry {
             Geometry::Placed { vertices, indices } => {
                 let offsets = self.place(vertices, indices, (width, height), depth_map)?;
-                (indices.len(), offsets, None, (VertexStage::Placed, false))
+                (indices.len(), offsets, (None, vk::IndexType::UINT32), (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
-                let staged = self.stage_shading(memory, shading, depth_map)?;
-                (shading.indices.len(), (0, 0), Some(staged), self.vertex_stage(shading))
+                let (staged, index_type) = self.stage_shading(memory, shading, depth_map)?;
+                (shading.indices.len(), (0, 0), (Some(staged), index_type), self.vertex_stage(shading))
             }
         };
 
@@ -3952,6 +3977,7 @@ impl Hardware {
             shaded,
             placed: (vertex_offset, index_offset),
             count: vertex_count as u32,
+            index_type,
         };
         if real {
             self.record(&recorded);
@@ -4052,7 +4078,7 @@ impl Hardware {
             self.draws += 1;
             match vertex_infos {
                 Some(infos) => {
-                    device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, vk::IndexType::UINT32);
+                    device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, r.index_type);
                     device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
                 }
                 None => {
