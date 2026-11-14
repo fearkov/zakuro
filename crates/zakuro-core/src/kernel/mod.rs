@@ -587,6 +587,57 @@ impl Kernel {
         quiet.then_some((object, true))
     }
 
+    /// whether recompiled code can take and let go of the mutex handle
+    /// names itself for a while from tick, see recomp_abi::Context, nothing
+    /// but the current thread being able to touch it: the mutex free or
+    /// the current thread's, and what quiet_release finds of a release,
+    /// nothing waiting on the mutex, nothing more urgent ready and so on,
+    /// none of which changes while only the thread's code runs. the mutex,
+    /// how many times the thread holds it, and the tick that holds until,
+    /// when a timer comes due or the threads below the current one get a
+    /// share.
+    pub(crate) fn lendable(&self, handle: Handle, tick: u64) -> Option<(ObjectId, u32, u64)> {
+        if handle == CURRENT_THREAD || handle == CURRENT_PROCESS || self.all_blocked {
+            return None;
+        }
+        let object = self.handles.resolve(handle)?;
+        let Some(KObject::Mutex(mutex)) = self.objects.get(object) else { return None };
+        let current = self.current_thread?;
+        if mutex.owner.is_some_and(|owner| owner != current) {
+            return None;
+        }
+        let running = &self.threads[current as usize];
+        if running.status != ThreadStatus::Running
+            || running.waited
+            || running.wait_result.is_some()
+            || running.wait_syscall.is_some()
+            || !self.pulsed.is_empty()
+        {
+            return None;
+        }
+        let quiet = self.threads.iter().enumerate().all(|(id, thread)| match thread.status {
+            ThreadStatus::WaitSync => !thread.wait_objects.contains(&object),
+            ThreadStatus::Ready | ThreadStatus::Running => id as ThreadId == current || thread.priority >= running.priority,
+            _ => true,
+        });
+        let timer = |id: &ObjectId| match self.objects.get(*id) {
+            Some(KObject::Timer(timer)) => timer.fire_at,
+            _ => None,
+        };
+        let until = self.timers.iter().filter_map(timer).fold(running.running_since + STARVATION_TICKS + 1, u64::min);
+        (quiet && tick < until).then_some((object, mutex.lock_count, until))
+    }
+
+    /// the mutex lent to recompiled code as the code left it, held count
+    /// times by the current thread, or free.
+    pub(crate) fn held_as(&mut self, object: ObjectId, count: u32) {
+        let owner = self.current_thread.filter(|_| count > 0);
+        if let Some(KObject::Mutex(mutex)) = self.objects.get_mut(object) {
+            mutex.lock_count = count;
+            mutex.owner = owner;
+        }
+    }
+
     /// whether waiting on object would succeed right now for waiter.
     pub fn is_signaled(&self, object: ObjectId, waiter: ThreadId) -> bool {
         match self.objects.get(object) {

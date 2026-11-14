@@ -245,6 +245,8 @@ pub const PREEMPT_INTERVAL: u64 = 8192;
 
 /// how many instruction addresses are kept for fault reports.
 const HISTORY_LENGTH: usize = 64;
+// the svcs recompiled code answers itself go in the history from its trail
+const _: () = assert!(HISTORY_LENGTH <= recomp_abi::TRAIL);
 
 /// what one call to [System::step] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,6 +684,27 @@ impl System {
         self.history_index = (self.history_index + count - noted) % HISTORY_LENGTH;
         for _ in 0..noted {
             self.note_plain(at);
+        }
+    }
+
+    /// what tick_in_place, wait_in_place and release_in_place did for the
+    /// svcs recompiled code answered itself, done of them, the last at tick
+    /// last and the clock left at after it, the addresses after the last
+    /// of them in trail, see recomp_abi::Context. what they did to the
+    /// kernel is the caller's.
+    pub(crate) fn answered_in_place(&mut self, trail: &[u32; recomp_abi::TRAIL], done: u32, last: u64, after: u64) {
+        self.cpu.cycles = last;
+        self.ran_recompiled();
+        // the last one moves the next idle check furthest
+        self.idle_interrupted(true);
+        self.cpu.cycles = after;
+        // the history holds the last HISTORY_LENGTH of them at most, which
+        // the trail has
+        let done = done as usize;
+        let noted = done.min(HISTORY_LENGTH);
+        self.history_index = (self.history_index + done - noted) % HISTORY_LENGTH;
+        for at in done - noted..done {
+            self.note_plain(trail[at % recomp_abi::TRAIL]);
         }
     }
 
@@ -1786,6 +1809,30 @@ mod tests {
         0xEAFF_FFF9, // b 0x00100200
     ];
 
+    /// a loop that takes the mutex twice and lets it go twice, each time at
+    /// the same svc, reading the tick in between, the way a title's lock
+    /// and unlock functions take a mutex again inside, at 0x00100280. r12
+    /// counts how many times it holds it, r9 the rounds.
+    const NESTING: [u32; 17] = [
+        0xE289_9001, // add r9, r9, #1
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0
+        0xE1A0_1008, // mov r1, r8
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25
+        0xE28C_C001, // add r12, r12, #1
+        0xE35C_0002, // cmp r12, #2
+        0xBAFF_FFF6, // blt 0x00100284, taking it again
+        0xEF00_0028, // svc 0x28
+        0xE087_7000, // add r7, r7, r0
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14
+        0xE25C_C001, // subs r12, r12, #1
+        0x1AFF_FFFB, // bne 0x001002B0, letting it go again
+        0xEAFF_FFEE, // b 0x00100280
+    ];
+
     /// where the threads find the mutex's handle.
     const MUTEX_HANDLE_AT: u32 = 0x0010_0800;
 
@@ -1819,12 +1866,57 @@ mod tests {
             0x0010_01A4 => (3, None, 0x0010_0180),
             0x0010_0200 => (4, Some(0x24), 0x0010_0210),
             0x0010_0210 => (2, None, 0x0010_0200),
+            0x0010_0280 => (1, None, 0x0010_0284),
+            0x0010_0284 => (6, Some(0x25), 0x0010_029C),
+            // where the two branches go is the code's to say
+            0x0010_029C => (3, None, 0x0010_02A8),
+            0x0010_02A8 => (1, Some(0x28), 0x0010_02AC),
+            0x0010_02AC => (1, None, 0x0010_02B0),
+            0x0010_02B0 => (2, Some(0x14), 0x0010_02B8),
+            0x0010_02B8 => (2, None, 0x0010_02C0),
+            0x0010_02C0 => (1, None, 0x0010_0280),
             _ => return None,
         })
     }
 
     /// the ticks the code below read itself.
     static TICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// the waits and releases the code below answered itself.
+    static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// the word at address, where the page tables reach it directly, as
+    /// recomp_held_at reads it.
+    unsafe fn word_at(ctx: *mut recomp_abi::Context, address: u32) -> Option<u32> {
+        unsafe {
+            let page = *(*ctx).read_pages.add(address as usize >> 12);
+            let offset = (address & 0xFFF) as usize;
+            (!page.is_null() && offset <= 0xFFC).then(|| u32::from_le_bytes(std::array::from_fn(|i| *page.add(offset + i))))
+        }
+    }
+
+    /// the flags of a - b, as cmp and subs set them, and whether a < b
+    /// signed, which lt takes.
+    unsafe fn subtract_flags(ctx: *mut recomp_abi::Context, a: u32, b: u32) -> bool {
+        unsafe {
+            let (result, borrow) = a.overflowing_sub(b);
+            let overflow = (a as i32).overflowing_sub(b as i32).1;
+            (*ctx).n = (result >> 31) as u8;
+            (*ctx).z = (result == 0) as u8;
+            (*ctx).c = !borrow as u8;
+            (*ctx).v = overflow as u8;
+            (*ctx).n != (*ctx).v
+        }
+    }
+
+    /// what ANSWERED leaves of an svc the code answered itself at at.
+    unsafe fn answered(ctx: *mut recomp_abi::Context, at: u32) {
+        unsafe {
+            (*ctx).tick_last = (*ctx).tick_end - (*ctx).budget as i64 as u64;
+            (*ctx).trail[(*ctx).done as usize % recomp_abi::TRAIL] = at;
+            (*ctx).done += 1;
+        }
+    }
 
     /// the loops above as 3dsrecomp writes code, each block charged to
     /// the budget as it starts. their svcs run in place, reading the clock
@@ -1835,7 +1927,7 @@ mod tests {
         unsafe {
             let mut at = (*ctx).r[15];
             loop {
-                let Some((size, svc, next)) = block(at) else {
+                let Some((size, svc, mut next)) = block(at) else {
                     (*ctx).exit = recomp_abi::EXIT_UNWIND;
                     return recomp_abi::STOPPED;
                 };
@@ -1886,6 +1978,30 @@ mod tests {
                         (r[0], r[2], r[3]) = (r[10], u32::MAX, u32::MAX);
                     }
                     0x0010_0210 => (*ctx).r[9] = (*ctx).r[9].wrapping_add(1),
+                    0x0010_0280 => (*ctx).r[9] = (*ctx).r[9].wrapping_add(1),
+                    0x0010_0284 => {
+                        let r = &mut (*ctx).r;
+                        (r[0], r[4], r[1], r[2], r[3]) = (u32::MAX, u32::MAX, r[8], 1, 0);
+                    }
+                    // add r12, r12, #1, cmp r12, #2, blt
+                    0x0010_029C => {
+                        (*ctx).r[12] = (*ctx).r[12].wrapping_add(1);
+                        let less = subtract_flags(ctx, (*ctx).r[12], 2);
+                        if less {
+                            next = 0x0010_0284;
+                        }
+                    }
+                    0x0010_02AC => (*ctx).r[7] = (*ctx).r[7].wrapping_add((*ctx).r[0]),
+                    0x0010_02B0 => (*ctx).r[0] = (*ctx).r[5],
+                    // subs r12, r12, #1, bne
+                    0x0010_02B8 => {
+                        let held = (*ctx).r[12];
+                        subtract_flags(ctx, held, 1);
+                        (*ctx).r[12] = held.wrapping_sub(1);
+                        if (*ctx).z == 0 {
+                            next = 0x0010_02B0;
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(number) = svc {
@@ -1895,16 +2011,34 @@ mod tests {
                         (*ctx).exit = recomp_abi::EXIT_SVC;
                         return recomp_abi::STOPPED;
                     }
-                    // the tick read where the host lets the code, as
-                    // SVC_TICK reads it
+                    // the tick read, the mutex lent taken and let go of,
+                    // where the host lets the code, as SVC_TICK, SVC_WAIT
+                    // and SVC_RELEASE do
+                    let held = (*ctx).budget > (*ctx).held_floor;
                     if number == 0x28 && (*ctx).tick_at == next && (*ctx).budget > (*ctx).tick_floor {
                         let tick = (*ctx).tick_end - (*ctx).budget as i64 as u64;
+                        answered(ctx, next);
                         (*ctx).budget -= (*ctx).tick_cost;
-                        (*ctx).tick_last = tick;
                         (*ctx).ticks += 1;
                         (*ctx).r[0] = tick as u32;
                         (*ctx).r[1] = (tick >> 32) as u32;
                         TICKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else if number == 0x25
+                        && (*ctx).wait_at == next
+                        && held
+                        && (*ctx).r[2] == 1
+                        && word_at(ctx, (*ctx).r[1]) == Some((*ctx).held)
+                    {
+                        answered(ctx, next);
+                        (*ctx).holding += 1;
+                        (*ctx).r[0] = 0;
+                        (*ctx).r[1] = 0;
+                        HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else if number == 0x14 && (*ctx).release_at == next && held && (*ctx).r[0] == (*ctx).held && (*ctx).holding != 0 {
+                        answered(ctx, next);
+                        (*ctx).holding -= 1;
+                        (*ctx).r[0] = 0;
+                        HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         ((*(*ctx).host).svc)(ctx, number);
                         if (*ctx).exit != 0 {
@@ -1927,7 +2061,7 @@ mod tests {
         let mut system = System::new(Config { clock: Some(0), ..Config::default() });
         let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
         system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
-        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..])] {
+        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..]), (0x0010_0280, &NESTING[..])] {
             for (index, word) in code.iter().enumerate() {
                 system.memory.write32(address + index as u32 * 4, *word);
             }
@@ -1963,6 +2097,7 @@ mod tests {
             0x0010_0000, 0x0010_0004, 0x0010_0020, 0x0010_0024, 0x0010_002C, 0x0010_0038, 0x0010_0040, 0x0010_0044, 0x0010_0060,
             0x0010_007C, 0x0010_0088, 0x0010_008C, 0x0010_0098, 0x0010_00A0, 0x0010_0100, 0x0010_011C, 0x0010_0128, 0x0010_0130,
             0x0010_013C, 0x0010_0144, 0x0010_0180, 0x0010_0198, 0x0010_019C, 0x0010_01A4, 0x0010_0200, 0x0010_0210,
+            0x0010_0280, 0x0010_0284, 0x0010_029C, 0x0010_02A8, 0x0010_02AC, 0x0010_02B0, 0x0010_02B8, 0x0010_02C0,
         ];
         let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
         let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
@@ -1994,7 +2129,7 @@ mod tests {
         for case in 0..60 {
             let mut threads: Vec<(u32, u32, u32)> = (0..1 + case % 3)
                 .map(|_| {
-                    let entry = pick(&[0x0010_0000, 0x0010_0000, 0x0010_0040, 0x0010_0060, 0x0010_0100]);
+                    let entry = pick(&[0x0010_0000, 0x0010_0000, 0x0010_0040, 0x0010_0060, 0x0010_0100, 0x0010_0280, 0x0010_0280]);
                     (entry, pick(&[0, 0, 900, 13_000, 50_000, 400_000]), pick(&[0x2F, 0x30, 0x30, 0x31]))
                 })
                 .collect();
@@ -2024,6 +2159,8 @@ mod tests {
         assert!(ran_in_place > 100_000, "{ran_in_place} svcs ran in place");
         let ticked = TICKED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(ticked > 50_000, "the code read {ticked} ticks itself");
+        let held = HELD.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(held > 50_000, "the code took and let go of the mutex {held} times itself");
     }
 
     /// runs steps until the run gets to tick or steps runs out, how many it
