@@ -191,6 +191,29 @@ struct ShadingStaged {
     kept: bool,
 }
 
+/// what the command buffer was last set to draw with, which draws in a row
+/// mostly share, each draw setting only what it changes, a call into the
+/// driver for each costing more than the comparing. a command buffer
+/// starts with nothing set.
+#[derive(Clone, Copy, Default)]
+struct Set {
+    pipeline: Option<vk::Pipeline>,
+    viewport: Option<[u32; 6]>,
+    cull: Option<vk::CullModeFlags>,
+    topology: Option<vk::PrimitiveTopology>,
+    scissor: Option<[i32; 4]>,
+    depth_test: Option<bool>,
+    depth_compare: Option<vk::CompareOp>,
+    depth_write: Option<bool>,
+    /// whether the test is on, its register, the op register and whether
+    /// the draw may write.
+    stencil: Option<(bool, u32, u32, bool)>,
+    blend_constants: Option<[u32; 4]>,
+    /// the blend's configuration and the color mask.
+    blend: Option<(Option<u32>, u32)>,
+    logic_op: Option<Option<LogicOp>>,
+}
+
 /// a vertex array a draw read, what memory gave to tell whether something
 /// wrote over it since, and where the heap has it once it was seen the
 /// same twice.
@@ -1612,6 +1635,8 @@ pub struct Hardware {
     heap: Buffer,
     heap_used: u64,
     arrays: QuickMap<u64, Seen>,
+    /// what the command buffer was last set to draw with.
+    set: Set,
     readback: Option<Buffer>,
     surfaces: Vec<Surface>,
     /// by the address of the decoded texels.
@@ -1876,6 +1901,7 @@ impl Hardware {
                 heap: unmade(),
                 heap_used: 0,
                 arrays: QuickMap::default(),
+                set: Set::default(),
                 readback: None,
                 surfaces: Vec::new(),
                 textures: HashMap::new(),
@@ -2161,6 +2187,7 @@ impl Hardware {
                     .map_err(vk_error("begin a command buffer"))?;
             }
             self.recording = true;
+            self.set = Set::default();
             self.start_timing()?;
             // the batch before may still be running
             self.unfenced = true;
@@ -4247,36 +4274,75 @@ impl Hardware {
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
         let (test, op) = r.stencil;
         let stencil_op = |raw: u32| vk::StencilOp::from_raw((raw & 7) as i32);
+        let v = r.viewport;
+        let (offset, extent) = (r.scissor.offset, r.scissor.extent);
+        let set = Set {
+            pipeline: Some(r.pipeline),
+            viewport: Some([v.x, v.y, v.width, v.height, v.min_depth, v.max_depth].map(f32::to_bits)),
+            cull: Some(r.cull),
+            topology: Some(r.topology),
+            scissor: Some([offset.x, offset.y, extent.width as i32, extent.height as i32]),
+            depth_test: Some(r.depth_test),
+            depth_compare: Some(r.depth_compare),
+            depth_write: Some(r.depth_write),
+            stencil: Some((r.stencil_test, test, op, r.writable)),
+            blend_constants: Some(r.blend_constants.map(f32::to_bits)),
+            blend: Some((r.blend, r.color_mask)),
+            logic_op: Some(r.logic_op),
+        };
+        let last = std::mem::replace(&mut self.set, set);
         // SAFETY: recording inside rendering, with everything the draw
         // reads staged in the ring and every image in the general layout
         unsafe {
             let device = &self.device;
-            device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
-            device.cmd_set_viewport(commands, 0, &[r.viewport]);
-            device.cmd_set_cull_mode(commands, r.cull);
-            device.cmd_set_primitive_topology(commands, r.topology);
-            device.cmd_set_scissor(commands, 0, &[r.scissor]);
-            device.cmd_set_depth_test_enable(commands, r.depth_test);
-            device.cmd_set_depth_compare_op(commands, r.depth_compare);
-            device.cmd_set_depth_write_enable(commands, r.depth_write);
-            device.cmd_set_stencil_test_enable(commands, r.stencil_test);
-            device.cmd_set_stencil_op(
-                commands,
-                face,
-                stencil_op(op),
-                stencil_op(op >> 8),
-                stencil_op(op >> 4),
-                COMPARES[((test >> 4) & 7) as usize],
-            );
-            device.cmd_set_stencil_compare_mask(commands, face, (test >> 24) & 0xFF);
-            device.cmd_set_stencil_write_mask(commands, face, if r.writable { (test >> 8) & 0xFF } else { 0 });
-            device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
-            device.cmd_set_blend_constants(commands, &r.blend_constants);
+            if last.pipeline != set.pipeline {
+                device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
+            }
+            if last.viewport != set.viewport {
+                device.cmd_set_viewport(commands, 0, &[r.viewport]);
+            }
+            if last.cull != set.cull {
+                device.cmd_set_cull_mode(commands, r.cull);
+            }
+            if last.topology != set.topology {
+                device.cmd_set_primitive_topology(commands, r.topology);
+            }
+            if last.scissor != set.scissor {
+                device.cmd_set_scissor(commands, 0, &[r.scissor]);
+            }
+            if last.depth_test != set.depth_test {
+                device.cmd_set_depth_test_enable(commands, r.depth_test);
+            }
+            if last.depth_compare != set.depth_compare {
+                device.cmd_set_depth_compare_op(commands, r.depth_compare);
+            }
+            if last.depth_write != set.depth_write {
+                device.cmd_set_depth_write_enable(commands, r.depth_write);
+            }
+            if last.stencil != set.stencil {
+                device.cmd_set_stencil_test_enable(commands, r.stencil_test);
+                device.cmd_set_stencil_op(
+                    commands,
+                    face,
+                    stencil_op(op),
+                    stencil_op(op >> 8),
+                    stencil_op(op >> 4),
+                    COMPARES[((test >> 4) & 7) as usize],
+                );
+                device.cmd_set_stencil_compare_mask(commands, face, (test >> 24) & 0xFF);
+                device.cmd_set_stencil_write_mask(commands, face, if r.writable { (test >> 8) & 0xFF } else { 0 });
+                device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
+            }
+            if last.blend_constants != set.blend_constants {
+                device.cmd_set_blend_constants(commands, &r.blend_constants);
+            }
             if let Some(state) = &self.blend_state {
-                state.cmd_set_color_blend_enable(commands, 0, &[r.blend.is_some().into()]);
-                state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(r.blend.unwrap_or(0))]);
-                state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(r.color_mask)]);
-                if let Some(ops) = &self.logic_op_state {
+                if last.blend != set.blend {
+                    state.cmd_set_color_blend_enable(commands, 0, &[r.blend.is_some().into()]);
+                    state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(r.blend.unwrap_or(0))]);
+                    state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(r.color_mask)]);
+                }
+                if let Some(ops) = self.logic_op_state.as_ref().filter(|_| last.logic_op != set.logic_op) {
                     state.cmd_set_logic_op_enable(commands, r.logic_op.is_some());
                     ops.cmd_set_logic_op(commands, r.logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
                 }
