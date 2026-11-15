@@ -4278,8 +4278,8 @@ impl Hardware {
         // what each binding takes, the ones a draw the CPU placed lacks
         // left as they were
         let mut bound: [Option<[u64; 3]>; BINDINGS] = [None; BINDINGS];
-        for unit in 0..3 {
-            bound[unit] = Some([vk::Handle::as_raw(r.views[unit]), vk::Handle::as_raw(r.samplers[unit]), 0]);
+        for (slot, (&view, &sampler)) in bound.iter_mut().zip(r.views.iter().zip(&r.samplers)) {
+            *slot = Some([vk::Handle::as_raw(view), vk::Handle::as_raw(sampler), 0]);
         }
         bound[3] = Some([vk::Handle::as_raw(self.ring.buffer), r.uniforms, UNIFORM_SIZE]);
         bound[4] = Some([vk::Handle::as_raw(self.ring.buffer), r.tables, TABLES_SIZE]);
