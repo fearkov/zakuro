@@ -110,6 +110,10 @@ struct Machine<'a> {
     /// whether the code can be lent one, having been made for version 8 of
     /// the interface or a later one.
     lends: bool,
+    /// a tick the code would answer itself has to come to the host, which
+    /// a try at skipping turns of a loop polling the clock takes, see
+    /// crate::spin.
+    tick_wanted: bool,
 }
 
 impl Machine<'_> {
@@ -321,12 +325,25 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         // to do itself, see Machine::lend
         let mut mutex = None;
         let done = match number {
-            0x28 => system.tick_in_place(cycles, at, event, deadline, limit, library).inspect(|_| {
-                ctx.r[0] = cycles as u32;
-                ctx.r[1] = (cycles >> 32) as u32;
-                // the code reads the clock here itself from now on
-                tick_at = Some(at);
-            }),
+            0x28 => {
+                // whole turns of a loop polling the clock skipped first, see
+                // crate::spin
+                let mut cycles = cycles;
+                if system.spin.due(cycles) {
+                    let core = Core::of(ctx, &system.cpu);
+                    if let Some(skipped) = system.spin_skip(&core, cycles, at, event, deadline, library) {
+                        machine.ran += skipped.instructions;
+                        library.in_place.set(library.in_place.get() + skipped.svcs);
+                        cycles += skipped.cycles;
+                    }
+                }
+                system.tick_in_place(cycles, at, event, deadline, limit, library).inspect(|_| {
+                    ctx.r[0] = cycles as u32;
+                    ctx.r[1] = (cycles >> 32) as u32;
+                    // the code reads the clock here itself from now on
+                    tick_at = Some(at);
+                })
+            }
             0x25 => {
                 let regs = [ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3], ctx.r[4]];
                 system.wait_in_place(cycles, at, regs, event, deadline, limit, library).map(|(budget, index)| {
@@ -351,13 +368,15 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             machine.went_on = true;
             library.in_place.set(library.in_place.get() + 1);
             machine.budget = ctx.budget;
-            // nothing it looks at changed, unless the budget was cut short
-            // or a preempt passed, which moves the next
+            // nothing it looks at changed, unless the budget was cut short,
+            // a preempt passed, which moves the next, or this is the tick a
+            // try at skipping turns wanted
             let passed = system.next_preempt != preempt;
             if passed {
                 machine.due = system.tick_due(event, deadline);
             }
-            if passed || machine.cycles + machine.budget as u64 != ctx.tick_end {
+            let wanted = number == 0x28 && std::mem::take(&mut machine.tick_wanted);
+            if passed || wanted || machine.cycles + machine.budget as u64 != ctx.tick_end {
                 machine.ticks_from(ctx);
             }
             if let Some(at) = tick_at {
@@ -373,6 +392,15 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                 // lent again
                 let (handle, release_at) = (ctx.held, ctx.release_at);
                 machine.lend(ctx, (handle, false), release_at);
+            }
+            // a try at skipping turns of a loop polling the clock is due,
+            // which takes the next tick, see crate::spin. a turn's other
+            // svcs may be the ones coming to the preempts every time, or a
+            // try was at another of the turn's ticks than the one it starts at
+            let wants = if number == 0x28 { system.spin.wants_tick() } else { system.spin.due(machine.cycles) };
+            if wants {
+                ctx.tick_floor = i32::MAX;
+                machine.tick_wanted = true;
             }
             return;
         }
@@ -623,6 +651,7 @@ impl Library {
             due,
             held: None,
             lends,
+            tick_wanted: false,
         };
         ctx.user = &mut machine as *mut Machine as *mut c_void;
         machine.ticks_from(&mut ctx);
@@ -666,6 +695,452 @@ impl Library {
         // the budget already has
         cpu.cycles = machine.cycles + ran;
         (machine.ran + ran, stop, machine.event)
+    }
+}
+
+// -- turns run on the side, see crate::spin ------------------------------
+
+/// the core of recompiled code at an svc, all a turn run on the side starts
+/// from: the registers, the flags, the monitor and the VFP registers, which
+/// the code works on where the system's CPU has them.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Core {
+    pub r: [u32; 16],
+    /// n, z, c, v, q, thumb, ge and exclusive, as the context has them.
+    flags: [u8; 8],
+    exclusive_address: u32,
+    tls: u32,
+    vfp: [u32; 32],
+    fpscr: u32,
+}
+
+impl Core {
+    /// the core the code has at an svc, the context's and the CPU's VFP
+    /// registers.
+    pub(crate) fn of(ctx: &Context, cpu: &Cpu) -> Core {
+        Core {
+            r: ctx.r,
+            flags: [ctx.n, ctx.z, ctx.c, ctx.v, ctx.q, ctx.thumb, ctx.ge, ctx.exclusive],
+            exclusive_address: ctx.exclusive_address,
+            tls: ctx.tls,
+            vfp: cpu.vfp.regs,
+            fpscr: cpu.vfp.fpscr,
+        }
+    }
+
+    pub(crate) fn thumb(&self) -> bool {
+        self.flags[5] != 0
+    }
+}
+
+/// where turns run on the side write: a write table with no page in it,
+/// which has their code write every byte through the host, the pages it
+/// wrote, saved first and written for real, to be put back after, and the
+/// bytes written.
+pub(crate) struct Sandbox {
+    table: Vec<*mut u8>,
+    saved: Vec<(usize, *mut u8, Box<[u8]>)>,
+    written: Vec<u32>,
+}
+
+impl Sandbox {
+    pub(crate) fn new() -> Sandbox {
+        Sandbox { table: vec![std::ptr::null_mut(); zakuro_common::memory_map::PAGE_TABLE_ENTRIES], saved: Vec::new(), written: Vec::new() }
+    }
+
+    /// each byte the turns run since put_back changed, of those written,
+    /// with what it holds now.
+    pub(crate) fn changed(&self, memory: &mut Memory) -> Vec<(u32, u8)> {
+        let page_size = zakuro_common::memory_map::PAGE_SIZE as usize;
+        let mut changed: Vec<(u32, u8)> = Vec::new();
+        for &addr in &self.written {
+            let page = addr as usize / page_size;
+            if let Some((_, at, old)) = self.saved.iter().find(|(saved, _, _)| *saved == page) {
+                let offset = addr as usize % page_size;
+                // SAFETY: a page saved is one of the CPU's, there while the turns ran
+                let now = unsafe { *at.add(offset) };
+                if now != old[offset] {
+                    changed.push((addr, now));
+                }
+            }
+        }
+        for (addr, old) in memory.logged_old() {
+            let mut now = [0u8];
+            memory.read_bytes(addr, &mut now);
+            if now[0] != old {
+                changed.push((addr, now[0]));
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        changed
+    }
+
+    /// the bytes the turns run since put_back wrote, the interpreter's for
+    /// their code too.
+    pub(crate) fn written(&self, memory: &Memory) -> Vec<u32> {
+        let mut written = self.written.clone();
+        written.extend(memory.logged_old().into_iter().map(|(addr, _)| addr));
+        written.sort_unstable();
+        written.dedup();
+        written
+    }
+
+    /// puts back what the turns run since wrote, what the interpreter wrote
+    /// for their code and then the pages saved, and forgets them.
+    pub(crate) fn put_back(&mut self, memory: &mut Memory) {
+        memory.undo_writes();
+        for (_, at, old) in self.saved.drain(..) {
+            // SAFETY: as in changed
+            unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), at, old.len()) };
+        }
+        self.written.clear();
+    }
+}
+
+/// a turn run on the side: its svcs, the address after each with bit 0
+/// set for Thumb, the cycles from the start each came at and its number,
+/// the cycles it took and the core the next turn starts from.
+pub(crate) struct Side {
+    pub svcs: Vec<(u32, u64, u32)>,
+    pub cost: u64,
+    pub end: Core,
+}
+
+/// a turn running on the side.
+struct Run<'a> {
+    system: *mut System,
+    library: &'a Library,
+    sandbox: *mut Sandbox,
+    /// where the turn starts, the pc after its svc, Thumb, sp and lr.
+    start: (u32, u8, u32, u32),
+    period: usize,
+    tick: u64,
+    /// the budget the code started with, before the first svc's cost.
+    from: i32,
+    svcs: Vec<(u32, u64, u32)>,
+    mutex: Option<u32>,
+    holding: u32,
+    /// the cycles it took and the core the next turn starts from, once it
+    /// got there.
+    end: Option<(u64, Core)>,
+    failed: bool,
+    vfp: [u32; 32],
+    fpscr: u32,
+}
+
+/// the turn running on the side, which the context's user points at.
+unsafe fn run<'a>(ctx: *mut Context) -> &'a mut Run<'a> {
+    unsafe { &mut *((*ctx).user as *mut Run) }
+}
+
+impl Run<'_> {
+    /// writes bytes at address for real, noting them, after saving each
+    /// page they fall in. a page the CPU can't write plainly, guarded,
+    /// watched or not there, is no polling loop's.
+    fn write(&mut self, address: u32, bytes: &[u8]) {
+        let page_size = zakuro_common::memory_map::PAGE_SIZE as usize;
+        // SAFETY: the system and the sandbox outlive the run, and nothing
+        // else holds them meanwhile
+        let (system, sandbox) = unsafe { (&mut *self.system, &mut *self.sandbox) };
+        let (_, real) = system.memory.page_tables();
+        for (offset, &byte) in bytes.iter().enumerate() {
+            let at = address.wrapping_add(offset as u32);
+            let page = at as usize / page_size;
+            let ptr = match sandbox.saved.iter().find(|(saved, _, _)| *saved == page) {
+                Some(&(_, ptr, _)) => ptr,
+                None => {
+                    // SAFETY: the CPU's write table has an entry for every page
+                    let ptr = unsafe { *real.add(page) };
+                    if ptr.is_null() {
+                        self.failed = true;
+                        return;
+                    }
+                    // SAFETY: a non-null entry is a whole page
+                    let mut old: Box<[u8]> = unsafe { std::slice::from_raw_parts(ptr, page_size) }.into();
+                    // what the interpreter wrote there for the code already
+                    // is not what the page held
+                    for (addr, byte) in system.memory.logged_old() {
+                        if addr as usize / page_size == page {
+                            old[addr as usize % page_size] = byte;
+                        }
+                    }
+                    sandbox.saved.push((page, ptr, old));
+                    ptr
+                }
+            };
+            // SAFETY: as above
+            unsafe { *ptr.add(at as usize % page_size) = byte };
+            sandbox.written.push(at);
+        }
+    }
+
+    fn core(&self, ctx: &Context) -> Core {
+        Core {
+            r: ctx.r,
+            flags: [ctx.n, ctx.z, ctx.c, ctx.v, ctx.q, ctx.thumb, ctx.ge, ctx.exclusive],
+            exclusive_address: ctx.exclusive_address,
+            tls: ctx.tls,
+            vfp: self.vfp,
+            fpscr: self.fpscr,
+        }
+    }
+}
+
+unsafe extern "C" fn side_read8(ctx: *mut Context, address: u32) -> u8 {
+    unsafe { (*run(ctx).system).memory.read8(address) }
+}
+
+unsafe extern "C" fn side_read16(ctx: *mut Context, address: u32) -> u16 {
+    unsafe { (*run(ctx).system).memory.read16(address) }
+}
+
+unsafe extern "C" fn side_read32(ctx: *mut Context, address: u32) -> u32 {
+    unsafe { (*run(ctx).system).memory.read32(address) }
+}
+
+unsafe extern "C" fn side_write8(ctx: *mut Context, address: u32, value: u8) {
+    unsafe { run(ctx).write(address, &[value]) }
+}
+
+unsafe extern "C" fn side_write16(ctx: *mut Context, address: u32, value: u16) {
+    unsafe { run(ctx).write(address, &value.to_le_bytes()) }
+}
+
+unsafe extern "C" fn side_write32(ctx: *mut Context, address: u32, value: u32) {
+    unsafe { run(ctx).write(address, &value.to_le_bytes()) }
+}
+
+/// memory as the interpreter reaches it for a turn on the side, a type of
+/// its own so that the interpreter the steps run stays as the compiler
+/// built it, the interpreter being inlined where it is called.
+struct SideBus<'a>(&'a mut Memory);
+
+impl Bus for SideBus<'_> {
+    fn read8(&mut self, addr: u32) -> u8 {
+        self.0.read8(addr)
+    }
+
+    fn read16(&mut self, addr: u32) -> u16 {
+        self.0.read16(addr)
+    }
+
+    fn read32(&mut self, addr: u32) -> u32 {
+        self.0.read32(addr)
+    }
+
+    fn write8(&mut self, addr: u32, value: u8) {
+        self.0.write8(addr, value)
+    }
+
+    fn write16(&mut self, addr: u32, value: u16) {
+        self.0.write16(addr, value)
+    }
+
+    fn write32(&mut self, addr: u32, value: u32) {
+        self.0.write32(addr, value)
+    }
+}
+
+/// an instruction the code leaves to the interpreter, its writes noted to
+/// be undone with the rest.
+unsafe extern "C" fn side_interpret(ctx: *mut Context, address: u32, _opcode: u32) {
+    unsafe {
+        let run = run(ctx);
+        let ctx = &mut *ctx;
+        let system = &mut *run.system;
+        let mut cpu = system.cpu.clone();
+        load(ctx, &mut cpu);
+        (cpu.vfp.regs, cpu.vfp.fpscr) = (run.vfp, run.fpscr);
+        cpu.regs[15] = address;
+        let exit = cpu.step(&mut SideBus(&mut system.memory));
+        store(&cpu, ctx);
+        (run.vfp, run.fpscr) = (cpu.vfp.regs, cpu.vfp.fpscr);
+        let step = if ctx.thumb != 0 { 2 } else { 4 };
+        if exit.is_some() || ctx.r[15] != address.wrapping_add(step) {
+            run.failed = true;
+            ctx.exit = EXIT_UNWIND;
+        }
+    }
+}
+
+unsafe extern "C" fn side_lookup(ctx: *mut Context, address: u32) -> Option<Code> {
+    unsafe { run(ctx).library.lookup(address) }
+}
+
+/// an svc of a turn on the side: the clock read as the code would find it
+/// then, a wait on the mutex alone taking it and its release letting it go
+/// in a count of their own. the one the next turn starts at ends it, and
+/// any other svc, or one where the turn would wait, fails it.
+unsafe extern "C" fn side_svc(ctx: *mut Context, number: u32) {
+    unsafe {
+        let run = run(ctx);
+        let ctx = &mut *ctx;
+        let system = &mut *run.system;
+        let elapsed = (run.from - ctx.budget) as u64;
+        if run.svcs.len() == run.period {
+            let back = number == 0x28 && (ctx.r[15], ctx.thumb, ctx.r[13], ctx.r[14]) == run.start && run.holding == 0;
+            match back {
+                true => run.end = Some((elapsed, run.core(ctx))),
+                false => run.failed = true,
+            }
+            ctx.exit = EXIT_UNWIND;
+            return;
+        }
+        run.svcs.push((ctx.r[15] | ctx.thumb as u32, elapsed, number));
+        match number {
+            0x28 => {
+                let now = run.tick + elapsed;
+                ctx.r[0] = now as u32;
+                ctx.r[1] = (now >> 32) as u32;
+                ctx.budget -= crate::kernel::svc::SYSTEM_TICK_COST as i32;
+            }
+            // WaitSynchronizationN on the mutex alone, which wait_in_place
+            // answers with the handle where the CPU reads it plainly
+            0x25 => match system.memory.plain_read32(ctx.r[1]) {
+                Some(handle) if ctx.r[2] == 1 && *run.mutex.get_or_insert(handle) == handle && system.kernel.quiet_mutex(handle) => {
+                    run.holding += 1;
+                    ctx.r[0] = 0;
+                    ctx.r[1] = 0;
+                }
+                _ => {
+                    run.failed = true;
+                    ctx.exit = EXIT_UNWIND;
+                }
+            },
+            0x14 if run.mutex == Some(ctx.r[0]) && run.holding > 0 => {
+                run.holding -= 1;
+                ctx.r[0] = 0;
+            }
+            _ => {
+                run.failed = true;
+                ctx.exit = EXIT_UNWIND;
+            }
+        }
+    }
+}
+
+static SIDE: Host = Host {
+    read8: side_read8,
+    read16: side_read16,
+    read32: side_read32,
+    write8: side_write8,
+    write16: side_write16,
+    write32: side_write32,
+    interpret: side_interpret,
+    lookup: side_lookup,
+    svc: side_svc,
+};
+
+impl Library {
+    /// runs a turn of a loop on the side, from core at the svc reading the
+    /// clock it starts at, answered with tick, up to the svc period svcs on,
+    /// the next turn's first, which it leaves unanswered, see side_svc.
+    /// none when it does anything else or comes back elsewhere. what it
+    /// wrote stays, for sandbox.put_back.
+    ///
+    /// # Safety
+    ///
+    /// the system outlives the call and nothing else uses it meanwhile, as
+    /// inside an svc of the code, which is the library's own.
+    pub(crate) unsafe fn run_on_the_side(
+        &self,
+        system: *mut System,
+        sandbox: &mut Sandbox,
+        core: &Core,
+        tick: u64,
+        period: usize,
+        mutex: &mut Option<u32>,
+    ) -> Option<Side> {
+        const BUDGET: i32 = 1 << 20;
+        let faulted = unsafe { (*system).memory.faulted() };
+        let (read_pages, _) = unsafe { (*system).memory.page_tables() };
+        let mut svcs = Vec::with_capacity(period);
+        svcs.push((core.r[15] | core.thumb() as u32, 0, 0x28));
+        let mut run = Run {
+            system,
+            library: self,
+            sandbox,
+            start: (core.r[15], core.flags[5], core.r[13], core.r[14]),
+            period,
+            tick,
+            from: BUDGET,
+            svcs,
+            mutex: *mutex,
+            holding: 0,
+            end: None,
+            failed: false,
+            vfp: core.vfp,
+            fpscr: core.fpscr,
+        };
+        let [n, z, c, v, q, thumb, ge, exclusive] = core.flags;
+        let mut ctx = Context {
+            r: core.r,
+            n,
+            z,
+            c,
+            v,
+            q,
+            thumb,
+            ge,
+            exclusive,
+            budget: BUDGET - crate::kernel::svc::SYSTEM_TICK_COST as i32,
+            exit: 0,
+            svc: 0,
+            depth: 0,
+            exclusive_address: core.exclusive_address,
+            tls: core.tls,
+            read_pages,
+            write_pages: run.sandbox_table(),
+            vfp: run.vfp.as_mut_ptr(),
+            fpscr: &raw mut run.fpscr,
+            host: &SIDE,
+            user: std::ptr::null_mut(),
+            stack_limit: 0,
+            tick_end: 0,
+            tick_last: 0,
+            tick_floor: i32::MAX,
+            tick_cost: crate::kernel::svc::SYSTEM_TICK_COST as i32,
+            tick_at: recomp_abi::NO_TICKS,
+            ticks: 0,
+            wait_at: recomp_abi::NO_TICKS,
+            release_at: recomp_abi::NO_TICKS,
+            held: 0,
+            holding: 0,
+            held_floor: NOTHING_HELD,
+            done: 0,
+            trail: [0; TRAIL],
+        };
+        ctx.r[0] = tick as u32;
+        ctx.r[1] = (tick >> 32) as u32;
+        ctx.user = &raw mut run as *mut c_void;
+        while run.end.is_none() && !run.failed {
+            let code = match self.lookup(ctx.r[15] | ctx.thumb as u32) {
+                Some(code) if ctx.budget > 0 => code,
+                _ => break,
+            };
+            ctx.exit = 0;
+            ctx.depth = 0;
+            ctx.stack_limit = recomp_abi::stack_limit();
+            // SAFETY: the code came from the library and ctx is set up the
+            // way it expects, with user pointing at run
+            unsafe { code(&mut ctx) };
+            if ctx.exit == EXIT_BUDGET {
+                break;
+            }
+        }
+        *mutex = run.mutex;
+        let clean = !run.failed && unsafe { (*system).memory.faulted() } == faulted;
+        let (svcs, end) = (std::mem::take(&mut run.svcs), run.end.take());
+        end.filter(|_| clean).map(|(cost, end)| Side { svcs, cost, end })
+    }
+}
+
+impl Run<'_> {
+    /// the write table the turn's code goes through.
+    fn sandbox_table(&self) -> *const *mut u8 {
+        // SAFETY: the sandbox outlives the run
+        unsafe { (*self.sandbox).table.as_ptr() }
     }
 }
 

@@ -204,6 +204,33 @@ impl Kernel {
         self.threads.iter().enumerate().any(|(id, thread)| Some(id as ThreadId) != self.current_thread && thread.is_runnable())
     }
 
+    /// whether a turn of a loop can take and let go of the mutex handle
+    /// names, with nothing but the current thread running: a mutex, free or
+    /// the current thread's, that no thread waits on.
+    pub(crate) fn quiet_mutex(&self, handle: Handle) -> bool {
+        if handle == CURRENT_THREAD || handle == CURRENT_PROCESS {
+            return false;
+        }
+        let (Some(object), Some(current)) = (self.handles.resolve(handle), self.current_thread) else { return false };
+        let Some(KObject::Mutex(mutex)) = self.objects.get(object) else { return false };
+        mutex.owner.is_none_or(|owner| owner == current)
+            && !self.threads.iter().any(|thread| thread.status == ThreadStatus::WaitSync && thread.wait_objects.contains(&object))
+    }
+
+    /// the tick from which the pass a preempt has due is no longer quiet
+    /// whatever else happens, see quiet_pass: the first a timer fires at,
+    /// waited on or not, or the current thread has run long enough for the
+    /// others to get a share.
+    pub(crate) fn quiet_until(&self) -> Option<u64> {
+        let current = self.current_thread?;
+        let timer = |id: &ObjectId| match self.objects.get(*id) {
+            Some(KObject::Timer(timer)) => timer.fire_at,
+            _ => None,
+        };
+        let starving = self.threads[current as usize].running_since + STARVATION_TICKS + 1;
+        Some(self.timers.iter().filter_map(timer).fold(starving, u64::min))
+    }
+
     /// whether the pass a preempt has due at tick would change nothing but
     /// all_blocked, which it leaves false: the current thread running on
     /// alone, not long enough for a share to go to the others, no wait

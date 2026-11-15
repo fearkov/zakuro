@@ -8,6 +8,7 @@ pub mod cro;
 pub mod download_play;
 pub mod hints;
 pub mod idle;
+pub mod spin;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
@@ -216,6 +217,8 @@ pub struct System {
 
     /// loops that change nothing, which the interpreter skips past.
     pub idle: idle::IdleLoops,
+    /// loops in recompiled code polling the clock, see spin.
+    pub spin: spin::SpinLoops,
 
     /// code recompiled ahead of time, which runs instead of the interpreter
     /// wherever it has something.
@@ -260,6 +263,7 @@ impl System {
     pub fn new(config: Config) -> System {
         let boot_clock = config.clock.unwrap_or_else(memory::config::host_clock);
         let idle = idle::IdleLoops::new(config.skip_idle_loops);
+        let spin = spin::SpinLoops::new(config.skip_idle_loops);
         let app_bytes = 64 * 1024 * 1024;
         let mut services = ServiceState::default();
         if let Some(dir) = &config.data_dir {
@@ -301,6 +305,7 @@ impl System {
             profile: None,
             profile_skip: 0,
             idle,
+            spin,
             recompiled: None,
             hints: None,
             interpreted_instructions: 0,
@@ -1851,8 +1856,142 @@ mod tests {
         0xEAFF_FFEE, // b 0x00100280
     ];
 
+    /// a loop that waits for a time the way a title's scheduler waits for
+    /// its next task, at 0x00100300: it reads the clock until it reaches
+    /// the target where r11 points, taking and letting go of the mutex and
+    /// leaving the tick it read in the fourth word each turn, which the next
+    /// turn writes over, then sets the next target r6 after the tick it got
+    /// there at and counts the times in r9. its turns go the same way until
+    /// the target, which the run skips to.
+    const SCHEDULING: [u32; 23] = [
+        0xEF00_0028, // svc 0x28
+        0xE1A0_7000, // mov r7, r0
+        0xE59B_2000, // ldr r2, [r11], the target
+        0xE59B_3004, // ldr r3, [r11, #4]
+        0xE050_2002, // subs r2, r0, r2
+        0xE0D1_3003, // sbcs r3, r1, r3
+        0x2A00_0009, // bhs 0x00100344, there
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0
+        0xE1A0_1008, // mov r1, r8
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14
+        0xE58B_700C, // str r7, [r11, #12]
+        0xEAFF_FFEE, // b 0x00100300
+        0xE090_2006, // adds r2, r0, r6
+        0xE2A1_3000, // adc r3, r1, #0
+        0xE58B_2000, // str r2, [r11]
+        0xE58B_3004, // str r3, [r11, #4]
+        0xE289_9001, // add r9, r9, #1
+        0xEAFF_FFE8, // b 0x00100300
+    ];
+
+    /// a thread that sleeps r6 nanoseconds and then has the first thread's
+    /// SCHEDULING reach its target sooner, 0x5000 cycles after the tick it
+    /// woke at, at 0x00100380, the way a title has its scheduler run a task
+    /// another thread readied.
+    const POSTING: [u32; 10] = [
+        0xE1A0_0006, // mov r0, r6
+        0xE3A0_1000, // mov r1, #0
+        0xEF00_000A, // svc 0x0A
+        0xEF00_0028, // svc 0x28
+        0xE59F_300C, // ldr r3, [pc, #12], TARGETS_AT
+        0xE280_2A05, // add r2, r0, #0x5000
+        0xE583_2000, // str r2, [r3]
+        0xE583_1004, // str r1, [r3, #4]
+        0xEAFF_FFF6, // b 0x00100380
+        TARGETS_AT,
+    ];
+
+    /// SCHEDULING with its waiting in a block of its own, at 0x00100400:
+    /// each turn that waits on leaves the block that would move the target
+    /// in the middle, which the code charges whole as it starts it, so the
+    /// code's turns take longer than the instructions they run.
+    const LEAVING: [u32; 21] = [
+        0xEF00_0028, // svc 0x28
+        0xE59B_2000, // ldr r2, [r11]
+        0xE59B_3004, // ldr r3, [r11, #4]
+        0xE050_2002, // subs r2, r0, r2
+        0xE0D1_3003, // sbcs r3, r1, r3
+        0x3A00_0005, // bcc 0x00100430, waiting on
+        0xE090_2006, // adds r2, r0, r6
+        0xE2A1_3000, // adc r3, r1, #0
+        0xE58B_2000, // str r2, [r11]
+        0xE58B_3004, // str r3, [r11, #4]
+        0xE289_9001, // add r9, r9, #1
+        0xEAFF_FFF3, // b 0x00100400
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0
+        0xE1A0_1008, // mov r1, r8
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14
+        0xEAFF_FFEA, // b 0x00100400
+    ];
+
+    /// SCHEDULING reading the clock twice a turn through a function of its
+    /// own, at 0x00100480, as titles read it through one: the two reads
+    /// make the same svc, with the same sp and lr, the place each comes
+    /// back to on the stack.
+    const TWICE: [u32; 24] = [
+        0xEB00_001E, // bl 0x00100500, the clock
+        0xE1A0_7000, // mov r7, r0
+        0xEB00_001C, // bl 0x00100500, again
+        0xE59B_2000, // ldr r2, [r11]
+        0xE59B_3004, // ldr r3, [r11, #4]
+        0xE050_2002, // subs r2, r0, r2
+        0xE0D1_3003, // sbcs r3, r1, r3
+        0x2A00_0009, // bhs 0x001004C8, there
+        0xE3E0_0000, // mvn r0, #0
+        0xE3E0_4000, // mvn r4, #0
+        0xE1A0_1008, // mov r1, r8
+        0xE3A0_2001, // mov r2, #1
+        0xE3A0_3000, // mov r3, #0
+        0xEF00_0025, // svc 0x25
+        0xE1A0_0005, // mov r0, r5
+        0xEF00_0014, // svc 0x14
+        0xE58B_700C, // str r7, [r11, #12]
+        0xEAFF_FFED, // b 0x00100480
+        0xE090_2006, // adds r2, r0, r6
+        0xE2A1_3000, // adc r3, r1, #0
+        0xE58B_2000, // str r2, [r11]
+        0xE58B_3004, // str r3, [r11, #4]
+        0xE289_9001, // add r9, r9, #1
+        0xEAFF_FFE7, // b 0x00100480
+    ];
+
+    /// the function TWICE reads the clock through, at 0x00100500, which
+    /// calls the one making the svc.
+    const TICKER: [u32; 6] = [
+        0xE52D_E004, // str lr, [sp, #-4]!
+        0xEB00_0001, // bl 0x00100510
+        0xE49D_F004, // ldr pc, [sp], #4
+        0xE1A0_0000, // nop
+        0xEF00_0028, // svc 0x28
+        0xE12F_FF1E, // bx lr
+    ];
+
+    /// a loop that reads the clock and counts its turns in the third word
+    /// where r11 points, at 0x001003C0, leaving nothing of it in registers:
+    /// every turn changes memory, and none is skipped.
+    const TALLYING: [u32; 6] = [
+        0xEF00_0028, // svc 0x28
+        0xE59B_2008, // ldr r2, [r11, #8]
+        0xE282_2001, // add r2, r2, #1
+        0xE58B_2008, // str r2, [r11, #8]
+        0xE3A0_2000, // mov r2, #0
+        0xEAFF_FFF9, // b 0x001003C0
+    ];
+
     /// where the threads find the mutex's handle.
     const MUTEX_HANDLE_AT: u32 = 0x0010_0800;
+    /// where SCHEDULING's targets are, a pair of words for each thread.
+    const TARGETS_AT: u32 = 0x0010_0880;
 
     /// the blocks of the loops above the way 3dsrecomp cuts code, each
     /// with its length, the svc it ends with and where it goes on.
@@ -1893,6 +2032,36 @@ mod tests {
             0x0010_02B0 => (2, Some(0x14), 0x0010_02B8),
             0x0010_02B8 => (2, None, 0x0010_02C0),
             0x0010_02C0 => (1, None, 0x0010_0280),
+            0x0010_0300 => (1, Some(0x28), 0x0010_0304),
+            // where the branch goes is the code's to say
+            0x0010_0304 => (6, None, 0x0010_031C),
+            0x0010_031C => (6, Some(0x25), 0x0010_0334),
+            0x0010_0334 => (2, Some(0x14), 0x0010_033C),
+            0x0010_033C => (2, None, 0x0010_0300),
+            0x0010_0344 => (6, None, 0x0010_0300),
+            0x0010_0380 => (3, Some(0x0A), 0x0010_038C),
+            0x0010_038C => (1, Some(0x28), 0x0010_0390),
+            0x0010_0390 => (5, None, 0x0010_0380),
+            0x0010_03C0 => (1, Some(0x28), 0x0010_03C4),
+            0x0010_03C4 => (5, None, 0x0010_03C0),
+            0x0010_0400 => (1, Some(0x28), 0x0010_0404),
+            // charged whole, where it goes the code's to say
+            0x0010_0404 => (11, None, 0x0010_0400),
+            0x0010_0430 => (6, Some(0x25), 0x0010_0448),
+            0x0010_0448 => (2, Some(0x14), 0x0010_0450),
+            0x0010_0450 => (1, None, 0x0010_0400),
+            // calls, and returns, which go where lr and the stack say
+            0x0010_0480 => (1, None, 0x0010_0500),
+            0x0010_0484 => (2, None, 0x0010_0500),
+            0x0010_048C => (5, None, 0x0010_04A0),
+            0x0010_04A0 => (6, Some(0x25), 0x0010_04B8),
+            0x0010_04B8 => (2, Some(0x14), 0x0010_04C0),
+            0x0010_04C0 => (2, None, 0x0010_0480),
+            0x0010_04C8 => (6, None, 0x0010_0480),
+            0x0010_0500 => (2, None, 0x0010_0510),
+            0x0010_0508 => (1, None, 0),
+            0x0010_0510 => (1, Some(0x28), 0x0010_0514),
+            0x0010_0514 => (1, None, 0),
             _ => return None,
         })
     }
@@ -1910,6 +2079,22 @@ mod tests {
             let page = *(*ctx).read_pages.add(address as usize >> 12);
             let offset = (address & 0xFFF) as usize;
             (!page.is_null() && offset <= 0xFFC).then(|| u32::from_le_bytes(std::array::from_fn(|i| *page.add(offset + i))))
+        }
+    }
+
+    /// writes the word at address as code does, through the page the
+    /// context has for it or the host's callback.
+    unsafe fn set_word(ctx: *mut recomp_abi::Context, address: u32, value: u32) {
+        unsafe {
+            let page = *(*ctx).write_pages.add(address as usize >> 12);
+            let offset = (address & 0xFFF) as usize;
+            if !page.is_null() && offset <= 0xFFC {
+                for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+                    *page.add(offset + i) = byte;
+                }
+            } else {
+                ((*(*ctx).host).write32)(ctx, address, value);
+            }
         }
     }
 
@@ -2020,6 +2205,159 @@ mod tests {
                             next = 0x0010_02B0;
                         }
                     }
+                    // mov r7, r0; ldr r2, [r11]; ldr r3, [r11, #4];
+                    // subs r2, r0, r2; sbcs r3, r1, r3; bhs
+                    0x0010_0304 => {
+                        let r = &mut (*ctx).r;
+                        r[7] = r[0];
+                        let (low, high) = (word_at(ctx, r[11]).unwrap(), word_at(ctx, r[11] + 4).unwrap());
+                        let (below, borrow) = r[0].overflowing_sub(low);
+                        let (part, first) = r[1].overflowing_sub(high);
+                        let (above, second) = part.overflowing_sub(borrow as u32);
+                        let overflow = ((r[1] ^ high) & (r[1] ^ above)) >> 31 != 0;
+                        (r[2], r[3]) = (below, above);
+                        (*ctx).n = (above >> 31) as u8;
+                        (*ctx).z = (above == 0) as u8;
+                        (*ctx).c = !(first || second) as u8;
+                        (*ctx).v = overflow as u8;
+                        if (*ctx).c != 0 {
+                            next = 0x0010_0344;
+                        }
+                    }
+                    0x0010_031C => {
+                        let r = &mut (*ctx).r;
+                        (r[0], r[4], r[1], r[2], r[3]) = (u32::MAX, u32::MAX, r[8], 1, 0);
+                    }
+                    0x0010_0334 => (*ctx).r[0] = (*ctx).r[5],
+                    // the store left to the interpreter, as code leaves an
+                    // instruction it has no C for
+                    0x0010_033C => {
+                        ((*(*ctx).host).interpret)(ctx, 0x0010_033C, SCHEDULING[15]);
+                        if (*ctx).exit != 0 {
+                            return recomp_abi::STOPPED;
+                        }
+                    }
+                    // the next target, adds then adc, the first half of it
+                    // stored by the interpreter, and counted
+                    0x0010_0344 => {
+                        let r = &mut (*ctx).r;
+                        let (low, step) = (r[0], r[6]);
+                        let (sum, carry) = low.overflowing_add(step);
+                        let above = r[1].wrapping_add(carry as u32);
+                        (r[2], r[3]) = (sum, above);
+                        let at = r[11];
+                        (*ctx).n = (sum >> 31) as u8;
+                        (*ctx).z = (sum == 0) as u8;
+                        (*ctx).c = carry as u8;
+                        (*ctx).v = (((low ^ sum) & (step ^ sum)) >> 31 != 0) as u8;
+                        ((*(*ctx).host).interpret)(ctx, 0x0010_034C, SCHEDULING[19]);
+                        if (*ctx).exit != 0 {
+                            return recomp_abi::STOPPED;
+                        }
+                        set_word(ctx, at + 4, above);
+                        (*ctx).r[9] = (*ctx).r[9].wrapping_add(1);
+                    }
+                    0x0010_0390 => {
+                        let r = &mut (*ctx).r;
+                        (r[3], r[2]) = (TARGETS_AT, r[0].wrapping_add(0x5000));
+                        let (low, high) = (r[2], r[1]);
+                        set_word(ctx, TARGETS_AT, low);
+                        set_word(ctx, TARGETS_AT + 4, high);
+                    }
+                    0x0010_0404 => {
+                        let r = &mut (*ctx).r;
+                        let (low, high) = (word_at(ctx, r[11]).unwrap(), word_at(ctx, r[11] + 4).unwrap());
+                        let (below, borrow) = r[0].overflowing_sub(low);
+                        let (part, first) = r[1].overflowing_sub(high);
+                        let (above, second) = part.overflowing_sub(borrow as u32);
+                        (r[2], r[3]) = (below, above);
+                        (*ctx).n = (above >> 31) as u8;
+                        (*ctx).z = (above == 0) as u8;
+                        (*ctx).c = !(first || second) as u8;
+                        (*ctx).v = (((r[1] ^ high) & (r[1] ^ above)) >> 31 != 0) as u8;
+                        if (*ctx).c == 0 {
+                            next = 0x0010_0430;
+                        } else {
+                            let r = &mut (*ctx).r;
+                            let (low, step) = (r[0], r[6]);
+                            let (sum, carry) = low.overflowing_add(step);
+                            let above = r[1].wrapping_add(carry as u32);
+                            (r[2], r[3]) = (sum, above);
+                            r[9] = r[9].wrapping_add(1);
+                            let at = r[11];
+                            (*ctx).n = (sum >> 31) as u8;
+                            (*ctx).z = (sum == 0) as u8;
+                            (*ctx).c = carry as u8;
+                            (*ctx).v = (((low ^ sum) & (step ^ sum)) >> 31 != 0) as u8;
+                            set_word(ctx, at, sum);
+                            set_word(ctx, at + 4, above);
+                        }
+                    }
+                    0x0010_0430 => {
+                        let r = &mut (*ctx).r;
+                        (r[0], r[4], r[1], r[2], r[3]) = (u32::MAX, u32::MAX, r[8], 1, 0);
+                    }
+                    0x0010_0448 => (*ctx).r[0] = (*ctx).r[5],
+                    0x0010_0480 => (*ctx).r[14] = 0x0010_0484,
+                    0x0010_0484 => {
+                        (*ctx).r[7] = (*ctx).r[0];
+                        (*ctx).r[14] = 0x0010_048C;
+                    }
+                    0x0010_048C => {
+                        let r = &mut (*ctx).r;
+                        let (low, high) = (word_at(ctx, r[11]).unwrap(), word_at(ctx, r[11] + 4).unwrap());
+                        let (below, borrow) = r[0].overflowing_sub(low);
+                        let (part, first) = r[1].overflowing_sub(high);
+                        let (above, second) = part.overflowing_sub(borrow as u32);
+                        (r[2], r[3]) = (below, above);
+                        (*ctx).n = (above >> 31) as u8;
+                        (*ctx).z = (above == 0) as u8;
+                        (*ctx).c = !(first || second) as u8;
+                        (*ctx).v = (((r[1] ^ high) & (r[1] ^ above)) >> 31 != 0) as u8;
+                        if (*ctx).c != 0 {
+                            next = 0x0010_04C8;
+                        }
+                    }
+                    0x0010_04A0 => {
+                        let r = &mut (*ctx).r;
+                        (r[0], r[4], r[1], r[2], r[3]) = (u32::MAX, u32::MAX, r[8], 1, 0);
+                    }
+                    0x0010_04B8 => (*ctx).r[0] = (*ctx).r[5],
+                    0x0010_04C0 => set_word(ctx, (*ctx).r[11] + 12, (*ctx).r[7]),
+                    0x0010_04C8 => {
+                        let r = &mut (*ctx).r;
+                        let (low, step) = (r[0], r[6]);
+                        let (sum, carry) = low.overflowing_add(step);
+                        let above = r[1].wrapping_add(carry as u32);
+                        (r[2], r[3]) = (sum, above);
+                        r[9] = r[9].wrapping_add(1);
+                        let at = r[11];
+                        (*ctx).n = (sum >> 31) as u8;
+                        (*ctx).z = (sum == 0) as u8;
+                        (*ctx).c = carry as u8;
+                        (*ctx).v = (((low ^ sum) & (step ^ sum)) >> 31 != 0) as u8;
+                        set_word(ctx, at, sum);
+                        set_word(ctx, at + 4, above);
+                    }
+                    // str lr, [sp, #-4]!; bl
+                    0x0010_0500 => {
+                        let sp = (*ctx).r[13] - 4;
+                        set_word(ctx, sp, (*ctx).r[14]);
+                        (*ctx).r[13] = sp;
+                        (*ctx).r[14] = 0x0010_0508;
+                    }
+                    // ldr pc, [sp], #4
+                    0x0010_0508 => {
+                        let sp = (*ctx).r[13];
+                        next = word_at(ctx, sp).unwrap();
+                        (*ctx).r[13] = sp + 4;
+                    }
+                    0x0010_0514 => next = (*ctx).r[14],
+                    0x0010_03C4 => {
+                        let at = (*ctx).r[11] + 8;
+                        set_word(ctx, at, word_at(ctx, at).unwrap().wrapping_add(1));
+                        (*ctx).r[2] = 0;
+                    }
                     _ => {}
                 }
                 if let Some(number) = svc {
@@ -2079,7 +2417,7 @@ mod tests {
         let mut system = System::new(Config { clock: Some(0), ..Config::default() });
         let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
         system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
-        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..]), (0x0010_0280, &NESTING[..])] {
+        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..]), (0x0010_0280, &NESTING[..]), (0x0010_0300, &SCHEDULING[..]), (0x0010_0380, &POSTING[..]), (0x0010_03C0, &TALLYING[..]), (0x0010_0400, &LEAVING[..]), (0x0010_0480, &TWICE[..]), (0x0010_0500, &TICKER[..])] {
             for (index, word) in code.iter().enumerate() {
                 system.memory.write32(address + index as u32 * 4, *word);
             }
@@ -2108,6 +2446,7 @@ mod tests {
             regs[6] = sleep;
             regs[8] = MUTEX_HANDLE_AT;
             regs[10] = set;
+            regs[11] = TARGETS_AT + index as u32 * 16;
         }
         system.kernel.schedule(&mut system.cpu, 0);
         let code: recomp_abi::Code = if in_place { polling::<true> } else { polling::<false> };
@@ -2116,6 +2455,10 @@ mod tests {
             0x0010_007C, 0x0010_0088, 0x0010_008C, 0x0010_0098, 0x0010_00A0, 0x0010_0100, 0x0010_011C, 0x0010_0128, 0x0010_0130,
             0x0010_013C, 0x0010_0144, 0x0010_0180, 0x0010_0198, 0x0010_019C, 0x0010_01A4, 0x0010_0200, 0x0010_0210,
             0x0010_0280, 0x0010_0284, 0x0010_029C, 0x0010_02A8, 0x0010_02AC, 0x0010_02B0, 0x0010_02B8, 0x0010_02C0,
+            0x0010_0300, 0x0010_0304, 0x0010_031C, 0x0010_0334, 0x0010_033C, 0x0010_0344, 0x0010_0380, 0x0010_038C,
+            0x0010_0390, 0x0010_03C0, 0x0010_03C4, 0x0010_0400, 0x0010_0404, 0x0010_0430, 0x0010_0448, 0x0010_0450,
+            0x0010_0480, 0x0010_0484, 0x0010_048C, 0x0010_04A0, 0x0010_04B8, 0x0010_04C0, 0x0010_04C8, 0x0010_0500, 0x0010_0508,
+            0x0010_0510, 0x0010_0514,
         ];
         let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
         let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
@@ -2124,6 +2467,27 @@ mod tests {
         let linked = unsafe { recompiled::Linked::new(0, abi, entries.as_ptr().cast(), entries.len() as u32, std::ptr::null(), 0) };
         system.recompiled = Some(recompiled::Library::linked(&linked).unwrap());
         system
+    }
+
+    /// runs the threads six frames as code that leaves for the step at each
+    /// svc and as code that runs them in place, which has to leave the
+    /// machine the same: how many svcs ran in place, the cycles of turns of
+    /// loops skipped, and the most rounds a thread went.
+    fn the_same_both_ways(threads: &[(u32, u32, u32)], timer: Option<u32>) -> (u64, u64, u32) {
+        let mut systems = [polling_system(false, threads, timer), polling_system(true, threads, timer)];
+        let [steps, in_place] = &mut systems;
+        for frame in 0..6 {
+            assert_eq!(steps.run_frame(), FrameOutcome::Completed);
+            assert_eq!(in_place.run_frame(), FrameOutcome::Completed);
+            assert_eq!(in_place.cpu.cycles, steps.cpu.cycles, "{threads:x?} {timer:?} frame {frame}");
+            assert_eq!(in_place.history, steps.history, "{threads:x?} {timer:?} frame {frame}");
+            assert!(in_place.save_state().unwrap() == steps.save_state().unwrap(), "{threads:x?} {timer:?} elsewhere at frame {frame}");
+        }
+        // the current thread's registers are the CPU's
+        let rounds = steps.kernel.threads.iter().map(|thread| thread.context.regs[9]).chain([steps.cpu.regs[9]]);
+        assert_eq!(steps.recompiled.as_ref().unwrap().in_place(), 0);
+        assert_eq!(steps.spin.skipped, 0);
+        (in_place.recompiled.as_ref().unwrap().in_place(), in_place.spin.skipped, rounds.max().unwrap())
     }
 
     /// code that runs its svcs in place leaves the machine just as code
@@ -2158,23 +2522,49 @@ mod tests {
                 threads.push((0x0010_0180, pick(&[2_000, 20_000, 60_000]), pick(&[0x30, 0x31])));
             }
             let timer = (case % 4 == 3).then(|| pick(&[70_000, 300_000, 2_000_000]));
-            let mut systems = [polling_system(false, &threads, timer), polling_system(true, &threads, timer)];
-            for system in &mut systems {
-                for _ in 0..6 {
-                    assert_eq!(system.run_frame(), FrameOutcome::Completed);
-                }
-            }
-            let [steps, in_place] = &mut systems;
-            assert_eq!(in_place.cpu.cycles, steps.cpu.cycles, "{threads:x?} {timer:?}");
-            assert_eq!(in_place.history, steps.history, "{threads:x?} {timer:?}");
-            assert!(in_place.save_state().unwrap() == steps.save_state().unwrap(), "{threads:x?} {timer:?} ends elsewhere");
-            // the current thread's registers are the CPU's
-            let rounds = steps.kernel.threads.iter().map(|thread| thread.context.regs[9]).chain([steps.cpu.regs[9]]);
-            assert!(rounds.max().unwrap() > 100, "{threads:x?} went round");
-            assert_eq!(steps.recompiled.as_ref().unwrap().in_place(), 0);
-            ran_in_place += in_place.recompiled.as_ref().unwrap().in_place();
+            let (in_place, _, rounds) = the_same_both_ways(&threads, timer);
+            assert!(rounds > 100, "{threads:x?} went round");
+            ran_in_place += in_place;
         }
         assert!(ran_in_place > 100_000, "{ran_in_place} svcs ran in place");
+        // a thread waiting for a time alone, or with others asleep or
+        // waiting, which the run skips turns of, and with others ready or
+        // timers due, which it doesn't
+        let mut skipped = 0;
+        for (threads, timer) in [
+            (&[(0x0010_0300, 13_000, 0x30)][..], None),
+            (&[(0x0010_0300, 50_000, 0x30)], None),
+            (&[(0x0010_0300, 400_000, 0x30)], None),
+            (&[(0x0010_0300, 2_000_000, 0x30)], None),
+            (&[(0x0010_0300, 900, 0x30)], None),
+            (&[(0x0010_0300, 400_000, 0x31), (0x0010_0000, 400_000, 0x30)], None),
+            (&[(0x0010_0300, 2_000_000, 0x31), (0x0010_0000, 50_000, 0x2F)], None),
+            (&[(0x0010_0300, 50_000, 0x30), (0x0010_0200, 0, 0x2F), (0x0010_0180, 20_000, 0x31)], None),
+            (&[(0x0010_0300, 400_000, 0x30), (0x0010_0300, 400_000, 0x30)], None),
+            (&[(0x0010_0300, 300_000, 0x30), (0x0010_0300, 2_000_000, 0x31)], None),
+            (&[(0x0010_0300, 400_000, 0x30)], Some(300_000)),
+            (&[(0x0010_0300, 2_000_000, 0x30)], Some(70_000)),
+            // a thread readying the scheduler's task while it waits
+            (&[(0x0010_0300, 2_000_000, 0x31), (0x0010_0380, 1_000_000, 0x30)], None),
+            (&[(0x0010_0300, 400_000, 0x31), (0x0010_0380, 3_000_000, 0x30)], None),
+            // turns the code charges more than the instructions they run
+            (&[(0x0010_0400, 50_000, 0x30)], None),
+            (&[(0x0010_0400, 2_000_000, 0x30)], None),
+            (&[(0x0010_0400, 400_000, 0x31), (0x0010_0000, 400_000, 0x30)], None),
+            (&[(0x0010_0400, 2_000_000, 0x31), (0x0010_0380, 1_000_000, 0x30)], None),
+            // the clock read twice a turn through a function
+            (&[(0x0010_0480, 50_000, 0x30)], None),
+            (&[(0x0010_0480, 2_000_000, 0x30)], None),
+            (&[(0x0010_0480, 400_000, 0x31), (0x0010_0000, 400_000, 0x30)], None),
+            (&[(0x0010_0480, 2_000_000, 0x31), (0x0010_0380, 1_000_000, 0x30)], None),
+            // turns that change memory each time
+            (&[(0x0010_03C0, 0, 0x30)], None),
+            (&[(0x0010_03C0, 0, 0x31), (0x0010_0000, 400_000, 0x30)], None),
+        ] {
+            let (_, skips, _) = the_same_both_ways(threads, timer);
+            skipped += skips;
+        }
+        assert!(skipped > 1_000_000, "{skipped} cycles of turns skipped");
         let ticked = TICKED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(ticked > 50_000, "the code read {ticked} ticks itself");
         let held = HELD.load(std::sync::atomic::Ordering::Relaxed);

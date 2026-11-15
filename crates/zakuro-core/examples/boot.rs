@@ -444,6 +444,9 @@ fn main() {
     if system.idle.skipped > 0 {
         println!("idle skipped:  {} cycles of loops that changed nothing", system.idle.skipped);
     }
+    if system.spin.skipped > 0 {
+        println!("spin skipped:  {} cycles in {} turns of loops polling the clock", system.spin.skipped, system.spin.turns);
+    }
     println!(
         "speed:         {:.2} MIPS",
         system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1_000_000.0

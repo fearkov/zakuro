@@ -94,6 +94,8 @@ pub struct Memory {
     /// accesses to unmapped addresses, deduplicated so one bad loop does not
     /// produce a gigabyte of log.
     faults: BTreeMap<VAddr, u32>,
+    /// accesses to unmapped pages so far, all of them.
+    faulted: u64,
 
     /// while a loop is watched for changing nothing, what each byte the CPU
     /// wrote held before its first write, see crate::idle.
@@ -115,6 +117,9 @@ struct WriteLog {
     old: HashMap<VAddr, u8>,
     /// it wrote more than is kept, too much for a loop that polls.
     overflowed: bool,
+    /// every write kept, however many, so that all can be undone, for a
+    /// turn of a loop run on the side, see crate::spin.
+    all: bool,
 }
 
 /// the most bytes a write log keeps.
@@ -221,6 +226,7 @@ impl Memory {
             gpu_sync: None,
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
+            faulted: 0,
             write_log: None,
             watched: zakuro_common::hash::IntMap::default(),
             watches: 0,
@@ -299,6 +305,39 @@ impl Memory {
         self.write_log = None;
     }
 
+    /// starts noting what every write of the CPU writes over, however many,
+    /// forgetting what was noted before, see undo_writes.
+    pub(crate) fn log_all_writes(&mut self) {
+        self.write_log = Some(Box::new(WriteLog { all: true, ..WriteLog::default() }));
+    }
+
+    /// whether the CPU's writes are being noted, for a watched loop or a
+    /// turn of one run on the side.
+    pub(crate) fn logging_writes(&self) -> bool {
+        self.write_log.is_some()
+    }
+
+    /// puts back what the CPU's writes since log_all_writes wrote over, the
+    /// way the emulator writes, and goes on noting from there.
+    pub(crate) fn undo_writes(&mut self) {
+        let Some(log) = self.write_log.take() else { return };
+        for (&addr, &old) in &log.old {
+            self.write_bytes(addr, &[old]);
+        }
+        self.log_all_writes();
+    }
+
+    /// the bytes the CPU wrote since the log started, with what each held
+    /// before.
+    pub(crate) fn logged_old(&self) -> Vec<(VAddr, u8)> {
+        self.write_log.as_ref().map_or_else(Vec::new, |log| log.old.iter().map(|(&addr, &old)| (addr, old)).collect())
+    }
+
+    /// accesses to unmapped pages so far.
+    pub(crate) fn faulted(&self) -> u64 {
+        self.faulted
+    }
+
     /// whether every byte the CPU wrote since log_writes holds again what it
     /// held before, but those in skip.
     pub(crate) fn writes_undone(&mut self, skip: std::ops::Range<VAddr>) -> bool {
@@ -322,7 +361,7 @@ impl Memory {
         self.read_bytes(addr, &mut old[..len]);
         let Some(log) = &mut self.write_log else { return };
         for (offset, byte) in old[..len].iter().enumerate() {
-            if log.old.len() >= MOST_LOGGED {
+            if log.old.len() >= MOST_LOGGED && !log.all {
                 log.overflowed = true;
                 return;
             }
@@ -797,6 +836,7 @@ impl Memory {
     }
 
     fn note_fault(&mut self, addr: VAddr) {
+        self.faulted += 1;
         let page = addr & !PAGE_MASK;
         let count = self.faults.entry(page).or_insert(0);
         *count += 1;

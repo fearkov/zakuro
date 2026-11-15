@@ -154,6 +154,7 @@ impl System {
     /// the state is not one this game and this Zakuro can take.
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.idle_interrupted(true);
+        self.spin.forget();
         let mut reader = Reader(bytes);
         if reader.take(MAGIC.len())? != MAGIC {
             return Err("it is not a saved state".into());
