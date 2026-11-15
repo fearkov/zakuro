@@ -99,7 +99,7 @@ impl SpinLoops {
 struct Turn {
     svcs: Vec<(u32, u64, u32)>,
     cost: u64,
-    written: Vec<u32>,
+    written: Vec<(u32, recompiled::Bytes)>,
 }
 
 /// a loop learned.

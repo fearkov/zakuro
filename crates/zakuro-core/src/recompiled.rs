@@ -738,41 +738,99 @@ impl Core {
 }
 
 /// where turns run on the side write: a write table with no page in it,
-/// which has their code write every byte through the host, the pages it
-/// wrote, saved first and written for real, to be put back after, and the
-/// bytes written.
+/// which has their code write every byte through the host, the pages they
+/// wrote for real, each with the bytes written, and what each byte held
+/// before, to be put back after.
 pub(crate) struct Sandbox {
     table: Vec<*mut u8>,
-    saved: Vec<(usize, *mut u8, Box<[u8]>)>,
-    written: Vec<u32>,
+    /// the pages written since put_back, the first used of them, the rest
+    /// kept for the next with no byte written.
+    touched: Vec<Touched>,
+    used: usize,
+    /// the one of them written last.
+    last: usize,
+    /// each byte written since put_back, once, with what it held before the
+    /// first write, what the interpreter wrote over for their code before
+    /// that aside.
+    old: Vec<Old>,
 }
+
+/// bytes written in a page, a bit each.
+pub(crate) type Bytes = [u64; PAGE_SIZE / 64];
+
+/// a page turns run on the side wrote.
+struct Touched {
+    page: usize,
+    at: *mut u8,
+    written: Bytes,
+}
+
+/// a byte turns run on the side wrote, where the host has it, its address
+/// and what it held.
+struct Old {
+    at: *mut u8,
+    address: u32,
+    old: u8,
+}
+
+const PAGE_SIZE: usize = zakuro_common::memory_map::PAGE_SIZE as usize;
+const PAGE_BITS: u32 = zakuro_common::memory_map::PAGE_BITS;
 
 impl Sandbox {
     pub(crate) fn new() -> Sandbox {
-        Sandbox { table: vec![std::ptr::null_mut(); zakuro_common::memory_map::PAGE_TABLE_ENTRIES], saved: Vec::new(), written: Vec::new() }
+        Sandbox {
+            table: vec![std::ptr::null_mut(); zakuro_common::memory_map::PAGE_TABLE_ENTRIES],
+            touched: Vec::new(),
+            used: 0,
+            last: 0,
+            old: Vec::new(),
+        }
+    }
+
+    /// the page written at, which the CPU writes plainly at real, noted
+    /// from now on, or none when it can't.
+    #[inline]
+    fn page(&mut self, page: usize, real: *const *mut u8) -> Option<&mut Touched> {
+        if self.last < self.used && self.touched[self.last].page == page {
+            return Some(&mut self.touched[self.last]);
+        }
+        self.other_page(page, real)
+    }
+
+    fn other_page(&mut self, page: usize, real: *const *mut u8) -> Option<&mut Touched> {
+        if let Some(index) = self.touched[..self.used].iter().position(|touched| touched.page == page) {
+            self.last = index;
+            return Some(&mut self.touched[index]);
+        }
+        // SAFETY: the CPU's write table has an entry for every page
+        let at = unsafe { *real.add(page) };
+        if at.is_null() {
+            return None;
+        }
+        if self.used == self.touched.len() {
+            self.touched.push(Touched { page, at, written: [0; PAGE_SIZE / 64] });
+        }
+        let touched = &mut self.touched[self.used];
+        (touched.page, touched.at) = (page, at);
+        self.last = self.used;
+        self.used += 1;
+        Some(touched)
     }
 
     /// each byte the turns run since put_back changed, of those written,
-    /// with what it holds now.
+    /// with what it holds now, by address.
     pub(crate) fn changed(&self, memory: &mut Memory) -> Vec<(u32, u8)> {
-        let page_size = zakuro_common::memory_map::PAGE_SIZE as usize;
-        let mut changed: Vec<(u32, u8)> = Vec::new();
-        for &addr in &self.written {
-            let page = addr as usize / page_size;
-            if let Some((_, at, old)) = self.saved.iter().find(|(saved, _, _)| *saved == page) {
-                let offset = addr as usize % page_size;
-                // SAFETY: a page saved is one of the CPU's, there while the turns ran
-                let now = unsafe { *at.add(offset) };
-                if now != old[offset] {
-                    changed.push((addr, now));
+        // SAFETY: a byte written is in one of the CPU's pages, there while the
+        // turns ran
+        let mut changed: Vec<(u32, u8)> =
+            self.old.iter().filter_map(|old| Some((old.address, unsafe { *old.at })).filter(|&(_, now)| now != old.old)).collect();
+        if memory.logged_any() {
+            for (addr, old) in memory.logged_old() {
+                let mut now = [0u8];
+                memory.read_bytes(addr, &mut now);
+                if now[0] != old {
+                    changed.push((addr, now[0]));
                 }
-            }
-        }
-        for (addr, old) in memory.logged_old() {
-            let mut now = [0u8];
-            memory.read_bytes(addr, &mut now);
-            if now[0] != old {
-                changed.push((addr, now[0]));
             }
         }
         changed.sort_unstable();
@@ -781,24 +839,40 @@ impl Sandbox {
     }
 
     /// the bytes the turns run since put_back wrote, the interpreter's for
-    /// their code too.
-    pub(crate) fn written(&self, memory: &Memory) -> Vec<u32> {
-        let mut written = self.written.clone();
-        written.extend(memory.logged_old().into_iter().map(|(addr, _)| addr));
-        written.sort_unstable();
-        written.dedup();
+    /// their code too, by page.
+    pub(crate) fn written(&mut self, memory: &Memory) -> Vec<(u32, Bytes)> {
+        self.touched[..self.used].sort_unstable_by_key(|touched| touched.page);
+        self.last = 0;
+        let mut written: Vec<(u32, Bytes)> = self.touched[..self.used].iter().map(|touched| (touched.page as u32, touched.written)).collect();
+        if memory.logged_any() {
+            for (addr, _) in memory.logged_old() {
+                let page = addr >> PAGE_BITS;
+                let index = match written.binary_search_by_key(&page, |&(page, _)| page) {
+                    Ok(index) => index,
+                    Err(index) => {
+                        written.insert(index, (page, [0; PAGE_SIZE / 64]));
+                        index
+                    }
+                };
+                let offset = (addr as usize) % PAGE_SIZE;
+                written[index].1[offset / 64] |= 1 << (offset % 64);
+            }
+        }
         written
     }
 
     /// puts back what the turns run since wrote, what the interpreter wrote
-    /// for their code and then the pages saved, and forgets them.
+    /// for their code first, and forgets them.
     pub(crate) fn put_back(&mut self, memory: &mut Memory) {
         memory.undo_writes();
-        for (_, at, old) in self.saved.drain(..) {
+        for old in self.old.drain(..) {
             // SAFETY: as in changed
-            unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), at, old.len()) };
+            unsafe { *old.at = old.old };
         }
-        self.written.clear();
+        for touched in &mut self.touched[..self.used] {
+            touched.written = [0; PAGE_SIZE / 64];
+        }
+        (self.used, self.last) = (0, 0);
     }
 }
 
@@ -839,43 +913,51 @@ unsafe fn run<'a>(ctx: *mut Context) -> &'a mut Run<'a> {
 }
 
 impl Run<'_> {
-    /// writes bytes at address for real, noting them, after saving each
-    /// page they fall in. a page the CPU can't write plainly, guarded,
-    /// watched or not there, is no polling loop's.
-    fn write(&mut self, address: u32, bytes: &[u8]) {
-        let page_size = zakuro_common::memory_map::PAGE_SIZE as usize;
+    /// writes the len bytes of value at address for real, noting each with
+    /// what it held before the first write. a page the CPU can't write
+    /// plainly, guarded, watched or not there, is no polling loop's.
+    #[inline]
+    fn write(&mut self, address: u32, value: u32, len: usize) {
         // SAFETY: the system and the sandbox outlive the run, and nothing
         // else holds them meanwhile
         let (system, sandbox) = unsafe { (&mut *self.system, &mut *self.sandbox) };
+        let offset = address as usize % PAGE_SIZE;
+        // within a page and a word of its bytes written, as nearly all are
+        if offset % 64 + len > 64 {
+            return self.write_bytes(address, value, len);
+        }
         let (_, real) = system.memory.page_tables();
-        for (offset, &byte) in bytes.iter().enumerate() {
-            let at = address.wrapping_add(offset as u32);
-            let page = at as usize / page_size;
-            let ptr = match sandbox.saved.iter().find(|(saved, _, _)| *saved == page) {
-                Some(&(_, ptr, _)) => ptr,
-                None => {
-                    // SAFETY: the CPU's write table has an entry for every page
-                    let ptr = unsafe { *real.add(page) };
-                    if ptr.is_null() {
-                        self.failed = true;
-                        return;
-                    }
-                    // SAFETY: a non-null entry is a whole page
-                    let mut old: Box<[u8]> = unsafe { std::slice::from_raw_parts(ptr, page_size) }.into();
-                    // what the interpreter wrote there for the code already
-                    // is not what the page held
-                    for (addr, byte) in system.memory.logged_old() {
-                        if addr as usize / page_size == page {
-                            old[addr as usize % page_size] = byte;
-                        }
-                    }
-                    sandbox.saved.push((page, ptr, old));
-                    ptr
-                }
-            };
-            // SAFETY: as above
-            unsafe { *ptr.add(at as usize % page_size) = byte };
-            sandbox.written.push(at);
+        let Some(touched) = sandbox.page((address >> PAGE_BITS) as usize, real) else {
+            self.failed = true;
+            return;
+        };
+        let at = touched.at;
+        let (word, mask) = (offset / 64, ((1u64 << len) - 1) << (offset % 64));
+        let mut fresh = mask & !touched.written[word];
+        if fresh != 0 {
+            touched.written[word] |= mask;
+            let logged = system.memory.logged_any();
+            while fresh != 0 {
+                let byte = word * 64 + fresh.trailing_zeros() as usize;
+                fresh &= fresh - 1;
+                let address = (address & !(PAGE_SIZE as u32 - 1)) | byte as u32;
+                // what the interpreter wrote there for the code already is
+                // not what the byte held
+                // SAFETY: a page touched is a whole one of the CPU's
+                let old = unsafe { *at.add(byte) };
+                let old = if logged { system.memory.logged_old_at(address).unwrap_or(old) } else { old };
+                sandbox.old.push(Old { at: unsafe { at.add(byte) }, address, old });
+            }
+        }
+        // SAFETY: as above, the bytes within the page
+        unsafe { std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), at.add(offset), len) };
+    }
+
+    /// write, a byte at a time, for bytes across pages or words.
+    #[cold]
+    fn write_bytes(&mut self, address: u32, value: u32, len: usize) {
+        for (offset, &byte) in value.to_le_bytes()[..len].iter().enumerate() {
+            self.write(address.wrapping_add(offset as u32), byte as u32, 1);
         }
     }
 
@@ -904,15 +986,15 @@ unsafe extern "C" fn side_read32(ctx: *mut Context, address: u32) -> u32 {
 }
 
 unsafe extern "C" fn side_write8(ctx: *mut Context, address: u32, value: u8) {
-    unsafe { run(ctx).write(address, &[value]) }
+    unsafe { run(ctx).write(address, value as u32, 1) }
 }
 
 unsafe extern "C" fn side_write16(ctx: *mut Context, address: u32, value: u16) {
-    unsafe { run(ctx).write(address, &value.to_le_bytes()) }
+    unsafe { run(ctx).write(address, value as u32, 2) }
 }
 
 unsafe extern "C" fn side_write32(ctx: *mut Context, address: u32, value: u32) {
-    unsafe { run(ctx).write(address, &value.to_le_bytes()) }
+    unsafe { run(ctx).write(address, value, 4) }
 }
 
 /// memory as the interpreter reaches it for a turn on the side, a type of

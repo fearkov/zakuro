@@ -333,6 +333,17 @@ impl Memory {
         self.write_log.as_ref().map_or_else(Vec::new, |log| log.old.iter().map(|(&addr, &old)| (addr, old)).collect())
     }
 
+    /// whether the CPU wrote anything since the log started.
+    #[inline]
+    pub(crate) fn logged_any(&self) -> bool {
+        self.write_log.as_ref().is_some_and(|log| !log.old.is_empty())
+    }
+
+    /// what the CPU wrote over at addr since the log started, if it did.
+    pub(crate) fn logged_old_at(&self, addr: VAddr) -> Option<u8> {
+        self.write_log.as_ref().and_then(|log| log.old.get(&addr).copied())
+    }
+
     /// accesses to unmapped pages so far.
     pub(crate) fn faulted(&self) -> u64 {
         self.faulted
