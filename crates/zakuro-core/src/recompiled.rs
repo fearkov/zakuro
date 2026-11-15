@@ -329,9 +329,9 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                 // whole turns of a loop polling the clock skipped first, see
                 // crate::spin
                 let mut cycles = cycles;
-                if system.spin.due(cycles) {
+                if let Some(period) = system.spin.due(cycles).then(|| system.spin_period(at)).flatten() {
                     let core = Core::of(ctx, &system.cpu);
-                    if let Some(skipped) = system.spin_skip(&core, cycles, at, event, deadline, library) {
+                    if let Some(skipped) = system.spin_skip(&core, cycles, at, period, event, deadline, library) {
                         machine.ran += skipped.instructions;
                         library.in_place.set(library.in_place.get() + skipped.svcs);
                         cycles += skipped.cycles;
@@ -394,10 +394,14 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                 machine.lend(ctx, (handle, false), release_at);
             }
             // a try at skipping turns of a loop polling the clock is due,
-            // which takes the next tick, see crate::spin. a turn's other
-            // svcs may be the ones coming to the preempts every time, or a
-            // try was at another of the turn's ticks than the one it starts at
-            let wants = if number == 0x28 { system.spin.wants_tick() } else { system.spin.due(machine.cycles) };
+            // the history showing one, which takes the next tick, see
+            // crate::spin. a turn's other svcs may be the ones coming to the
+            // preempts every time, or a try was at another of the turn's
+            // ticks than the one it starts at
+            let wants = match number {
+                0x28 => system.spin.wants_tick(),
+                _ => system.spin.due(machine.cycles) && system.history_repeats(),
+            };
             if wants {
                 ctx.tick_floor = i32::MAX;
                 machine.tick_wanted = true;

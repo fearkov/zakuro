@@ -17,6 +17,12 @@
 //! when each comes, the cycles it takes and the bytes it changes. a turn
 //! goes another way past a tick, the way a time reached does, and before it
 //! the same, so the turns to skip are found by halving.
+//!
+//! a try starts at a tick the host answers when the history of svcs shows a
+//! loop, and the ticks a loop's other svcs come to the host before then
+//! have the next one come too. a loop going another way soon is tried again
+//! once it did, for the next it comes back to, and one whose turn can't be
+//! learned waits, longer each time.
 
 use crate::kernel::svc::SYSTEM_TICK_COST;
 use crate::kernel::thread::ThreadId;
@@ -30,15 +36,18 @@ const FEWEST_TURNS: u64 = 4;
 /// how close the turn a loop goes another way at is found, the turns
 /// between running.
 const ROUGHLY: u64 = 16;
-/// after a try that found no loop to skip, the next waits this long at
-/// first, twice as long each time it finds none again, up to the most.
-const RETRY: u64 = 65_536;
+/// after a loop's turn couldn't be learned, no try starts for this long at
+/// first, twice as long each time that loop's can't again, up to the most.
+const RETRY: u64 = 8192;
 const MOST_RETRY: u64 = 2 * 1024 * 1024;
 
 /// loops skipped, and the one learned.
 pub struct SpinLoops {
     /// before this cycle no try starts, an svc pays one comparison.
     next_try: u64,
+    /// the loop whose turn couldn't be learned last, its thread, the svc at
+    /// and the svcs in a turn, and how long its next try waited.
+    failed: Option<(ThreadId, u32, usize)>,
     retry: u64,
     learned: Option<Box<Learned>>,
     /// where turns run on the side write, made at the first try.
@@ -56,19 +65,20 @@ impl SpinLoops {
     /// them off too.
     pub fn new(on: bool) -> SpinLoops {
         let on = on && std::env::var("ZAKURO_SPIN").map_or(true, |value| value != "0");
-        SpinLoops { next_try: if on { 0 } else { u64::MAX }, retry: 0, learned: None, sandbox: None, wants_tick: false, skipped: 0, turns: 0 }
+        SpinLoops { next_try: if on { 0 } else { u64::MAX }, failed: None, retry: 0, learned: None, sandbox: None, wants_tick: false, skipped: 0, turns: 0 }
     }
 
     /// forgets the loop learned and when to try next, for a state loaded.
     pub(crate) fn forget(&mut self) {
         self.learned = None;
+        self.failed = None;
         self.retry = 0;
         if self.next_try != u64::MAX {
             self.next_try = 0;
         }
     }
 
-    /// whether an svc at tick is worth a try.
+    /// whether an svc at tick is worth a try, the history showing a loop.
     #[inline(always)]
     pub(crate) fn due(&self, tick: u64) -> bool {
         tick >= self.next_try
@@ -128,22 +138,29 @@ enum Tried {
     Past(u64),
     /// the loop learned, at another of its ticks, tried again at the next.
     Next,
+    /// a turn of the loop that couldn't be learned, tried again later.
+    Failed,
+    /// nothing to skip now, tried again at the next tick the history shows
+    /// a loop at.
     Nothing,
 }
 
 impl System {
     /// before the clock is read in place at at, the core the code has at
     /// the svc, tick what it reads: whole turns of a loop polling it
-    /// skipped, when the code is in one, up to the event or the deadline at
-    /// the most, with the history and the preempt as answering each of
-    /// their svcs would leave them. the svc then has to be answered after
-    /// them, which this makes sure tick_in_place does. none, having done
-    /// nothing, when there is nothing to skip.
+    /// skipped, when the code is in one, the history showing its turns of
+    /// period svcs, see spin_period, up to the event or the deadline at the
+    /// most, with the history and the preempt as answering each of their
+    /// svcs would leave them. the svc then has to be answered after them,
+    /// which this makes sure tick_in_place does. none, having done nothing,
+    /// when there is nothing to skip.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spin_skip(
         &mut self,
         core: &Core,
         tick: u64,
         at: u32,
+        period: usize,
         event: Option<u64>,
         deadline: Option<u64>,
         library: &recompiled::Library,
@@ -152,26 +169,36 @@ impl System {
         if self.memory.logging_writes() {
             return None;
         }
-        match self.try_spin_skip(core, tick, at, event, deadline, library) {
+        let tried = self.try_spin_skip(core, tick, at, period, event, deadline, library);
+        let thread = self.kernel.current_thread;
+        let this = thread.map(|thread| (thread, at, period));
+        match tried {
             Tried::Skipped(skipped) => {
-                self.spin.retry = 0;
+                if self.spin.failed == this {
+                    (self.spin.failed, self.spin.retry) = (None, 0);
+                }
                 return Some(skipped);
             }
             Tried::Past(past) => self.spin.next_try = past,
             Tried::Next => self.spin.wants_tick = true,
-            Tried::Nothing => {
-                self.spin.retry = (self.spin.retry * 2).clamp(RETRY, MOST_RETRY);
+            Tried::Failed => {
+                // the same loop failing again waits longer
+                self.spin.retry = if self.spin.failed == this { (self.spin.retry * 2).min(MOST_RETRY) } else { RETRY };
+                self.spin.failed = this;
                 self.spin.next_try = tick + self.spin.retry;
             }
+            Tried::Nothing => {}
         }
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_spin_skip(
         &mut self,
         core: &Core,
         tick: u64,
         at: u32,
+        period: usize,
         event: Option<u64>,
         deadline: Option<u64>,
         library: &recompiled::Library,
@@ -190,7 +217,6 @@ impl System {
         if self.spin.learned.as_ref().is_some_and(|learned| horizon.saturating_sub(after) / learned.turn.cost < FEWEST_TURNS + 2) {
             return Tried::Past(horizon);
         }
-        let Some(period) = self.spin_period(at) else { return Tried::Nothing };
         // the loop learned, at another of its turn's ticks
         if self.spin.learned.as_ref().is_some_and(|learned| self.learned_turn_at(learned, thread, period).is_some_and(|phase| phase != 0)) {
             return Tried::Next;
@@ -200,17 +226,22 @@ impl System {
             Some(learned) => learned,
             None => match self.learn_turn(library, thread, core, tick, period) {
                 Some(learned) => learned,
-                None => return Tried::Nothing,
+                None => return Tried::Failed,
             },
         };
         let turns = self.turns_to_skip(library, &mut learned, core, tick, horizon);
-        let after = tick + turns * learned.turn.cost + SYSTEM_TICK_COST;
+        let cost = learned.turn.cost;
+        let after = tick + turns * cost + SYSTEM_TICK_COST;
         let skipped = (turns >= FEWEST_TURNS && self.plain_in_place(after, at, event, deadline, library))
             .then(|| self.skip_turns(&learned, tick, turns));
+        // too few turns before the loop goes another way: the next try once
+        // it did, rather than at the horizon, which a loop the code comes
+        // back to meanwhile would spin to
+        let past = learned.other_from.map_or(horizon, |other| other.max(tick + cost).min(horizon));
         self.spin.learned = Some(learned);
         match skipped {
             Some(skipped) => Tried::Skipped(skipped),
-            None => Tried::Past(horizon),
+            None => Tried::Past(past),
         }
     }
 
@@ -218,10 +249,19 @@ impl System {
     /// in the history repeating that often and the one at at the first of
     /// them, the history holding each svc answered in place. none when they
     /// don't repeat.
-    fn spin_period(&self, at: u32) -> Option<usize> {
+    #[inline]
+    pub(crate) fn spin_period(&self, at: u32) -> Option<usize> {
         // back 0 the newest
         let entry = |back: usize| self.history[(self.history_index + 2 * HISTORY_LENGTH - 1 - back) % HISTORY_LENGTH];
         (1..=MOST_SVCS).find(|&period| entry(period - 1) == at && (period..HISTORY_LENGTH).all(|back| entry(back) == entry(back - period)))
+    }
+
+    /// whether the history repeats, the svcs answered in place a loop's
+    /// turns, which a try at skipping them wants the next tick for.
+    #[inline]
+    pub(crate) fn history_repeats(&self) -> bool {
+        let entry = |back: usize| self.history[(self.history_index + 2 * HISTORY_LENGTH - 1 - back) % HISTORY_LENGTH];
+        (1..=MOST_SVCS).any(|period| (period..HISTORY_LENGTH).all(|back| entry(back) == entry(back - period)))
     }
 
     /// where in a turn of the loop learned the svc at hand is, by the
