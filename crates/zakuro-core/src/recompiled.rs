@@ -298,6 +298,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         let machine = machine(ctx);
         let ctx = &mut *ctx;
         machine.caught_up(ctx);
+        let lent = machine.held.is_some();
         machine.take_back(ctx);
         if !svcs_in_place() || !crate::kernel::svc::in_place(number) {
             ctx.svc = number;
@@ -365,6 +366,13 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             }
             if let Some(mutex) = mutex.filter(|_| machine.lends) {
                 machine.lend(ctx, mutex, at);
+            } else if lent && tick_at.is_some() {
+                // a tick changes nothing the mutex was lent on, nor does
+                // the pass of a preempt it came to, so the code keeps it,
+                // rather than coming back with its next wait to have it
+                // lent again
+                let (handle, release_at) = (ctx.held, ctx.release_at);
+                machine.lend(ctx, (handle, false), release_at);
             }
             return;
         }
