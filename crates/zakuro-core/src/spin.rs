@@ -7,8 +7,8 @@
 //! once, up to the last before the loop would go another way or the next
 //! thing happens, leaving the machine as running every one of them would:
 //! the clock, the history, the preempt and the instructions counted. the
-//! code then runs the turn after them for real, which writes over all that
-//! the skipped ones would have left.
+//! code then runs the turn after them for real, which goes the same way and
+//! so writes over all that the skipped ones would have left.
 //!
 //! which way a turn goes from a tick is found by running the code for it on
 //! the side, see recompiled::Library::run_on_the_side, on a copy of the
@@ -333,10 +333,11 @@ impl System {
     }
 
     /// how many turns of the loop learned to skip from the core at tick:
-    /// all going the same way, and the turn after them and the start of
-    /// the next before horizon, so that one runs whole before anything
-    /// looks. found by running the last of them, and halving when that one
-    /// goes another way.
+    /// all going the same way, and the turn after them too, which runs for
+    /// real and so writes over all that they would have left, and the start
+    /// of the next before horizon, so that one runs whole before anything
+    /// looks. found by running that last turn, and halving when it goes
+    /// another way.
     fn turns_to_skip(&mut self, library: &recompiled::Library, learned: &mut Learned, core: &Core, tick: u64, horizon: u64) -> u64 {
         let cost = learned.turn.cost;
         let start = |turn: u64| tick + turn * cost;
@@ -351,21 +352,21 @@ impl System {
         }
         // those starting by same_until go the same way
         let same = if learned.same_until >= tick { (learned.same_until - tick) / cost + 1 } else { 0 };
-        if most <= same {
+        if most < same {
             return most;
         }
-        // the one after them is between one known to go the same way and
-        // one known to go another, and runs
+        // the first going another way is known, the turns before it only as
+        // far as same_until
         if learned.other_from.is_some() {
-            return same;
+            return same.saturating_sub(1);
         }
-        if self.goes_the_same(library, learned, core, start(most - 1)) {
-            learned.same_until = start(most - 1);
+        if self.goes_the_same(library, learned, core, start(most)) {
+            learned.same_until = start(most);
             return most;
         }
-        // the first going another way, roughly, which runs with the few
-        // before it
-        let (mut same_turns, mut other) = (same, most - 1);
+        // the first going another way, roughly, the last known to go the
+        // same way before it the one that runs
+        let (mut same_turns, mut other) = (same, most);
         while other > same_turns + ROUGHLY {
             let middle = same_turns + (other - same_turns) / 2;
             if self.goes_the_same(library, learned, core, start(middle)) {
@@ -378,7 +379,7 @@ impl System {
             learned.same_until = learned.same_until.max(start(same_turns - 1));
         }
         learned.other_from = Some(start(other));
-        same_turns
+        same_turns.saturating_sub(1)
     }
 
     /// skips turns of the loop learned from tick, noting each of their svcs

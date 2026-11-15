@@ -1976,6 +1976,28 @@ mod tests {
         0xE12F_FF1E, // bx lr
     ];
 
+    /// SCHEDULING without the mutex, at 0x00100540, its next target set from
+    /// the tick the turn before left in the fourth word: the turn it goes
+    /// another way at reads what the turns before it wrote, which skipping
+    /// them has to leave.
+    const SETTLING: [u32; 15] = [
+        0xEF00_0028, // svc 0x28
+        0xE59B_2000, // ldr r2, [r11], the target
+        0xE59B_3004, // ldr r3, [r11, #4]
+        0xE050_2002, // subs r2, r0, r2
+        0xE0D1_3003, // sbcs r3, r1, r3
+        0x2A00_0001, // bhs 0x00100560, there
+        0xE58B_000C, // str r0, [r11, #12]
+        0xEAFF_FFF7, // b 0x00100540
+        0xE59B_200C, // ldr r2, [r11, #12], the tick the turn before read
+        0xE092_2006, // adds r2, r2, r6
+        0xE2A1_3000, // adc r3, r1, #0
+        0xE58B_2000, // str r2, [r11]
+        0xE58B_3004, // str r3, [r11, #4]
+        0xE289_9001, // add r9, r9, #1
+        0xEAFF_FFF0, // b 0x00100540
+    ];
+
     /// a loop that reads the clock and counts its turns in the third word
     /// where r11 points, at 0x001003C0, leaving nothing of it in registers:
     /// every turn changes memory, and none is skipped.
@@ -2062,6 +2084,11 @@ mod tests {
             0x0010_0508 => (1, None, 0),
             0x0010_0510 => (1, Some(0x28), 0x0010_0514),
             0x0010_0514 => (1, None, 0),
+            0x0010_0540 => (1, Some(0x28), 0x0010_0544),
+            // where the branch goes is the code's to say
+            0x0010_0544 => (5, None, 0x0010_0558),
+            0x0010_0558 => (2, None, 0x0010_0540),
+            0x0010_0560 => (7, None, 0x0010_0540),
             _ => return None,
         })
     }
@@ -2353,6 +2380,40 @@ mod tests {
                         (*ctx).r[13] = sp + 4;
                     }
                     0x0010_0514 => next = (*ctx).r[14],
+                    // ldr r2, [r11]; ldr r3, [r11, #4]; subs r2, r0, r2;
+                    // sbcs r3, r1, r3; bhs
+                    0x0010_0544 => {
+                        let r = &mut (*ctx).r;
+                        let (low, high) = (word_at(ctx, r[11]).unwrap(), word_at(ctx, r[11] + 4).unwrap());
+                        let (below, borrow) = r[0].overflowing_sub(low);
+                        let (part, first) = r[1].overflowing_sub(high);
+                        let (above, second) = part.overflowing_sub(borrow as u32);
+                        (r[2], r[3]) = (below, above);
+                        (*ctx).n = (above >> 31) as u8;
+                        (*ctx).z = (above == 0) as u8;
+                        (*ctx).c = !(first || second) as u8;
+                        (*ctx).v = (((r[1] ^ high) & (r[1] ^ above)) >> 31 != 0) as u8;
+                        if (*ctx).c != 0 {
+                            next = 0x0010_0560;
+                        }
+                    }
+                    0x0010_0558 => set_word(ctx, (*ctx).r[11] + 12, (*ctx).r[0]),
+                    // the next target from the tick the turn before left
+                    0x0010_0560 => {
+                        let r = &mut (*ctx).r;
+                        let (low, step) = (word_at(ctx, r[11] + 12).unwrap(), r[6]);
+                        let (sum, carry) = low.overflowing_add(step);
+                        let above = r[1].wrapping_add(carry as u32);
+                        (r[2], r[3]) = (sum, above);
+                        r[9] = r[9].wrapping_add(1);
+                        let at = r[11];
+                        (*ctx).n = (sum >> 31) as u8;
+                        (*ctx).z = (sum == 0) as u8;
+                        (*ctx).c = carry as u8;
+                        (*ctx).v = (((low ^ sum) & (step ^ sum)) >> 31 != 0) as u8;
+                        set_word(ctx, at, sum);
+                        set_word(ctx, at + 4, above);
+                    }
                     0x0010_03C4 => {
                         let at = (*ctx).r[11] + 8;
                         set_word(ctx, at, word_at(ctx, at).unwrap().wrapping_add(1));
@@ -2417,7 +2478,7 @@ mod tests {
         let mut system = System::new(Config { clock: Some(0), ..Config::default() });
         let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
         system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
-        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..]), (0x0010_0280, &NESTING[..]), (0x0010_0300, &SCHEDULING[..]), (0x0010_0380, &POSTING[..]), (0x0010_03C0, &TALLYING[..]), (0x0010_0400, &LEAVING[..]), (0x0010_0480, &TWICE[..]), (0x0010_0500, &TICKER[..])] {
+        for (address, code) in [(0x0010_0000, &POLLING[..]), (0x0010_0040, &TICKING[..]), (0x0010_0060, &LOCKING[..]), (0x0010_0100, &HOLDING[..]), (0x0010_0180, &TIMING[..]), (0x0010_0200, &WAITING[..]), (0x0010_0280, &NESTING[..]), (0x0010_0300, &SCHEDULING[..]), (0x0010_0380, &POSTING[..]), (0x0010_03C0, &TALLYING[..]), (0x0010_0400, &LEAVING[..]), (0x0010_0480, &TWICE[..]), (0x0010_0500, &TICKER[..]), (0x0010_0540, &SETTLING[..])] {
             for (index, word) in code.iter().enumerate() {
                 system.memory.write32(address + index as u32 * 4, *word);
             }
@@ -2458,7 +2519,7 @@ mod tests {
             0x0010_0300, 0x0010_0304, 0x0010_031C, 0x0010_0334, 0x0010_033C, 0x0010_0344, 0x0010_0380, 0x0010_038C,
             0x0010_0390, 0x0010_03C0, 0x0010_03C4, 0x0010_0400, 0x0010_0404, 0x0010_0430, 0x0010_0448, 0x0010_0450,
             0x0010_0480, 0x0010_0484, 0x0010_048C, 0x0010_04A0, 0x0010_04B8, 0x0010_04C0, 0x0010_04C8, 0x0010_0500, 0x0010_0508,
-            0x0010_0510, 0x0010_0514,
+            0x0010_0510, 0x0010_0514, 0x0010_0540, 0x0010_0544, 0x0010_0558, 0x0010_0560,
         ];
         let entries: &'static [recomp_abi::Entry] = Box::leak(Box::from(addresses.map(|address| recomp_abi::Entry { address, code })));
         let abi = if in_place { recomp_abi::ABI } else { recomp_abi::OLDEST_ABI };
@@ -2557,6 +2618,12 @@ mod tests {
             (&[(0x0010_0480, 2_000_000, 0x30)], None),
             (&[(0x0010_0480, 400_000, 0x31), (0x0010_0000, 400_000, 0x30)], None),
             (&[(0x0010_0480, 2_000_000, 0x31), (0x0010_0380, 1_000_000, 0x30)], None),
+            // the turn going another way reading what the turns before it
+            // left
+            (&[(0x0010_0540, 50_000, 0x30)], None),
+            (&[(0x0010_0540, 400_000, 0x30)], None),
+            (&[(0x0010_0540, 2_000_000, 0x30)], None),
+            (&[(0x0010_0540, 400_000, 0x31), (0x0010_0380, 3_000_000, 0x30)], None),
             // turns that change memory each time
             (&[(0x0010_03C0, 0, 0x30)], None),
             (&[(0x0010_03C0, 0, 0x31), (0x0010_0000, 400_000, 0x30)], None),
