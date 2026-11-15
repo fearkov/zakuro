@@ -204,6 +204,26 @@ impl Kernel {
         self.threads.iter().enumerate().any(|(id, thread)| Some(id as ThreadId) != self.current_thread && thread.is_runnable())
     }
 
+    /// whether the pass a preempt has due at tick would change nothing but
+    /// all_blocked, which it leaves false: the current thread running on
+    /// alone, not long enough for a share to go to the others, no wait
+    /// result left for it, no timer due and nothing pulsed. whatever else
+    /// could wake a thread has a pass due, a thread waiting until a tick
+    /// wakes on its own, which the caller has ahead of tick, and a pass
+    /// leaves no wait it could satisfy.
+    pub(crate) fn quiet_pass(&self, tick: u64) -> bool {
+        let Some(current) = self.current_thread else { return false };
+        let running = &self.threads[current as usize];
+        running.status == ThreadStatus::Running
+            && !running.waited
+            && tick.saturating_sub(running.running_since) <= STARVATION_TICKS
+            && running.wait_result.is_none()
+            && running.wait_syscall.is_none()
+            && self.pulsed.is_empty()
+            && !self.timer_due(tick)
+            && !self.others_runnable()
+    }
+
     pub fn current_mut(&mut self) -> Option<&mut Thread> {
         let id = self.current_thread?;
         Some(self.thread_mut(id))

@@ -665,6 +665,7 @@ impl System {
         self.ran_recompiled();
         self.idle_interrupted(true);
         self.cpu.cycles = after;
+        self.preempt_in_place(after);
         self.note_plain(at);
         Some(limit.saturating_sub(after).max(1))
     }
@@ -710,7 +711,8 @@ impl System {
 
     /// what a GetSystemTick that recompiled code reads itself has to end
     /// before, see recomp_abi::Context: the first thing plain_in_place has
-    /// tick_in_place leave for the step at, none when plain_in_place fails
+    /// tick_in_place leave for the step at, or the preempt, which it passes
+    /// itself when the pass is quiet, none when plain_in_place fails
     /// whatever the tick, which only the step and svcs change.
     pub(crate) fn tick_due(&self, event: Option<u64>, deadline: Option<u64>) -> Option<u64> {
         let plain = !self.exited
@@ -758,6 +760,7 @@ impl System {
         } else {
             self.kernel.acquire_public(objects[index as usize], thread);
         }
+        self.preempt_in_place(cycles);
         self.note_plain(at);
         Some((limit.saturating_sub(cycles).max(1), index))
     }
@@ -793,15 +796,17 @@ impl System {
                 self.kernel.all_blocked = false;
             }
         }
+        self.preempt_in_place(cycles);
         self.note_plain(at);
         Some(limit.saturating_sub(cycles).max(1))
     }
 
     /// whether svc_in_place, for an svc that changes no thread and leaves
-    /// the clock at after, would do nothing around it but note at: the
-    /// event, the preempt, the deadline and the frame and audio boundaries
-    /// all ahead of after, nothing pending for the scheduler, and code at
-    /// at, the pc with bit 0 set for Thumb.
+    /// the clock at after, would do nothing around it but note at and pass
+    /// the preempt quietly, see preempt_in_place: the event, the deadline
+    /// and the frame and audio boundaries all ahead of after, the preempt
+    /// too or its pass one that changes nothing, nothing pending for the
+    /// scheduler, and code at at, the pc with bit 0 set for Thumb.
     fn plain_in_place(&self, after: u64, at: u32, event: Option<u64>, deadline: Option<u64>, library: &recompiled::Library) -> bool {
         let ahead = |tick: u64| after < tick;
         !self.exited
@@ -812,11 +817,24 @@ impl System {
             && !log::log_enabled!(log::Level::Trace)
             && event.is_none_or(ahead)
             && deadline.is_none_or(ahead)
-            && ahead(self.next_preempt)
+            && (ahead(self.next_preempt) || self.kernel.quiet_pass(after))
             && ahead(self.next_frame_boundary)
             && ahead(self.next_audio_frame)
             && self.memory.is_executable(at & !1)
             && library.has_code(at)
+    }
+
+    /// what preempt and the pass it has due do after an svc that leaves the
+    /// clock at after, when plain_in_place found that pass quiet: the next
+    /// preempt from after, all_blocked as the pass leaves it. a thread
+    /// alone spinning on the clock and a mutex comes to one every 8192
+    /// cycles, which no longer stops it for a whole pass. none while the
+    /// preempt is ahead.
+    fn preempt_in_place(&mut self, after: u64) {
+        if after >= self.next_preempt {
+            self.next_preempt = after + PREEMPT_INTERVAL;
+            self.kernel.all_blocked = false;
+        }
     }
 
     /// what note does without a profile, for at, the pc with bit 0 set for

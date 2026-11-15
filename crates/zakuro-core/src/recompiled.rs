@@ -314,6 +314,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
         let cycles = machine.cycles + ran;
         let at = ctx.r[15] | ctx.thumb as u32;
         let (event, deadline, limit, library) = (machine.event, machine.deadline, machine.limit, machine.library);
+        let preempt = system.next_preempt;
         let mut tick_at = None;
         // a mutex taken or let go of alone, which the code may then go on
         // to do itself, see Machine::lend
@@ -350,7 +351,12 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             library.in_place.set(library.in_place.get() + 1);
             machine.budget = ctx.budget;
             // nothing it looks at changed, unless the budget was cut short
-            if machine.cycles + machine.budget as u64 != ctx.tick_end {
+            // or a preempt passed, which moves the next
+            let passed = system.next_preempt != preempt;
+            if passed {
+                machine.due = system.tick_due(event, deadline);
+            }
+            if passed || machine.cycles + machine.budget as u64 != ctx.tick_end {
                 machine.ticks_from(ctx);
             }
             if let Some(at) = tick_at {
