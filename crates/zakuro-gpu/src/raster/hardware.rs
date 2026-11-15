@@ -1660,9 +1660,9 @@ pub struct Hardware {
     readback: Option<Buffer>,
     surfaces: Vec<Surface>,
     /// by the address of the decoded texels.
-    textures: HashMap<usize, Texture>,
+    textures: QuickMap<usize, Texture>,
     /// textures copied from surfaces, by what they are.
-    copies: HashMap<DrawnTexture, Copied>,
+    copies: QuickMap<DrawnTexture, Copied>,
     /// texture pack pictures, by the hash of the textures they replace.
     replaced: HashMap<u64, Replaced>,
     /// the bytes those take, and how many they may, half the GPU's memory.
@@ -1709,7 +1709,7 @@ pub struct Hardware {
     /// twins once rather than once a draw.
     twin_draws: Vec<Recorded>,
     /// textures copied from twins, as copies has those from surfaces.
-    twin_copies: HashMap<DrawnTexture, Copied>,
+    twin_copies: QuickMap<DrawnTexture, Copied>,
     /// the batch the draw a draw in between follows staged its vertices
     /// and its indices in, and where, which the one in between reads too.
     twinned_inputs: Option<(u64, Staged, Staged, bool)>,
@@ -1925,8 +1925,8 @@ impl Hardware {
                 pushed: [None; BINDINGS],
                 readback: None,
                 surfaces: Vec::new(),
-                textures: HashMap::new(),
-                copies: HashMap::new(),
+                textures: QuickMap::default(),
+                copies: QuickMap::default(),
                 replaced: HashMap::new(),
                 replaced_bytes: 0,
                 // half the GPU's own memory, up to 4 GiB, and a quarter, up
@@ -1955,7 +1955,7 @@ impl Hardware {
                 pass: Pass::Real,
                 twins: false,
                 twin_draws: Vec::new(),
-                twin_copies: HashMap::new(),
+                twin_copies: QuickMap::default(),
                 twinned_inputs: None,
                 batch: 0,
                 name,
@@ -4823,7 +4823,7 @@ impl Hardware {
     }
 
     /// the textures copied from surfaces, or from their twins.
-    fn copies(&mut self, twin: bool) -> &mut HashMap<DrawnTexture, Copied> {
+    fn copies(&mut self, twin: bool) -> &mut QuickMap<DrawnTexture, Copied> {
         match twin {
             true => &mut self.twin_copies,
             false => &mut self.copies,

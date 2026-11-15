@@ -7,7 +7,6 @@ pub(crate) mod glsl;
 #[cfg(feature = "jit")]
 mod jit;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use isa::{Instruction, OpCode, OperandDescriptor};
@@ -61,7 +60,7 @@ pub struct ShaderUnit {
     decoded: Option<Arc<Program>>,
     /// programs decoded before, by fingerprint. titles upload the program
     /// again each time they switch shaders, often the same few.
-    decoded_before: HashMap<u64, Arc<Program>>,
+    decoded_before: zakuro_common::hash::IntMap<u64, Arc<Program>>,
     /// the runs of words the unit's fingerprint last went over, and their
     /// hashes.
     hashed: Option<Box<Hashed>>,
@@ -111,7 +110,7 @@ impl ShaderUnit {
             float_uniform_wide: false,
             float_uniform_staging: [0; 4],
             decoded: None,
-            decoded_before: HashMap::new(),
+            decoded_before: Default::default(),
             hashed: None,
         }
     }
@@ -214,7 +213,7 @@ impl ShaderUnit {
             float_uniform_wide: self.float_uniform_wide,
             float_uniform_staging: self.float_uniform_staging,
             decoded: self.decoded.clone(),
-            decoded_before: HashMap::new(),
+            decoded_before: Default::default(),
             hashed: None,
         }
     }

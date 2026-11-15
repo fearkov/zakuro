@@ -1,6 +1,5 @@
 //! software rasterization of PICA200 draw calls.
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -1648,8 +1647,9 @@ impl Scratch {
 /// of them when filtering, costs far more than looking one up.
 #[derive(Default)]
 pub struct TextureCache {
-    /// by address, format and size.
-    entries: HashMap<TextureKey, Decoded>,
+    /// by address, format and size, hashed by a multiply rather than
+    /// SipHash, as each draw looks its textures up.
+    entries: zakuro_common::hash::IntMap<TextureKey, Decoded>,
     texels: usize,
     /// counts command lists. nothing but drawing changes memory while one
     /// runs, so a texture checked during it is not checked again unless a
