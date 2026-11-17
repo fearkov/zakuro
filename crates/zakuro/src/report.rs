@@ -1,5 +1,4 @@
-//! the log the app keeps in a file next to the saves, and what a report on
-//! a game wants, put together to copy.
+//! the log the app keeps in a file next to the saves, plus what a report on a game needs, put together to copy
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -10,16 +9,15 @@ use std::time::Instant;
 
 use zakuro_core::System;
 
-/// the lines a report takes from the end of the log.
+/// the lines a report takes from the end of the log
 const REPORT_LINES: usize = 40;
-/// the lines kept for one, and for the file until it is open.
+/// the lines kept for one, and for the file till it's open
 const KEPT: usize = 400;
 
 struct Sink {
     file: Option<File>,
     recent: VecDeque<String>,
-    /// the GPU the screen is drawn on, kept when the presenter says, it is
-    /// long gone from the recent lines by the time a report is wanted.
+    /// the GPU the screen is drawn on, kept when the presenter says, it's long gone from the recent lines by the time a report is wanted
     gpu: Option<String>,
 }
 
@@ -34,8 +32,7 @@ impl Sink {
 
 static SINK: Mutex<Sink> = Mutex::new(Sink { file: None, recent: VecDeque::new(), gpu: None });
 
-/// the log as the terminal shows it, written to the file and kept for a
-/// report as well.
+/// the log as the terminal shows it, written to the file and kept for a report too
 struct Logger {
     terminal: env_logger::Logger,
     started: Instant,
@@ -72,10 +69,8 @@ impl log::Log for Logger {
     }
 }
 
-/// logs what RUST_LOG asks for, info and up without it, and puts a panic in
-/// the file as well, the terminal shows it as it always has. Cranelift's
-/// JIT logs each shader it compiles whole at info, megabytes of it, which
-/// only RUST_LOG brings back.
+/// logs what RUST_LOG asks for (info and up w/o it) and puts a panic in the file too, the terminal shows it like always
+/// Cranelift's JIT logs each shader it compiles whole at info, MBs of it, only RUST_LOG brings that back
 pub fn init() {
     let terminal = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,cranelift_jit=warn")).build();
     let level = terminal.filter();
@@ -104,8 +99,7 @@ pub fn init() {
     }));
 }
 
-/// the GPU a presenter's line names, Vulkan on the device, or OpenGL in its
-/// version on the renderer, with which of the two.
+/// the GPU a presenter's line names, Vulkan on the device, or OpenGL in its version on the renderer, w/ which of the two
 fn device(message: &str) -> Option<String> {
     if let Some(rest) = message.strip_prefix("Vulkan on ") {
         return Some(format!("{} (Vulkan)", rest.split(',').next().unwrap_or(rest)));
@@ -114,8 +108,7 @@ fn device(message: &str) -> Option<String> {
     Some(format!("{renderer} (OpenGL)"))
 }
 
-/// writes the log to zakuro.log in the data folder from now on, starting
-/// with what was logged before. the last run's stays as zakuro.previous.log.
+/// writes the log to zakuro.log in the data folder from now on, starting w/ what was logged b4, the last run's stays as zakuro.previous.log
 pub fn to_file(dir: &Path) {
     let path = dir.join("zakuro.log");
     let _ = std::fs::create_dir_all(dir);
@@ -128,8 +121,7 @@ pub fn to_file(dir: &Path) {
     sink.file = Some(file);
 }
 
-/// a report on a game, the fields the report channel asks for, those only
-/// the player knows left to fill in, then the end of the log.
+/// a report on a game, the fields the report channel asks for (the ones only the player knows left to fill in), then the end of the log
 pub fn text(name: &str, system: &System) -> String {
     let (recent, gpu) = {
         let sink = SINK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -159,8 +151,7 @@ pub fn text(name: &str, system: &System) -> String {
     out
 }
 
-/// the region a product code's last letter stands for, CTR-P-ARAP for
-/// Europe.
+/// the region a product code's last letter stands for, `CTR-P-ARAP` for Europe
 fn region(product_code: &str) -> &'static str {
     match product_code.trim_end_matches('\0').chars().last() {
         Some('E') => "USA",
@@ -174,7 +165,7 @@ fn region(product_code: &str) -> &'static str {
     }
 }
 
-/// the system's name, the distribution's on Linux.
+/// the system's name, the distro's on Linux
 fn os() -> String {
     let pretty = std::fs::read_to_string("/etc/os-release").ok().and_then(|release| {
         release.lines().find_map(|line| line.strip_prefix("PRETTY_NAME=").map(|name| name.trim_matches('"').to_owned()))
@@ -187,7 +178,7 @@ fn os() -> String {
     }
 }
 
-/// the processor's name, as it gives it.
+/// the processor's name, as it gives it
 fn cpu() -> String {
     #[cfg(target_arch = "x86_64")]
     {

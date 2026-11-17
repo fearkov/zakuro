@@ -1,6 +1,5 @@
 #version 450
-// compiled twice, as it is and with STEREO defined, which draws the top
-// screen's two pictures in one for 3D:
+// compiled twice, as is and w/ STEREO defined, which draws the top screen's two pictures in one for 3D
 //   glslc present.frag -o present.frag.spv
 //   glslc -DSTEREO present.frag -o present_stereo.frag.spv
 layout(location = 0) in vec2 uv;
@@ -9,18 +8,16 @@ layout(set = 0, binding = 0) uniform sampler2D screen;
 #ifdef STEREO
 layout(set = 0, binding = 1) uniform sampler2D right_eye;
 #endif
-// where the screen lies in the image, its corner and size as texture
-// coordinates, then the corners inset by half a texel, which samples keep
-// within so filtering takes nothing from around it. the whole image when it
-// holds just the screen. then how a screen drawn bigger than its pixels is
-// filtered: 0 smooth, 1 pixels, 2 sharp.
+// where the screen lies in the image, its corner and size as texture coords,
+// then the corners inset by half a texel, which samples stay inside so filtering takes nothing from around it
+// the whole image when it holds just the screen
+// then how a screen drawn bigger than its pixels gets filtered, 0 smooth, 1 pixels, 2 sharp
 layout(push_constant) uniform Crop {
     layout(offset = 16) vec4 area;
     vec4 bounds;
     int mode;
 #ifdef STEREO
-    // how the eyes are shown, 1 in red and cyan, 2 on alternate rows,
-    // whether they swap, then where the right eye's picture lies
+    // how the eyes are shown, 1 in red and cyan, 2 on alternate rows, if they swap, then where the right eye's picture lies
     int stereo;
     int swap;
     int unused;
@@ -29,11 +26,10 @@ layout(push_constant) uniform Crop {
 #endif
 } crop;
 
-// a screen drawn bigger than the window shows it is averaged over every
-// texel a window pixel covers, which smooths its edges the way drawing at a
-// higher resolution should. one drawn smaller is filtered as asked. a
-// little over a texel a pixel still counts as one, at 1:1 the derivatives
-// land on either side of it.
+// a screen drawn bigger than the window shows it gets averaged over every texel a window pixel covers,
+// smoothing its edges like drawing at a higher res should
+// one drawn smaller gets filtered as asked
+// a bit over a texel a pixel still counts as one, at 1 to 1 the derivatives land on either side of it
 vec3 shown(sampler2D image, vec4 area, vec4 bounds) {
     vec2 at = area.xy + uv * area.zw;
     vec2 size = vec2(textureSize(image, 0));
@@ -44,8 +40,7 @@ vec3 shown(sampler2D image, vec4 area, vec4 bounds) {
             // the nearest texel, its middle sampled
             at = (floor(texel) + 0.5) / size;
         } else if (crop.mode == 2) {
-            // bilinear between texel centres, its blend squeezed into the
-            // one window pixel each texel's edge falls in, at any scale
+            // bilinear between texel centers, its blend squeezed into the one window pixel each texel's edge falls in, at any scale
             vec2 scale = 1.0 / max(covered, vec2(1e-6));
             vec2 centred = texel - 0.5;
             vec2 blend = clamp((fract(centred) - 0.5) * scale + 0.5, 0.0, 1.0);
@@ -75,8 +70,7 @@ void main() {
         right = other;
     }
     if (crop.stereo == 1) {
-        // Dubois' red and cyan projection, least squares over what the
-        // glasses let through, with less ghosting than the plain split
+        // Dubois' red and cyan projection, least squares over what the glasses let thru, less ghosting than the plain split
         vec3 red = vec3(dot(left, vec3(0.437, 0.449, 0.164)), dot(left, vec3(-0.062, -0.062, -0.024)), dot(left, vec3(-0.048, -0.050, -0.017)));
         vec3 cyan = vec3(dot(right, vec3(-0.011, -0.032, -0.007)), dot(right, vec3(0.377, 0.761, 0.009)), dot(right, vec3(-0.026, -0.093, 1.234)));
         colour = vec4(clamp(red + cyan, 0.0, 1.0), 1.0);

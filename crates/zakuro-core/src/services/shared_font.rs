@@ -1,70 +1,61 @@
-//! a stand-in for the console's shared font. its characters come from a
-//! font the host has for Japanese, the alphabets and Japanese a title
-//! writes in, or where there is none, printable ASCII from a small bitmap
-//! font of our own.
+//! a stand in for the console's shared font
+//! its chars come from a host font for Japanese (the alphabets and Japanese a title writes in),
+//! or if there's none, printable ASCII from a lil bitmap font of our own
 
-/// where the font block a title is handed starts, past the status word and
-/// the rest of the block header.
+/// where the font block a title gets starts, past the status word and the rest of the block header
 pub const FONT_OFFSET: u32 = 0x80;
 
-/// section offsets inside a BCFNT point at the section's *body*, past its
-/// magic and size, and are absolute addresses in the block as mapped.
+/// section offsets in a BCFNT point at the section's *body* (past its magic and size) and are absolute addrs in the block as mapped
 const SECTION_BODY: u32 = 8;
 
-/// every glyph's cell, in both fonts.
+/// every glyph's cell, in both fonts
 const CELL_WIDTH: u8 = 24;
 const CELL_HEIGHT: u8 = 24;
-/// cells sit a pixel apart on the sheet, which is where a font's renderer
-/// looks for each glyph.
+/// cells sit a pixel apart on the sheet, that's where a font's renderer looks for each glyph
 const CELL_STRIDE_X: u16 = CELL_WIDTH as u16 + 1;
 const CELL_STRIDE_Y: u16 = CELL_HEIGHT as u16 + 1;
 const SHEET_WIDTH: u16 = 256;
 const SHEET_HEIGHT: u16 = 256;
 const COLUMNS: u16 = SHEET_WIDTH / CELL_STRIDE_X;
 const ROWS: u16 = SHEET_HEIGHT / CELL_STRIDE_Y;
-/// 4-bit alpha, the format a real shared font's sheets use.
+/// 4 bit alpha, the format a real shared font's sheets use
 const SHEET_FORMAT_A4: u16 = 11;
-/// the GPU takes a texture's address in 8-byte steps, a console's font has
-/// its sheets further aligned, to 128 bytes.
+/// the GPU takes a texture's addr in 8 byte steps, a console's font aligns its sheets further, to 128 bytes
 const SHEET_ALIGN: u32 = 0x80;
-/// the console's own font block, which a title may map no more of.
+/// the console's own font block, a title may map no more of it
 const BLOCK_LIMIT: u32 = 0x33_2000;
-/// characters in a row that get a map of their own rather than going in
-/// the list of the rest.
+/// chars in a row that get a map of their own instead of going in the list of the rest
 const DIRECT_RUN: usize = 16;
 
-/// the bitmap font enlarges each pixel this much, and moves on less than
-/// the cell, its glyphs leave a column or two of their eight blank.
+/// the bitmap font blows each pixel up this much and moves on less than the cell, its glyphs leave a column or two of their eight blank
 const GLYPH_SCALE: u16 = 3;
 const CHARACTER_WIDTH: u8 = 21;
 
-/// the host's font at this many pixels an em, with its baseline on this
-/// row of the cell, which leaves room below for descenders.
+/// the host's font at this many pixels an em, w/ its baseline on this row of the cell, leaving room below for descenders
 const EM: f32 = 22.0;
 const HOST_BASELINE: u8 = 20;
 
-/// one character, its image in its cell and how wide it is.
+/// one char, its image in its cell and how wide it is
 #[derive(Clone)]
 struct Glyph {
     code: u16,
-    /// the cell's pixels, rows of CELL_WIDTH, each 0 to 15.
+    /// the cell's pixels, rows of CELL_WIDTH, each 0 to 15
     alpha: Box<[u8]>,
     /// where the image starts from the pen, how much of it to draw, and
-    /// how far the pen moves on.
+    /// how far the pen moves on
     left: i8,
     width: u8,
     advance: u8,
 }
 
-/// a font's glyphs in the order of their characters, the row its baseline
-/// is on, and how far its widest characters move the pen.
+/// a font's glyphs in char order, the row its baseline is on, and how far its widest chars move the pen
 struct Face {
     glyphs: Vec<Glyph>,
     baseline: u8,
     advance: u8,
 }
 
-/// builds the font block, laid out for being mapped at base.
+/// builds the font block, laid out to be mapped at base
 pub fn build(base: u32) -> Vec<u8> {
     match host_face() {
         Some(face) => write(base, face),
@@ -72,7 +63,7 @@ pub fn build(base: u32) -> Vec<u8> {
     }
 }
 
-/// the font block for face, laid out for being mapped at base.
+/// the font block for face, laid out to be mapped at base
 fn write(base: u32, face: &Face) -> Vec<u8> {
     let glyphs = &face.glyphs;
     let count = glyphs.len() as u32;
@@ -81,7 +72,7 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
     let sheet_size = SHEET_WIDTH as u32 * SHEET_HEIGHT as u32 / 2; // 4 bits per pixel
     let maps = maps(glyphs);
 
-    // sizes first, so every section can be given the address of the next.
+    // sizes first, so every section can get the addr of the next
     const CFNT_SIZE: u32 = 0x14;
     const FINF_SIZE: u32 = 0x20;
     const TGLP_HEADER_SIZE: u32 = 0x20;
@@ -106,16 +97,14 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
 
     let mut out = vec![0u8; total as usize];
 
-    // the status word a title polls before it touches anything else, the
-    // region's font, the standard one, and how big the font is, which some
-    // titles read to tell the font from a resource of their own
+    // the status word a title polls b4 touching anything else, the region's font, the standard one,
+    // and how big the font is (some titles read that to tell the font from a resource of their own)
     put32(&mut out, 0x00, 2);
     put32(&mut out, 0x04, 1);
     put32(&mut out, 0x08, total - FONT_OFFSET);
 
-    // the file header, CFNU rather than CFNT as the console keeps the font,
-    // its pointers already absolute, which the SDK takes as it is instead
-    // of turning offsets into pointers a second time
+    // the file header, CFNU instead of CFNT like the console keeps the font, its ptrs already absolute
+    // the SDK takes it as is instead of turning offsets into ptrs a second time
     write_magic(&mut out, FONT_OFFSET, b"CFNU");
     put16(&mut out, FONT_OFFSET + 4, 0xFEFF); // little endian
     put16(&mut out, FONT_OFFSET + 6, CFNT_SIZE as u16);
@@ -123,12 +112,11 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
     put32(&mut out, FONT_OFFSET + 12, total - FONT_OFFSET);
     put32(&mut out, FONT_OFFSET + 16, 3 + maps.len() as u32); // FINF, TGLP, CWDH, the CMAPs
 
-    // FINF, the font's metrics, and where the other sections are. a
-    // character the font lacks shows as its question mark
+    // FINF, the font's metrics and where the other sections are, a char the font lacks shows as its question mark
     let unknown = glyphs.iter().position(|glyph| glyph.code == u16::from(b'?')).unwrap_or(0);
     write_magic(&mut out, finf_at, b"FINF");
     put32(&mut out, finf_at + 4, FINF_SIZE);
-    out[finf_at as usize + 8] = 1; // glyph-sheet font
+    out[finf_at as usize + 8] = 1; // glyph sheet font
     out[finf_at as usize + 9] = CELL_HEIGHT + 1; // line feed
     put16(&mut out, finf_at + 10, unknown as u16);
     out[finf_at as usize + 12] = 0; // default left spacing
@@ -142,7 +130,7 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
     out[finf_at as usize + 29] = CELL_WIDTH;
     out[finf_at as usize + 30] = face.baseline; // ascent
 
-    // TGLP, the sheets the glyph images live in.
+    // TGLP, the sheets the glyph images live in
     write_magic(&mut out, tglp_at, b"TGLP");
     put32(&mut out, tglp_at + 4, cwdh_at - tglp_at);
     out[tglp_at as usize + 8] = CELL_WIDTH;
@@ -162,7 +150,7 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
         draw_glyph(&mut out[(sheet_at + sheet * sheet_size) as usize..][..sheet_size as usize], cell as u16, glyph);
     }
 
-    // CWDH, how wide each glyph is.
+    // CWDH, how wide each glyph is
     write_magic(&mut out, cwdh_at, b"CWDH");
     put32(&mut out, cwdh_at + 4, cwdh_size);
     put16(&mut out, cwdh_at + 8, 0);
@@ -175,8 +163,7 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
         out[at + 2] = glyph.advance;
     }
 
-    // CMAP, which glyph each character uses, each map pointing on to the
-    // next, runs of characters in a row first and the list of the rest last.
+    // CMAP, which glyph each char uses, each map pointing on to the next, runs of chars in a row first and the list of the rest last
     for (i, (map, &at)) in maps.iter().zip(&cmap_at).enumerate() {
         let next = cmap_at.get(i + 1).map_or(0, |&next| base + next + SECTION_BODY);
         write_magic(&mut out, at, b"CMAP");
@@ -205,12 +192,11 @@ fn write(base: u32, face: &Face) -> Vec<u8> {
     out
 }
 
-/// how a CMAP gives the glyph of a character.
+/// how a CMAP gives a char's glyph
 enum Map {
-    /// characters from begin to end, the glyphs from first on in order.
+    /// chars from begin to end, the glyphs from first on in order
     Direct { begin: u16, end: u16, first: u16 },
-    /// pairs of a character and its glyph, in the order of the characters,
-    /// which the SDK searches.
+    /// pairs of a char and its glyph in char order, the SDK searches them
     Scan(Vec<(u16, u16)>),
 }
 
@@ -223,9 +209,8 @@ impl Map {
     }
 }
 
-/// the maps that give each glyph's character, glyphs in order of their
-/// characters: runs of characters in a row each a direct map, the rest in
-/// one scanned list after them.
+/// the maps that give each glyph's char, glyphs in char order
+/// runs of chars in a row get a direct map each, the rest one scanned list after them
 fn maps(glyphs: &[Glyph]) -> Vec<Map> {
     let mut maps = Vec::new();
     let mut rest = Vec::new();
@@ -248,8 +233,7 @@ fn maps(glyphs: &[Glyph]) -> Vec<Map> {
     maps
 }
 
-/// puts a glyph's image in a cell of a sheet, laid out as the GPU reads
-/// a texture.
+/// puts a glyph's image in a cell of a sheet, laid out like the GPU reads a texture
 fn draw_glyph(sheet: &mut [u8], cell: u16, glyph: &Glyph) {
     // past the line that starts each cell
     let cell_x = (cell % COLUMNS) * CELL_STRIDE_X + 1;
@@ -257,13 +241,13 @@ fn draw_glyph(sheet: &mut [u8], cell: u16, glyph: &Glyph) {
     for (row, line) in glyph.alpha.chunks(CELL_WIDTH as usize).enumerate() {
         for (column, &alpha) in line.iter().enumerate().filter(|&(_, &alpha)| alpha != 0) {
             let texel = morton_index((cell_x + column as u16) as u32, (cell_y + row as u16) as u32, SHEET_WIDTH as u32);
-            // two 4-bit texels per byte, low nibble first.
+            // two 4 bit texels per byte, low nibble first
             sheet[texel as usize / 2] |= (alpha & 0xF) << if texel.is_multiple_of(2) { 0 } else { 4 };
         }
     }
 }
 
-/// printable ASCII from the 8x8 bitmap font, each pixel enlarged.
+/// printable ASCII from the 8x8 bitmap font, each pixel blown up
 fn bitmap_face() -> Face {
     use crate::services::glyphs::GLYPHS;
 
@@ -288,9 +272,8 @@ fn bitmap_face() -> Face {
     Face { glyphs, baseline: CELL_HEIGHT - GLYPH_SCALE as u8, advance: CHARACTER_WIDTH }
 }
 
-/// the characters the console's font has, near enough: JIS X 0208's, with
-/// the NEC row of circled numbers, the Latin alphabets of European titles,
-/// and full and half width forms.
+/// the chars the console's font has, near enough
+/// JIS X 0208's, w/ the NEC row of circled numbers, the Latin alphabets of European titles, and full and half width forms
 fn characters() -> Vec<char> {
     let mut characters: Vec<char> = include_str!("jis0208.txt").chars().filter(|&c| c != '\n').collect();
     let ranges = [
@@ -312,8 +295,7 @@ fn characters() -> Vec<char> {
     characters
 }
 
-/// the host's font for Japanese made into glyphs, the first time a title
-/// asks for the shared font, none where the host has no such font.
+/// the host's Japanese font made into glyphs the first time a title asks for the shared font, none when the host has no such font
 fn host_face() -> Option<&'static Face> {
     static FACE: std::sync::OnceLock<Option<Face>> = std::sync::OnceLock::new();
     FACE.get_or_init(|| {
@@ -325,7 +307,7 @@ fn host_face() -> Option<&'static Face> {
     .as_ref()
 }
 
-/// glyphs for the characters a font has, at EM pixels an em.
+/// glyphs for the chars a font has, at EM pixels an em
 fn rasterize(data: &[u8]) -> Option<Face> {
     use ab_glyph::{point, Font, FontRef, PxScale};
     use rayon::prelude::*;
@@ -360,7 +342,7 @@ fn rasterize(data: &[u8]) -> Option<Face> {
             Some(Glyph { code: character as u16, alpha, left, width: drawn, advance })
         })
         .collect();
-    // a font that has none of Japanese is no better than the bitmap one
+    // a font w/ no Japanese at all is no better than the bitmap one
     if !glyphs.iter().any(|glyph| glyph.code == 0x3042) {
         return None;
     }
@@ -368,19 +350,19 @@ fn rasterize(data: &[u8]) -> Option<Face> {
     Some(Face { glyphs, baseline: HOST_BASELINE, advance })
 }
 
-/// the first font for Japanese the host has, and where it is.
+/// the first Japanese font the host has, and where it is
 fn host_font() -> Option<(std::path::PathBuf, Vec<u8>)> {
     font_candidates().into_iter().find_map(|path| Some((path.clone(), std::fs::read(&path).ok()?)))
 }
 
-/// where Windows keeps its fonts for Japanese.
+/// where Windows keeps its Japanese fonts
 #[cfg(windows)]
 fn font_candidates() -> Vec<std::path::PathBuf> {
     let folder = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
     ["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"].iter().map(|name| folder.join(name)).collect()
 }
 
-/// where macOS keeps its fonts for Japanese.
+/// where macOS keeps its Japanese fonts
 #[cfg(target_os = "macos")]
 fn font_candidates() -> Vec<std::path::PathBuf> {
     ["/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"]
@@ -389,8 +371,7 @@ fn font_candidates() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// where Linux distributions put Noto's fonts for Japanese, the medium
-/// weight nearest the console's, or else the font fontconfig picks.
+/// where Linux distros put Noto's Japanese fonts, the medium weight closest to the console's, or else whatever fontconfig picks
 #[cfg(all(unix, not(target_os = "macos")))]
 fn font_candidates() -> Vec<std::path::PathBuf> {
     let folders = ["/usr/share/fonts/noto-cjk", "/usr/share/fonts/opentype/noto", "/usr/share/fonts/google-noto-cjk", "/usr/share/fonts/noto"];
@@ -407,9 +388,8 @@ fn font_candidates() -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// moves a font block's internal pointers to the address the guest has just
-/// mapped it at, from wherever it was laid out for before, a dump's console
-/// or an earlier mapping.
+/// moves a font block's internal ptrs to the addr the guest just mapped it at,
+/// from wherever it was laid out for b4 (a dump's console or an earlier mapping)
 pub fn relocate(memory: &mut crate::memory::Memory, block: u32, paddr: u32) {
     use zakuro_cpu::Bus;
 
@@ -446,8 +426,7 @@ pub fn relocate(memory: &mut crate::memory::Memory, block: u32, paddr: u32) {
     if delta == 0 {
         return;
     }
-    // the block is mapped read-only, so the edits go to the physical pages
-    // behind it rather than through the guest's view of them.
+    // the block is mapped read only, so the edits go to the physical pages behind it, not thru the guest's view of them
     let moved = |memory: &mut crate::memory::Memory, at: u32| -> u32 {
         let pointer = memory.read32(at);
         let moved = pointer.wrapping_add(delta);
@@ -473,8 +452,7 @@ pub fn relocate(memory: &mut crate::memory::Memory, block: u32, paddr: u32) {
     log::debug!("relocated the shared font for its mapping at 0x{block:08X}");
 }
 
-/// index of a texel in a PICA-tiled image, 8x8 tiles in raster order, and a
-/// Z-order curve inside each tile.
+/// index of a texel in a PICA tiled image, 8x8 tiles in raster order and a Z order curve inside each tile
 fn morton_index(x: u32, y: u32, width: u32) -> u32 {
     let (tile_x, tile_y) = (x / 8, y / 8);
     let (px, py) = (x % 8, y % 8);
@@ -517,9 +495,8 @@ mod tests {
     const BASE: u32 = 0x1800_0000;
     const FINF: u32 = FONT_OFFSET + 0x14;
 
-    /// the glyph a character has, the way a title's font library finds it:
-    /// down the maps from FINF's first, a direct one counting from its
-    /// first glyph, a scanned one searched.
+    /// the glyph a char has, the way a title's font library finds it
+    /// down the maps from FINF's first, a direct one counting from its first glyph, a scanned one searched
     fn glyph_of(font: &[u8], code: u16) -> Option<u16> {
         let mut body = read32(font, FINF + 24);
         while body != 0 {
@@ -543,7 +520,7 @@ mod tests {
         None
     }
 
-    /// the 4-bit alpha of a pixel of a glyph's cell.
+    /// the 4 bit alpha of a pixel of a glyph's cell
     fn pixel(font: &[u8], glyph: u16, x: u16, y: u16) -> u8 {
         let tglp = read32(font, FINF + 16) - BASE - SECTION_BODY;
         let sheet_size = read32(font, tglp + 12);
@@ -555,8 +532,7 @@ mod tests {
         if texel.is_multiple_of(2) { byte & 0xF } else { byte >> 4 }
     }
 
-    /// a face of the given characters, each with one pixel lit where its
-    /// character says, and its code for a width.
+    /// a face of the given chars, each w/ one pixel lit where its char says, and its code for a width
     fn face_of(codes: &[u16]) -> Face {
         let glyphs = codes
             .iter()
@@ -569,9 +545,8 @@ mod tests {
         Face { glyphs, baseline: 20, advance: 22 }
     }
 
-    /// walks the block the way a title's font loader does, check the status,
-    /// find the header, then follow each section offset and confirm it lands
-    /// on that section's magic.
+    /// walks the block like a title's font loader does, check the status, find the header,
+    /// then follow each section offset and confirm it lands on that section's magic
     #[test]
     fn the_block_parses_as_a_font() {
         let font = write(BASE, &bitmap_face());
@@ -585,11 +560,11 @@ mod tests {
             "the recorded size should match the block"
         );
 
-        // FINF follows the header, and its three offsets are absolute.
+        // FINF follows the header and its three offsets are absolute
         assert_eq!(&font[FINF as usize..FINF as usize + 4], b"FINF");
         for (offset_at, magic) in [(16, b"TGLP"), (20, b"CWDH"), (24, b"CMAP")] {
             let pointer = read32(&font, FINF + offset_at);
-            // the offset points past the magic and size, so step back.
+            // the offset points past the magic and size, so step back
             let at = (pointer - BASE - SECTION_BODY) as usize;
             assert_eq!(
                 &font[at..at + 4],
@@ -602,8 +577,8 @@ mod tests {
         assert_eq!(glyph_of(&font, 0x3042), None);
     }
 
-    /// the sheets are where the GPU can be pointed at, an address it takes
-    /// in 8-byte steps. one 4 bytes off had it read every glyph shifted.
+    /// the sheets are where the GPU can be pointed at, an addr it takes in 8 byte steps
+    /// one 4 bytes off had it read every glyph shifted
     #[test]
     fn the_glyph_sheets_are_aligned() {
         let font = write(BASE, &face_of(&(0x20..0x400).collect::<Vec<u16>>()));
@@ -612,8 +587,7 @@ mod tests {
         assert_eq!(read32(&font, tglp + 12) % SHEET_ALIGN, 0, "and each sheet after the first");
     }
 
-    /// the sheets have to be entirely inside the block, or a title reading a
-    /// glyph walks off the end of the mapping.
+    /// the sheets have to be fully inside the block, or a title reading a glyph walks off the end of the mapping
     #[test]
     fn the_glyph_sheets_are_within_the_block() {
         for face in [bitmap_face(), face_of(&(0x20..0x1000).collect::<Vec<u16>>())] {
@@ -626,9 +600,8 @@ mod tests {
         }
     }
 
-    /// every character finds its own glyph, in runs of characters in a row
-    /// and scattered ones alike, the glyph's pixel and widths where it put
-    /// them, and a character the font lacks finds none.
+    /// every char finds its own glyph, in runs of chars in a row and scattered ones alike,
+    /// the glyph's pixel and widths where it put them, and a char the font lacks finds none
     #[test]
     fn every_character_finds_its_glyph() {
         let mut codes: Vec<u16> = (0x20..=0x7E).collect();
@@ -651,9 +624,8 @@ mod tests {
         }
     }
 
-    /// with a font for Japanese on the host, kana, kanji and the alphabet
-    /// all have glyphs with something drawn, and the block stays as small
-    /// as the console's.
+    /// w/ a Japanese font on the host, kana, kanji and the alphabet all have glyphs w/ something drawn,
+    /// and the block stays as small as the console's
     #[test]
     fn the_host_font_draws_japanese() {
         let Some(face) = host_face() else {

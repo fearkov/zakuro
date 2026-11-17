@@ -1,6 +1,5 @@
-//! game controllers, any the system knows, read through gilrs, and the
-//! Switch's Pro Controller on macOS read from its reports, see
-//! pro_controller.
+//! game controllers, any the system knows, read thru gilrs,
+//! plus the Switch's Pro Controller on macOS read from its reports, see pro_controller
 
 use gilrs::{Axis, Button, EventType, Gamepad, Gilrs};
 use zakuro_core::services::hid::{InputState, PadState};
@@ -8,23 +7,20 @@ use zakuro_core::services::hid::{InputState, PadState};
 use crate::pro_controller::{is_pro_controller, Controllers, Report};
 use crate::settings::PadButtons;
 
-/// how far a stick has to lean before it counts, some rest a little off
-/// center.
+/// how far a stick has to lean b4 it counts, some rest a bit off center
 const DEADZONE: f32 = 0.15;
 
 pub struct Gamepads {
-    /// none when the system could not be asked for controllers.
+    /// none when the system couldn't be asked for controllers
     gilrs: Option<Gilrs>,
     buttons: PadButtons,
-    /// Pro Controllers read from their own reports, on macOS.
+    /// Pro Controllers read from their own reports, on macOS
     pro: Controllers,
-    /// the buttons they held at the last poll, to tell the ones pressed
-    /// since.
+    /// the buttons they held at the last poll, to tell which got pressed since
     pro_held: Vec<Button>,
 }
 
-/// whether gilrs's reading of a controller is left out, a Pro Controller's
-/// while one is read from its reports.
+/// is gilrs's reading of a controller left out, a Pro Controller's while one is read from its reports
 fn left_out(pad: &Gamepad, reports: &[Report]) -> bool {
     !reports.is_empty() && is_pro_controller(pad.vendor_id(), pad.product_id(), pad.name())
 }
@@ -41,8 +37,7 @@ impl Gamepads {
         self.buttons = buttons;
     }
 
-    /// takes in what the controllers did since the last call, and returns the
-    /// buttons pressed meanwhile.
+    /// takes in what the controllers did since the last call and returns the buttons pressed meanwhile
     pub fn poll(&mut self) -> Vec<Button> {
         let mut pressed = Vec::new();
         let reports = self.pro.reports();
@@ -64,7 +59,7 @@ impl Gamepads {
         pressed
     }
 
-    /// whether a controller holds button down.
+    /// does a controller hold button down
     pub fn holding(&self, button: Button) -> bool {
         let reports = self.pro.reports();
         reports.iter().any(|report| report.buttons.contains(&button))
@@ -73,7 +68,7 @@ impl Gamepads {
             })
     }
 
-    /// what the controllers hold down, over what the keyboard does.
+    /// what the controllers hold down, over what the keyboard does
     pub fn apply(&self, mut state: InputState) -> InputState {
         let reports = self.pro.reports();
         for report in &reports {
@@ -94,7 +89,7 @@ impl Gamepads {
                     state.buttons.set(button, true);
                 }
             }
-            // the d-pad of some controllers is a pair of axes
+            // the d pad of some controllers is a pair of axes
             let dpad = [
                 (PadState::RIGHT, pad.value(Axis::DPadX) > 0.5),
                 (PadState::LEFT, pad.value(Axis::DPadX) < -0.5),
@@ -114,8 +109,8 @@ impl Gamepads {
     }
 }
 
-/// the left stick is the circle pad and the right one the C-stick, up
-/// positive as the console has it, each once it leans past the deadzone.
+/// the left stick is the circle pad and the right one the C stick, up positive like the console has it,
+/// each once it leans past the deadzone
 fn sticks(state: &mut InputState, [x, y]: [f32; 2], [cx, cy]: [f32; 2]) {
     if x.hypot(y) > DEADZONE {
         state.circle_x = x.clamp(-1.0, 1.0);
@@ -127,7 +122,7 @@ fn sticks(state: &mut InputState, [x, y]: [f32; 2], [cx, cy]: [f32; 2]) {
     }
 }
 
-/// a controller button as a person would call it.
+/// a controller button as a person would call it
 pub fn button_name(button: Button) -> &'static str {
     match button {
         Button::South => "Bottom face",
@@ -157,8 +152,7 @@ pub fn button_name(button: Button) -> &'static str {
 mod tests {
     use super::*;
 
-    /// with no controller, or no way to ask for one, the keyboard's input
-    /// goes through as it was.
+    /// w/ no controller, or no way to ask for one, the keyboard's input goes thru as it was
     #[test]
     fn no_controller_leaves_the_keyboard_alone() {
         let gamepads = Gamepads::new(PadButtons::default());

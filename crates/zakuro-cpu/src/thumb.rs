@@ -1,4 +1,4 @@
-//! thumb-state instruction decoding.
+//! Thumb state instruction decoding
 
 use zakuro_common::bits::{bit, bits, sign_extend};
 
@@ -53,7 +53,7 @@ pub fn execute<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     }
 }
 
-// -- format 1, shift by immediate -------------------------------------------
+// format 1, shift by immediate
 
 fn shift_immediate(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let ty = ShiftType::from_bits(bits(op, 11, 12));
@@ -68,7 +68,7 @@ fn shift_immediate(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 2, add/subtract register or 3-bit immediate ----------------------
+// format 2, add/subtract register or 3 bit immediate
 
 fn add_subtract(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let immediate = bit(op, 10);
@@ -94,7 +94,7 @@ fn add_subtract(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 3, MOV/CMP/ADD/SUB with an 8-bit immediate -----------------------
+// format 3, MOV/CMP/ADD/SUB w/ an 8 bit immediate
 
 fn immediate_ops(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let rd = bits(op, 8, 10) as usize;
@@ -132,7 +132,7 @@ fn immediate_ops(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 4, the ALU operations --------------------------------------------
+// format 4, the ALU ops
 
 fn alu_operations(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let rs = bits(op, 3, 5) as usize;
@@ -184,7 +184,7 @@ fn alu_operations(cpu: &mut Cpu, op: u32) -> Option<Exit> {
             cpu.set_nz(r);
         }
         0x9 => {
-            // NEG, encoded as RSB #0.
+            // NEG, encoded as RSB #0
             let (r, carry, overflow) = sub_with_flags(0, b);
             cpu.regs[rd] = r;
             cpu.set_nz(r);
@@ -227,14 +227,13 @@ fn alu_operations(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 5, high registers and BX/BLX -------------------------------------
+// format 5, high registers and BX/BLX
 
 fn high_register<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     let rd = ((op & 7) | ((op >> 4) & 8)) as usize;
     let rs = bits(op, 3, 6) as usize;
 
-    // reading r15 in Thumb gives the instruction address plus 4, which is what
-    // regs[PC] already holds, but with bit 1 cleared for the ALU forms.
+    // reading r15 in Thumb gives the instruction addr plus 4, which regs[PC] already holds, but w/ bit 1 cleared for the ALU forms
     let source = cpu.regs[rs];
 
     match bits(op, 8, 9) {
@@ -250,7 +249,7 @@ fn high_register<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
         }
         0b10 => cpu.set_reg(rd, source),
         _ => {
-            // BX, or BLX when bit 7 is set.
+            // BX, or BLX when bit 7 is set
             if bit(op, 7) {
                 cpu.regs[LR] = cpu.regs[PC].wrapping_sub(2) | 1;
             }
@@ -260,18 +259,18 @@ fn high_register<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 6, PC-relative load ----------------------------------------------
+// format 6, PC relative load
 
 fn pc_relative_load<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let rd = bits(op, 8, 10) as usize;
     let offset = (op & 0xFF) * 4;
-    // the literal pool is addressed from the word-aligned PC.
+    // the literal pool is addressed from the word aligned PC
     let addr = (cpu.regs[PC] & !3).wrapping_add(offset);
     cpu.regs[rd] = bus.read32(addr);
     None
 }
 
-// -- formats 7 and 8, register-offset loads and stores -----------------------
+// formats 7 and 8, register offset loads and stores
 
 fn load_store_register<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let ro = bits(op, 6, 8) as usize;
@@ -280,7 +279,7 @@ fn load_store_register<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Ex
     let addr = cpu.regs[rb].wrapping_add(cpu.regs[ro]);
 
     if bit(op, 9) {
-        // format 8, sign-extended byte and halfword.
+        // format 8, sign extended byte and halfword
         match bits(op, 10, 11) {
             0b00 => bus.write16(addr, cpu.regs[rd] as u16),
             0b01 => cpu.regs[rd] = bus.read8(addr) as i8 as i32 as u32,
@@ -298,7 +297,7 @@ fn load_store_register<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Ex
     None
 }
 
-// -- format 9, immediate-offset loads and stores -----------------------------
+// format 9, immediate offset loads and stores
 
 fn load_store_immediate<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let byte = bit(op, 12);
@@ -306,7 +305,7 @@ fn load_store_immediate<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<E
     let offset = bits(op, 6, 10);
     let rb = bits(op, 3, 5) as usize;
     let rd = (op & 7) as usize;
-    // word accesses scale the offset by four, byte accesses not at all.
+    // word accesses scale the offset by four, byte ones don't at all
     let addr = cpu.regs[rb].wrapping_add(if byte { offset } else { offset * 4 });
 
     match (load, byte) {
@@ -318,7 +317,7 @@ fn load_store_immediate<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<E
     None
 }
 
-// -- format 10, halfword loads and stores ------------------------------------
+// format 10, halfword loads and stores
 
 fn load_store_halfword<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 11);
@@ -335,7 +334,7 @@ fn load_store_halfword<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Ex
     None
 }
 
-// -- format 11, SP-relative loads and stores ---------------------------------
+// format 11, SP relative loads and stores
 
 fn sp_relative<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 11);
@@ -350,7 +349,7 @@ fn sp_relative<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 12, ADD Rd, PC/SP, #imm ------------------------------------------
+// format 12, ADD Rd, PC/SP, #imm
 
 fn load_address(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let rd = bits(op, 8, 10) as usize;
@@ -364,11 +363,11 @@ fn load_address(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 13/14 and the ARMv6 additions ------------------------------------
+// format 13/14 and the ARMv6 additions
 
 fn miscellaneous<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     match bits(op, 8, 11) {
-        // ADD/SUB immediate to SP.
+        // ADD/SUB immediate to SP
         0b0000 => {
             let offset = (op & 0x7F) * 4;
             cpu.regs[SP] = if bit(op, 7) {
@@ -378,7 +377,7 @@ fn miscellaneous<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
             };
             None
         }
-        // SXTH / SXTB / UXTH / UXTB.
+        // SXTH / SXTB / UXTH / UXTB
         0b0010 => {
             let rd = (op & 7) as usize;
             let rm = bits(op, 3, 5) as usize;
@@ -391,7 +390,7 @@ fn miscellaneous<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
             };
             None
         }
-        // REV / REV16 / REVSH.
+        // REV / REV16 / REVSH
         0b1010 => {
             let rd = (op & 7) as usize;
             let rm = bits(op, 3, 5) as usize;
@@ -412,16 +411,16 @@ fn miscellaneous<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
             };
             None
         }
-        // CPS and SETEND, privileged or irrelevant, so nothing to do.
+        // CPS and SETEND, privileged or irrelevant, so nothing to do
         0b0110 => None,
-        // PUSH / POP.
+        // PUSH / POP
         0b0100 | 0b0101 | 0b1100 | 0b1101 => push_pop(cpu, bus, op),
-        // BKPT.
+        // BKPT
         0b1110 => Some(Exit::Breakpoint {
             pc: cpu.current_pc(),
             imm: op & 0xFF,
         }),
-        // NOP and the ARMv6K hints.
+        // NOP and the ARMv6K hints
         0b1111 => None,
         _ => Some(Exit::Undefined {
             pc: cpu.current_pc(),
@@ -437,7 +436,7 @@ fn push_pop<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let count = list.count_ones() + extra as u32;
 
     if load {
-        // POP, read upward from SP.
+        // POP, read upward from SP
         let mut addr = cpu.regs[SP];
         for i in 0..8 {
             if list & (1 << i) != 0 {
@@ -447,12 +446,12 @@ fn push_pop<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
         }
         cpu.regs[SP] = cpu.regs[SP].wrapping_add(count * 4);
         if extra {
-            // POP {..., pc} interworks on ARMv5 and later.
+            // POP {..., pc} interworks on ARMv5 and later
             let target = bus.read32(addr);
             cpu.branch_exchange(target);
         }
     } else {
-        // PUSH, the lowest register ends up at the lowest address.
+        // PUSH, the lowest register ends up at the lowest addr
         let start = cpu.regs[SP].wrapping_sub(count * 4);
         let mut addr = start;
         for i in 0..8 {
@@ -469,7 +468,7 @@ fn push_pop<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// -- format 15, LDMIA / STMIA ------------------------------------------------
+// format 15, LDMIA / STMIA
 
 fn block_transfer<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 11);
@@ -477,7 +476,7 @@ fn block_transfer<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let list = op & 0xFF;
 
     if list == 0 {
-        // an empty list transfers r15 and moves the base by 0x40 on ARMv4.
+        // an empty list transfers r15 and moves the base by 0x40 on ARMv4
         cpu.regs[rb] = cpu.regs[rb].wrapping_add(0x40);
         return None;
     }
@@ -504,12 +503,12 @@ fn block_transfer<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// -- formats 16/17, conditional branch and SVC -------------------------------
+// formats 16/17, conditional branch and SVC
 
 fn conditional_branch(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let cond = bits(op, 8, 11);
     if cond == 0b1111 {
-        // SWI / SVC.
+        // SWI / SVC
         let next = cpu.regs[PC].wrapping_sub(2);
         cpu.branch(next);
         return Some(Exit::Supervisor(op & 0xFF));
@@ -528,7 +527,7 @@ fn conditional_branch(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// -- formats 18/19, unconditional and long branches --------------------------
+// formats 18/19, unconditional and long branches
 
 fn long_branch(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     match bits(op, 11, 12) {
@@ -538,20 +537,20 @@ fn long_branch(cpu: &mut Cpu, op: u32) -> Option<Exit> {
             let target = cpu.regs[PC].wrapping_add(offset as u32);
             cpu.branch(target);
         }
-        // BL/BLX suffix with the low half of the offset.
+        // BL/BLX suffix w/ the low half of the offset
         0b01 | 0b11 => {
             let target = cpu.regs[LR].wrapping_add((op & 0x7FF) << 1);
             let return_addr = cpu.regs[PC].wrapping_sub(2) | 1;
             cpu.regs[LR] = return_addr;
             if bits(op, 11, 12) == 0b01 {
-                // BLX, switch to ARM state and force word alignment.
+                // BLX, switch to ARM state and force word alignment
                 cpu.cpsr.thumb = false;
                 cpu.branch(target & !3);
             } else {
                 cpu.branch(target);
             }
         }
-        // BL/BLX prefix, stash the high half of the offset in LR.
+        // BL/BLX prefix, stash the high half of the offset in LR
         _ => {
             let offset = sign_extend(op & 0x7FF, 11) << 12;
             cpu.regs[LR] = cpu.regs[PC].wrapping_add(offset as u32);

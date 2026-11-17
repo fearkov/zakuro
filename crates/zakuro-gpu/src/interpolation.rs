@@ -1,55 +1,48 @@
-//! frame interpolation, a picture in between each two of a title's own, for
-//! titles that draw one every other refresh. the draws of a frame are
-//! matched with the frame before's, by what they draw and how near their
-//! places are, and each one that moved is drawn a second time with the float
-//! uniforms of its shaders halfway between its own and its match's. that
-//! draw goes into twins of the buffers it draws into, see the hardware
-//! renderer, and the twin of a screen's buffer is the picture in between.
-//! the matrices of a draw are mostly what changes, and halfway between two
-//! of them is close to the transform halfway between, for the little a
-//! thirtieth of a second moves things.
+//! frame interpolation, a picture in between each two of a title's own, for titles that draw one every other refresh
+//! the draws of a frame get matched w/ the frame b4's by what they draw and how near their places are,
+//! and each one that moved gets drawn a second time w/ the float uniforms of its shaders halfway between its own
+//! and its match's
+//! that draw goes into twins of the buffers it draws into (see the hardware renderer),
+//! and the twin of a screen's buffer is the picture in between
+//! a draw's matrices are mostly what changes,
+//! and halfway between two of them is close to the transform halfway between,
+//! for the lil a 30th of a second moves things
 
 use std::collections::HashMap;
 
 use crate::registers::*;
 use crate::shader::{ShaderUnit, Vec4, FLOAT_UNIFORMS};
 
-/// the vertex shader's float uniforms at a draw.
+/// the vertex shader's float uniforms at a draw
 pub(crate) type Uniforms = [Vec4; FLOAT_UNIFORMS];
 
-/// how much a component's move from one frame to the next may differ from
-/// its move the frame before, before the draw counts as a different one, a
-/// jump rather than a move, which is drawn as it is. a model in the distance
-/// or the camera going on as it went moves as it did however fast, a camera
-/// cutting elsewhere, another model taken for this one or a flag kept in a
-/// float do not. a component of a rotation turning faster by less than
-/// about 30 degrees moves less than half again, a translation less than a
-/// quarter of its distance again.
+/// how much a component's move from one frame to the next may differ from its move the frame b4,
+/// past that the draw counts as a different one, a jump instead of a move, drawn as is
+/// a model in the distance or the camera going on like it went moves like it did however fast,
+/// a camera cutting elsewhere, another model taken for this one or a flag kept in a float don't
+/// a rotation component turning faster by less than about 30 degrees moves less than half again,
+/// a translation less than a quarter of its distance again
 const JUMP: f32 = 0.5;
 const JUMP_PART: f32 = 0.25;
 
-/// whether a component a texture's coordinates may read steps from one
-/// round value to another, sixty-fourths, as a sprite's offset into its
-/// sheet of them does, rather than moves, as a matrix's does.
+/// does a component a texture's coords may read step from one round value to another (64ths),
+/// like a sprite's offset into its sheet does, instead of moving like a matrix does
 fn steps(before: f32, now: f32) -> bool {
     let round = |value: f32| (value * 64.0).fract() == 0.0;
     round(before) && round(now)
 }
 
-/// how many draws of the frame before drawn the same way a draw's match is
-/// looked for among, around its own place among them.
+/// how many draws of the frame b4 drawn the same way a draw's match gets looked for among, around its own place among them
 const NEAREST: usize = 32;
 
-/// for how many frames after jumping a draw that jumps again counts as one
-/// that keeps jumping rather than as a camera cutting elsewhere. a sprite's
-/// animation that steps every other frame jumps every other frame.
+/// for how many frames after jumping a draw that jumps again counts as one that keeps jumping instead of a camera cutting elsewhere
+/// a sprite's animation stepping every other frame jumps every other frame
 const RESTLESS: u8 = 4;
 
-/// the draws of a frame drawn the same way, see key, in the order they
-/// came, how far each one's uniforms moved since the frame before, zero
-/// for one it had not, how many frames on a jump still counts as one more
-/// of its jumps, see RESTLESS, and which of them a draw of the next frame
-/// took for its own.
+/// the draws of a frame drawn the same way (see key) in the order they came,
+/// how far each one's uniforms moved since the frame b4 (zero for one it didn't have),
+/// how many frames on a jump still counts as one more of its jumps (see RESTLESS),
+/// and which of them a draw of the next frame took for its own
 #[derive(Default)]
 struct Drawn {
     uniforms: Vec<Uniforms>,
@@ -58,12 +51,12 @@ struct Drawn {
     taken: Vec<bool>,
 }
 
-/// the draw of the frame before, among those drawn the same way and not
-/// taken yet, whose uniforms placing the vertices are nearest a draw's,
-/// around its place among them, the one at its place when that is as near.
-/// a title can draw a model twice in an order of its own each frame,
-/// Majora's Mask 3D draws the two eyes of the 3D the other way round every
-/// other frame, and in the order they came they would swap places.
+/// the draw of the frame b4, among those drawn the same way and not taken yet,
+/// whose vertex placing uniforms are nearest a draw's, around its place among them,
+/// the one at its place when that's as near
+/// a title can draw a model twice in its own order each frame,
+/// Majora's Mask 3D draws the two 3D eyes the other way round every other frame,
+/// and in the order they came they'd swap places
 fn nearest(drawn: &Drawn, place: usize, now: &Uniforms, placing: u128) -> Option<usize> {
     let distance = |before: &Uniforms| {
         let mut total = 0.0f32;
@@ -89,24 +82,21 @@ fn nearest(drawn: &Drawn, place: usize, now: &Uniforms, placing: u128) -> Option
     own.into_iter().chain(others).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
 }
 
-/// what frame interpolation keeps of the draws of a frame and the one before.
+/// what frame interpolation keeps of the draws of a frame and the one b4
 #[derive(Default)]
 pub(crate) struct Interpolation {
-    /// the uniforms of the frame before's draws, by what they drew.
+    /// the uniforms of the frame b4's draws, by what they drew
     before: HashMap<u64, Drawn>,
-    /// this frame's so far.
+    /// this frame's so far
     now: HashMap<u64, Drawn>,
-    /// uniforms in between given back, for the next ones rather than
-    /// allocating.
+    /// uniforms in between given back, for the next ones instead of allocating
     spare: Option<Box<Uniforms>>,
-    /// the uniforms each program places its vertices with, by its
-    /// fingerprint, its entry point, the outputs that place them and those
-    /// of the textures' coordinates, see ShaderUnit::uniforms_feeding, those
-    /// it may read for the coordinates too second. only those move in
-    /// between, a texture's offset into a sheet of sprites or a flag are as
-    /// the frame's.
+    /// the uniforms each program places its vertices w/, by its fingerprint, its entry point,
+    /// the outputs that place them and those of the textures' coords (see ShaderUnit::uniforms_feeding),
+    /// the ones it may read for the coords too second
+    /// only those move in between, a texture's offset into a sprite sheet or a flag stay as the frame has them
     placing: HashMap<(u64, u32, u16, u16), (u128, u128)>,
-    /// this frame's counts, see Matches.
+    /// this frame's counts, see Matches
     draws: u32,
     matched: u32,
     moved: u32,
@@ -114,10 +104,10 @@ pub(crate) struct Interpolation {
     jumping: u32,
 }
 
-/// how the draws of a frame went, see Interpolation::frame_done. of those
-/// the frame before had too, those that moved, those that jumped, and those
-/// that jumped a few frames before too, see RESTLESS, as a batch of sprites
-/// sorted anew every frame or a flag that flips does.
+/// how the draws of a frame went (see Interpolation::frame_done)
+/// of those the frame b4 had too, the ones that moved, the ones that jumped,
+/// and the ones that jumped a few frames b4 too (see RESTLESS),
+/// like a batch of sprites sorted fresh every frame or a flipping flag does
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Matches {
     pub draws: u32,
@@ -128,21 +118,19 @@ pub struct Matches {
 }
 
 impl Matches {
-    /// whether the picture in between looks right. most of the draws were
-    /// there the frame before, and few of those that had not jumped lately
-    /// jumped now, as everything does when the camera cuts to somewhere else.
+    /// does the picture in between look right
+    /// most of the draws were there the frame b4, and few of those that hadn't jumped lately jumped now,
+    /// like everything does when the camera cuts somewhere else
     pub fn smooth(&self) -> bool {
         self.moved > 0 && self.matched * 2 >= self.draws && self.jumped * 4 <= self.matched
     }
 }
 
 impl Interpolation {
-    /// the uniforms halfway between the draw's and those of the frame
-    /// before's draw that matches it, for drawing it again in between, none
-    /// when they are the same or it has no match or it jumped, or nothing
-    /// is drawn in between. the draw's own are kept for the next frame's to
-    /// match. a draw through a geometry shader is left as it is. give the
-    /// uniforms back once drawn with.
+    /// the uniforms halfway between the draw's and those of the frame b4's draw that matches it, to draw it again in between
+    /// none when they're the same, it has no match, it jumped, or nothing is drawn in between
+    /// the draw's own are kept for the next frame's to match, a draw thru a geometry shader is left as is
+    /// give the uniforms back once drawn w/
     pub(crate) fn draw(&mut self, registers: &[u32], vertex: &ShaderUnit, geometry: Option<&ShaderUnit>, between: bool) -> Option<Box<Uniforms>> {
         self.draws += 1;
         let key = key(registers, vertex, geometry);
@@ -176,8 +164,7 @@ impl Interpolation {
         self.matched += 1;
         let placed = |uniform: usize| (placing | shared) & (1 << uniform) != 0;
         let shared = |uniform: usize| shared & (1 << uniform) != 0;
-        // what moves, the components that changed of the uniforms placing
-        // the vertices, but for steps of those the coordinates may read
+        // what moves, the components that changed of the vertex placing uniforms, except steps of those the coords may read
         let moves = |uniform: usize, before: f32, now: f32| placed(uniform) && before != now && !(shared(uniform) && steps(before, now));
         let changes = |uniform: usize, before: &Vec4, now: &Vec4| (0..4).any(|i| moves(uniform, before[i], now[i]));
         if !before.iter().zip(now.iter()).enumerate().any(|(uniform, (before, now))| changes(uniform, before, now)) {
@@ -185,9 +172,8 @@ impl Interpolation {
         }
         let mut between = self.spare.take().unwrap_or_else(|| Box::new([[0.0; 4]; FLOAT_UNIFORMS]));
         let mut jumped = false;
-        // a component jumps when its move differs from its move the frame
-        // before by more than JUMP says. NaN and infinity compare false,
-        // and jump
+        // a component jumps when its move differs from its move the frame b4 by more than JUMP says,
+        // NaN and infinity compare false and jump
         let jumps = |before: f32, now: f32, moved_before: f32| {
             let change = (now - before - moved_before).abs();
             !(change <= JUMP || change <= JUMP_PART * before.abs().max(now.abs()))
@@ -198,9 +184,8 @@ impl Interpolation {
             let moving: [bool; 4] = std::array::from_fn(|i| moves(uniform, before[i], now[i]));
             let jumping: [bool; 4] = std::array::from_fn(|i| moving[i] && jumps(before[i], now[i], moved_before[i]));
             if jumping.contains(&true) {
-                // one the coordinates may read too is as the frame has it,
-                // whatever it is, one that only places the vertices says
-                // the draw is another than the one before
+                // one the coords may read too is as the frame has it, whatever it is,
+                // one that only places the vertices says the draw is another than the one b4
                 if !shared(uniform) {
                     jumped = true;
                     break;
@@ -229,13 +214,12 @@ impl Interpolation {
         Some(between)
     }
 
-    /// takes back the uniforms draw gave.
+    /// takes back the uniforms draw gave
     pub(crate) fn give_back(&mut self, uniforms: Box<Uniforms>) {
         self.spare = Some(uniforms);
     }
 
-    /// the frame is done, its draws are the ones the next frame's match,
-    /// and how they matched the frame before's.
+    /// the frame's done, its draws are the ones the next frame's match, plus how they matched the frame b4's
     pub(crate) fn frame_done(&mut self) -> Matches {
         let matches = Matches { draws: self.draws, matched: self.matched, moved: self.moved, jumped: self.jumped, jumping: self.jumping };
         let mut older = std::mem::replace(&mut self.before, std::mem::take(&mut self.now));
@@ -243,8 +227,7 @@ impl Interpolation {
             drawn.taken.clear();
             drawn.taken.resize(drawn.uniforms.len(), false);
         }
-        // emptied, with the lists of the draws that frame had, which the
-        // next one mostly draws too
+        // emptied, w/ the lists of the draws that frame had, the next one mostly draws them too
         older.retain(|_, drawn| {
             let kept = !drawn.uniforms.is_empty();
             drawn.uniforms.clear();
@@ -258,12 +241,11 @@ impl Interpolation {
     }
 }
 
-/// what a draw draws, the same from frame to frame for a model drawn the
-/// same way, its programs, its vertex arrays and the buffers it draws into
-/// and its first texture.
+/// what a draw draws, the same from frame to frame for a model drawn the same way, its programs,
+/// its vertex arrays, the buffers it draws into and its first texture
 fn key(registers: &[u32], vertex: &ShaderUnit, geometry: Option<&ShaderUnit>) -> u64 {
     let mix = |hash: u64, word: u64| (hash.rotate_left(5) ^ word).wrapping_mul(0x517C_C1B7_2722_0A95);
-    // from an odd start, so that words of zero still count
+    // from an odd start, so words of zero still count
     let mut hash = mix(mix(0x9E37_79B9_7F4A_7C15, vertex.fingerprint()), vertex.entry_point as u64);
     if let Some(geometry) = geometry {
         hash = mix(mix(mix(hash, 1), geometry.fingerprint()), geometry.entry_point as u64);
@@ -301,9 +283,8 @@ mod tests {
         unit
     }
 
-    /// a draw that moved between two frames is drawn in between halfway,
-    /// one that stayed or is new is not drawn again, and draws of the same
-    /// model match in the order they come.
+    /// a draw that moved between two frames gets drawn in between halfway,
+    /// one that stayed or is new isn't drawn again, and draws of the same model match in the order they come
     #[test]
     fn draws_match_the_frame_before_in_order() {
         let mut interpolation = Interpolation::default();
@@ -328,9 +309,8 @@ mod tests {
         assert!(second.smooth());
     }
 
-    /// a uniform the coordinates may read too that jumps is as the frame has
-    /// it, while what only places the vertices moves, and the draw does not
-    /// count as a jump.
+    /// a uniform the coords may read too that jumps is as the frame has it,
+    /// while what only places the vertices moves, and the draw doesn't count as a jump
     #[test]
     fn a_shared_uniform_that_jumps_stays_as_the_frame_has_it() {
         // o0.x = c0 . v0, o0.y = c[a0.x + 20] . v0, o2 = c[a0.x + 20]
@@ -367,8 +347,7 @@ mod tests {
         assert!(interpolation.draw(&registers, &at(0.2, 6.0), None, true).is_none(), "only the shared one changed, and jumped");
     }
 
-    /// a model going on as it went moves in between however fast, through
-    /// zero too, once it has moved a frame. its first move that fast jumps.
+    /// a model going on like it went moves in between however fast, thru zero too, once it's moved a frame, its first move that fast jumps
     #[test]
     fn going_on_as_before_moves_however_fast() {
         let mut interpolation = Interpolation::default();
@@ -384,10 +363,9 @@ mod tests {
         assert_eq!(moved, [false, false, true, true, true], "nothing before, then the first move jumps");
     }
 
-    /// a draw that jumps frame after frame, a batch of sprites sorted anew
-    /// each frame, is drawn as it is and counts apart, the frame is still
-    /// smooth for the rest of its draws. one that jumps after moving counts
-    /// as a jump.
+    /// a draw that jumps frame after frame (a batch of sprites sorted fresh each frame) gets drawn as is and
+    /// counts apart, the frame's still smooth for the rest of its draws
+    /// one that jumps after moving counts as a jump
     #[test]
     fn draws_that_keep_jumping_count_apart() {
         let mut interpolation = Interpolation::default();
@@ -420,8 +398,7 @@ mod tests {
         assert_eq!(jumps, [(0, 0), (0, 0), (1, 0), (0, 0), (0, 1), (0, 0), (0, 1)]);
     }
 
-    /// a model drawn twice, the two eyes of the 3D, in the other order the
-    /// next frame, matches the draw nearest it, not the one in its place.
+    /// a model drawn twice (the two 3D eyes) in the other order the next frame matches the draw nearest it, not the one in its place
     #[test]
     fn draws_drawn_the_other_way_round_match_the_nearest() {
         let mut interpolation = Interpolation::default();
@@ -437,9 +414,8 @@ mod tests {
         assert_eq!(interpolation.frame_done(), Matches { draws: 2, matched: 2, moved: 2, jumped: 0, jumping: 0 });
     }
 
-    /// a draw whose uniforms jump, as a matrix does when the camera cuts or
-    /// a flag kept in a float flips, is drawn as it is, and a frame where
-    /// most of them jump is not smooth.
+    /// a draw whose uniforms jump, like a matrix does when the camera cuts or a flag kept in a float flips,
+    /// gets drawn as is, and a frame where most of them jump isn't smooth
     #[test]
     fn jumps_are_not_drawn_in_between() {
         let mut interpolation = Interpolation::default();
@@ -456,8 +432,7 @@ mod tests {
         assert_eq!(interpolation.frame_done().jumped, 1, "five sixths of its distance");
     }
 
-    /// a draw through a geometry shader is drawn as it is, and never
-    /// matches one without it.
+    /// a draw thru a geometry shader gets drawn as is and never matches one w/o it
     #[test]
     fn geometry_shaders_are_drawn_as_they_are() {
         let mut interpolation = Interpolation::default();
@@ -469,13 +444,11 @@ mod tests {
         assert_eq!(interpolation.frame_done(), Matches { draws: 2, matched: 1, moved: 0, jumped: 0, jumping: 0 });
     }
 
-    /// only the uniforms that place the vertices move in between, a
-    /// texture's offset into a sheet of sprites stays as the frame has it,
-    /// and its jumping does not count.
+    /// only the uniforms that place the vertices move in between,
+    /// a texture's offset into a sprite sheet stays as the frame has it, and its jumping doesn't count
     #[test]
     fn only_what_places_the_vertices_moves() {
-        // o0 = c0 . v0, o2 = c1, with o0 the position and o2 a texture's
-        // coordinates
+        // o0 = c0 . v0, o2 = c1, w/ o0 the position and o2 a texture's coords
         let mut program = ShaderUnit::new();
         program.program[0] = (0x02 << 26) | (0x20 << 12);
         program.program[1] = (0x13 << 26) | (0x02 << 21) | (0x21 << 12);
@@ -505,9 +478,8 @@ mod tests {
         assert!(interpolation.draw(&registers, &at(0.6, 9.0), None, true).is_some(), "the sprite's jump does not count");
     }
 
-    /// uniforms the coordinates may read through an address register too,
-    /// a block that holds both a sprite's place and its offset into its
-    /// sheet, move but for steps between round values, the offsets'.
+    /// uniforms the coords may read thru an addr register too (a block holding both a sprite's place and its
+    /// offset into its sheet) move except for steps between round values, the offsets'
     #[test]
     fn shared_uniforms_move_but_for_round_steps() {
         // o0 = c[a0.x + 20] . v0, o2 = c[a0.x + 20]

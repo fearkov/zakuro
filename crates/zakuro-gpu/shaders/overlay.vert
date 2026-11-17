@@ -1,5 +1,5 @@
 #version 450
-// the overlay's triangles, given in window pixels from the top left.
+// the overlay's triangles, in window pixels from the top left
 layout(push_constant) uniform Screen {
     vec2 size;
     uint srgb;

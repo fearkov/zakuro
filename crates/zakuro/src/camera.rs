@@ -1,5 +1,5 @@
-//! what the console's cameras see on the computer: its own camera, on only
-//! while a game takes pictures, or a picture from a file, a QR code's say.
+//! what the console's cameras see on the computer,
+//! its own camera (only on while a game takes pictures) or a picture from a file, like a QR code's
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,11 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use zakuro_core::camera::{Camera, Fit, Picture, Still};
 
-/// no camera of the console sees finer than VGA, a bigger picture is made
-/// smaller when it is read.
+/// no console camera sees finer than VGA, a bigger picture gets shrunk when it's read
 const LARGEST: u32 = 1280;
 
-/// a picture from a file, shown whole.
+/// a picture from a file, shown whole
 pub fn picture(path: &Path) -> Result<Still, String> {
     let image = image::open(path).map_err(|error| format!("could not open {}, {error}", path.display()))?;
     let image = if image.width().max(image.height()) > LARGEST {
@@ -23,12 +22,11 @@ pub fn picture(path: &Path) -> Result<Still, String> {
     Ok(Still(Arc::new(Picture { width: rgb.width(), height: rgb.height(), rgb: rgb.into_raw(), fit: Fit::Whole })))
 }
 
-/// the computer's camera, read on a thread of its own while a game
-/// captures.
+/// the computer's camera, read on a thread of its own while a game captures
 #[derive(Default)]
 pub struct Webcam {
     latest: Arc<Mutex<Option<Arc<Picture>>>>,
-    /// whether the thread should go on reading, while there is one.
+    /// should the thread go on reading, while there's one
     running: Option<Arc<AtomicBool>>,
 }
 
@@ -71,8 +69,7 @@ impl Drop for Webcam {
 fn read(latest: &Mutex<Option<Arc<Picture>>>, running: &AtomicBool) {
     use nokhwa::utils::{CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 
-    // the formats there is a way to turn into pictures here, the first
-    // ones taking least work
+    // the formats there's a way to turn into pictures here, the first ones taking the least work
     const FORMATS: [FrameFormat; 6] =
         [FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::MJPEG, FrameFormat::RAWRGB, FrameFormat::RAWBGR, FrameFormat::GRAY];
     let requested = RequestedFormat::with_formats(RequestedFormatType::None, &FORMATS);
@@ -129,7 +126,7 @@ fn read(_latest: &Mutex<Option<Arc<Picture>>>, _running: &AtomicBool) {
     log::warn!("there is no way to read a camera on this system");
 }
 
-/// a frame of the camera as a picture, from the format it came in.
+/// a frame of the camera as a picture, from the format it came in
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn decode(bytes: &[u8], format: nokhwa::utils::FrameFormat, width: u32, height: u32) -> Option<Picture> {
     use nokhwa::utils::FrameFormat;
@@ -171,8 +168,7 @@ fn decode(bytes: &[u8], format: nokhwa::utils::FrameFormat, width: u32, height: 
     }
 }
 
-/// red, green and blue of a camera's Y, U and V, ITU-R BT.601 with Y from
-/// 16 to 235, as cameras send it.
+/// red, green and blue of a camera's Y, U and V, ITU R BT.601 w/ Y from 16 to 235, like cameras send it
 fn from_yuv(y: u8, u: u8, v: u8) -> [u8; 3] {
     let (y, u, v) = (1.164 * (y as f32 - 16.0), u as f32 - 128.0, v as f32 - 128.0);
     let byte = |value: f32| value.round().clamp(0.0, 255.0) as u8;
@@ -183,7 +179,7 @@ fn from_yuv(y: u8, u: u8, v: u8) -> [u8; 3] {
 mod tests {
     use super::*;
 
-    /// the camera's black and white come out black and white, and red red.
+    /// the camera's black and white come out black and white, and red red
     #[test]
     fn camera_colors_come_out_right() {
         assert_eq!(from_yuv(16, 128, 128), [0, 0, 0]);
@@ -192,7 +188,7 @@ mod tests {
         assert!(r > 250 && g < 5 && b < 5, "{r} {g} {b}");
     }
 
-    /// a YUYV frame's pairs of pixels share their U and V.
+    /// a YUYV frame's pairs of pixels share their U and V
     #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     #[test]
     fn a_yuyv_frame_becomes_a_picture() {

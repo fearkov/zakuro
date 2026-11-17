@@ -1,9 +1,7 @@
-//! ir:USER, the infrared link titles look for the Circle Pad Pro over. a
-//! title asking for one finds one, the C-stick, ZL and ZR standing in for
-//! its stick and buttons as on a New 3DS. it answers the title's requests
-//! and reports as often as asked, in packets put in the receive buffer of
-//! the block the title shares. anything else a title connects to is never
-//! there.
+//! ir:USER, the infrared link titles look for the Circle Pad Pro over
+//! a title asking for one finds one, the C stick, ZL and ZR stand in for its stick and buttons like on a New 3DS
+//! it answers the title's requests and reports as often as asked, in packets put in the receive buffer of the block the title shares
+//! anything else a title connects to is never there
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, ObjectId};
@@ -21,65 +19,61 @@ const MACHINE_ID: u32 = 0x0B;
 const CONNECTED: u32 = 0x0C;
 const NETWORK_ID: u32 = 0x0D;
 const INITIALIZED: u32 = 0x0E;
-/// the header, then where the receive buffer's packets start and end.
+/// the header, then where the receive buffer's packets start and end
 const HEADER_SIZE: usize = 0x20;
-/// where the receive buffer's packets start and end, and the buffer, its
-/// table of packets first, the bytes of the packets after.
+/// where the receive buffer's packets start and end, and the buffer, its packet table first, the packets' bytes after
 const RECEIVE_INFO: u32 = 0x10;
 const RECEIVE_BUFFER: u32 = 0x20;
 
-/// the device a title connects to for a Circle Pad Pro.
+/// the device a title connects to for a Circle Pad Pro
 const CIRCLE_PAD_PRO: u32 = 1;
-/// what a connected link reads in the block's status bytes.
+/// what a connected link reads in the block's status bytes
 const STATUS_CONNECTED: u8 = 2;
 const ROLE: u8 = 2;
 
-/// sending with nothing connected.
+/// sending with nothing connected
 const NOT_CONNECTED: ResultCode = ResultCode::new(Level::Status, Summary::InvalidState, Module::Ir, 13);
 
-/// what a Circle Pad Pro is asked, the first byte of a request.
+/// what a Circle Pad Pro is asked, the first byte of a request
 const READ_INPUT: u8 = 1;
 const READ_CALIBRATION: u8 = 2;
-/// what it answers with, the first byte of a response.
+/// what it answers with, the first byte of a response
 const INPUT: u8 = 0x10;
 const CALIBRATION: u8 = 0x11;
 
-/// the stick's center, and how far from it a full push goes. the
-/// calibration says to take the center off, scale by 0.625 and divide by
-/// 8, which gives the 0x9C each way the circle pad reports.
+/// the stick's center and how far from it a full push goes
+/// the calibration says take the center off, scale by 0.625 and divide by 8, giving the 0x9C each way the circle pad reports
 const STICK_CENTER: f32 = 2048.0;
 const STICK_REACH: f32 = 0x9C as f32 * 8.0 / CALIBRATION_SCALE;
 const CALIBRATION_SCALE: f32 = 0.625;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct IrState {
-    /// the block a title shares for the link's state and data.
+    /// the block a title shares for the link's state and data
     pub memory: Option<ObjectId>,
-    /// the receive, send and connection status events.
+    /// the receive, send and connection status events
     events: Option<[ObjectId; 3]>,
-    /// the receive buffer, when the block holds its state too.
+    /// the receive buffer, when the block holds its state too
     receive: Option<Receive>,
-    /// a Circle Pad Pro is connected.
     connected: bool,
-    /// ticks between its reports, none until a title asks for them, and
-    /// when the next is due.
+    /// ticks between its reports, none till a title asks for them, and when the next is due
     period: Option<u64>,
     next_report: u64,
 }
 
-/// the receive buffer's room and the packets in it.
+/// the receive buffer's room and the packets in it
 #[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Receive {
-    /// its size, the table of packets included, and how many the table holds.
+    /// its size (packet table included) and how many the table holds
     size: u32,
     slots: u32,
-    /// the first packet in the table, the one past the last, and how many.
+    /// the first packet in the table, the one past the last, and how many
     begin: u32,
     end: u32,
     count: u32,
 }
 
-/// the connection status event, after the receive and send ones.
+/// the connection status event, after the receive and send ones
 const RECEIVED: usize = 0;
 const SENT: usize = 1;
 const CONNECTION: usize = 2;
@@ -87,10 +81,8 @@ const CONNECTION: usize = 2;
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     let command = header.command_id();
     match command {
-        // InitializeIrNop / InitializeIrNopShared(sizes and counts, baud
-        // rate, block), the block's handle comes last. only the shared form
-        // keeps the receive buffer's state in the block, where a title reads
-        // what came in
+        // InitializeIrNop / InitializeIrNopShared(sizes and counts, baud rate, block), the block's handle comes last
+        // only the shared form keeps the receive buffer's state in the block, where a title reads what came in
         0x0001 | 0x0018 => {
             let normal = (header.0 >> 6) & 0x3F;
             let handle = buffer.get(&mut system.memory, normal + 2);
@@ -131,9 +123,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // WaitConnection / RequireConnection / AutoConnection /
-        // AnyConnection, with nothing else to connect to the attempt is
-        // over as soon as it starts, and Disconnect
+        // WaitConnection / RequireConnection / AutoConnection / AnyConnection,
+        // w/ nothing else to connect to the attempt is over as soon as it starts, and Disconnect
         0x0005..=0x0009 => {
             log::debug!("ir:USER: command 0x{command:04X}, nothing is connected");
             system.services.ir.connected = false;
@@ -181,8 +172,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // ReleaseReceivedData(count), the title is done with the oldest
-        // packets
+        // ReleaseReceivedData(count), the title's done w/ the oldest packets
         0x0019 => {
             let count = buffer.get(&mut system.memory, 1);
             if let Some(receive) = &mut system.services.ir.receive {
@@ -213,8 +203,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[value as u32]);
             true
         }
-        // GetLatestReceiveErrorResult / GetLatestSendErrorResult /
-        // GetTryingToConnectStatus
+        // GetLatestReceiveErrorResult / GetLatestSendErrorResult / GetTryingToConnectStatus
         0x0011 | 0x0012 | 0x0014 => {
             buffer.reply(&mut system.memory, command, &[0]);
             true
@@ -228,11 +217,10 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// what the Circle Pad Pro does with a request.
+/// what the Circle Pad Pro does w/ a request
 fn answer(system: &mut System, request: &[u8]) {
     match request.first() {
-        // ReadInput(period in ms, ?), reports from now on at that period,
-        // a period of zero stops them
+        // ReadInput(period in ms, ?), reports from now on at that period, zero stops them
         Some(&READ_INPUT) if request.len() >= 2 => {
             let milliseconds = request[1] as u64;
             log::debug!("ir:USER: the Circle Pad Pro reports every {milliseconds} ms");
@@ -240,7 +228,7 @@ fn answer(system: &mut System, request: &[u8]) {
             ir.period = (milliseconds > 0).then_some(milliseconds * CPU_CLOCK_HZ / 1000);
             ir.next_report = system.cpu.cycles + ir.period.unwrap_or(0);
         }
-        // ReadCalibrationData(response time, offset, size), both sixteens
+        // ReadCalibrationData(response time, offset, size), offset and size are 16 bit
         Some(&READ_CALIBRATION) if request.len() >= 6 => {
             let offset = u16::from_le_bytes([request[2], request[3]]);
             let size = u16::from_le_bytes([request[4], request[5]]);
@@ -261,12 +249,11 @@ fn answer(system: &mut System, request: &[u8]) {
     }
 }
 
-/// the Circle Pad Pro's calibration, four sets alike, the stick's center
-/// and how its values scale, each with its checksum.
+/// the Circle Pad Pro's calibration, four identical sets, the stick's center and how its values scale, each w/ its checksum
 fn calibration() -> [u8; 0x40] {
     let mut data = [0u8; 0x40];
     for set in data.chunks_mut(0x10) {
-        // the center, two twelve bit fields
+        // the center, two 12 bit fields
         let center = 0x800u32 | 0x800 << 12;
         set[1..4].copy_from_slice(&center.to_le_bytes()[..3]);
         set[4..8].copy_from_slice(&CALIBRATION_SCALE.to_le_bytes());
@@ -277,7 +264,7 @@ fn calibration() -> [u8; 0x40] {
     data
 }
 
-/// reports what the stick and the buttons do when a report is due.
+/// reports what the stick and buttons do when a report's due
 pub fn tick(system: &mut System) {
     let ir = &system.services.ir;
     let (true, Some(period)) = (ir.connected, ir.period) else { return };
@@ -292,8 +279,7 @@ pub fn tick(system: &mut System) {
     receive(system, &report);
 }
 
-/// a report of the Circle Pad Pro, the stick's place in two twelve bit
-/// fields, then the battery and its buttons, set while not held.
+/// a Circle Pad Pro report, the stick's place in two 12 bit fields, then the battery and its buttons (set while not held)
 fn report(input: &crate::services::hid::InputState) -> [u8; 6] {
     let axis = |value: f32| (STICK_CENTER + value.clamp(-1.0, 1.0) * STICK_REACH).round().clamp(0.0, 4095.0) as u32;
     let stick = axis(input.c_stick_x) | axis(input.c_stick_y) << 12;
@@ -309,14 +295,13 @@ fn report(input: &crate::services::hid::InputState) -> [u8; 6] {
     [INPUT, low, middle, high, buttons, 0]
 }
 
-/// puts what the Circle Pad Pro sent in the receive buffer as a packet, and
-/// tells the title.
+/// puts what the Circle Pad Pro sent in the receive buffer as a packet and tells the title
 fn receive(system: &mut System, payload: &[u8]) {
     let Some(mut state) = system.services.ir.receive else { return };
     let mut network = [0u8];
     read(system, &mut network, NETWORK_ID);
     let mut packet = vec![0xA5, network[0]];
-    // the size in a byte below 0x40, in two past it
+    // the size in one byte below 0x40, in two past it
     if payload.len() < 0x40 {
         packet.push(payload.len() as u8);
     } else {
@@ -333,7 +318,7 @@ fn receive(system: &mut System, payload: &[u8]) {
     let table = state.slots * 8;
     let room = state.size.saturating_sub(table);
     let length = packet.len() as u32;
-    // after the last packet, in the circle the bytes go round
+    // after the last packet, in the ring the bytes go round
     let offset = if state.count == 0 {
         0
     } else {
@@ -364,7 +349,7 @@ fn receive(system: &mut System, payload: &[u8]) {
     signal(system, RECEIVED);
 }
 
-/// where packet index of the table is in the buffer's bytes, and its length.
+/// where packet index of the table is in the buffer's bytes, and its length
 fn slot(system: &mut System, index: u32) -> (u32, u32) {
     let mut entry = [0u8; 8];
     read(system, &mut entry, RECEIVE_BUFFER + index * 8);
@@ -380,14 +365,14 @@ fn write_receive_info(system: &mut System) {
     write(system, &info, RECEIVE_INFO);
 }
 
-/// the CRC-8 the packets and the calibration end with, x^8 + x^2 + x + 1.
+/// the CRC8 the packets and calibration end w/, x^8 + x^2 + x + 1
 fn crc8(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |crc, &byte| {
         (0..8).fold(crc ^ byte, |crc, _| if crc & 0x80 != 0 { (crc << 1) ^ 0x07 } else { crc << 1 })
     })
 }
 
-/// the events, made the first time a title asks for one.
+/// the events, made the first time a title asks for one
 fn events(system: &mut System) -> [ObjectId; 3] {
     if let Some(events) = system.services.ir.events {
         return events;
@@ -395,8 +380,7 @@ fn events(system: &mut System) -> [ObjectId; 3] {
     let names = ["ir:USER:Receive", "ir:USER:Send", "ir:USER:ConnectionStatus"];
     let events = names.map(|name| {
         let object = system.kernel.objects.insert(KObject::Event(crate::kernel::sync::Event::new(ResetType::OneShot, name)));
-        // the service holds on to them, a title closing its handles must
-        // not take them away
+        // the service keeps them, a title closing its handles must not take them away
         system.kernel.objects.add_ref(object);
         object
     });
@@ -409,7 +393,7 @@ fn signal(system: &mut System, event: usize) {
     system.kernel.signal_event(object);
 }
 
-/// where the shared block's bytes are, when there is one.
+/// where the shared block's bytes are, when there's one
 fn block(system: &System) -> Option<(u32, u32)> {
     let object = system.services.ir.memory?;
     match system.kernel.objects.get(object) {
@@ -418,7 +402,7 @@ fn block(system: &System) -> Option<(u32, u32)> {
     }
 }
 
-/// writes into the shared block, when there is one.
+/// writes into the shared block, when there's one
 fn write(system: &mut System, bytes: &[u8], offset: u32) {
     let Some((paddr, size)) = block(system) else { return };
     if (offset as usize + bytes.len()) as u32 <= size {
@@ -426,7 +410,7 @@ fn write(system: &mut System, bytes: &[u8], offset: u32) {
     }
 }
 
-/// reads from the shared block, zeroes when there is none.
+/// reads from the shared block, zeroes when there's none
 fn read(system: &mut System, bytes: &mut [u8], offset: u32) {
     bytes.fill(0);
     let Some((paddr, size)) = block(system) else { return };
@@ -443,7 +427,7 @@ mod tests {
     use crate::services::tests::system_with_thread;
     use crate::services::{handle_request, Target};
 
-    /// the checksum the Circle Pad Pro's calibration data is known with.
+    /// the checksum matches the one known Circle Pad Pro calibration data has
     #[test]
     fn the_checksum_is_the_one_the_calibration_has() {
         let set = [0x00, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF];
@@ -453,8 +437,7 @@ mod tests {
         assert_eq!(crc8(&other), 0x65);
     }
 
-    /// a full push reads 0x9C each way through the calibration, as the
-    /// circle pad does.
+    /// a full push reads 0x9C each way thru the calibration, like the circle pad
     #[test]
     fn a_full_push_reads_as_far_as_the_circle_pad() {
         let input = InputState { c_stick_x: 1.0, c_stick_y: -1.0, buttons: PadState::ZL, ..InputState::default() };
@@ -467,9 +450,8 @@ mod tests {
         assert_eq!(report[4] & 0xE0, 0xC0);
     }
 
-    /// a title that connects to a Circle Pad Pro gets its calibration when
-    /// it asks and its reports at the period it asks for, as packets in the
-    /// receive buffer, and lets go of them.
+    /// a title connecting to a Circle Pad Pro gets its calibration when it asks and its reports at the period it
+    /// asks for, as packets in the receive buffer, and lets go of them
     #[test]
     fn a_circle_pad_pro_answers_and_reports() {
         let (mut system, buffer) = system_with_thread();

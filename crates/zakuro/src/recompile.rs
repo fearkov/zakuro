@@ -1,7 +1,5 @@
-//! recompiling a game with 3dsrecomp, on a thread of its own while the rest
-//! carries on, with the code and the modules its mods change. one game
-//! recompiles at a time, the others wait for their turn, as one already has
-//! the computer's cores and the memory it can spare.
+//! recompiling a game w/ 3dsrecomp on a thread of its own while the rest carries on, w/ the code and the modules its mods change
+//! one game recompiles at a time, the others wait their turn, since one already has the computer's cores and the memory it can spare
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -12,17 +10,15 @@ use std::time::{Duration, Instant};
 use recomp3ds::build::{self, Event};
 use recomp3ds::compile::Compiler;
 
-/// the compiler a recompile uses: one there is, or Zig, downloaded first
-/// into this folder of tools.
+/// the compiler a recompile uses, one that's there, or Zig, downloaded first into this tools folder
 #[derive(Debug, Clone, PartialEq)]
 pub enum Toolchain {
     Ready(Compiler),
     Download(PathBuf),
 }
 
-/// a game to recompile: the file to read, the same game being in a folder
-/// twice sometimes, and its id, which goes for either, as there is one
-/// library for both.
+/// a game to recompile, the file to read (the same game is in a folder twice sometimes) and its id,
+/// which goes for either, since there's one library for both
 #[derive(Debug, Clone, PartialEq)]
 pub struct Wanted {
     pub program_id: u64,
@@ -31,12 +27,12 @@ pub struct Wanted {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
-    /// fetching the compiler, how much of it has arrived, 0 to 1.
+    /// fetching the compiler, how much of it arrived, 0 to 1
     Downloading(f32),
-    /// finding the code and writing it as C.
+    /// finding the code and writing it as C
     Generating,
     Compiling { done: usize, total: usize },
-    /// linking the library and putting it where Zakuro finds it.
+    /// linking the library and putting it where Zakuro finds it
     Installing,
     Done,
     Failed(String),
@@ -47,7 +43,7 @@ impl Stage {
         matches!(self, Stage::Done | Stage::Failed(_))
     }
 
-    /// how far along it is, 0 to 1, going by the part that takes longest.
+    /// how far along it is, 0 to 1, going by the part that takes longest
     pub fn fraction(&self) -> f32 {
         match self {
             Stage::Downloading(arrived) => *arrived,
@@ -58,8 +54,7 @@ impl Stage {
         }
     }
 
-    /// where an event of the build leaves it, none for one that changes
-    /// nothing.
+    /// where an event of the build leaves it, none for one that changes nothing
     fn after(event: &Event) -> Option<Stage> {
         match event {
             Event::Generated { .. } => Some(Stage::Compiling { done: 0, total: 1 }),
@@ -78,7 +73,7 @@ struct State {
 pub struct Job {
     pub program_id: u64,
     pub name: String,
-    /// the user was told how it ended.
+    /// the user got told how it ended
     pub announced: bool,
     started: Instant,
     state: Arc<Mutex<State>>,
@@ -86,9 +81,8 @@ pub struct Job {
 }
 
 impl Job {
-    /// starts recompiling the game at rom with toolchain's compiler, with
-    /// what its mods in data_dir change. the compilers run below normal
-    /// priority, so that a game can be played meanwhile.
+    /// starts recompiling the game at rom w/ toolchain's compiler, w/ what its mods in data_dir change
+    /// the compilers run below normal priority, so a game can be played meanwhile
     pub fn start(rom: &Path, update: Option<&Path>, program_id: u64, name: &str, data_dir: Option<&Path>, toolchain: Toolchain) -> Job {
         let first = if matches!(toolchain, Toolchain::Download(_)) { Stage::Downloading(0.0) } else { Stage::Generating };
         let state = Arc::new(Mutex::new(State { stage: first, finished_at: None }));
@@ -116,8 +110,7 @@ impl Job {
                     downloaded
                 }
             };
-            // a bug on the way fails this game, and the ones waiting get
-            // their turn, rather than this one never ending
+            // a bug on the way fails this game and the ones waiting get their turn, instead of this one never ending
             let result = compiler.and_then(|compiler| {
                 let build = AssertUnwindSafe(|| recompile(&rom, update.as_deref(), program_id, &game, data_dir.as_deref(), compiler, &stop, &events));
                 std::panic::catch_unwind(build).unwrap_or_else(|_| Err("Zakuro hit a bug recompiling it, please report it".to_owned()))
@@ -134,7 +127,7 @@ impl Job {
         Job { program_id, name: name.to_owned(), announced: false, started: Instant::now(), state, cancel }
     }
 
-    /// a job at a stage, with no build behind it.
+    /// a job at a stage, w/ no build behind it
     #[cfg(test)]
     pub fn at_stage(program_id: u64, stage: Stage) -> Job {
         let state = Arc::new(Mutex::new(State { stage, finished_at: None }));
@@ -145,21 +138,19 @@ impl Job {
         self.state.lock().map(|state| state.stage.clone()).unwrap_or(Stage::Failed("lost track".to_owned()))
     }
 
-    /// how long it has run, or ran.
+    /// how long it's run, or ran
     pub fn elapsed(&self) -> Duration {
         let finished = self.state.lock().ok().and_then(|state| state.finished_at);
         finished.unwrap_or_else(Instant::now) - self.started
     }
 
-    /// stops it after the files being compiled, the C being written first
-    /// if it is at that.
+    /// stops it after the files being compiled, the C being written first if it's at that
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
-/// recompiles the game at rom, its code and its modules the way its update
-/// and its mods in data_dir leave them when they change any.
+/// recompiles the game at rom, its code and its modules the way its update and its mods in data_dir leave them when they change any
 #[allow(clippy::too_many_arguments)]
 fn recompile(
     rom: &Path,
@@ -185,20 +176,18 @@ fn recompile(
     build::build(rom, &options, events)
 }
 
-/// what a game's mods change in what gets recompiled.
+/// what a game's mods change in what gets recompiled
 struct Changes {
-    /// the code, decompressed, when they change it.
+    /// the code, decompressed, when they change it
     code: Option<Vec<u8>>,
-    /// the game's modules and static.crs they replace or patch, by their
-    /// paths in the RomFS, with their bytes.
+    /// the game's modules and static.crs they replace or patch, by their paths in the RomFS, w/ their bytes
     modules: Vec<(String, Vec<u8>)>,
-    /// the exheader they give, which says where the code's segments lie.
+    /// the exheader they give, it says where the code's segments lie
     exheader: Option<Vec<u8>>,
 }
 
 impl Changes {
-    /// what the update at update and the mods in data_dir change for the
-    /// game at rom, none when they leave its code and its modules alone.
+    /// what the update at update and the mods in data_dir change for the game at rom, none when they leave its code and its modules alone
     fn read(rom: &Path, update: Option<&Path>, program_id: u64, data_dir: Option<&Path>) -> Option<Changes> {
         let modded = data_dir.is_some_and(|data_dir| zakuro_core::mods::present(data_dir, program_id));
         if !modded && update.is_none() {
@@ -206,8 +195,7 @@ impl Changes {
         }
         let mut title = zakuro_fs::Title::load(rom).inspect_err(|error| log::warn!("mods: {}: {error}", rom.display())).ok()?;
         let updated = update.is_some_and(|update| zakuro_core::loader::attach_update(&mut title, update));
-        // the mods' exheader, or the update's, which says where its code's
-        // segments are
+        // the mods' exheader, or the update's, it says where its code's segments are
         let exheader = data_dir
             .and_then(|data_dir| zakuro_core::mods::exheader(&title, data_dir))
             .map(|(bytes, _)| bytes)
@@ -220,9 +208,8 @@ impl Changes {
                 None
             }
         };
-        // 3dsrecomp reads the modules the game has, the update's version of
-        // one, and the mods' over either. one either adds is left to the
-        // interpreter
+        // 3dsrecomp reads the modules the game has, the update's version of one, and the mods' over either,
+        // one either adds is left to the interpreter
         let mut modules = match (title.update(), &title.romfs) {
             (Some(update), Some(game)) => update_modules(&update.title, game),
             _ => Vec::new(),
@@ -236,20 +223,20 @@ impl Changes {
         (code.is_some() || !modules.is_empty()).then_some(Changes { code, modules, exheader })
     }
 
-    /// the bytes the mods put in place of the module at path.
+    /// the bytes the mods put in place of the module at path
     fn module(&self, path: &str) -> Option<Vec<u8>> {
         self.modules.iter().find(|(at, _)| at.eq_ignore_ascii_case(path)).map(|(_, bytes)| bytes.clone())
     }
 
-    /// what they change, the code and the modules by path.
+    /// what they change, the code and the modules by path
     fn describe(&self) -> String {
         let code = self.code.as_ref().map(|_| "the code");
         code.into_iter().chain(self.modules.iter().map(|(path, _)| path.as_str())).collect::<Vec<_>>().join(", ")
     }
 }
 
-/// the modules of the game an update has a version of, by their paths, with
-/// that version's bytes, with the mods over the update when there are any.
+/// the modules of the game an update has a version of, by their paths, w/ that version's bytes,
+/// w/ the mods over the update when there are any
 fn update_modules(update: &zakuro_fs::Title, game: &zakuro_fs::RomFs) -> Vec<(String, Vec<u8>)> {
     let Some(romfs) = &update.romfs else { return Vec::new() };
     let modded: Vec<(String, Vec<u8>)> = update.layered.as_ref().map(|layered| layered.modded_files(is_module)).unwrap_or_default();
@@ -275,8 +262,7 @@ fn update_modules(update: &zakuro_fs::Title, game: &zakuro_fs::RomFs) -> Vec<(St
     modules
 }
 
-/// whether the RomFS file at path is code 3dsrecomp reads, a CRO module or
-/// the static module that describes the executable.
+/// is the RomFS file at path code 3dsrecomp reads, a CRO module or the static module that describes the executable
 fn is_module(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
     path.ends_with(".cro") || path == "static.crs"
@@ -297,18 +283,16 @@ mod tests {
         assert!(Stage::Compiling { done: 140, total: 279 }.fraction() > 0.5);
     }
 
-    /// the id of the game the tests make, which no real game has.
+    /// the id of the game the tests make, no real game has it
     const PROGRAM_ID: u64 = 0x0004_0000_0FF3_DE00;
 
     fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
         out[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
-    /// writes a decrypted .cxi to a file named after test, its code all
-    /// text and its RomFS holding files.
+    /// writes a decrypted .cxi to a file named after test, its code all text and its RomFS holding files
     fn rom(test: &str, code: &[u8], files: &[(&str, &[u8])]) -> PathBuf {
-        // the NCCH header, never encrypted, the exheader after it, and the
-        // ExeFS at 0x600 with .code its only file
+        // the NCCH header (never encrypted), the exheader after it, and the ExeFS at 0x600 w/ .code its only file
         let mut out = vec![0; 0x800];
         put(&mut out, 0x100, b"NCCH");
         put(&mut out, 0x118, &PROGRAM_ID.to_le_bytes());
@@ -318,7 +302,7 @@ mod tests {
         put(&mut out, 0x600, b".code");
         put(&mut out, 0x60C, &(code.len() as u32).to_le_bytes());
         out.extend_from_slice(code);
-        // the RomFS, an IVFC header without hashes and level 3 right after
+        // the RomFS, an IVFC header w/o hashes and level 3 right after
         let files: Vec<_> = files.iter().map(|(path, data)| BuildFile { path: path.to_string(), data: data.to_vec() }).collect();
         let at = out.len().next_multiple_of(0x200);
         out.resize(at + 0x60, 0);
@@ -339,8 +323,7 @@ mod tests {
         std::fs::write(path, data).unwrap();
     }
 
-    /// what a mod does to the code and to the game's modules is what gets
-    /// recompiled, and a mod of other files changes nothing recompiled.
+    /// what a mod does to the code and to the game's modules is what gets recompiled, and a mod of other files changes nothing recompiled
     #[test]
     fn the_code_and_the_modules_a_mod_changes_are_found() {
         let files: [(&str, &[u8]); 4] = [("static.crs", b"crs"), ("cro/Battle.cro", b"battle"), ("cro/Field.cro", b"field"), ("a.bin", b"a")];
@@ -370,9 +353,8 @@ mod tests {
         std::fs::remove_file(rom).unwrap();
     }
 
-    /// a mod's exheader.bin takes the place of the game's when it is the
-    /// game's own with its code made longer, and goes to 3dsrecomp, and one
-    /// that looks like another game's, or still encrypted, is left out.
+    /// a mod's exheader.bin replaces the game's when it's the game's own w/ its code made longer,
+    /// and goes to 3dsrecomp, one that looks like another game's, or still encrypted, gets left out
     #[test]
     fn a_mods_exheader_is_taken_when_it_is_the_games() {
         let rom = rom("exheader", &[0; 8], &[]);

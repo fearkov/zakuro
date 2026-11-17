@@ -1,18 +1,16 @@
-//! filling triangles on the host's GPU through Vulkan. the GPU runs the
-//! title's vertex shader, clips and culls, then does what costs, the
-//! pixels, texturing, lighting, the combiners, the tests and blending. a
-//! draw with a geometry shader has the CPU work out its triangles the way
-//! the software path does instead.
+//! filling triangles on the host's GPU thru Vulkan
+//! the GPU runs the title's vertex shader, clips and culls, then does the expensive stuff, the pixels, texturing,
+//! lighting, the combiners, the tests and blending
+//! a draw w/ a geometry shader has the CPU work out its triangles like the software path does instead
 //!
-//! guest memory stays where images live between command lists. a buffer a
-//! list draws into goes up to the GPU the first time the list needs it,
-//! unless it is still as the GPU left it, and comes back down only when
-//! something else is about to read it, a texture, a fill or the CPU.
+//! guest memory stays where images live between command lists
+//! a buffer a list draws into goes up to the GPU the first time the list needs it,
+//! unless it's still how the GPU left it,
+//! and only comes back down when something else is about to read it (a texture, a fill or the CPU)
 //!
-//! a display transfer out of such a buffer runs on the GPU as well, then its
-//! batch goes to the GPU without waiting for it, along with a copy of the
-//! output for the host to read later. recording goes on in a second command
-//! buffer meanwhile, so the CPU rarely waits for the GPU.
+//! a display transfer out of such a buffer runs on the GPU too, then its batch goes to the GPU w/o waiting for it,
+//! along w/ a copy of the output for the host to read later
+//! recording goes on in a second command buffer meanwhile, so the CPU rarely waits for the GPU
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -42,59 +40,51 @@ mod hasher;
 const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
-/// raster.frag built with WRITES_DEPTH, for the draws whose depth the
-/// rasterizer can't work out.
+/// raster.frag built w/ WRITES_DEPTH, for the draws whose depth the rasterizer can't work out
 const FRAGMENT_DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/raster_depth.frag.spv");
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
 const DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/depth.comp.spv");
 const UPRIGHT_SPIRV: &[u8] = include_bytes!("../../shaders/upright.comp.spv");
-/// upright.comp built with TO_IMAGE, for a presenter sharing the device.
+/// upright.comp built w/ TO_IMAGE, for a presenter sharing the device
 const UPRIGHT_IMAGE_SPIRV: &[u8] = include_bytes!("../../shaders/upright_image.comp.spv");
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
-/// the depth format on GPUs that can't draw into DEPTH_FORMAT, AMD's and
-/// Apple's, its floats standing for the console's 24 bits, see float_depth.
+/// the depth format on GPUs that can't draw into DEPTH_FORMAT (AMD's and Apple's),
+/// its floats standing for the console's 24 bits, see float_depth
 const FLOAT_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT_S8_UINT;
 
-/// where a batch keeps its vertices, uniforms and uploads.
+/// where a batch keeps its vertices, uniforms and uploads
 const RING_SIZE: u64 = 64 << 20;
-/// batches the GPU may be running while the next one is recorded, so the
-/// emulation goes on meanwhile.
+/// batches the GPU may be running while the next one's recorded, so emulation goes on meanwhile
 const IN_FLIGHT: usize = 3;
-/// a batch past this much is run before the next draw, so a draw always
-/// finds room.
+/// a batch past this much runs b4 the next draw, so a draw always finds room
 const RING_FLUSH: u64 = RING_SIZE / 2;
-/// where vertex arrays that stay the same go once and stay, rather than
-/// into each batch's ring again, see Hardware::kept.
+/// where vertex arrays that stay the same go once and stay, instead of into each batch's ring again, see Hardware::kept
 const HEAP_SIZE: u64 = 32 << 20;
-/// the heap starts over before a draw once this much is in it, each draw
-/// finding room for the 4 MiB of arrays raw_inputs hands over at most.
+/// the heap starts over b4 a draw once this much is in it, each draw finding room for the 4 MiB of arrays raw_inputs hands over at most
 const HEAP_FLUSH: u64 = HEAP_SIZE - (8 << 20);
-/// how many arrays are looked out for, past which those seen once go,
-/// titles putting what they write each frame somewhere else each time,
-/// and past half of which in the heap it starts over.
+/// how many arrays get looked out for, past that the ones seen once go (titles put what they write each frame
+/// somewhere else each time), and past half of it in the heap it starts over
 const MOST_ARRAYS: usize = 1 << 14;
 
-/// a vertex is six vectors, position, color, texture coordinates 0 and 1,
-/// coordinate 2 with the mapped depth, the quaternion and the view vector.
+/// a vertex is six vectors, position, color, texture coords 0 and 1, coord 2 w/ the mapped depth, the quaternion and the view vector
 const VERTEX_SIZE: usize = 24 * 4;
-/// the words of a draw's uniform block, the combiners, the texture units
-/// and the flags, then the lighting.
-/// the procedural texture's registers, at the end of the uniforms.
+/// the words of a draw's uniform block, the combiners, the texture units and the flags, then the lighting
+/// the procedural texture's registers, at the end of the uniforms
 const PROCTEX_WORDS: usize = 8;
-/// the fog's color, and room.
+/// the fog's color, and room
 const FOG_WORDS: usize = 4;
 const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328 + PROCTEX_WORDS + FOG_WORDS;
 const UNIFORM_SIZE: u64 = (UNIFORM_WORDS * 4) as u64;
-/// 24 lighting tables of 256 entries, each a value and a step.
-/// the lighting tables, then the procedural texture's, its noise, color
-/// map and alpha map as values and steps and its colors and their steps as
-/// two pairs each, then the fog's, a value and a step an entry.
+/// 24 lighting tables of 256 entries, each a value and a step
+/// the lighting tables, then the procedural texture's (its noise,
+/// color map and alpha map as values and steps and its colors and their steps as two pairs each), then the fog's,
+/// a value and a step per entry
 const TABLES_SIZE: u64 = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES + fog::ENTRIES) as u64 * 8;
-/// a set of tables as the batch copied it, the hashes of the lighting
-/// tables and the generations of the procedural texture's and the fog's,
-/// which titles seldom change.
+/// a set of tables as the batch copied it,
+/// the hashes of the lighting tables and the generations of the procedural texture's and the fog's,
+/// titles rarely change those
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TablesKey {
     light: [u64; lighting::TABLES],
@@ -103,8 +93,7 @@ struct TablesKey {
     read: Read,
 }
 
-/// the tables a draw reads, the lighting ones a bit each, and whether the
-/// procedural texture's and the fog's.
+/// the tables a draw reads, the lighting ones a bit each, and if the procedural texture's and the fog's
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct Read {
     light: u32,
@@ -112,9 +101,8 @@ struct Read {
     fog: bool,
 }
 
-/// a hash of a lighting table's entries. every step is one to one, so two
-/// tables apart in a single entry never share it. eight lanes, so that
-/// the multiplies overlap.
+/// a hash of a lighting table's entries
+/// every step is one to one, so two tables apart in a single entry never share it, eight lanes so the multiplies overlap
 fn table_hash(table: &[[f32; 2]; 256]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mix = |hash: u64, word: u64| {
@@ -130,26 +118,25 @@ fn table_hash(table: &[[f32; 2]; 256]) -> u64 {
     lanes.into_iter().fold(0, mix)
 }
 
-/// a shader program and its operand descriptors.
+/// a shader program and its operand descriptors
 const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
-/// the words of what a vertex shader reads besides its program, the float
-/// uniforms, the integer ones, the bools and the entry point, the
-/// semantics, the depth map, the viewport, and where each input register
-/// finds its attribute and what it reads without one.
+/// the words of what a vertex shader reads besides its program, the float uniforms, the integer ones,
+/// the bools and the entry point, the semantics, the depth map, the viewport,
+/// and where each input register finds its attribute and what it reads w/o one
 const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 24 + 4 + 4 + 16 * 4 + 16 * 4;
 const SHADING_SIZE: u64 = (SHADING_WORDS * 4) as u64;
-/// a semantic no output register carries, which takes its default.
+/// a semantic no output register carries, which takes its default
 pub(super) const MISSING: u32 = u32::MAX;
-/// a semantic in an output attribute past the enabled registers, zero.
+/// a semantic in an output attribute past the enabled registers, zero
 pub(super) const ZERO: u32 = u32::MAX - 1;
 
-/// where each combiner stage's registers start.
+/// where each combiner stage's registers start
 const STAGE_REGISTERS: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
 const REG_UPDATE_BUFFER: usize = 0x0E0;
 const REG_BUFFER_COLOR: usize = 0x0FD;
 const REG_BLEND_COLOR: usize = 0x103;
 
-/// the PICA's comparisons in its own order.
+/// the PICA's comparisons in its own order
 const COMPARES: [vk::CompareOp; 8] = [
     vk::CompareOp::NEVER,
     vk::CompareOp::ALWAYS,
@@ -161,50 +148,47 @@ const COMPARES: [vk::CompareOp; 8] = [
     vk::CompareOp::GREATER_OR_EQUAL,
 ];
 
-/// what a draw needs from the rasterizer.
+/// what a draw needs from the rasterizer
 pub(super) struct Draw<'a> {
     pub(super) registers: &'a [u32],
     pub(super) target: u32,
     pub(super) format: ColorFormat,
     pub(super) width: u32,
     pub(super) height: u32,
-    /// the pixels the draw may touch, left, bottom, right and top in window
-    /// coordinates, y up.
+    /// the pixels the draw may touch, left, bottom, right and top in window coords, y up
     pub(super) scissor: [i32; 4],
-    /// the depth and stencil buffer and its bytes per sample, when the draw
-    /// uses one.
+    /// the depth and stencil buffer plus its bytes per sample, when the draw uses one
     pub(super) depth: Option<(u32, u32)>,
     pub(super) depth_map: DepthMap,
     pub(super) geometry: Geometry<'a>,
     pub(super) textures: &'a [Option<BoundTexture>; 3],
     pub(super) lighting: Option<&'a Lighting>,
     pub(super) tables: &'a Tables,
-    /// whether the procedural texture is on, and its tables.
+    /// whether the procedural texture is on, and its tables
     pub(super) proctex: bool,
     pub(super) proctex_tables: &'a proctex::Tables,
-    /// whether the fog is on, and its table.
+    /// whether the fog is on, and its table
     pub(super) fog: bool,
     pub(super) fog_table: &'a fog::Table,
 }
 
-/// where something is staged in the ring, and its bytes.
+/// where something is staged in the ring, and its bytes
 type Staged = (u64, u64);
 
-/// where stage_shading put what the vertex shader reads.
+/// where stage_shading put what the vertex shader reads
 #[derive(Clone, Copy)]
 struct ShadingStaged {
-    /// the program, its uniforms, the inputs and the indices.
+    /// the program, its uniforms, the inputs and the indices
     ranges: [Staged; 4],
-    /// how wide the indices are, none for vertices in a row.
+    /// how wide the indices are, none for vertices in a row
     index_type: Option<vk::IndexType>,
-    /// whether the inputs are the heap's rather than the ring's.
+    /// are the inputs the heap's instead of the ring's
     kept: bool,
 }
 
-/// what the command buffer was last set to draw with, which draws in a row
-/// mostly share, each draw setting only what it changes, a call into the
-/// driver for each costing more than the comparing. a command buffer
-/// starts with nothing set.
+/// what the command buffer was last set to draw w/, draws in a row mostly share it,
+/// each draw setting only what it changes since a call into the driver for each costs more than comparing
+/// a command buffer starts w/ nothing set
 #[derive(Clone, Copy, Default)]
 struct Set {
     pipeline: Option<vk::Pipeline>,
@@ -215,30 +199,26 @@ struct Set {
     depth_test: Option<bool>,
     depth_compare: Option<vk::CompareOp>,
     depth_write: Option<bool>,
-    /// whether the test is on, its register, the op register and whether
-    /// the draw may write.
+    /// is the test on, its register, the op register and if the draw may write
     stencil: Option<(bool, u32, u32, bool)>,
     blend_constants: Option<[u32; 4]>,
-    /// the blend's configuration and the color mask.
+    /// the blend's configuration and the color mask
     blend: Option<(Option<u32>, u32)>,
     logic_op: Option<Option<LogicOp>>,
 }
 
-/// the bindings of the draws' descriptor set, three textures, the
-/// uniforms, the tables, then the program, its uniforms and the inputs of
-/// a draw the GPU shades.
+/// the bindings of the draws' descriptor set, three textures, the uniforms, the tables, then the program,
+/// its uniforms and the inputs of a draw the GPU shades
 const BINDINGS: usize = 8;
 
-/// a vertex array a draw read, what memory gave to tell whether something
-/// wrote over it since, and where the heap has it once it was seen the
-/// same twice.
+/// a vertex array a draw read, what memory gave to tell if something wrote over it since,
+/// and where the heap has it once it was seen the same twice
 struct Seen {
     watch: u64,
     at: Option<u32>,
 }
 
-/// a draw as recorded, once what it reads is staged, so the same draw can
-/// go into the twins of its buffers later.
+/// a draw as recorded once what it reads is staged, so the same draw can go into the twins of its buffers later
 #[derive(Clone, Copy)]
 struct Recorded {
     color: usize,
@@ -251,7 +231,7 @@ struct Recorded {
     depth_compare: vk::CompareOp,
     depth_write: bool,
     stencil_test: bool,
-    /// the stencil test register and the stencil op one.
+    /// the stencil test register and the stencil op one
     stencil: (u32, u32),
     writable: bool,
     blend_constants: [f32; 4],
@@ -262,56 +242,53 @@ struct Recorded {
     samplers: [vk::Sampler; 3],
     uniforms: u64,
     tables: u64,
-    /// what the vertex shader reads, for a draw the GPU shades.
+    /// what the vertex shader reads, for a draw the GPU shades
     shaded: Option<ShadingStaged>,
-    /// where the vertices and the indices are, for one the CPU placed.
+    /// where the vertices and the indices are, for one the CPU placed
     placed: (u64, u64),
     count: u32,
     topology: vk::PrimitiveTopology,
 }
 
-/// the triangles of a draw.
+/// the triangles of a draw
 #[derive(Clone, Copy)]
 pub(super) enum Geometry<'a> {
-    /// shaded, clipped and culled on the CPU, placed vertices and the
-    /// triangles, three indices each, that share them.
+    /// shaded, clipped and culled on the CPU, placed vertices and the triangles (three indices each) that share them
     Placed { vertices: &'a [Screen], indices: &'a [u32] },
-    /// for the GPU to shade.
+    /// for the GPU to shade
     Shaded(&'a Shading<'a>),
 }
 
-/// vertices the GPU runs the vertex shader over.
+/// vertices the GPU runs the vertex shader over
 pub(super) struct Shading<'a> {
     pub(super) unit: &'a ShaderUnit,
     pub(super) inputs: Inputs<'a>,
-    /// how the inputs go together into triangles.
+    /// how the inputs go together into triangles
     pub(super) primitives: Primitives<'a>,
-    /// where each varying is in the output registers.
+    /// where each varying is in the output registers
     pub(super) semantics: [u32; 24],
-    /// left, bottom, width and height.
+    /// left, bottom, width and height
     pub(super) viewport: (f32, f32, f32, f32),
-    /// the face culling register.
+    /// the face culling register
     pub(super) cull: u32,
 }
 
-/// the inputs of each triangle of a draw, as the GPU puts them together.
+/// the inputs of each triangle of a draw, as the GPU puts them together
 #[derive(Clone, Copy)]
 pub(super) enum Primitives<'a> {
-    /// three inputs a triangle.
+    /// three inputs a triangle
     Triangles(&'a [u32]),
-    /// a list or a strip of the inputs, in a row or in the order the
-    /// guest's own index buffer has them, which goes to the GPU nearly as it
-    /// is rather than three indices a triangle.
+    /// a list or a strip of the inputs, in a row or in the order the guest's own index buffer has them,
+    /// which goes to the GPU nearly as is instead of three indices a triangle
     Raw { strip: bool, order: RawOrder<'a> },
 }
 
-/// which input each vertex of a draw from raw arrays is.
+/// which input each vertex of a draw from raw arrays is
 #[derive(Clone, Copy)]
 pub(super) enum RawOrder<'a> {
-    /// that many, the first input on.
+    /// that many, the first input on
     InARow(usize),
-    /// the guest's index buffer, a byte an index or a halfword when short,
-    /// less the first index, which the arrays start at.
+    /// the guest's index buffer, a byte an index or a halfword when short, minus the first index, which the arrays start at
     Indexed { bytes: &'a [u8], short: bool, first: u32 },
 }
 
@@ -325,7 +302,7 @@ impl RawOrder<'_> {
 }
 
 impl Primitives<'_> {
-    /// the vertices the GPU takes, a list's last triangle whole.
+    /// the vertices the GPU takes, a list's last triangle whole
     fn count(&self) -> usize {
         match *self {
             Primitives::Triangles(indices) => indices.len(),
@@ -349,59 +326,55 @@ impl Primitives<'_> {
     }
 }
 
-/// a draw's input registers, as the vertex shader gets them.
+/// a draw's input registers, as the vertex shader gets them
 #[derive(Clone, Copy)]
 pub(super) enum Inputs<'a> {
-    /// each vertex's registers, worked out on the CPU.
+    /// each vertex's registers, worked out on the CPU
     Decoded(&'a [[Vec4; INPUT_REGISTERS]]),
-    /// the vertex arrays as guest memory holds them, the shader working
-    /// out each vertex's registers itself.
+    /// the vertex arrays as guest memory holds them, the shader working out each vertex's registers itself
     Raw(&'a RawInputs),
 }
 
-/// a draw's vertex arrays for the GPU to decode.
+/// a draw's vertex arrays for the GPU to decode
 #[derive(Default)]
 pub(super) struct RawInputs {
-    /// each array's bytes from the first vertex the draw uses to the last,
-    /// as an address and a length in one piece of host memory.
+    /// each array's bytes from the first vertex the draw uses to the last, as an addr and a length in one piece of host memory
     pub(super) arrays: Vec<(u32, u32)>,
-    /// for each input register, the attribute an array gives it.
+    /// for each input register, the attribute an array gives it
     pub(super) fields: [Option<RawField>; INPUT_REGISTERS],
-    /// what each register reads where no attribute gives a component.
+    /// what each register reads where no attribute gives a component
     pub(super) defaults: [Vec4; INPUT_REGISTERS],
 }
 
-/// where an attribute is in its array, and what it is.
+/// where an attribute is in its array, and what it is
 #[derive(Clone, Copy)]
 pub(super) struct RawField {
     pub(super) array: usize,
-    /// from one vertex to the next, and from a vertex's start, in bytes.
+    /// from one vertex to the next, and from a vertex's start, in bytes
     pub(super) stride: u32,
     pub(super) offset: u32,
-    /// signed byte, byte, signed short or float, and how many components.
+    /// signed byte, byte, signed short or float, and how many components
     pub(super) ty: u32,
     pub(super) count: u32,
 }
 
-/// a block of words a draw stages, the uniforms or what else the vertex
-/// shader reads, and the last one of its kind the batch holds.
+/// a block of words a draw stages (the uniforms or whatever else the vertex shader reads), and the last one of its kind the batch holds
 #[derive(Default)]
 struct Block {
-    /// the words being gathered.
+    /// the words being gathered
     words: Vec<u32>,
-    /// the words staged last, and where, until the batch is handed over.
+    /// the words staged last, and where, till the batch is handed over
     last: Vec<u32>,
     at: Option<u64>,
 }
 
 impl Block {
-    /// where the batch holds the words gathered, when they are the words
-    /// the last block of the kind staged.
+    /// where the batch holds the words gathered, when they're the words the last block of the kind staged
     fn staged(&self) -> Option<u64> {
         self.at.filter(|_| self.words == self.last)
     }
 
-    /// the words gathered went into the batch at offset.
+    /// the words gathered went into the batch at offset
     fn staged_at(&mut self, offset: u64) {
         std::mem::swap(&mut self.words, &mut self.last);
         self.at = Some(offset);
@@ -417,7 +390,7 @@ struct Buffer {
     memory: vk::DeviceMemory,
     size: u64,
     mapped: *mut u8,
-    /// the host's view needs invalidating before it reads what the GPU wrote.
+    /// the host's view needs invalidating b4 it reads what the GPU wrote
     incoherent: bool,
 }
 
@@ -430,7 +403,7 @@ struct Image {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Color(ColorFormat),
-    /// bytes per sample, 2 for D16, 3 for D24 and 4 for D24S8.
+    /// bytes per sample, 2 for D16, 3 for D24 and 4 for D24S8
     Depth(u32),
 }
 
@@ -443,62 +416,52 @@ impl Kind {
     }
 }
 
-/// a color or depth buffer of the guest's, kept on the GPU with its rows
-/// bottom first, the other way from memory, see draw.
+/// a color or depth buffer of the guest's, kept on the GPU w/ its rows bottom first, the other way from memory, see draw
 struct Surface {
     image: Image,
     addr: u32,
     width: u32,
     height: u32,
     kind: Kind,
-    /// tiled the way the PICA draws, or in plain rows, as a display
-    /// transfer can leave its output.
+    /// tiled like the PICA draws, or in plain rows, like a display transfer can leave its output
     tiled: bool,
-    /// the guest's bytes the last time the image matched them.
+    /// the guest's bytes the last time the image matched them
     shadow: Vec<u8>,
-    /// the pixel all of those are, when a fill left them so or memory held
-    /// nothing else, standing in for them. a frame's fills would copy
-    /// megabytes into shadows, and memory compares faster with a pixel.
+    /// the pixel all of those are, when a fill left them like that or memory held nothing else, standing in for them
+    /// a frame's fills would copy MBs into shadows, and memory compares faster w/ a pixel
     pixel: Option<[u8; 4]>,
-    /// what memory gave to watch the buffer's bytes when they last held
-    /// what the shadow does. while nothing wrote over them since, a lookup
-    /// takes them as unchanged rather than comparing them again.
+    /// what memory gave to watch the buffer's bytes when they last held what the shadow does
+    /// while nothing wrote over them since, a lookup takes them as unchanged instead of comparing them again
     watch: Option<u64>,
-    /// the image is known to match guest memory in this batch.
+    /// the image is known to match guest memory in this batch
     checked: bool,
-    /// the rows drawn into since guest memory last got the image, rows of
-    /// memory from the buffer's start, whole rows of tiles.
+    /// the rows drawn into since guest memory last got the image, rows of memory from the buffer's start, whole rows of tiles
     dirty: Option<(u32, u32)>,
-    /// the rows of those whose reads the CPU was told to ask for first.
+    /// the rows of those whose reads the CPU was told to ask for first
     guarded: Option<(u32, u32)>,
-    /// and those its writes have to wait for, see guard_writes.
+    /// and those its writes have to wait for, see guard_writes
     write_guarded: Option<(u32, u32)>,
-    /// rows a fill cleared while others it drew had not come down, which
-    /// another surface over the same memory may have drawn over since.
+    /// rows a fill cleared while others it drew hadn't come down, another surface over the same memory may have drawn over them since
     cleared: Option<(u32, u32)>,
     /// bytes a fill wrote after the GPU drew there, from the buffer's start,
-    /// memory's from then on and none of the image's, what it drew past
-    /// them still has to come down, around them.
+    /// memory's from then on and none of the image's, what it drew past them still has to come down, around them
     stale: Option<(u32, u32)>,
     capture: Option<Capture>,
-    /// when drawing scaled, an image at the console's resolution the
-    /// surface goes through on its way to and from guest memory, and a
-    /// copy of the scaled image for showing it.
+    /// when drawing scaled, an image at the console's res the surface goes thru on its way to and from guest
+    /// memory, plus a copy of the scaled image for showing it
     native: Option<Image>,
     screen: Option<Capture>,
-    /// the picture screen would copy out, kept on the GPU instead when the
-    /// presenter shares the device.
+    /// the picture screen would copy out, kept on the GPU instead when the presenter shares the device
     upright: Option<Upright>,
-    /// counts the changes to the image, for the textures copied from it.
+    /// counts the changes to the image, for the textures copied from it
     generation: u64,
-    /// the buffer as frame interpolation's picture in between has it, kept
-    /// made for the next time once it no longer differs.
+    /// the buffer as frame interpolation's in between picture has it, kept made for next time once it no longer differs
     twin: Option<Image>,
-    /// the twin holds the buffer in between, which differs from the image.
+    /// the twin holds the buffer in between, which differs from the image
     twinned: bool,
-    /// counts the changes to the twin, as generation does the image's.
+    /// counts the changes to the twin, as generation does the image's
     twin_generation: u64,
-    /// the twin turned upright, as upright has the image.
+    /// the twin turned upright, as upright has the image
     twin_upright: Option<Upright>,
 }
 
@@ -511,13 +474,12 @@ impl Surface {
         addr < self.addr + self.size() && self.addr < addr + len
     }
 
-    /// the bytes a row of the buffer takes.
+    /// the bytes a row of the buffer takes
     fn row_bytes(&self) -> u32 {
         self.width * self.kind.bytes()
     }
 
-    /// whether the shadow holds bytes over a range of the buffer's memory,
-    /// one starting at a pixel. the shadow holds all of the buffer or none.
+    /// does the shadow hold bytes over a range of the buffer's memory (one starting at a pixel), the shadow holds all of the buffer or none
     fn shadows(&self, range: std::ops::Range<usize>, bytes: &[u8]) -> bool {
         match self.pixel {
             Some(pixel) => {
@@ -530,9 +492,8 @@ impl Surface {
         }
     }
 
-    /// has the shadow hold the buffer's bytes as memory does, through the
-    /// pixel they all are when they are, as memory under a buffer the GPU
-    /// draws often is.
+    /// has the shadow hold the buffer's bytes as memory does, thru the pixel they all are when they are,
+    /// like memory under a buffer the GPU draws often is
     fn keep(&mut self, bytes: &[u8]) {
         self.watch = None;
         let bpp = self.kind.bytes() as usize;
@@ -548,7 +509,7 @@ impl Surface {
         }
     }
 
-    /// has the shadow hold the pixel all over the buffer.
+    /// has the shadow hold the pixel all over the buffer
     fn keep_pixel(&mut self, pixel: &[u8]) {
         self.watch = None;
         let mut kept = [0; 4];
@@ -556,8 +517,7 @@ impl Surface {
         self.pixel = Some(kept);
     }
 
-    /// has the shadow hold the pixel over a range of the buffer's memory,
-    /// one starting at a pixel, when it holds the buffer at all.
+    /// has the shadow hold the pixel over a range of the buffer's memory (one starting at a pixel) when it holds the buffer at all
     fn keep_rows(&mut self, range: std::ops::Range<usize>, pixel: &[u8]) {
         // a shadow all of the same pixel holds them already
         if self.pixel.is_none_or(|kept| kept[..pixel.len()] != *pixel) {
@@ -567,7 +527,7 @@ impl Surface {
         }
     }
 
-    /// the shadow's bytes, written out where a pixel stood in for them.
+    /// the shadow's bytes, written out where a pixel stood in for them
     fn shadow(&mut self) -> &mut Vec<u8> {
         // whatever is done with it, memory is to be compared with it again
         self.watch = None;
@@ -578,9 +538,8 @@ impl Surface {
         &mut self.shadow
     }
 
-    /// whether guest memory over a range is behind the image, where the GPU
-    /// drew. titles pack buffers tightly, one's unused rows can be
-    /// another's, and only rows really drawn matter.
+    /// is guest memory over a range behind the image, where the GPU drew
+    /// titles pack buffers tightly, one's unused rows can be another's, and only rows really drawn matter
     fn dirty_overlaps(&self, addr: u32, len: u32) -> bool {
         self.dirty.is_some_and(|(start, end)| {
             let (from, to) = (self.addr + start * self.row_bytes(), self.addr + end * self.row_bytes());
@@ -595,10 +554,9 @@ impl Surface {
         })
     }
 
-    /// a fill wrote over some of the bytes it drew, which are memory's now,
-    /// the rest of what it drew stays on the GPU until something needs it.
-    /// false when they do not join the bytes stale already, one span holds
-    /// them all.
+    /// a fill wrote over some of the bytes it drew, those are memory's now,
+    /// the rest of what it drew stays on the GPU till something needs it
+    /// false when they don't join the bytes already stale, one span holds them all
     fn supersede(&mut self, addr: u32, len: u32) -> bool {
         let start = addr.max(self.addr) - self.addr;
         let end = ((addr as u64 + len as u64).min(self.addr as u64 + self.size() as u64) - self.addr as u64) as u32;
@@ -615,7 +573,7 @@ impl Surface {
         joined.is_some()
     }
 
-    /// the GPU changed rows of the image, rows of memory from the start.
+    /// the GPU changed rows of the image, rows of memory from the start
     fn drew(&mut self, (start, end): (u32, u32)) {
         let rows = ((start / 8 * 8).min(self.height), end.div_ceil(8).saturating_mul(8).min(self.height));
         self.dirty = Some(match self.dirty {
@@ -625,13 +583,12 @@ impl Surface {
         self.replaced();
     }
 
-    /// the GPU changed the whole image.
+    /// the GPU changed the whole image
     fn changed(&mut self) {
         self.drew((0, self.height));
     }
 
-    /// has the CPU's reads of the rows drawn ask for them first, until
-    /// guest memory gets them. draw does it for depth buffers alone.
+    /// has the CPU's reads of the rows drawn ask for them first, till guest memory gets them, draw only does it for depth buffers
     fn guard<M: GpuMemory>(&mut self, memory: &mut M) {
         let row = self.row_bytes();
         if let Some((addr, len)) = widen(&mut self.guarded, self.dirty, self.addr, row) {
@@ -639,10 +596,8 @@ impl Surface {
         }
     }
 
-    /// has the rows drawn reach guest memory before the CPU writes over
-    /// them, as on the console, where the GPU put its pixels there at once.
-    /// a title can put something else where a buffer it is done with was,
-    /// which the drawing written back later would break.
+    /// has the rows drawn reach guest memory b4 the CPU writes over them, like on the console where the GPU put its pixels there at once
+    /// a title can put something else where a buffer it's done w/ was, which the drawing written back later would break
     fn guard_writes<M: GpuMemory>(&mut self, memory: &mut M) {
         let row = self.row_bytes();
         if let Some((addr, len)) = widen(&mut self.write_guarded, self.dirty, self.addr, row) {
@@ -650,7 +605,7 @@ impl Surface {
         }
     }
 
-    /// the image holds something new, the copies of it are old.
+    /// the image holds something new, the copies of it are old
     fn replaced(&mut self) {
         self.generation += 1;
         for capture in [&mut self.capture, &mut self.screen].into_iter().flatten() {
@@ -661,25 +616,23 @@ impl Surface {
         }
     }
 
-    /// what a capture holds, when it still has the image.
+    /// what a capture holds, when it still has the image
     fn captured(&self) -> Option<&Capture> {
         self.capture.as_ref().filter(|capture| self.dirty.is_some() && capture.current)
     }
 
-    /// the buffer is the same in between as it is, all of it was cleared
-    /// or memory gave it.
+    /// the buffer is the same in between as it is, all of it was cleared or memory gave it
     fn untwin(&mut self) {
         self.twinned = false;
     }
 
-    /// something was drawn into the twin.
+    /// something was drawn into the twin
     fn twin_changed(&mut self) {
         self.twin_generation += 1;
     }
 }
 
-/// the format, the uses and the aspects of the image a surface of a kind
-/// draws into, depth buffers in the depth format given.
+/// the format, uses and aspects of the image a surface of a kind draws into, depth buffers in the depth format given
 fn surface_image(kind: Kind, depth_format: vk::Format) -> (vk::Format, vk::ImageUsageFlags, vk::ImageAspectFlags) {
     let (format, usage, aspect) = match kind {
         Kind::Color(_) => (
@@ -696,15 +649,13 @@ fn surface_image(kind: Kind, depth_format: vk::Format) -> (vk::Format, vk::Image
     (format, usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST, aspect)
 }
 
-/// how big a game's pipelines get before they are thrown away and compiled
-/// again, a session of Ocarina of Time 3D makes 1.3 MB of them.
+/// how big a game's pipelines get b4 they're thrown away and compiled again, a session of Ocarina of Time 3D makes 1.3 MB of them
 const MOST_PIPELINE_BYTES: u64 = 64 << 20;
 
-/// where the pipelines compiled for a game are kept, the system's place for
-/// caches. each game keeps its own, all of them in one file only grew, the
-/// pipelines of every game played and of every version of Zakuro, to
-/// hundreds of megabytes read into memory at every start. the tests keep
-/// none, theirs are no use to anyone playing.
+/// where the pipelines compiled for a game are kept, the system's place for caches
+/// each game keeps its own, all of them in one file just grew (every game played and every Zakuro version) to
+/// hundreds of MBs read into memory at every start
+/// the tests keep none, theirs are no use to anyone playing
 pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
     if cfg!(test) {
         return None;
@@ -729,8 +680,7 @@ pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
     Some(dir.join("pipelines").join(format!("{title:016X}.bin")))
 }
 
-/// the pipelines kept for a game, none when there are none or they grew past
-/// MOST_PIPELINE_BYTES, which then go.
+/// the pipelines kept for a game, none when there are none or they grew past MOST_PIPELINE_BYTES, which then go
 fn read_pipeline_cache(path: &std::path::Path) -> Option<Vec<u8>> {
     let size = std::fs::metadata(path).ok()?.len();
     if size > MOST_PIPELINE_BYTES {
@@ -741,11 +691,9 @@ fn read_pipeline_cache(path: &std::path::Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-/// keeps the pipelines compiled so far for the next run, by way of a file
-/// of its own, so a run killed halfway leaves the last one whole.
+/// keeps the pipelines compiled so far for the next run, via a file of its own, so a run killed halfway leaves the last one whole
 fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &std::path::Path) {
-    // SAFETY: the cache is the device's, and taking its data needs no one
-    // else to keep off it
+    // safe bc the cache is the device's, and taking its data needs nobody else to keep off it
     let data = match unsafe { device.get_pipeline_cache_data(cache) } {
         Ok(data) => data,
         Err(error) => {
@@ -769,20 +717,18 @@ fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &st
     }
 }
 
-/// how long the compiler thread waits between keeping what it compiled, a
-/// run that does not end well losing no more than that.
+/// how long the compiler thread waits between keeping what it compiled, a run that ends badly loses no more than that
 const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// how much a surface holds the latest of some of its rows of memory, of
-/// those over the same rows, what the GPU drew there and guest memory lacks
-/// first, then the taller, which titles draw a shorter buffer into the start
-/// of. drawn in other rows, it may have older ones there.
+/// how much a surface holds the latest of some of its rows of memory, among those over the same rows,
+/// what the GPU drew there and guest memory lacks first,
+/// then the taller one (titles draw a shorter buffer into its start)
+/// drawn in other rows, it may have older ones there
 fn newest(surface: &Surface, (start, end): (u32, u32)) -> (bool, u32) {
     (surface.dirty.is_some_and(|(from, to)| from < end && start < to), surface.height)
 }
 
-/// the rows of memory of a tiled surface a fill covers, when it covers some
-/// of its rows of tiles whole but not all of them.
+/// the rows of memory of a tiled surface a fill covers, when it covers some of its rows of tiles whole but not all of them
 fn rows_filled(surface: &Surface, addr: u32, len: u32) -> Option<(u32, u32)> {
     let row = surface.row_bytes() as u64;
     let start = (addr as u64).max(surface.addr as u64) - surface.addr as u64;
@@ -793,8 +739,7 @@ fn rows_filled(surface: &Surface, addr: u32, len: u32) -> Option<(u32, u32)> {
     (surface.tiled && end > start && partial && whole(start) && whole(end)).then(|| ((start / row) as u32, (end / row) as u32))
 }
 
-/// the rows of a span left once other rows are taken out of it, which can
-/// only shorten it at either end, rows in its middle leave all of it.
+/// the rows of a span left once other rows get taken out of it, which can only shorten it at either end, rows in its middle leave all of it
 fn without((start, end): (u32, u32), (from, to): (u32, u32)) -> Option<(u32, u32)> {
     if from <= start && end <= to {
         None
@@ -807,7 +752,7 @@ fn without((start, end): (u32, u32), (from, to): (u32, u32)) -> Option<(u32, u32
     }
 }
 
-/// where a pixel's bytes are in a buffer of guest memory, from its start.
+/// where a pixel's bytes are in a buffer of guest memory, from its start
 fn pixel_offset(tiled: bool, x: u32, y: u32, width: u32, bpp: u32) -> usize {
     if tiled {
         morton_offset(x, y, width, bpp) as usize
@@ -816,33 +761,31 @@ fn pixel_offset(tiled: bool, x: u32, y: u32, width: u32, bpp: u32) -> usize {
     }
 }
 
-/// a screen's newest picture turned upright into an image that a presenter
-/// sharing the device draws straight from, and the batch that drew it. one
-/// is enough, every batch starts with a barrier that waits for the presents
-/// submitted before it, so no picture is drawn over while one shows it.
+/// a screen's newest picture turned upright into an image that a presenter sharing the device draws straight from,
+/// plus the batch that drew it
+/// one is enough, every batch starts w/ a barrier that waits for the presents submitted b4 it,
+/// so no picture gets drawn over while one shows it
 struct Upright {
     image: Image,
     batch: u64,
-    /// nothing changed the surface since.
+    /// nothing changed the surface since
     current: bool,
 }
 
-/// a copy of a surface on its way to the host, recorded along with what
-/// changed the surface so reading it back needs no batch of its own.
+/// a copy of a surface on its way to the host, recorded along w/ what changed the surface so reading it back needs no batch of its own
 struct Capture {
     buffer: Buffer,
-    /// the batch that fills it.
+    /// the batch that fills it
     batch: u64,
-    /// nothing changed the surface since.
+    /// nothing changed the surface since
     current: bool,
-    /// a screen shows the surface, so each picture is read out of the
-    /// buffer as its batch finishes, before a later one fills it again.
+    /// a screen shows the surface, so each picture gets read out of the buffer as its batch finishes, b4 a later one fills it again
     watched: bool,
-    /// the last pictures read out, and the batches that drew them.
+    /// the last pictures read out, and the batches that drew them
     pictures: VecDeque<(u64, Arc<Vec<u8>>)>,
 }
 
-/// kinds of work the GPU does, to tell where its time goes.
+/// kinds of work the GPU does, to tell where its time goes
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     Other,
@@ -858,71 +801,67 @@ enum Work {
 
 const WORK_NAMES: [&str; 9] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download", "barrier"];
 
-/// what the pipeline statistics count, in the order the results come.
+/// what the pipeline statistics count, in the order the results come
 const STATISTICS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFlags::from_raw(
     vk::QueryPipelineStatisticFlags::VERTEX_SHADER_INVOCATIONS.as_raw()
         | vk::QueryPipelineStatisticFlags::CLIPPING_PRIMITIVES.as_raw()
         | vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS.as_raw()
         | vk::QueryPipelineStatisticFlags::COMPUTE_SHADER_INVOCATIONS.as_raw(),
 );
-/// timestamps a batch can take.
+/// timestamps a batch can take
 const TIMESTAMPS: u32 = 4096;
-/// batches the times are added up over before they are logged.
+/// batches the times get added up over b4 they're logged
 const TIMED_BATCHES: u32 = 600;
 
-/// the GPU's time per kind of work, from timestamps written whenever the
-/// work changes kind, ZAKURO_GPU_TIMES=1 turns it on.
+/// the GPU's time per kind of work, from timestamps written whenever the work changes kind, ZAKURO_GPU_TIMES=1 turns it on
 struct Timing {
-    /// nanoseconds a tick of the GPU's clock lasts.
+    /// nanoseconds a tick of the GPU's clock lasts
     period: f64,
-    /// each command buffer's timestamps, and the work between them.
+    /// each command buffer's timestamps, and the work between them
     pools: HashMap<vk::CommandBuffer, (vk::QueryPool, Vec<Work>)>,
     current: Work,
-    /// milliseconds per kind of work.
+    /// milliseconds per kind of work
     totals: [f64; WORK_NAMES.len()],
     batches: u32,
     barriers: u64,
     renderings: u64,
     draws: u64,
-    /// each command buffer's pipeline statistics, when the device keeps
-    /// them, and the vertices, primitives past clipping, fragments and
-    /// compute invocations they added up to.
+    /// each command buffer's pipeline statistics, when the device keeps them, and the vertices,
+    /// primitives past clipping, fragments and compute invocations they added up to
     statistics: Option<HashMap<vk::CommandBuffer, vk::QueryPool>>,
     counts: [u64; 4],
-    /// milliseconds the host waited for the GPU and how many times, for a
-    /// batch to record the next in, then for what it needed done.
+    /// ms the host waited for the GPU and how many times, for a batch to record the next in, then for what it needed done
     waited: [(f64, u32); 2],
 }
 
-/// what the host waited for the GPU for.
+/// what the host waited for the GPU for
 #[derive(Clone, Copy)]
 enum Wait {
-    /// a batch to record in, all of them in flight.
+    /// a batch to record in, all of them in flight
     Room,
-    /// work done, to read what it wrote or reuse what it read.
+    /// work done, to read what it wrote or reuse what it read
     Done,
 }
 
-/// a batch's command buffer, the fence the GPU signals once done with it and
-/// the ring it stages in.
+/// a batch's command buffer, the fence the GPU signals once done w/ it, and the ring it stages in
 struct Frame {
     commands: vk::CommandBuffer,
     fence: vk::Fence,
     ring: Buffer,
-    /// the batch it holds while the GPU may still be running it.
+    /// the batch it holds while the GPU may still be running it
     pending: Option<u64>,
 }
 
-/// a display transfer's registers, taken apart.
+/// a display transfer's registers, taken apart
 pub(crate) struct Transfer {
     pub(crate) input: u32,
     pub(crate) output: u32,
     pub(crate) input_width: u32,
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
-    /// the pixels written, width and height.
+    /// the pixels written, width and height
     pub(crate) copy: (u32, u32),
-    /// the input pixels averaged into each output pixel, across and down.
+    /// the input pixels averaged into each output pixel, across and down
     pub(crate) scale: (u32, u32),
     pub(crate) flip: bool,
     pub(crate) input_linear: bool,
@@ -931,7 +870,7 @@ pub(crate) struct Transfer {
     pub(crate) output_format: ColorFormat,
 }
 
-/// a compute pipeline, the shader and what it takes.
+/// a compute pipeline, the shader and what it takes
 struct Compute {
     shader: vk::ShaderModule,
     set_layout: vk::DescriptorSetLayout,
@@ -939,33 +878,32 @@ struct Compute {
     pipeline: vk::Pipeline,
 }
 
-/// a buffer only the GPU uses.
+/// a buffer only the GPU uses
 struct Local {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: u64,
 }
 
-/// a texture copied from a surface the GPU drew.
+/// a texture copied from a surface the GPU drew
 struct Copied {
     image: Image,
     surface: usize,
-    /// the surface's generation when it was copied.
+    /// the surface's generation when it was copied
     generation: u64,
-    /// the texture as memory held it, for the rows past the surface when
-    /// it reaches past its last row.
+    /// the texture as memory held it, for the rows past the surface when it reaches past its last row
     memory: Option<Arc<[[u8; 4]]>>,
     used: u64,
 }
 
 struct Texture {
     image: Image,
-    /// holds the decoded texels the key points at, so the key stays theirs.
+    /// holds the decoded texels the key points at, so the key stays theirs
     _texels: Arc<[[u8; 4]]>,
     used: u64,
 }
 
-/// a texture pack's picture, drawn with for every texture it replaces.
+/// a texture pack's picture, drawn w/ for every texture it replaces
 struct Replaced {
     image: Image,
     bytes: u64,
@@ -976,35 +914,32 @@ struct Replaced {
 }
 
 impl Replaced {
-    /// the smallest of its sizes a texture of this size is drawn with, the
-    /// one nearest the texture's own and no smaller, so that what a game
-    /// shows at a distance stays as it was, and alpha tested leaves and
-    /// fences do not thin out as smaller sizes average them away.
+    /// the smallest of its sizes a texture of this size gets drawn w/,
+    /// the one nearest the texture's own and no smaller, so what a game shows at a distance stays as it was,
+    /// and alpha tested leaves and fences don't thin out as smaller sizes average them away
     fn smallest(&self, (width, height): (u32, u32)) -> u32 {
         let times = (self.width / width.max(1)).min(self.height / height.max(1));
         times.max(1).ilog2().min(self.levels - 1)
     }
 }
 
-/// how a sampler filters and wraps, and goes between an image's sizes.
+/// how a sampler filters and wraps, and goes between an image's sizes
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Filtering {
-    /// bilinear rather than point sampling, magnifying and minifying.
+    /// bilinear instead of point sampling, magnifying and minifying
     magnify: bool,
     minify: bool,
-    /// blends the two sizes about the level of detail rather than taking
-    /// the nearer.
+    /// blends the two sizes about the level of detail instead of taking the nearer
     between: bool,
     s: Wrap,
     t: Wrap,
-    /// the levels of detail it is kept between, see Lod, and its bias in
-    /// 256ths.
+    /// the levels of detail it's kept between (see Lod), and its bias in 256ths
     levels: (u8, u8),
     bias: i16,
 }
 
 impl Filtering {
-    /// a unit's, for its texture's sizes.
+    /// a unit's, for its texture's sizes
     fn of(bound: &BoundTexture) -> Filtering {
         let lod = bound.lod;
         match bound.levels {
@@ -1014,10 +949,9 @@ impl Filtering {
         }
     }
 
-    /// for a texture pack's picture, going between its sizes down to
-    /// smallest, a little sharper than the rate the coordinates change
-    /// gives, so that one drawn a little smaller than its own size, as at 3
-    /// times the console's resolution, stays as sharp as it is.
+    /// for a texture pack's picture, going between its sizes down to smallest,
+    /// a bit sharper than the rate the coords change gives,
+    /// so one drawn a bit smaller than its own size (like at 3x the console's res) stays as sharp as it is
     fn picture(bound: &BoundTexture, smallest: u32) -> Filtering {
         Filtering {
             minify: bound.linear,
@@ -1028,70 +962,61 @@ impl Filtering {
         }
     }
 
-    /// the unit's magnifying filter and wrapping, one size of its texture.
+    /// the unit's magnifying filter and wrapping, one size of its texture
     fn wrapping(bound: &BoundTexture) -> Filtering {
         Filtering { s: bound.wrap_s, t: bound.wrap_t, magnify: bound.linear, ..Filtering::OFF }
     }
 
-    /// what a unit that is off samples with.
+    /// what a unit that's off samples w/
     const OFF: Filtering =
         Filtering { magnify: false, minify: false, between: false, s: Wrap::ClampToEdge, t: Wrap::ClampToEdge, levels: (0, 0), bias: 0 };
 }
 
-/// how long a batch spends uploading texture pack pictures, and how many
-/// bytes of them it uploads, past the first picture, so that a scene's
-/// pictures coming in at once are spread over a few frames rather than hold
-/// one up. each costs most of a millisecond however small.
+/// how long a batch spends uploading texture pack pictures and how many bytes of them it uploads past the first
+/// picture, so a scene's pictures coming in at once get spread over a few frames instead of holding one up,
+/// each costs most of a ms however small
 const REPLACING_TIME: std::time::Duration = std::time::Duration::from_millis(2);
 const REPLACING_BYTES: u64 = 64 << 20;
 
-/// pictures up to this size are staged in the ring rather than a buffer
-/// of their own, which takes a while to make.
+/// pictures up to this size get staged in the ring instead of a buffer of their own, which takes a while to make
 const RING_PICTURE: u64 = 4 << 20;
 
-/// batches a picture goes unused before it goes to make room for others,
-/// when they take most of the room they may, otherwise they stay.
+/// batches a picture goes unused b4 it goes to make room for others when they take most of the room they may, otherwise they stay
 const REPLACED_IDLE: u64 = 60;
 
-/// batches a picture read for a texture no longer drawn waits to be
-/// uploaded before the memory it takes goes.
+/// batches a picture read for a texture no longer drawn waits to be uploaded b4 the memory it takes goes
 const WAITING_IDLE: u64 = 120;
 
-/// batches pictures wait to be read and uploaded after the GPU had no
-/// memory for one.
+/// batches pictures wait to be read and uploaded after the GPU had no memory for one
 const REPLACING_PAUSE: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PipelineKey {
-    /// the blend function register, when blending.
+    /// the blend function register, when blending
     blend: Option<u32>,
-    /// the logic op, when one other than copy is in use.
+    /// the logic op, when one other than copy is in use
     logic_op: Option<LogicOp>,
-    /// red, green, blue and alpha writes, one bit each.
+    /// red, green, blue and alpha writes, one bit each
     mask: u32,
     depth: bool,
     vertex: VertexStage,
-    /// the fragment shader's specialization constants, what decides its
-    /// shape, the combiners, the units, lighting, the alpha test, depth.
+    /// the fragment shader's specialization constants, what decides its shape, the combiners, the units, lighting, the alpha test, depth
     fragment: [u32; FRAGMENT_CONSTANTS],
 }
 
-/// the fragment shader's specialization constants, as raster.frag numbers
-/// them, the last one making it the generic shader.
+/// the fragment shader's specialization constants as raster.frag numbers them, the last one makes it the generic shader
 const FRAGMENT_CONSTANTS: usize = 30;
 
-/// the generic fragment shader's specialization, which reads what the
-/// others have as constants from the draw's registers.
+/// the generic fragment shader's specialization, it reads what the others have as constants from the draw's registers
 const GENERIC: [u32; FRAGMENT_CONSTANTS] = {
     let mut constants = [0; FRAGMENT_CONSTANTS];
     constants[FRAGMENT_CONSTANTS - 1] = 1;
     constants
 };
 
-/// the generic fragment shader for a draw's constants. it keeps whether
-/// lighting and the procedural texture are on as constants, a lot of code
-/// it goes without when they are off, which costs a lot on a small GPU, and
-/// which build of the shader it is.
+/// the generic fragment shader for a draw's constants
+/// it keeps if lighting and the procedural texture are on as constants (lots of code it skips when they're off,
+/// which costs a lot on a small GPU), plus which build of the shader it is
 fn generic(fragment: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
     let mut generic = GENERIC;
     generic[25] = fragment[25] & 0x400;
@@ -1100,25 +1025,23 @@ fn generic(fragment: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
     generic
 }
 
-/// the bit of the depth mode constant for the build of raster.frag that
-/// works depth out itself.
+/// the depth mode constant's bit for the build of raster.frag that works depth out itself
 const WRITES_DEPTH: u32 = 4;
 
-/// the state draws set as they go rather than their pipelines hold, when
-/// the device can, so that draws differing only in it share a pipeline.
+/// the state draws set as they go instead of their pipelines holding it, when the device can,
+/// so draws differing only in it share a pipeline
 /// the generic pipelines are then few enough to make them all at the start,
-/// rather than each on the draw that first needs it, which stalled the game
-/// for as long as the driver took, up to a third of a second.
+/// instead of each on the draw that first needs it, which stalled the game for as long as the driver took,
+/// up to a third of a second
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Dynamic {
-    /// blending on or off, its equation, and the color write mask.
+    /// blending on or off, its equation, and the color write mask
     pub(crate) blend: bool,
-    /// the logic op on or off, and which.
+    /// the logic op on or off, and which
     pub(crate) logic_op: bool,
 }
 
-/// every generic pipeline a draw can need when the blend state is dynamic,
-/// with the vertex stages that draws have.
+/// every generic pipeline a draw can need when the blend state is dynamic, w/ the vertex stages draws have
 fn generic_keys(shades: bool) -> Vec<PipelineKey> {
     let vertices: &[VertexStage] = if shades { &[VertexStage::Interpreted, VertexStage::Placed] } else { &[VertexStage::Placed] };
     let mut keys = Vec::new();
@@ -1140,13 +1063,13 @@ fn generic_keys(shades: bool) -> Vec<PipelineKey> {
     keys
 }
 
-/// what the PICA's blend function register asks for.
+/// what the PICA's blend function register asks for
 fn blend_equation(config: u32) -> vk::ColorBlendEquationEXT {
     let factor = |raw: u32| {
         if raw & 0xF == 15 {
             vk::BlendFactor::ONE
         } else {
-            // the PICA numbers its factors the way Vulkan does
+            // the PICA numbers its factors like Vulkan does
             vk::BlendFactor::from_raw((raw & 0xF) as i32)
         }
     };
@@ -1166,8 +1089,7 @@ fn blend_equation(config: u32) -> vk::ColorBlendEquationEXT {
         .dst_alpha_blend_factor(factor(config >> 28))
 }
 
-/// the build of raster.frag a pipeline runs, of the one leaving depth to
-/// the rasterizer and the one working it out.
+/// the build of raster.frag a pipeline runs, the one leaving depth to the rasterizer or the one working it out
 fn fragment_module([plain, writing]: [vk::ShaderModule; 2], key: &PipelineKey) -> vk::ShaderModule {
     if key.fragment[28] & WRITES_DEPTH != 0 {
         writing
@@ -1176,81 +1098,74 @@ fn fragment_module([plain, writing]: [vk::ShaderModule; 2], key: &PipelineKey) -
     }
 }
 
-/// what a draw's vertices go through on the GPU.
+/// what a draw's vertices go thru on the GPU
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum VertexStage {
-    /// triangles the CPU shaded and placed, raster.vert passing them on.
+    /// triangles the CPU shaded and placed, raster.vert passing them on
     Placed,
-    /// the title's program interpreted, shade.vert.
+    /// the title's program interpreted, shade.vert
     Interpreted,
-    /// the title's program translated into a module of its own.
+    /// the title's program translated into a module of its own
     Translated(vk::ShaderModule),
 }
 
-/// a program translated, by its fingerprint, its entry point and where
-/// its outputs go, what the translation is made from.
+/// a program translated, by its fingerprint, its entry point and where its outputs go, what the translation's made from
 type ProgramKey = (u64, u32, [u32; SEMANTICS]);
 
-/// how far a program's translation got.
+/// how far a program's translation got
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Translation {
-    /// the compiler is on it.
+    /// the compiler is on it
     Pending,
-    /// it stays interpreted.
+    /// it stays interpreted
     Failed,
     Done(vk::ShaderModule),
 }
 
-/// work for the compiler thread.
+/// work for the compiler thread
 enum Job {
-    /// a program to translate.
+    /// a program to translate
     Translate(ProgramKey, Arc<Program>),
-    /// a pipeline to compile, with its vertex shader's module.
+    /// a pipeline to compile, w/ its vertex shader's module
     Compile(PipelineKey, vk::ShaderModule),
 }
 
-/// what the compiler thread made of a job.
+/// what the compiler thread made of a job
 enum Made {
-    /// the SPIR-V and the source it came from, which programs that run
-    /// the same share a module by.
+    /// the SPIR-V and the source it came from, programs that run the same share a module by it
     Translated(ProgramKey, Result<(Vec<u32>, String), String>),
     Compiled(PipelineKey, Result<vk::Pipeline, String>),
 }
 
-/// the jobs waiting for the compiler threads, translations first, as they
-/// are quick and pipelines wait for them, then the generic pipelines made at
-/// the start, which draws fall back on, then the pipelines asked for last,
-/// as those are what is being drawn now, and whether the threads should stop.
+/// the jobs waiting for the compiler threads, translations first (they're quick and pipelines wait for them),
+/// then the generic pipelines made at the start, which draws fall back on,
+/// then the pipelines asked for last (those are what's being drawn now), and if the threads should stop
 struct Queue {
     translations: VecDeque<Job>,
     generic: VecDeque<Job>,
     compiles: Vec<Job>,
     stopped: bool,
-    /// pipelines compiled since the cache was last kept on disk, and when
-    /// that was, which a thread with nothing else to do sees to.
+    /// pipelines compiled since the cache was last kept on disk, and when that was, a thread w/ nothing else to do sees to it
     compiled: usize,
     saved: std::time::Instant,
 }
 
-/// threads translating programs and compiling pipelines, which takes the
-/// driver up to seconds for one. draws go on meanwhile through pipelines
-/// that draw the same, rather than stall.
+/// threads translating programs and compiling pipelines, which takes the driver up to seconds for one,
+/// draws go on meanwhile thru pipelines that draw the same instead of stalling
 struct Compiler {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     made: mpsc::Receiver<Made>,
-    /// the jobs queued and not made yet.
+    /// the jobs queued and not made yet
     outstanding: usize,
-    /// the pipelines asked for, each only once.
+    /// the pipelines asked for, each only once
     asked: QuickSet<PipelineKey>,
     threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl Compiler {
-    /// the threads, compiling with a cache, a layout and a fragment shader
-    /// that outlive them. a slow driver takes a long while over a scene's
-    /// pipelines, which are drawn through the slower generic shader until
-    /// then, so there is one for each core the emulation and the driver
-    /// leave, up to three.
+    /// the threads, compiling w/ a cache, a layout and a fragment shader that outlive them
+    /// a slow driver takes a long while over a scene's pipelines, drawn thru the slower generic shader till then,
+    /// so there's one per core the emulation and the driver leave, up to three
     fn start(
         device: ash::Device,
         cache: vk::PipelineCache,
@@ -1283,8 +1198,7 @@ impl Compiler {
         Compiler { queue, made, outstanding: 0, asked: QuickSet::default(), threads }
     }
 
-    /// queues a generic pipeline ahead of the pipelines asked for, unless
-    /// there are no threads, when it is not made until a draw needs it.
+    /// queues a generic pipeline ahead of the pipelines asked for, unless there are no threads, then it's not made till a draw needs it
     fn send_generic(&mut self, job: Job) {
         if self.threads.is_empty() {
             return;
@@ -1295,7 +1209,7 @@ impl Compiler {
         self.outstanding += 1;
     }
 
-    /// queues a job for the threads, or gives it back when there are none.
+    /// queues a job for the threads, or gives it back when there are none
     fn send(&mut self, job: Job) -> Option<Job> {
         if self.threads.is_empty() {
             return Some(job);
@@ -1311,8 +1225,7 @@ impl Compiler {
         None
     }
 
-    /// waits for the jobs the threads are on and drops the rest, giving
-    /// back the pipelines they made that no one took.
+    /// waits for the jobs the threads are on and drops the rest, giving back the pipelines they made that nobody took
     fn finish(&mut self) -> Vec<vk::Pipeline> {
         let (queue, ready) = &*self.queue;
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1333,8 +1246,7 @@ impl Compiler {
     }
 }
 
-/// what a compiler thread does until it is told to stop, jobs as they come,
-/// and keeping the cache on disk now and then when there are none.
+/// what a compiler thread does till it's told to stop, jobs as they come, and keeping the cache on disk now and then when there are none
 #[allow(clippy::too_many_arguments)]
 fn compile(
     jobs: &(Mutex<Queue>, Condvar),
@@ -1384,8 +1296,7 @@ fn compile(
     }
 }
 
-/// a job done, on the compiler thread or, when waiting for it, on the
-/// caller's.
+/// a job done, on the compiler thread or, when waiting for it, on the caller's
 fn work(
     job: Job,
     device: &ash::Device,
@@ -1398,8 +1309,7 @@ fn work(
     let started = std::time::Instant::now();
     match job {
         Job::Translate(key, program) => {
-            // a panic is a bug in the translation, which the interpreter
-            // can cover for
+            // a panic is a bug in the translation, the interpreter can cover for it
             let source = std::panic::catch_unwind(|| glsl::translate(&program, key.1, &key.2))
                 .unwrap_or_else(|_| Err("the translation panicked".to_owned()));
             let made = source.and_then(|source| Ok((glsl::compile(&source)?, source)));
@@ -1433,8 +1343,7 @@ fn work(
     }
 }
 
-/// a draw pipeline for a key, with its vertex and fragment shader modules,
-/// drawing depth in the depth format given.
+/// a draw pipeline for a key, w/ its vertex and fragment shader modules, drawing depth in the depth format given
 #[allow(clippy::too_many_arguments)]
 fn compile_pipeline(
     device: &ash::Device,
@@ -1484,10 +1393,8 @@ fn compile_pipeline(
     };
     let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
-    // depth comes from the fragment shader, what the CPU sends it has
-    // been clipped already, what the GPU shades has z clipped to 0..w.
-    // the images run bottom up, so a triangle wound counter-clockwise
-    // with y up is wound clockwise to Vulkan, which culls per draw
+    // depth comes from the fragment shader, what the CPU sends it was clipped already, what the GPU shades has z clipped to 0..w
+    // the images run bottom up, so a triangle wound counterclockwise w/ y up is wound clockwise to Vulkan, which culls per draw
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .depth_clamp_enable(key.vertex == VertexStage::Placed)
         .polygon_mode(vk::PolygonMode::FILL)
@@ -1560,18 +1467,16 @@ fn compile_pipeline(
         .dynamic_state(&dynamic)
         .layout(layout)
         .push_next(&mut rendering);
-    // SAFETY: every state the create info points at lives until it
-    // returns
+    // safe bc every state the create info points at lives till it returns
     unsafe { device.create_graphics_pipelines(cache, &[info], None) }
         .map(|pipelines| pipelines[0])
         .map_err(|(_, error)| format!("could not create a pipeline, {error}"))
 }
 
 pub struct Hardware {
-    /// the device, maybe the presenter's too, kept until this lets go.
+    /// the device (maybe the presenter's too), kept till this lets go
     _shared: Arc<SharedDevice>,
-    /// whether the presenter shares the device, and shows screens straight
-    /// from the images the GPU turns them upright into.
+    /// does the presenter share the device and show screens straight from the images the GPU turns them upright into
     direct: bool,
     device: ash::Device,
     push: ash::khr::push_descriptor::Device,
@@ -1582,10 +1487,9 @@ pub struct Hardware {
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
-    /// the batches handed to the GPU that it may still be running, oldest
-    /// first.
+    /// the batches handed to the GPU that it may still be running, oldest first
     in_flight: VecDeque<Frame>,
-    /// command buffers, fences and rings free for the next batch.
+    /// command buffers, fences and rings free for the next batch
     free: Vec<Frame>,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -1593,175 +1497,155 @@ pub struct Hardware {
     fragment_shader: vk::ShaderModule,
     depth_fragment_shader: vk::ShaderModule,
     shade_shader: vk::ShaderModule,
-    /// whether draws go to shade_shader.
+    /// do draws go to shade_shader
     shades: bool,
-    /// whether programs are translated rather than interpreted.
+    /// do programs get translated instead of interpreted
     translates: bool,
-    /// what a surface's memory was read into last, the next read's buffer.
+    /// what a surface's memory was read into last, the next read's buffer
     scratch: Vec<u8>,
-    /// the programs seen and how far their translation got.
+    /// the programs seen and how far their translation got
     translated: QuickMap<ProgramKey, Translation>,
-    /// the last draw's program and how far its translation got, which the
-    /// next draw mostly shares, until the compiler brings anything in.
+    /// the last draw's program and how far its translation got, the next draw mostly shares it till the compiler brings anything in
     last_translation: Option<(ProgramKey, Translation)>,
-    /// the modules made, by their source, which programs differing only in
-    /// words they never run share, and so their pipelines.
+    /// the modules made, by their source, programs differing only in words they never run share them, and so their pipelines
     modules: HashMap<String, vk::ShaderModule>,
-    /// whether draws wait for their translations and pipelines rather than
-    /// draw the same through others meanwhile.
+    /// do draws wait for their translations and pipelines instead of drawing the same thru others meanwhile
     waits: bool,
-    /// whether draws always go through the generic fragment shader, to
-    /// compare the two.
+    /// do draws always go thru the generic fragment shader, to compare the two
     generic: bool,
     compiler: Compiler,
-    /// whether the device does logic ops.
+    /// does the device do logic ops
     logic_ops: bool,
-    /// the state draws set as they go, and what sets it.
+    /// the state draws set as they go, and what sets it
     dynamic: Dynamic,
     blend_state: Option<ash::ext::extended_dynamic_state3::Device>,
     logic_op_state: Option<ash::ext::extended_dynamic_state2::Device>,
-    /// where the batch copied programs, by their fingerprints.
+    /// where the batch copied programs, by their fingerprints
     programs: QuickMap<u64, u64>,
-    /// the blocks the last draw staged, its uniforms and what else its
-    /// vertex shader read.
+    /// the blocks the last draw staged, its uniforms and whatever else its vertex shader read
     uniforms: Block,
     shading: Block,
     pipelines: QuickMap<PipelineKey, vk::Pipeline>,
-    /// the last pipeline a draw found made for its own key, which the next
-    /// draw mostly shares. a pipeline stays in the map for good.
+    /// the last pipeline a draw found made for its own key, the next draw mostly shares it, a pipeline stays in the map for good
     last_pipeline: Option<(PipelineKey, vk::Pipeline)>,
-    /// made the first time a display transfer runs here.
+    /// made the first time a display transfer runs here
     transfer: Option<Compute>,
-    /// made the first time a texture is read out of a depth buffer, with
-    /// where the samples go on the way.
+    /// made the first time a texture gets read out of a depth buffer, w/ where the samples go on the way
     depth: Option<Compute>,
-    /// made the first time a scaled screen is captured.
+    /// made the first time a scaled screen is captured
     upright: Option<Compute>,
-    /// the same writing an image, made the first time it is needed.
+    /// the same writing an image, made the first time it is needed
     upright_image: Option<Compute>,
     samples: Option<Local>,
     samplers: QuickMap<Filtering, vk::Sampler>,
-    /// the furthest a sampler's bias reaches, past which a unit's is cut.
+    /// the furthest a sampler's bias reaches, past which a unit's is cut
     max_bias: f32,
     ring: Buffer,
     used: u64,
-    /// vertex arrays kept across batches, how much of it they take, and
-    /// the arrays draws read, by address and length, see kept.
+    /// vertex arrays kept across batches, how much of it they take, and the arrays draws read, by addr and length, see kept
     heap: Buffer,
     heap_used: u64,
     arrays: QuickMap<u64, Seen>,
-    /// what the command buffer was last set to draw with.
+    /// what the command buffer was last set to draw with
     set: Set,
-    /// what each binding of the draws' descriptor set was last pushed
-    /// with in the command buffer, a view and a sampler or a buffer, where
-    /// in it and how much. the rest keep theirs when a draw pushes some,
-    /// the layout being the same for every draw.
+    /// what each binding of the draws' descriptor set was last pushed w/ in the command buffer,
+    /// a view and a sampler or a buffer, where in it and how much
+    /// the rest keep theirs when a draw pushes some, the layout's the same for every draw
     pushed: [Option<[u64; 3]>; BINDINGS],
     readback: Option<Buffer>,
     surfaces: Vec<Surface>,
-    /// by the address of the decoded texels.
+    /// by the addr of the decoded texels
     textures: QuickMap<usize, Texture>,
-    /// textures copied from surfaces, by what they are.
+    /// textures copied from surfaces, by what they are
     copies: QuickMap<DrawnTexture, Copied>,
-    /// texture pack pictures, by the hash of the textures they replace.
+    /// texture pack pictures, by the hash of the textures they replace
     replaced: HashMap<u64, Replaced>,
-    /// the bytes those take, and how many they may, half the GPU's memory.
+    /// the bytes those take, and how many they may, half the GPU's memory
     replaced_bytes: u64,
     replaced_budget: u64,
-    /// how many of them may stay, each being memory of its own, of which
-    /// some drivers give out 4096 in all.
+    /// how many of them may stay, each being memory of its own, some drivers only give out 4096 in all
     replaced_most: usize,
     /// how long the batch being recorded spent uploading them, and how many
-    /// bytes it uploaded.
+    /// bytes it uploaded
     replacing: (std::time::Duration, u64),
-    /// the buffers they were uploaded from, by batch, freed once it is done.
+    /// the buffers they were uploaded from, by batch, freed once it's done
     staged: Vec<(u64, Buffer)>,
-    /// pictures asked for and not uploaded yet, by hash, with the batch
-    /// they were last asked for in.
+    /// pictures asked for and not uploaded yet, by hash, w/ the batch they were last asked for in
     waiting: HashMap<u64, (Arc<Material>, u64)>,
     /// the batch pictures are read and uploaded again from, after the GPU
-    /// had no memory for one.
+    /// had no memory for one
     replacing_from: u64,
-    /// the widest or highest image the GPU makes.
+    /// the widest or tallest image the GPU makes
     max_image_size: u32,
-    /// what unused texture units sample.
+    /// what unused texture units sample
     blank: Image,
-    /// the tables' generation and where the batch copied them.
+    /// the tables' generation and where the batch copied them
     tables: Option<((u64, u64, u64, Read), u64)>,
-    /// a hash of each lighting table, with the generation it was taken
-    /// at, and which tables those were.
+    /// a hash of each lighting table, w/ the generation it was taken at, and which tables those were
     light_hashes: (u64, [(u64, u64); lighting::TABLES]),
     /// the sets of tables the batch copied and where, by the hashes of
-    /// the lighting tables and the generations of the others.
+    /// the lighting tables and the generations of the others
     copied_tables: Vec<(TablesKey, u64)>,
     recording: bool,
-    /// uploads waiting for a barrier before anything reads them.
+    /// uploads waiting for a barrier before anything reads them
     uploads: bool,
-    /// the color and depth surfaces being rendered into.
+    /// the color and depth surfaces being rendered into
     rendering: Option<(usize, Option<usize>)>,
-    /// what the draws do for frame interpolation.
+    /// what the draws do for frame interpolation
     pub(crate) pass: Pass,
-    /// whether draws go into twins at all, which frame interpolation turns
-    /// on for a title drawing a picture every other refresh.
+    /// do draws go into twins at all, frame interpolation turns that on for a title drawing a picture every other refresh
     twins: bool,
-    /// draws waiting to go into twins, after the rendering they follow ends,
-    /// so that each run of draws into the same buffers renders into their
-    /// twins once rather than once a draw.
+    /// draws waiting to go into twins after the rendering they follow ends,
+    /// so each run of draws into the same buffers renders into their twins once instead of once a draw
     twin_draws: Vec<Recorded>,
-    /// textures copied from twins, as copies has those from surfaces.
+    /// textures copied from twins, as copies has those from surfaces
     twin_copies: QuickMap<DrawnTexture, Copied>,
-    /// the batch the draw a draw in between follows staged its vertices
-    /// and its indices in, and where, which the one in between reads too.
+    /// the batch the draw a draw in between follows staged its vertices and indices in, and where, the one in between reads them too
     twinned_inputs: Option<(u64, Staged, Staged, bool)>,
     batch: u64,
     name: String,
-    /// how many times the console's resolution surfaces are drawn at.
+    /// how many times the console's res surfaces are drawn at
     scale: u32,
-    /// what depth buffers are drawn into, DEPTH_FORMAT, or where the GPU
-    /// can't, FLOAT_DEPTH_FORMAT.
+    /// what depth buffers get drawn into, DEPTH_FORMAT, or where the GPU can't, FLOAT_DEPTH_FORMAT
     depth_format: vk::Format,
-    /// whether the GPU can blit the color format, which scaling needs.
+    /// can the GPU blit the color format, scaling needs it
     blits: bool,
-    /// whether it can blit the depth format too. Intel's drivers for
-    /// Windows can't blit into it, so there a depth buffer is scaled on the
-    /// CPU on its way to and from memory, which is rare, and it has no image
-    /// at the console's resolution.
+    /// can it blit the depth format too
+    /// Intel's Windows drivers can't blit into it,
+    /// so there a depth buffer gets scaled on the CPU on its way to and from memory (that's rare),
+    /// and it has no image at the console's res
     depth_blits: bool,
     timing: Option<Timing>,
     barriers: u64,
-    /// whether anything that writes memory was recorded since the last
-    /// barrier, without which another one adds nothing.
+    /// was anything that writes memory recorded since the last barrier, w/o that another one adds nothing
     unfenced: bool,
     renderings: u64,
     draws: u64,
-    /// the pipelines compiled before, kept on disk between runs, so a
-    /// combination of fragment stages seen once does not stall again.
+    /// the pipelines compiled b4, kept on disk between runs, so a combination of fragment stages seen once doesn't stall again
     pipeline_cache: vk::PipelineCache,
-    /// the file they are kept in, none for nowhere.
+    /// the file they are kept in, none for nowhere
     kept_pipelines: Option<Arc<std::path::Path>>,
 }
 
 impl Hardware {
-    /// on a device of its own, keeping no pipelines, as the tests draw.
+    /// on a device of its own, keeping no pipelines, like the tests draw
     #[cfg(test)]
     pub fn new() -> Result<Hardware, String> {
         Hardware::with_device(Arc::new(own_device()?), false, None)
     }
 
-    /// draws with a device made by render_device, which the presenter may
-    /// share, and then shows screens straight from the GPU when direct. the
-    /// pipelines it compiles are kept in the file given.
+    /// draws w/ a device made by render_device, the presenter may share it, and then shows screens straight from the GPU when direct
+    /// the pipelines it compiles are kept in the file given
     pub fn with_device(shared: Arc<SharedDevice>, direct: bool, kept_pipelines: Option<std::path::PathBuf>) -> Result<Hardware, String> {
         let kept_pipelines: Option<Arc<std::path::Path>> = kept_pipelines.map(Into::into);
         let (instance, device, physical, family) = (shared.instance.clone(), shared.device.clone(), shared.physical, shared.family);
         let (logic_ops, statistics, dynamic) = (shared.logic_ops, shared.statistics, shared.dynamic);
-        // SAFETY: the physical device came from this instance
+        // safe bc the physical device came from this instance
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let push = ash::khr::push_descriptor::Device::new(&instance, &device);
 
-        // SAFETY: everything below is made from the device just created,
-        // with create infos that live as long as each call
+        // safe bc everything below is made from the device just created, w/ create infos that live as long as each call
         unsafe {
             let queue = shared.queue;
             let memory_types = instance.get_physical_device_memory_properties(physical);
@@ -1788,8 +1672,7 @@ impl Hardware {
                 spares.push((commands, fence));
             }
 
-            // the fragment stages', then the program, what else it reads and
-            // the inputs of the vertex shader
+            // the fragment stages', then the program, whatever else it reads and the vertex shader's inputs
             let bindings: Vec<_> = (0..8)
                 .map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
@@ -1842,8 +1725,7 @@ impl Hardware {
                 features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
             };
             let blits = blits_into(COLOR_FORMAT);
-            // ZAKURO_DEPTH_BLITS=0 scales depth buffers the other way all the
-            // same, to tell the two apart
+            // ZAKURO_DEPTH_BLITS=0 scales depth buffers the other way anyway, to tell the two apart
             let depth_blits = blits_into(depth_format) && std::env::var("ZAKURO_DEPTH_BLITS").map_or(true, |v| v != "0");
             if !depth_blits {
                 log::info!("the GPU can't blit depth buffers, they are scaled on the CPU on their way to and from memory");
@@ -1880,11 +1762,10 @@ impl Hardware {
                 fragment_shader,
                 depth_fragment_shader,
                 shade_shader,
-                // shading on the CPU instead, to tell the two apart. an
-                // integrated GPU does worse at it than the CPU, its draws
-                // read each vertex's inputs and uniforms out of storage
-                // buffers, a load after another. ZAKURO_GPU_SHADERS=1 has
-                // it shade all the same
+                // shading on the CPU instead, to tell the two apart
+                // an integrated GPU does worse at it than the CPU,
+                // its draws read each vertex's inputs and uniforms out of storage buffers, one load after another
+                // ZAKURO_GPU_SHADERS=1 makes it shade anyway
                 shades: match (std::env::var_os("ZAKURO_CPU_SHADERS"), std::env::var_os("ZAKURO_GPU_SHADERS")) {
                     (Some(_), _) => false,
                     (None, Some(_)) => true,
@@ -1896,8 +1777,7 @@ impl Hardware {
                 translated: QuickMap::default(),
                 last_translation: None,
                 modules: HashMap::new(),
-                // to draw through the pipeline made for each draw from the
-                // first on, as the tests do
+                // to draw thru the pipeline made for each draw from the first on, like the tests do
                 waits: cfg!(test) || std::env::var_os("ZAKURO_WAIT_FOR_SHADERS").is_some(),
                 generic: std::env::var_os("ZAKURO_GENERIC_SHADERS").is_some(),
                 compiler,
@@ -1929,8 +1809,7 @@ impl Hardware {
                 copies: QuickMap::default(),
                 replaced: HashMap::new(),
                 replaced_bytes: 0,
-                // half the GPU's own memory, up to 4 GiB, and a quarter, up
-                // to 2, of an integrated one's, which is the computer's
+                // half the GPU's own memory, up to 4 GiB, and a quarter (up to 2) of an integrated one's, which is the computer's
                 replaced_budget: {
                     let heaps = &memory_types.memory_heaps[..memory_types.memory_heap_count as usize];
                     let local = heaps.iter().filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|heap| heap.size);
@@ -2002,8 +1881,7 @@ impl Hardware {
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
                 vk::ImageAspectFlags::COLOR,
             )?;
-            // the generic pipelines, while the title starts. a draw that
-            // needs one before it is made makes it itself, as before
+            // the generic pipelines, while the title starts, a draw that needs one b4 it's made makes it itself, like b4
             if dynamic.blend && !hardware.waits {
                 for key in generic_keys(hardware.shades) {
                     let module = hardware.vertex_module(key.vertex);
@@ -2014,36 +1892,33 @@ impl Hardware {
         }
     }
 
-    /// the GPU it draws with.
+    /// the GPU it draws with
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// whether it runs vertex shaders.
+    /// does it run vertex shaders
     pub(crate) fn shades(&self) -> bool {
         self.shades
     }
 
-    /// how many times the console's resolution it draws at.
+    /// how many times the console's res it draws at
     pub fn scale(&self) -> u32 {
         self.scale
     }
 
-    /// draws at a multiple of the console's resolution, before anything is
-    /// drawn, when the GPU can scale surfaces, and says the one it took.
+    /// draws at a multiple of the console's res, b4 anything's drawn, when the GPU can scale surfaces, and says the one it took
     pub fn set_scale(&mut self, scale: u32) -> u32 {
         if self.surfaces.is_empty() && self.blits {
-            // up to 8, and no more than keeps the largest buffers, 1024
-            // pixels across, within what the GPU makes
+            // up to 8, and no more than keeps the biggest buffers (1024 pixels across) inside what the GPU makes
             self.scale = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
         }
         self.scale
     }
 
-    /// a host visible buffer, mapped for as long as it lives. one the host
-    /// reads back from is cached, reading uncached memory is slow.
+    /// a host visible buffer, mapped for as long as it lives, one the host reads back from is cached since reading uncached memory is slow
     fn buffer(&self, size: u64, usage: vk::BufferUsageFlags, readback: bool) -> Result<Buffer, String> {
-        // SAFETY: plain object creation on our device
+        // safe bc it's plain object creation on our device
         unsafe {
             let buffer = self
                 .device
@@ -2084,7 +1959,7 @@ impl Hardware {
         }
     }
 
-    /// memory with at least flags, and the flags it really has.
+    /// memory with at least flags, and the flags it really has
     fn allocate(
         &self,
         requirements: vk::MemoryRequirements,
@@ -2096,7 +1971,7 @@ impl Hardware {
             .enumerate()
             .position(|(i, t)| requirements.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(flags))
             .ok_or("no memory type fits")?;
-        // SAFETY: an allocation of a type the device reported
+        // safe bc it's an allocation of a type the device reported
         let memory = unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(index as u32),
@@ -2107,13 +1982,12 @@ impl Hardware {
         Ok((memory, types[index].property_flags))
     }
 
-    /// an image in device memory, put in the general layout by the batch
-    /// being recorded, which it never leaves.
+    /// an image in device memory, put in the general layout by the batch being recorded, it never leaves it
     fn image(&self, width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags, aspect: vk::ImageAspectFlags) -> Result<Image, String> {
         self.image_levels(width, height, 1, format, usage, aspect)
     }
 
-    /// the same with levels sizes, each half the last.
+    /// same w/ levels sizes, each half the last
     fn image_levels(
         &self,
         width: u32,
@@ -2123,8 +1997,7 @@ impl Hardware {
         usage: vk::ImageUsageFlags,
         aspect: vk::ImageAspectFlags,
     ) -> Result<Image, String> {
-        // SAFETY: plain object creation on our device, and a barrier into
-        // the command buffer being recorded
+        // safe bc it's plain object creation on our device, plus a barrier into the command buffer being recorded
         unsafe {
             let image = self
                 .device
@@ -2187,7 +2060,7 @@ impl Hardware {
     }
 
     fn destroy_image(&self, image: &Image) {
-        // SAFETY: only called once the GPU is done with the image
+        // safe bc it's only called once the GPU is done w/ the image
         unsafe {
             self.device.destroy_image_view(image.view, None);
             self.device.destroy_image(image.image, None);
@@ -2197,8 +2070,7 @@ impl Hardware {
 
     fn begin(&mut self) -> Result<(), String> {
         if !self.recording {
-            // SAFETY: the command buffer is not in use, the last batch was
-            // waited for
+            // safe bc the command buffer isn't in use, the last batch was waited for
             unsafe {
                 self.device
                     .begin_command_buffer(
@@ -2211,14 +2083,14 @@ impl Hardware {
             self.set = Set::default();
             self.pushed = [None; BINDINGS];
             self.start_timing()?;
-            // the batch before may still be running
+            // the batch b4 may still be running
             self.unfenced = true;
             self.barrier();
         }
         Ok(())
     }
 
-    /// stamps the start of a batch, when its time is being measured.
+    /// stamps the start of a batch, when its time is being measured
     fn start_timing(&mut self) -> Result<(), String> {
         let commands = self.commands;
         let Some(timing) = &mut self.timing else { return Ok(()) };
@@ -2229,14 +2101,14 @@ impl Hardware {
             }
             None => {
                 let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(TIMESTAMPS);
-                // SAFETY: a pool of ours, made once per command buffer
+                // safe bc it's a pool of ours, made once per command buffer
                 let pool = unsafe { self.device.create_query_pool(&info, None) }.map_err(vk_error("create a query pool"))?;
                 timing.pools.insert(commands, (pool, Vec::new()));
                 pool
             }
         };
         timing.current = Work::Other;
-        // SAFETY: recording, outside rendering
+        // safe bc we're recording, outside rendering
         unsafe {
             self.device.cmd_reset_query_pool(commands, pool, 0, TIMESTAMPS);
             self.device.cmd_write_timestamp2(commands, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 0);
@@ -2249,13 +2121,13 @@ impl Hardware {
                         .query_type(vk::QueryType::PIPELINE_STATISTICS)
                         .query_count(1)
                         .pipeline_statistics(STATISTICS);
-                    // SAFETY: a pool of ours, made once per command buffer
+                    // safe bc it's a pool of ours, made once per command buffer
                     let pool = unsafe { self.device.create_query_pool(&info, None) }.map_err(vk_error("create a query pool"))?;
                     statistics.insert(commands, pool);
                     pool
                 }
             };
-            // SAFETY: recording, outside rendering, ended before submitting
+            // safe bc we're recording outside rendering, ended b4 submitting
             unsafe {
                 self.device.cmd_reset_query_pool(commands, pool, 0, 1);
                 self.device.cmd_begin_query(commands, pool, 0, vk::QueryControlFlags::empty());
@@ -2264,8 +2136,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// the GPU starts on another kind of work, the time since the last
-    /// stamp goes to the kind before. ended stamps the end of the batch.
+    /// the GPU starts on another kind of work, the time since the last stamp goes to the kind b4, ended stamps the end of the batch
     fn mark(&mut self, work: Work, ended: bool) {
         let commands = self.commands;
         let Some(timing) = &mut self.timing else { return };
@@ -2274,7 +2145,7 @@ impl Hardware {
         }
         if let Some((pool, marks)) = timing.pools.get_mut(&commands) {
             if (marks.len() as u32) + 1 < TIMESTAMPS {
-                // SAFETY: recording, the query was reset when the batch began
+                // safe bc we're recording, the query was reset when the batch began
                 unsafe { self.device.cmd_write_timestamp2(commands, vk::PipelineStageFlags2::ALL_COMMANDS, *pool, marks.len() as u32 + 1) };
                 marks.push(timing.current);
             }
@@ -2282,7 +2153,7 @@ impl Hardware {
         timing.current = work;
     }
 
-    /// adds up a finished batch's times, and logs them every so many.
+    /// adds up a finished batch's times and logs them every so many
     fn add_times(&mut self, commands: vk::CommandBuffer) -> Result<(), String> {
         let barriers = std::mem::take(&mut self.barriers);
         let renderings = std::mem::take(&mut self.renderings);
@@ -2291,7 +2162,7 @@ impl Hardware {
         let Some((pool, marks)) = timing.pools.get_mut(&commands) else { return Ok(()) };
         if !marks.is_empty() {
             let mut stamps = vec![0u64; marks.len() + 1];
-            // SAFETY: the batch finished, its fence was waited for
+            // safe bc the batch finished, its fence was waited for
             unsafe {
                 self.device
                     .get_query_pool_results(*pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
@@ -2304,7 +2175,7 @@ impl Hardware {
         }
         if let Some(&pool) = timing.statistics.as_ref().and_then(|statistics| statistics.get(&commands)) {
             let mut values = [[0u64; 4]];
-            // SAFETY: the batch finished, its fence was waited for
+            // safe bc the batch finished, its fence was waited for
             unsafe {
                 self.device
                     .get_query_pool_results(pool, 0, &mut values, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
@@ -2357,8 +2228,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// makes everything recorded so far visible to everything after it,
-    /// unless nothing was recorded since the last time.
+    /// makes everything recorded so far visible to everything after it, unless nothing got recorded since last time
     fn barrier(&mut self) {
         if !std::mem::take(&mut self.unfenced) {
             return;
@@ -2369,21 +2239,20 @@ impl Hardware {
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
         self.barriers += 1;
-        // what it takes is timed on its own, then the work before goes on
+        // what it takes gets timed on its own, then the work b4 goes on
         let work = self.timing.as_ref().map(|timing| timing.current);
         self.mark(Work::Barrier, false);
-        // SAFETY: recording is on whenever this is called
+        // safe bc recording is on whenever this gets called
         unsafe { self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
         if let Some(work) = work {
             self.mark(work, false);
         }
     }
 
-    /// ends the rendering, and draws what waits to go into twins, before
-    /// anything else reads or writes them.
+    /// ends the rendering and draws what waits to go into twins, b4 anything else reads or writes them
     fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
-            // SAFETY: rendering was begun in this command buffer
+            // safe bc rendering was begun in this command buffer
             unsafe { self.device.cmd_end_rendering(self.commands) };
         }
         if !self.twin_draws.is_empty() {
@@ -2391,10 +2260,8 @@ impl Hardware {
         }
     }
 
-    /// records the draws waiting to go into twins, each run of them into
-    /// the same buffers in a rendering of its own. what they read was made
-    /// before the rendering they follow, behind its barrier, and nothing
-    /// else wrote the twins since.
+    /// records the draws waiting to go into twins, each run of them into the same buffers in a rendering of its own
+    /// what they read was made b4 the rendering they follow, behind its barrier, and nothing else wrote the twins since
     fn draw_twins(&mut self) {
         let draws = std::mem::take(&mut self.twin_draws);
         let mut into = None;
@@ -2402,7 +2269,7 @@ impl Hardware {
             let buffers = (recorded.color, recorded.depth);
             if into != Some(buffers) {
                 if into.take().is_some() {
-                    // SAFETY: begun below in this command buffer
+                    // safe bc it's begun below in this command buffer
                     unsafe { self.device.cmd_end_rendering(self.commands) };
                     self.unfenced = true;
                     self.barrier();
@@ -2422,7 +2289,7 @@ impl Hardware {
             self.record(recorded);
         }
         if into.is_some() {
-            // SAFETY: begun above in this command buffer
+            // safe bc it's begun above in this command buffer
             unsafe { self.device.cmd_end_rendering(self.commands) };
         }
         self.unfenced = true;
@@ -2430,7 +2297,7 @@ impl Hardware {
         self.twin_draws.clear();
     }
 
-    /// room for size bytes in the ring, where it starts.
+    /// room for size bytes in the ring, where it starts
     fn stage(&mut self, size: u64, align: u64) -> Result<u64, String> {
         let offset = self.used.next_multiple_of(align);
         if offset + size > self.ring.size {
@@ -2440,12 +2307,11 @@ impl Hardware {
         Ok(offset)
     }
 
-    /// where the batch holds a block's words, staged here unless they are
-    /// the words of the last block of its kind, which draws in a row mostly
-    /// share, the GPU reading those again. the ring is memory the CPU
-    /// writes past its caches, slower than gathering the words and
-    /// comparing them, and it takes a run of whole lines best, so the words
-    /// go in at once.
+    /// where the batch holds a block's words,
+    /// staged here unless they're the words of the last block of its kind (draws in a row mostly share those,
+    /// the GPU reads them again)
+    /// the ring is memory the CPU writes past its caches, slower than gathering the words and comparing them,
+    /// and it likes a run of whole lines best, so the words go in at once
     fn stage_block(&mut self, block: &mut Block, size: u64, align: u64) -> Result<u64, String> {
         debug_assert_eq!(block.words.len() as u64 * 4, size);
         if let Some(at) = block.staged() {
@@ -2460,13 +2326,12 @@ impl Hardware {
     }
 
     fn ring(&mut self, offset: u64, size: u64) -> &mut [u8] {
-        // SAFETY: the ring is mapped for its whole size and stage kept the
-        // range inside it, the GPU is not reading it while this batch is
-        // being recorded
+        // safe bc the ring is mapped for its whole size and stage kept the range inside it,
+        // the GPU isn't reading it while this batch is being recorded
         unsafe { std::slice::from_raw_parts_mut(self.ring.mapped.add(offset as usize), size as usize) }
     }
 
-    /// the surface for a guest buffer, matching guest memory.
+    /// the surface for a guest buffer, matching guest memory
     fn surface<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -2478,9 +2343,8 @@ impl Hardware {
         self.surface_rows(memory, addr, size, kind, tiled, None)
     }
 
-    /// the surface for a guest buffer, matching guest memory over the rows
-    /// of memory given, or all of them.
-    /// clears rows of memory of a surface to one pixel, on the GPU.
+    /// the surface for a guest buffer, matching guest memory over the rows of memory given, or all of them
+    /// clears rows of memory of a surface to one pixel, on the GPU
     fn clear_rows(&mut self, index: usize, rows: (u32, u32), pixel: &[u8]) -> Result<(), String> {
         self.begin()?;
         self.mark(Work::Clear, false);
@@ -2495,7 +2359,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// records clearing rows of a surface's image or its twin's.
+    /// records clearing rows of a surface's image or its twin's
     fn clear_rows_of(&mut self, index: usize, view: vk::ImageView, rows: (u32, u32), pixel: &[u8]) {
         let surface = &self.surfaces[index];
         let (width, height, kind) = (surface.width, surface.height, surface.kind);
@@ -2530,16 +2394,14 @@ impl Hardware {
                 (info.depth_attachment(&attachment[0]).stencil_attachment(&attachment[0]), clear)
             }
         };
-        // rows of memory run down from the window's top, which is the
-        // image's last row
+        // rows of memory run down from the window's top, which is the image's last row
         let rect = [vk::ClearRect::default()
             .rect(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: ((height - rows.1) * scale) as i32 },
                 extent: vk::Extent2D { width: width * scale, height: (rows.1 - rows.0) * scale },
             })
             .layer_count(1)];
-        // SAFETY: recording, outside rendering, on an image in the general
-        // layout made to be rendered into, the rectangle inside it
+        // safe bc we're recording, outside rendering, on an image in the general layout made to be rendered into, the rectangle inside it
         unsafe {
             self.unfenced = true;
             self.device.cmd_begin_rendering(self.commands, &info);
@@ -2548,8 +2410,7 @@ impl Hardware {
         }
     }
 
-    /// the height of the tallest surface of a kind at an address and width,
-    /// at least height, the one a draw of that height goes into.
+    /// the height of the tallest surface of a kind at an addr and width, at least height, the one a draw of that height goes into
     fn taller(&self, addr: u32, kind: Kind, width: u32, height: u32) -> u32 {
         self.surfaces
             .iter()
@@ -2618,8 +2479,7 @@ impl Hardware {
         if self.surfaces[index].checked {
             return Ok(index);
         }
-        // what another surface over the same memory drew has to reach guest
-        // memory before this one reads it, where this one is used
+        // what another surface over the same memory drew has to reach guest memory b4 this one reads it, where this one is used
         let size = self.surfaces[index].size();
         let row = self.surfaces[index].row_bytes();
         let (from, to) = rows.map_or((addr, size), |(start, end)| (addr + start * row, (end - start) * row));
@@ -2630,16 +2490,13 @@ impl Hardware {
             self.write_back(memory, others)?;
             self.begin()?;
         }
-        // into the last lookup's buffer, a surface's worth of bytes allocated
-        // for each costs more than reading them. compared in place where
-        // memory is in one piece, most lookups find nothing changed
+        // into the last lookup's buffer, allocating a surface's worth of bytes for each costs more than reading them
+        // compared in place where memory is in one piece, most lookups find nothing changed
         let mut bytes = std::mem::take(&mut self.scratch);
         let whole = 0..size as usize;
-        // bytes a fill wrote can hold what the shadow does, and still be
-        // newer than the image
+        // bytes a fill wrote can hold what the shadow does and still be newer than the image
         let stale = self.surfaces[index].stale.is_some();
-        // and none at all where nothing wrote over them since memory last
-        // held what the shadow does, a frame's buffers are megabytes
+        // and none at all where nothing wrote over them since memory last held what the shadow does, a frame's buffers are MBs
         let unchanged = !stale && self.surfaces[index].watch.is_some_and(|watch| memory.unchanged(addr, size, watch));
         let same = unchanged
             || (!stale && memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now)));
@@ -2649,9 +2506,8 @@ impl Hardware {
         }
         if !same && (stale || !self.surfaces[index].shadows(whole, &bytes)) {
             if self.surfaces[index].dirty.is_some() {
-                // memory changed beside rows the GPU drew and it lacks, which
-                // an upload alone would lose. they come down first, along
-                // with what changed
+                // memory changed beside rows the GPU drew and it lacks, an upload alone would lose them,
+                // they come down first along w/ what changed
                 self.write_back(memory, vec![index])?;
                 self.begin()?;
                 memory.read(addr, &mut bytes);
@@ -2661,22 +2517,20 @@ impl Hardware {
         }
         self.scratch = bytes;
         if !unchanged {
-            // memory holds what the shadow does now, until something writes
-            // over it
+            // memory holds what the shadow does now, till something writes over it
             self.surfaces[index].watch = memory.watch(addr, size);
         }
         self.surfaces[index].checked = true;
         Ok(index)
     }
 
-    /// the GPU drew rows of a surface, which other surfaces over the same
-    /// memory hold older, the next use of one looks at memory again, after
-    /// what this one drew is written back. the other buffer of the same draw
-    /// is left alone, titles pack color and depth next to each other.
+    /// the GPU drew rows of a surface that other surfaces over the same memory hold older,
+    /// the next use of one looks at memory again after what this one drew gets written back
+    /// the other buffer of the same draw is left alone, titles pack color and depth next to each other
     fn overdrawn(&mut self, index: usize, (start, end): (u32, u32), pair: Option<usize>) {
         let s = &self.surfaces[index];
         let row = s.row_bytes();
-        // whole rows of tiles, as a draw changes tiled memory
+        // whole rows of tiles, since a draw changes tiled memory
         let (start, end) = (start / 8 * 8, end.div_ceil(8).saturating_mul(8).min(s.height));
         let (addr, len) = (s.addr + start * row, end.saturating_sub(start) * row);
         for i in 0..self.surfaces.len() {
@@ -2686,13 +2540,12 @@ impl Hardware {
         }
     }
 
-    /// whether draws go into twins.
+    /// do draws go into twins
     pub(crate) fn twins(&self) -> bool {
         self.twins
     }
 
-    /// draws pictures in between into twins of the surfaces from now on,
-    /// for frame interpolation, or stops, the twins no longer different.
+    /// draws in between pictures into twins of the surfaces from now on, for frame interpolation, or stops, the twins no longer different
     pub(crate) fn set_twins(&mut self, twins: bool) {
         if !twins {
             // what waits for them goes first, it may draw into them
@@ -2707,13 +2560,12 @@ impl Hardware {
         self.twins = twins;
     }
 
-    /// whether a texture is rows of a surface with a twin.
+    /// is a texture rows of a surface w/ a twin
     fn reads_twin(&self, texture: &DrawnTexture) -> bool {
         self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].twinned)
     }
 
-    /// gives a surface a twin holding what the surface does, before a draw
-    /// in between goes into it.
+    /// gives a surface a twin holding what the surface does, b4 a draw in between goes into it
     fn make_twin(&mut self, index: usize) -> Result<(), String> {
         if self.surfaces[index].twinned {
             return Ok(());
@@ -2742,8 +2594,8 @@ impl Hardware {
             .src_subresource(layers)
             .dst_subresource(layers)
             .extent(vk::Extent3D { width, height, depth: 1 })];
-        // SAFETY: recording, outside rendering, between two images of the
-        // same size and format in the general layout made for transfers
+        // safe bc we're recording, outside rendering,
+        // between two images of the same size and format in the general layout made for transfers
         unsafe {
             self.unfenced = true;
             self.device.cmd_copy_image(self.commands, s.image.image, vk::ImageLayout::GENERAL, twin.image, vk::ImageLayout::GENERAL, &region);
@@ -2755,11 +2607,10 @@ impl Hardware {
         Ok(())
     }
 
-    /// copies a guest buffer's bytes into its surface.
+    /// copies a guest buffer's bytes into its surface
     fn upload(&mut self, index: usize, bytes: &[u8]) -> Result<(), String> {
         self.end_rendering();
-        // what drew into or cleared the surface's image in this batch comes
-        // first, the copy can go straight into the image it draws in
+        // what drew into or cleared the surface's image in this batch comes first, the copy can go straight into the image it draws in
         self.barrier();
         self.mark(Work::Upload, false);
         let (width, height, kind, tiled) = {
@@ -2789,7 +2640,7 @@ impl Hardware {
                     }
                 }
                 let regions = [region(offset, vk::ImageAspectFlags::COLOR)];
-                // SAFETY: recording, and the regions lie inside the ring
+                // safe bc we're recording, and the regions lie inside the ring
                 unsafe {
                     self.unfenced = true;
                     self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image, vk::ImageLayout::GENERAL, &regions)
@@ -2816,10 +2667,8 @@ impl Hardware {
                         }
                     }
                 }
-                // a depth buffer with no image at the console's resolution
-                // goes straight to its scaled one, scaled here the way a blit
-                // up scales, through a buffer of its own when that is more
-                // than the ring takes
+                // a depth buffer w/ no image at the console's res goes straight to its scaled one,
+                // scaled here like a blit up scales, thru a buffer of its own when that's more than the ring takes
                 let n = if self.surfaces[index].native.is_some() { 1 } else { self.scale };
                 if n > 1 {
                     values = scale_up(&values, width, height, n);
@@ -2837,8 +2686,7 @@ impl Hardware {
                 let floats = self.depth_format == FLOAT_DEPTH_FORMAT;
                 let out = match &staging {
                     Some(staging) => {
-                        // SAFETY: the buffer is mapped for its whole size,
-                        // texels * 5 bytes, and the GPU has not seen it yet
+                        // safe bc the buffer is mapped for its whole size (texels * 5 bytes) and the GPU hasn't seen it yet
                         unsafe { std::slice::from_raw_parts_mut(staging.mapped, (texels * 5) as usize) }
                     }
                     None => self.ring(depths, texels * 5),
@@ -2850,8 +2698,7 @@ impl Hardware {
                 bytes.copy_from_slice(&stencil);
                 let extent = vk::Extent3D { width: width * n, height: height * n, depth: 1 };
                 let regions = [region(depths, vk::ImageAspectFlags::DEPTH).image_extent(extent), region(stencils, vk::ImageAspectFlags::STENCIL).image_extent(extent)];
-                // SAFETY: as above, the regions lie inside the ring or the
-                // buffer made for them
+                // safe for the same reason, the regions lie inside the ring or the buffer made for them
                 unsafe {
                     self.unfenced = true;
                     self.device.cmd_copy_buffer_to_image(self.commands, buffer, image, vk::ImageLayout::GENERAL, &regions)
@@ -2872,10 +2719,9 @@ impl Hardware {
         Ok(())
     }
 
-    /// records a blit between a scaled surface and its image at the
-    /// console's resolution, up or down, taking the nearest pixel either way.
-    /// a surface with no such image, a depth buffer on a GPU that can't blit
-    /// them, is scaled on the CPU instead, see scale_up and scale_down_depth.
+    /// records a blit between a scaled surface and its image at the console's res, up or down, taking the nearest pixel either way
+    /// a surface w/ no such image (a depth buffer on a GPU that can't blit them) gets scaled on the CPU instead,
+    /// see scale_up and scale_down_depth
     fn blit(&mut self, index: usize, up: bool) {
         let s = &self.surfaces[index];
         let Some(native) = &s.native else { return };
@@ -2894,8 +2740,7 @@ impl Hardware {
             .src_offsets(from_corner)
             .dst_subresource(layers)
             .dst_offsets(to_corner)];
-        // SAFETY: recording, outside rendering, between two images of the
-        // surface's format in the general layout made for transfers
+        // safe bc we're recording, outside rendering, between two images of the surface's format in the general layout made for transfers
         unsafe {
             self.unfenced = true;
             self.device.cmd_blit_image(
@@ -2910,9 +2755,9 @@ impl Hardware {
         };
     }
 
-    /// the texture's image, uploaded the first time it is drawn with, all
-    /// its sizes, or a texture pack's picture in its place once it has been
-    /// read, with the smallest of the picture's sizes to draw with.
+    /// the texture's image, uploaded the first time it's drawn w/, all its sizes,
+    /// or a texture pack's picture in its place once it's been read,
+    /// w/ the smallest of the picture's sizes to draw w/
     fn texture(&mut self, bound: &BoundTexture) -> Result<(vk::ImageView, Option<u32>), String> {
         let size = (bound.width, bound.height);
         if let Some((view, smallest)) = bound.replacement.as_ref().and_then(|material| self.replacement(material, size)) {
@@ -2953,7 +2798,7 @@ impl Hardware {
                 Some(region)
             })
             .collect();
-        // SAFETY: recording, the regions lie inside the ring and the image
+        // safe bc we're recording, the regions lie inside the ring and the image
         unsafe {
             self.unfenced = true;
             self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image.image, vk::ImageLayout::GENERAL, &regions)
@@ -2964,10 +2809,9 @@ impl Hardware {
         Ok((view, None))
     }
 
-    /// the image of a texture pack's picture for a texture of size, and
-    /// the smallest of its sizes to draw with, uploaded once it has been
-    /// read, none until then, or while the pictures take most of the room
-    /// they may, the texture drawing as it is meanwhile.
+    /// the image of a texture pack's picture for a texture of size, and the smallest of its sizes to draw w/,
+    /// uploaded once it's been read, none till then, or while the pictures take most of the room they may,
+    /// the texture drawing as is meanwhile
     fn replacement(&mut self, material: &Arc<Material>, size: (u32, u32)) -> Option<(vk::ImageView, u32)> {
         let (hash, batch) = (material.hash(), self.batch);
         if let Some(replaced) = self.replaced.get_mut(&hash) {
@@ -2977,9 +2821,9 @@ impl Hardware {
         if self.crowded() || batch < self.replacing_from {
             return None;
         }
-        // read meanwhile, uploaded in a batch with room for it
+        // read meanwhile, uploaded in a batch w/ room for it
         self.waiting.entry(hash).or_insert_with(|| (material.clone(), batch)).1 = batch;
-        // as fine as the GPU draws the largest textures, 1024 texels across
+        // as fine as the GPU draws the biggest textures, 1024 texels across
         let kept = (1024 * self.scale).next_power_of_two().max(4096).min(self.max_image_size);
         let picture = material.picture(kept)?;
         let bytes = picture.texels.len() as u64;
@@ -2999,7 +2843,7 @@ impl Hardware {
         self.replacing = (spent + start.elapsed(), uploaded + bytes);
         match image {
             Ok(image) => {
-                // the GPU's copy is the one kept, read again should it go
+                // the GPU's copy is the one kept, read again if it goes
                 material.release();
                 self.waiting.remove(&hash);
                 self.replaced_bytes += bytes;
@@ -3009,7 +2853,7 @@ impl Hardware {
                 Some(found)
             }
             Err(error) => {
-                // memory may well come free, the picture waits until then
+                // memory may well come free, the picture waits till then
                 log::warn!("a texture pack picture can't go on the GPU yet, {error}");
                 self.replacing_from = batch + REPLACING_PAUSE;
                 None
@@ -3017,9 +2861,8 @@ impl Hardware {
         }
     }
 
-    /// uploads a picture and its smaller sizes, through the ring when there
-    /// is room, otherwise through a buffer of its own, as one can be bigger
-    /// than the ring.
+    /// uploads a picture and its smaller sizes, thru the ring when there's room,
+    /// otherwise thru a buffer of its own, since one can be bigger than the ring
     fn upload_picture(&mut self, picture: &crate::pack::Picture) -> Result<Image, String> {
         let (width, height) = (picture.width, picture.height);
         self.mark(Work::Upload, false);
@@ -3031,7 +2874,7 @@ impl Hardware {
             (self.ring.buffer, offset, None)
         } else {
             let staging = self.buffer(size, vk::BufferUsageFlags::TRANSFER_SRC, false)?;
-            // SAFETY: the buffer is mapped for its whole size, the picture's
+            // safe bc the buffer is mapped for its whole size, the picture's
             unsafe { std::ptr::copy_nonoverlapping(picture.texels.as_ptr(), staging.mapped, picture.texels.len()) };
             (staging.buffer, 0, Some(staging))
         };
@@ -3059,7 +2902,7 @@ impl Hardware {
                     .image_extent(vk::Extent3D { width: level.width, height: level.height, depth: 1 })
             })
             .collect();
-        // SAFETY: recording, the regions lie inside the buffer and the image
+        // safe bc we're recording, the regions lie inside the buffer and the image
         unsafe {
             self.unfenced = true;
             self.device.cmd_copy_buffer_to_image(self.commands, source, image.image, vk::ImageLayout::GENERAL, &regions)
@@ -3072,14 +2915,14 @@ impl Hardware {
     }
 
     fn destroy_buffer(&self, buffer: &Buffer) {
-        // SAFETY: only called once the GPU is done with the buffer
+        // safe bc it's only called once the GPU is done w/ the buffer
         unsafe {
             self.device.destroy_buffer(buffer.buffer, None);
             self.device.free_memory(buffer.memory, None);
         }
     }
 
-    /// a sampler for a unit.
+    /// a sampler for a unit
     fn sampler(&mut self, filtering: Filtering) -> Result<vk::Sampler, String> {
         if let Some(&sampler) = self.samplers.get(&filtering) {
             return Ok(sampler);
@@ -3102,14 +2945,13 @@ impl Hardware {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .min_lod(filtering.levels.0 as f32)
             .max_lod(filtering.levels.1 as f32);
-        // SAFETY: plain object creation on our device
+        // safe bc it's plain object creation on our device
         let sampler = unsafe { self.device.create_sampler(&info, None) }.map_err(vk_error("create a sampler"))?;
         self.samplers.insert(filtering, sampler);
         Ok(sampler)
     }
 
-    /// where the batch holds the current lighting tables, the ones a draw
-    /// reads, which the rest of what is staged for it lacks.
+    /// where the batch holds the current lighting tables (the ones a draw reads), the rest of what's staged for it lacks them
     fn tables(&mut self, tables: &Tables, procedural: &proctex::Tables, fog: &fog::Table, read: Read) -> Result<u64, String> {
         let generation = (tables.generation(), procedural.generation(), fog.generation(), read);
         if let Some((staged, offset)) = self.tables {
@@ -3117,11 +2959,9 @@ impl Hardware {
                 return Ok(offset);
             }
         }
-        // titles switch between a few sets of lighting tables, sending a
-        // set again each time it comes back, and a set the batch already
-        // copied is found by the hashes of its tables, each taken again
-        // only once its table changed. copying is what costs, the ring
-        // being memory the CPU writes past its caches
+        // titles switch between a few sets of lighting tables, sending a set again each time it comes back
+        // a set the batch already copied gets found by the hashes of its tables, each taken again only once its table changed
+        // copying is what costs, the ring is memory the CPU writes past its caches
         let (id, hashes) = &mut self.light_hashes;
         let other = *id != tables.id();
         *id = tables.id();
@@ -3150,11 +2990,9 @@ impl Hardware {
         let offset = self.stage(TABLES_SIZE, self.storage_alignment)?;
         let staging = self.ring(offset, TABLES_SIZE);
         let (colors, steps) = procedural.colors();
-        // each lighting table, then the others, in the places the shader
-        // reads them from, only the ones the draw reads being copied, a
-        // draw reading a few of the 24. a plain loop over each, which goes
-        // as fast as copying, a chain of flattened iterators took a
-        // quarter of a frame
+        // each lighting table, then the others, in the places the shader reads them from,
+        // only copying the ones the draw reads (a draw reads a few of the 24)
+        // a plain loop over each goes as fast as copying, a chain of flattened iterators took a quarter of a frame
         let lights = tables.entries().iter().enumerate().map(|(number, table)| (table.as_flattened(), read.light & (1 << number) != 0));
         let parts = [
             (procedural.maps().as_flattened().as_flattened(), read.procedural),
@@ -3203,8 +3041,7 @@ impl Hardware {
         Ok(pipeline)
     }
 
-    /// the pipeline for a key when the cache on disk has it, made without
-    /// compiling anything.
+    /// the pipeline for a key when the disk cache has it, made w/o compiling anything
     fn cached(&mut self, key: PipelineKey) -> Option<vk::Pipeline> {
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
@@ -3220,13 +3057,12 @@ impl Hardware {
         Some(pipeline)
     }
 
-    /// the pipeline a draw goes through. until the one made for its key is
-    /// ready the compiler makes it, and the draw goes through one that
-    /// draws the same, the interpreter's with the same fragment stages when
-    /// there is one, or else the generic fragment shader's, made right away
-    /// once per blend function and the like. a program still being
-    /// translated does not have its interpreted pipeline asked for, it
-    /// would not be used for long.
+    /// the pipeline a draw goes thru
+    /// till the one made for its key is ready the compiler makes it,
+    /// and the draw goes thru one that draws the same,
+    /// the interpreter's w/ the same fragment stages when there's one, otherwise the generic fragment shader's,
+    /// made right away once per blend function and such
+    /// a program still being translated doesn't get its interpreted pipeline asked for, it wouldn't be used for long
     fn pipeline_for(&mut self, key: PipelineKey, translating: bool) -> Result<vk::Pipeline, String> {
         let vertex = match key.vertex {
             VertexStage::Placed => VertexStage::Placed,
@@ -3265,12 +3101,12 @@ impl Hardware {
         self.pipeline(generic)
     }
 
-    /// raster.frag leaving depth to the rasterizer, and working it out.
+    /// raster.frag leaving depth to the rasterizer, and working it out
     fn fragment_modules(&self) -> [vk::ShaderModule; 2] {
         [self.fragment_shader, self.depth_fragment_shader]
     }
 
-    /// the module a vertex stage runs.
+    /// the module a vertex stage runs
     fn vertex_module(&self, vertex: VertexStage) -> vk::ShaderModule {
         match vertex {
             VertexStage::Placed => self.vertex_shader,
@@ -3279,18 +3115,15 @@ impl Hardware {
         }
     }
 
-    /// a memory fill wrote bytes at addr, a pattern of up to four bytes over
-    /// and over. a surface it covered with one value is cleared to it on the
-    /// GPU as well, rather than uploaded again the next time it is drawn
-    /// into.
+    /// a memory fill wrote bytes at addr, a pattern of up to four bytes over and over
+    /// a surface it covered w/ one value gets cleared to it on the GPU too, instead of uploaded again the next time it's drawn into
     pub(crate) fn filled(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         let end = addr as u64 + bytes.len() as u64;
         for index in 0..self.surfaces.len() {
             let surface = &self.surfaces[index];
             let size = surface.size() as usize;
             if let Some(rows) = rows_filled(surface, addr, bytes.len() as u32) {
-                // whole rows of tiles of it, cleared on the GPU, the rest of
-                // what it drew stays there
+                // whole rows of tiles of it, cleared on the GPU, the rest of what it drew stays there
                 let row = surface.row_bytes() as usize;
                 let at = (surface.addr as usize + rows.0 as usize * row) - addr as usize;
                 let filled = &bytes[at..at + (rows.1 - rows.0) as usize * row];
@@ -3300,11 +3133,9 @@ impl Hardware {
                     self.clear_rows(index, rows, &pixel)?;
                     let surface = &mut self.surfaces[index];
                     surface.keep_rows(rows.0 as usize * row..rows.1 as usize * row, &pixel);
-                    // memory holds those rows as the image does now, what
-                    // the GPU drew that has not come down is the rest. a
-                    // buffer of another shape drawn over the filled rows
-                    // does not have this one written back first, Inazuma
-                    // Eleven GO draws both screens through one every frame
+                    // memory holds those rows like the image does now, what the GPU drew that hasn't come down is the rest
+                    // a buffer of another shape drawn over the filled rows doesn't get this one written back
+                    // first, Inazuma Eleven GO draws both screens thru one every frame
                     let left = surface.dirty.and_then(|dirty| without(dirty, rows));
                     if left != surface.dirty {
                         surface.dirty = left;
@@ -3331,13 +3162,11 @@ impl Hardware {
             let offset = (surface.addr - addr) as usize;
             let filled = &bytes[offset..offset + size];
             let bpp = surface.kind.bytes() as usize;
-            // a pattern that does not line up with the pixels leaves them
-            // different from each other, and uploading handles that, what
-            // the GPU drew is gone
+            // a pattern that doesn't line up w/ the pixels leaves them different from each other and uploading
+            // handles that, what the GPU drew is gone
             if !filled.iter().enumerate().take(12).all(|(i, &b)| b == filled[i % bpp]) {
                 let surface = &mut self.surfaces[index];
-                // the image is not what memory holds, even when the fill left
-                // memory as the shadow had it, which is the same in between
+                // the image isn't what memory holds, even when the fill left memory as the shadow had it, which is the same in between
                 surface.untwin();
                 surface.shadow.clear();
                 surface.pixel = None;
@@ -3355,8 +3184,7 @@ impl Hardware {
             self.begin()?;
             self.mark(Work::Clear, false);
             self.end_rendering();
-            // SAFETY: recording, outside rendering, on an image in the
-            // general layout that allows transfers into it
+            // safe bc we're recording, outside rendering, on an image in the general layout that allows transfers into it
             unsafe {
                 match kind {
                     Kind::Color(format) => {
@@ -3390,8 +3218,7 @@ impl Hardware {
             }
             self.uploads = true;
             let surface = &mut self.surfaces[index];
-            // the pixel stands in for the bytes rather than a copy of them,
-            // and is all of it in between too
+            // the pixel stands in for the bytes instead of a copy of them, and is all of it in between too
             surface.untwin();
             surface.keep_pixel(&pixel);
             surface.dirty = None;
@@ -3405,8 +3232,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// makes sure guest memory holds what the GPU drew over a range, before
-    /// something reads it.
+    /// makes sure guest memory holds what the GPU drew over a range b4 something reads it
     pub(crate) fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         if self.surfaces.iter().any(|s| s.dirty_overlaps(addr, len)) {
             self.sync(memory, addr, len)?;
@@ -3414,12 +3240,10 @@ impl Hardware {
         Ok(())
     }
 
-    /// a fill is about to write a range, whatever the GPU drew over the part
-    /// of a buffer it leaves alone has to come down first.
+    /// a fill is about to write a range, whatever the GPU drew over the part of a buffer it leaves alone has to come down first
     pub(crate) fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, width: u32) -> Result<(), String> {
         let end = addr as u64 + len as u64;
-        // whole rows of tiles get cleared on the GPU, when the pattern lines
-        // up with the pixels
+        // whole rows of tiles get cleared on the GPU, when the pattern lines up w/ the pixels
         let cleared = |s: &Surface| s.kind.bytes().is_multiple_of(width) && rows_filled(s, addr, len).is_some();
         let partial: Vec<usize> = (0..self.surfaces.len())
             .filter(|&i| {
@@ -3427,10 +3251,8 @@ impl Hardware {
                 s.dirty_overlaps(addr, len) && (s.addr < addr || s.addr as u64 + s.size() as u64 > end) && !cleared(s)
             })
             .collect();
-        // rather than coming down now, which waits for the GPU, what it
-        // drew past the fill can come down when something needs it. Inazuma
-        // Eleven GO clears a depth buffer over the start of another every
-        // frame, which it clears whole before drawing into it again
+        // instead of coming down now (that waits for the GPU), what it drew past the fill can come down when something needs it
+        // Inazuma Eleven GO clears a depth buffer over the start of another every frame, which it clears whole b4 drawing into it again
         let written: Vec<usize> = partial.into_iter().filter(|&i| !self.surfaces[i].supersede(addr, len)).collect();
         if !written.is_empty() {
             self.write_back(memory, written)?;
@@ -3438,9 +3260,9 @@ impl Hardware {
         Ok(())
     }
 
-    /// copies the vertices the CPU shaded and placed into the batch, with
-    /// the target's pixels as clip space and w kept for perspective, then
-    /// the indices of the triangles, and says where both start.
+    /// copies the vertices the CPU shaded and placed into the batch,
+    /// w/ the target's pixels as clip space and w kept for perspective, then the triangles' indices,
+    /// and says where both start
     fn place(&mut self, vertices: &[Screen], indices: &[u32], (width, height): (f32, f32), depth_map: DepthMap) -> Result<(u64, u64), String> {
         let index_bytes = (indices.len() * 4) as u64;
         let index_offset = self.stage(index_bytes, 4)?;
@@ -3450,10 +3272,9 @@ impl Hardware {
         }
         let vertex_bytes = (vertices.len() * VERTEX_SIZE) as u64;
         let vertex_offset = self.stage(vertex_bytes, 16)?;
-        // a pixel whose center sits exactly on an edge goes to the triangle
-        // on its right, or above it for a flat edge, on the PICA, and in
-        // Vulkan to the one on its right or further down the image, so the
-        // images run bottom up
+        // a pixel whose center sits exactly on an edge goes to the triangle on its right (or above it for a flat
+        // edge) on the PICA, and in Vulkan to the one on its right or further down the image,
+        // so the images run bottom up
         let staging = self.ring(vertex_offset, vertex_bytes);
         for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(vertices) {
             let w = 1.0 / v.inv_w;
@@ -3494,48 +3315,45 @@ impl Hardware {
         Ok((vertex_offset, index_offset))
     }
 
-    /// whether programs get translated, for comparing the two, and whether
-    /// draws wait for that.
+    /// do programs get translated (for comparing the two), and do draws wait for that
     #[cfg(test)]
     pub(super) fn set_translates(&mut self, translates: bool, waits: bool) {
         self.translates = translates;
         self.waits = waits;
     }
 
-    /// how much of the heap kept arrays take.
+    /// how much of the heap kept arrays take
     #[cfg(test)]
     pub(super) fn heap_used(&self) -> u64 {
         self.heap_used
     }
 
-    /// whether draws always go through the generic fragment shader.
+    /// do draws always go thru the generic fragment shader
     #[cfg(test)]
     pub(super) fn set_generic(&mut self, generic: bool) {
         self.generic = generic;
     }
 
-    /// whether the device does logic ops, without which draws leave them out.
+    /// does the device do logic ops, w/o them draws leave them out
     #[cfg(test)]
     pub(super) fn logic_ops(&self) -> bool {
         self.logic_ops
     }
 
-    /// the programs that run translated so far.
+    /// the programs that run translated so far
     #[cfg(test)]
     pub(super) fn translations(&self) -> usize {
         self.translated.values().filter(|translation| matches!(translation, Translation::Done(_))).count()
     }
 
-    /// the pipelines made for translated programs so far.
+    /// the pipelines made for translated programs so far
     #[cfg(test)]
     pub(super) fn translated_pipelines(&self) -> usize {
         self.pipelines.keys().filter(|key| matches!(key.vertex, VertexStage::Translated(_))).count()
     }
 
-    /// the stage a draw's program runs in, and whether it is still being
-    /// translated. the first time it is seen the compiler starts translating
-    /// it, and it is interpreted until that is done, and for good if it
-    /// cannot be.
+    /// the stage a draw's program runs in, and if it's still being translated
+    /// the first time it's seen the compiler starts translating it, and it's interpreted till that's done, and for good if it can't be
     fn vertex_stage(&mut self, shading: &Shading) -> (VertexStage, bool) {
         if !self.translates {
             return (VertexStage::Interpreted, false);
@@ -3554,8 +3372,7 @@ impl Hardware {
         }
     }
 
-    /// how far a program's translation got, the compiler starting on it the
-    /// first time the program is seen.
+    /// how far a program's translation got, the compiler starting on it the first time the program is seen
     fn translation(&mut self, unit: &ShaderUnit, key: ProgramKey) -> Translation {
         if let Some(&translation) = self.translated.get(&key) {
             return translation;
@@ -3578,8 +3395,7 @@ impl Hardware {
         self.translated[&key]
     }
 
-    /// has the compiler do a job, or does it here, when waiting for it or
-    /// when there is no compiler.
+    /// has the compiler do a job, or does it here when waiting for it or when there's no compiler
     fn hand(&mut self, job: Job) {
         let job = match self.waits {
             true => job,
@@ -3592,7 +3408,7 @@ impl Hardware {
         self.take(made);
     }
 
-    /// takes in what the compiler made since last time.
+    /// takes in what the compiler made since last time
     fn collect(&mut self) {
         while self.compiler.outstanding > 0 {
             let Ok(made) = self.compiler.made.try_recv() else {
@@ -3612,7 +3428,7 @@ impl Hardware {
                     Some(&module) => module,
                     None => {
                         let info = vk::ShaderModuleCreateInfo::default().code(&words);
-                        // SAFETY: the words are SPIR-V naga made and validated
+                        // safe bc the words are SPIR-V naga made and validated
                         match unsafe { self.device.create_shader_module(&info, None) } {
                             Ok(module) => {
                                 self.modules.insert(source, module);
@@ -3637,12 +3453,11 @@ impl Hardware {
                     entry.insert(pipeline);
                 }
                 // a draw made it meanwhile
-                // SAFETY: nothing recorded uses the one just made
+                // safe bc nothing recorded uses the one just made
                 Entry::Occupied(_) => unsafe { self.device.destroy_pipeline(pipeline, None) },
             },
             Made::Compiled(key, Err(error)) => match key.vertex {
-                // a translated program the driver turns down goes back to
-                // the interpreter
+                // a translated program the driver turns down goes back to the interpreter
                 VertexStage::Translated(failed) => {
                     log::warn!("a translated vertex shader could not be used, {error}, interpreting it");
                     for translation in self.translated.values_mut() {
@@ -3657,9 +3472,8 @@ impl Hardware {
         }
     }
 
-    /// copies what the vertex shader reads into the batch, and says where
-    /// the program, the rest of what it reads, the inputs and the indices
-    /// went.
+    /// copies what the vertex shader reads into the batch, and says where the program, the rest of what it reads,
+    /// the inputs and the indices went
     fn stage_shading<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -3672,8 +3486,7 @@ impl Hardware {
             Some(&offset) => offset,
             None => {
                 let offset = self.stage(PROGRAM_BYTES, self.storage_alignment)?;
-                // the program, then its descriptors, each a run as fast as
-                // copying, a chain of the two goes a word at a time
+                // the program, then its descriptors, each a run as fast as copying, a chain of the two goes a word at a time
                 let (program, descriptors) = self.ring(offset, PROGRAM_BYTES).as_chunks_mut::<4>().0.split_at_mut(unit.program.len());
                 for (out, word) in program.iter_mut().zip(unit.program.iter()) {
                     *out = word.to_le_bytes();
@@ -3686,10 +3499,9 @@ impl Hardware {
             }
         };
 
-        // only the input registers the program reads are worked out, the
-        // others read zero. for each, the byte its attribute starts at in
-        // the first vertex, the bytes from one vertex to the next, and
-        // offset | type << 8 | count << 16, no count reading the default
+        // only the input registers the program reads get worked out, the others read zero
+        // for each, the byte its attribute starts at in the first vertex, the bytes from one vertex to the next,
+        // and offset | type << 8 | count << 16, no count reading the default
         let read = unit.inputs_read();
         let mut reads = [0usize; INPUT_REGISTERS];
         let mut count = 0;
@@ -3701,7 +3513,7 @@ impl Hardware {
         let mut attributes = [[0u32; 4]; INPUT_REGISTERS];
         let mut defaults = [crate::shader::ZERO; INPUT_REGISTERS];
         let mut starts = [0u32; 12];
-        // whether the arrays are read from the heap
+        // are the arrays read from the heap
         let mut kept = false;
         let input_bytes = match shading.inputs {
             Inputs::Decoded(decoded) => {
@@ -3719,8 +3531,7 @@ impl Hardware {
                         HEAP_SIZE
                     }
                     None => {
-                        // each array from a word on, and a word after the
-                        // last, a value can run into the word after its own
+                        // each array from a word on, plus a word after the last, a value can run into the word after its own
                         let mut total = 0;
                         for (start, &(_, len)) in starts.iter_mut().zip(&raw.arrays) {
                             *start = total;
@@ -3739,8 +3550,7 @@ impl Hardware {
                 bytes
             }
         };
-        // the arrays go in as slices, a flattened iterator has no length to
-        // reserve by and pushes a word at a time
+        // the arrays go in as slices, a flattened iterator has no length to reserve by and pushes a word at a time
         let mut block = std::mem::take(&mut self.shading);
         let words = &mut block.words;
         words.clear();
@@ -3759,10 +3569,9 @@ impl Hardware {
         self.shading = block;
         let uniforms = uniforms?;
 
-        // indices from the guest's arrays have 8 or 16 bits, and draws
-        // seldom have more vertices, so they mostly go in at half the size,
-        // the ring being memory the CPU writes past its caches. vertices in
-        // a row need none
+        // indices from the guest's arrays have 8 or 16 bits and draws rarely have more vertices,
+        // so they mostly go in at half the size, the ring being memory the CPU writes past its caches
+        // vertices in a row need none
         let count = shading.primitives.count();
         let index_type = match shading.primitives {
             Primitives::Triangles(indices) if indices.iter().fold(0, |all, &index| all | index) > 0xFFFF => {
@@ -3776,8 +3585,7 @@ impl Hardware {
             Some(_) => 2,
             None => 0,
         };
-        // the draw in between reads the vertices its own draw staged just
-        // before, only its uniforms differ
+        // the draw in between reads the vertices its own draw staged just b4, only its uniforms differ
         let index_bytes = (count * index_size) as u64;
         if let Some((batch, inputs, indices, were_kept)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
             if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes && were_kept == kept {
@@ -3794,8 +3602,7 @@ impl Hardware {
             _ if kept => {}
             Inputs::Decoded(decoded) => {
                 let staging = self.ring(inputs, input_bytes);
-                // the inner loop copies a register at a time, simple enough to
-                // run at memory speed, a vertex can have thousands of them
+                // the inner loop copies a register at a time, simple enough to run at memory speed, a vertex can have thousands of them
                 let mut out = staging.as_chunks_mut::<16>().0.iter_mut();
                 for input in decoded {
                     for &register in registers {
@@ -3826,7 +3633,7 @@ impl Hardware {
                     *out = (index as u16).to_le_bytes();
                 }
             }
-            // the guest's indices less the first, which none is below
+            // the guest's indices minus the first, none is below it
             Primitives::Raw { order: RawOrder::Indexed { bytes, short: true, first }, .. } => {
                 for (out, index) in staging.as_chunks_mut::<2>().0.iter_mut().zip(bytes.as_chunks::<2>().0) {
                     *out = u16::from_le_bytes(*index).wrapping_sub(first as u16).to_le_bytes();
@@ -3846,12 +3653,12 @@ impl Hardware {
         Ok(ShadingStaged { ranges, index_type, kept })
     }
 
-    /// where the heap has each of a draw's arrays, none when one of them is
-    /// new or something wrote over it since it was last seen, the draw then
-    /// staging them all in the ring. an array seen twice the same goes to
-    /// the heap, which later batches read it from while memory has nothing
-    /// written over it, as most of a title's models are, and the ring takes
-    /// those a title writes each frame.
+    /// where the heap has each of a draw's arrays,
+    /// none when one of them is new or something wrote over it since it was last seen,
+    /// then the draw stages them all in the ring
+    /// an array seen twice the same goes to the heap,
+    /// which later batches read it from while memory has nothing written over it (like most of a title's models),
+    /// and the ring takes the ones a title writes each frame
     fn kept<M: GpuMemory>(&mut self, memory: &mut M, raw: &RawInputs) -> Option<[u32; 12]> {
         let mut starts = [0u32; 12];
         let mut kept = true;
@@ -3861,16 +3668,14 @@ impl Hardware {
                 Some(seen) if memory.unchanged(addr, len, seen.watch) => match seen.at {
                     Some(at) => *start = at,
                     None => {
-                        // from a word on and with a word after it, as in
-                        // the ring
+                        // from a word on and w/ a word after it, like in the ring
                         let (at, room) = (self.heap_used, (len.div_ceil(4) * 4 + 4) as u64);
                         let bytes = memory.slice(addr, len as usize).filter(|_| at + room <= HEAP_SIZE);
                         let Some(bytes) = bytes else {
                             kept = false;
                             continue;
                         };
-                        // SAFETY: the heap is mapped for its whole size and
-                        // the range is inside it, past what any batch reads
+                        // safe bc the heap is mapped for its whole size and the range is inside it, past what any batch reads
                         unsafe { std::slice::from_raw_parts_mut(self.heap.mapped.add(at as usize), len as usize) }.copy_from_slice(bytes);
                         self.heap_used = at + room;
                         seen.at = Some(at as u32);
@@ -3912,17 +3717,15 @@ impl Hardware {
         if empty || right <= left || top <= bottom {
             return Ok(());
         }
-        // blocks used again add nothing to the ring, so a batch can run on
-        // past where it used to be handed over, which moves when that
-        // happens but not what is drawn
+        // blocks used again add nothing to the ring, so a batch can run on past where it used to get handed over,
+        // which moves when that happens but not what's drawn
         if self.used > RING_FLUSH {
             self.submit()?;
         }
         if self.arrays.len() > MOST_ARRAYS {
             self.arrays.retain(|_, seen| seen.at.is_some());
         }
-        // the batches reading the heap finish before it starts over, which
-        // takes far more frames than are in flight
+        // the batches reading the heap finish b4 it starts over, which takes way more frames than are in flight
         if self.heap_used > HEAP_FLUSH || self.arrays.len() > MOST_ARRAYS / 2 {
             self.submit()?;
             self.wait()?;
@@ -3931,12 +3734,10 @@ impl Hardware {
         }
         self.begin()?;
 
-        // the rows of memory the draw can touch, window rows run up from the
-        // bottom of the buffer
+        // the rows of memory the draw can touch, window rows run up from the bottom of the buffer
         let rows = ((draw.height as i32 - top) as u32, (draw.height as i32 - bottom) as u32);
-        // titles draw both screens into one buffer, the bottom one into the
-        // start of the top one's memory. a taller buffer over the same memory
-        // takes the draw, its first rows of memory are the window's top rows,
+        // titles draw both screens into one buffer, the bottom one into the start of the top one's memory
+        // a taller buffer over the same memory takes the draw, its first rows of memory are the window's top rows,
         // so the window goes up by the rows it lacks
         let height = self.taller(draw.target, Kind::Color(draw.format), draw.width, draw.height);
         let height = match draw.depth {
@@ -3958,9 +3759,8 @@ impl Hardware {
         };
         let (bottom, top) = (bottom + raise, top + raise);
 
-        // frame interpolation draws it into the twins of its buffers too, the
-        // draw in between where it moved, as it is where its buffers or what
-        // it reads have twins, which hold the picture in between
+        // frame interpolation draws it into the twins of its buffers too, the draw in between where it moved,
+        // as is where its buffers or what it reads have twins, which hold the in between picture
         let twinned = self.twins
             && match pass {
                 Pass::Real => {
@@ -3971,8 +3771,7 @@ impl Hardware {
                 Pass::Twinned | Pass::Twin => true,
             };
         if twinned {
-            // what the buffers hold before the draw, the title's own goes
-            // into them first
+            // what the buffers hold b4 the draw, the title's own goes into them first
             let made = self.make_twin(color).and_then(|()| depth.map_or(Ok(()), |depth| self.make_twin(depth)));
             if let Err(error) = made {
                 log::error!("the GPU could not draw the pictures in between, {error}");
@@ -3983,8 +3782,7 @@ impl Hardware {
             }
         }
         let twinned = twinned && self.twins;
-        // drawn here as the title made it, and into the twins here or in the
-        // draw in between that follows
+        // drawn here like the title made it, and into the twins here or in the draw in between that follows
         let real = pass != Pass::Twin;
         let twin = twinned && pass != Pass::Twinned;
 
@@ -4058,11 +3856,10 @@ impl Hardware {
             words.extend([r[base + 2], r[base], 0, 0]);
         }
         let depth_flags = depth_map.w_buffer as u32 | (shaded.is_some() as u32) << 1;
-        // the depth map goes through the viewport where it fits, and what
-        // the CPU placed carries its depth in its position, so the fragment
-        // shader leaves depth alone and the GPU skips what is hidden before
-        // shading it. a w-buffer is not linear on the screen, the fragment
-        // shader works that out as before
+        // the depth map goes thru the viewport where it fits,
+        // and what the CPU placed carries its depth in its position,
+        // so the fragment shader leaves depth alone and the GPU skips what's hidden b4 shading it
+        // a w buffer isn't linear on the screen, the fragment shader works that out like b4
         let mapped = (depth_map.offset, depth_map.offset - depth_map.scale);
         let (writes_depth, depth_range) = match draw.geometry {
             _ if depth_map.w_buffer => (true, (0.0, 1.0)),
@@ -4096,28 +3893,24 @@ impl Hardware {
         let writable = r[REG_DEPTH_STENCIL_WRITE] != 0;
         let depth_test = mask & 1 != 0;
         let depth_write = writable && mask & (1 << 12) != 0;
-        // the stencil's operations apply with its test's bit clear too, the
-        // test then passing always, see Stencil::read
+        // the stencil's ops apply w/ its test's bit clear too, the test then always passing, see Stencil::read
         let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && super::Stencil::read(r, writable).is_some();
         let stencil_compare = match r[REG_STENCIL_TEST] & 1 {
             0 => r[REG_STENCIL_TEST] & !0x70 | 0x10,
             _ => r[REG_STENCIL_TEST],
         };
-        // only the bits compile_pipeline reads, so draws that differ
-        // elsewhere share a pipeline
+        // only the bits compile_pipeline reads, so draws that differ elsewhere share a pipeline
         let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC] & 0xFFFF_0707);
         let mut logic_op = LogicOp::read(r);
         let mut color_mask = color_mask;
         if !self.logic_ops {
-            // without logic ops, a draw that keeps the colors can still just
-            // not write them
+            // w/o logic ops a draw that keeps the colors can still just not write them
             if logic_op == Some(LogicOp::Noop) {
                 color_mask = 0;
             }
             logic_op = None;
         }
-        // only the bits the shader reads, so draws that differ elsewhere
-        // share a pipeline
+        // only the bits the shader reads, so draws that differ elsewhere share a pipeline
         let mut fragment = [0u32; FRAGMENT_CONSTANTS];
         for (i, base) in STAGE_REGISTERS.into_iter().enumerate() {
             fragment[i] = r[base] & 0x0FFF_0FFF;
@@ -4130,9 +3923,8 @@ impl Hardware {
         fragment[26] = draw.lighting.is_some() as u32;
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
         fragment[28] = depth_flags | ((writes_depth as u32) * WRITES_DEPTH);
-        // what stands in for a translated program's pipeline, the
-        // interpreter, has the program staged and bound all the same. what
-        // is dynamic is set below rather than held by the pipeline
+        // what stands in for a translated program's pipeline (the interpreter) has the program staged and bound anyway
+        // what's dynamic gets set below instead of held by the pipeline
         let dynamic = self.dynamic;
         let key = PipelineKey {
             blend: blend.filter(|_| !dynamic.blend),
@@ -4165,10 +3957,9 @@ impl Hardware {
                 if depth_write || (stencil_test && writable) {
                     self.surfaces[depth].drew(rows);
                     self.overdrawn(depth, rows, Some(color));
-                    // only depth, which titles read to tell what is in view.
-                    // Super Mario 3D Land reads small color buffers back on
-                    // loading a course and stalls on what the GPU drew there,
-                    // it goes on with them as memory holds them
+                    // only depth, titles read it to tell what's in view
+                    // Super Mario 3D Land reads small color buffers back on loading a course and stalls on what
+                    // the GPU drew there, it goes on w/ them as memory holds them
                     self.surfaces[depth].guard(memory);
                     self.surfaces[depth].guard_writes(memory);
                 }
@@ -4183,13 +3974,12 @@ impl Hardware {
             }
         }
 
-        // a buffer upside down has the window's rows run from its top, a
-        // viewport of negative height turning clip space over, and the
-        // triangles that turns over cull as they would the right way up.
+        // an upside down buffer has the window's rows run from its top,
+        // a viewport of negative height flipping clip space,
+        // and the triangles that flips cull like they would right side up
         // the CPU placed its vertices that way already
         let flip = super::upside_down(draw.registers) && matches!(draw.geometry, Geometry::Shaded(_));
-        // where the PICA's viewport puts clip space, for what the GPU
-        // shades, the whole target for what the CPU placed on it
+        // where the PICA's viewport puts clip space for what the GPU shades, the whole target for what the CPU placed on it
         let (x, y, viewport_width, viewport_height) = match draw.geometry {
             Geometry::Shaded(shading) if flip => {
                 let (x, y, width, viewport_height) = shading.viewport;
@@ -4224,8 +4014,7 @@ impl Hardware {
                 extent: vk::Extent2D { width: (right - left) as u32 * scale, height: (top - bottom) as u32 * scale },
             },
             cull,
-            // with the test off the PICA still writes depth, which Vulkan
-            // only does while testing
+            // w/ the test off the PICA still writes depth, Vulkan only does that while testing
             depth_test: depth.is_some() && (depth_test || depth_write),
             depth_compare: if depth_test { COMPARES[((mask >> 4) & 7) as usize] } else { vk::CompareOp::ALWAYS },
             depth_write: depth.is_some() && depth_write,
@@ -4254,7 +4043,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// records a draw, inside the rendering into its buffers or their twins.
+    /// records a draw inside the rendering into its buffers or their twins
     fn record(&mut self, recorded: &Recorded) {
         let r = recorded;
         let image_infos: [[vk::DescriptorImageInfo; 1]; 3] = std::array::from_fn(|unit| {
@@ -4275,8 +4064,7 @@ impl Hardware {
             }
             infos
         });
-        // what each binding takes, the ones a draw the CPU placed lacks
-        // left as they were
+        // what each binding takes, the ones a draw the CPU placed lacks left as they were
         let mut bound: [Option<[u64; 3]>; BINDINGS] = [None; BINDINGS];
         for (slot, (&view, &sampler)) in bound.iter_mut().zip(r.views.iter().zip(&r.samplers)) {
             *slot = Some([vk::Handle::as_raw(view), vk::Handle::as_raw(sampler), 0]);
@@ -4327,8 +4115,7 @@ impl Hardware {
             logic_op: Some(r.logic_op),
         };
         let last = std::mem::replace(&mut self.set, set);
-        // SAFETY: recording inside rendering, with everything the draw
-        // reads staged in the ring and every image in the general layout
+        // safe bc we're recording inside rendering, w/ everything the draw reads staged in the ring and every image in the general layout
         unsafe {
             let device = &self.device;
             if last.pipeline != set.pipeline {
@@ -4410,8 +4197,7 @@ impl Hardware {
         self.rendering = Some((color, depth));
     }
 
-    /// begins rendering into views the size of a color surface, its own
-    /// image and its depth surface's or their twins.
+    /// begins rendering into views the size of a color surface, its own image and its depth surface's or their twins
     fn begin_rendering_into(&mut self, color: usize, color_view: vk::ImageView, depth_view: Option<vk::ImageView>) {
         self.renderings += 1;
         let surface = &self.surfaces[color];
@@ -4432,14 +4218,12 @@ impl Hardware {
         if let Some(depth_attachment) = &depth_attachment {
             info = info.depth_attachment(depth_attachment).stencil_attachment(depth_attachment);
         }
-        // SAFETY: recording, outside rendering, with images in the general
-        // layout
+        // safe bc we're recording, outside rendering, w/ images in the general layout
         self.unfenced = true;
         unsafe { self.device.cmd_begin_rendering(self.commands, &info) };
     }
 
-    /// runs what the batch recorded and writes everything it drew back to
-    /// guest memory.
+    /// runs what the batch recorded and writes everything it drew back to guest memory
     pub(crate) fn flush<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
         let dirty = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].dirty.is_some()).collect();
         self.write_back(memory, dirty)?;
@@ -4447,11 +4231,10 @@ impl Hardware {
         self.wait()
     }
 
-    /// lets go of what the GPU drew that guest memory lacks, memory having
-    /// been put back as a saved state had it. each buffer takes memory's
-    /// bytes at its next use.
+    /// drops what the GPU drew that guest memory lacks, memory having been put back like a save state had it,
+    /// each buffer takes memory's bytes at its next use
     pub(crate) fn forget(&mut self) {
-        // the heap starts over before the next draw
+        // the heap starts over b4 the next draw
         self.arrays.clear();
         self.heap_used = HEAP_SIZE;
         for surface in &mut self.surfaces {
@@ -4469,16 +4252,14 @@ impl Hardware {
         }
     }
 
-    /// makes guest memory right over a range something other than a draw
-    /// is about to read or write, what the GPU drew there comes down, and
-    /// the next draw looks at the memory again.
+    /// makes guest memory right over a range something other than a draw is about to read or write,
+    /// what the GPU drew there comes down, and the next draw looks at the memory again
     pub(crate) fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         self.sync_where(memory, addr, len, |_| true)
     }
 
-    /// the same over the depth buffers alone, for the CPU reading where a
-    /// depth buffer was drawn. the color buffers there it reads as memory
-    /// holds them, see draw, even over memory a depth buffer had before.
+    /// same over the depth buffers alone, for the CPU reading where a depth buffer was drawn
+    /// the color buffers there it reads as memory holds them (see draw), even over memory a depth buffer had b4
     pub(crate) fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         self.sync_where(memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_)))
     }
@@ -4500,28 +4281,25 @@ impl Hardware {
         Ok(())
     }
 
-    /// a display transfer out of a buffer the GPU holds, one it drew or an
-    /// earlier transfer wrote, done on the GPU, false when the input is
-    /// anything else, for the CPU to do. the output stays on the GPU, and a
-    /// copy of it heads for the host in the same batch, which goes to the
-    /// GPU right away without waiting for it.
+    /// a display transfer out of a buffer the GPU holds (one it drew or an earlier transfer wrote) done on the
+    /// GPU, false when the input is anything else, for the CPU to do
+    /// the output stays on the GPU, and a copy of it heads for the host in the same batch,
+    /// which goes to the GPU right away w/o waiting for it
     pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
         let t = transfer;
         let input_kind = Kind::Color(t.input_format);
         let output_kind = Kind::Color(t.output_format);
         let output_size = (t.output_width, t.output_height);
-        // a tiled output of part of a tile goes to the CPU, which leaves out
-        // the pixels the layout puts past its end, as draws do
+        // a tiled output of part of a tile goes to the CPU, which leaves out the pixels the layout puts past its end, like draws do
         let whole = t.output_width.is_multiple_of(8) && t.output_height.is_multiple_of(8);
-        // flipped, an input shorter than the output fills the output's last
-        // rows, which the CPU puts where they go
+        // flipped, an input shorter than the output fills the output's last rows, the CPU puts those where they go
         let short = t.flip && t.copy.1 < t.output_height;
         if t.copy.0 == 0 || t.copy.1 == 0 || (t.output_tiled && !whole) || short {
             return Ok(false);
         }
-        // the input rows read, from the first, which can start some rows into
-        // a buffer the GPU holds, titles draw both screens into one, a tiled
-        // buffer a row of tiles at a time
+        // the input rows read, from the first,
+        // which can start some rows into a buffer the GPU holds (titles draw both screens into one),
+        // a tiled buffer a row of tiles at a time
         let tiled = !t.input_linear;
         let rows = t.copy.1 * t.scale.1;
         let step = if tiled { 8 } else { 1 };
@@ -4540,10 +4318,10 @@ impl Hardware {
         else {
             return Ok(false);
         };
-        // rows read where the output goes, the CPU does in order. the rest
-        // of the input's buffer can be under the output, Monster Hunter 3
-        // Ultimate puts the bottom screen right before the rows it reads, and
-        // the output drawn over them is the overdrawn below
+        // rows read where the output goes, the CPU does in order
+        // the rest of the input's buffer can be under the output,
+        // Monster Hunter 3 Ultimate puts the bottom screen right b4 the rows it reads,
+        // and the output drawn over them is the overdrawn below
         let row_bytes = (input_size.0 * input_kind.bytes()) as u64;
         let read_start = addr as u64 + row as u64 * row_bytes;
         let read_end = read_start + rows as u64 * row_bytes;
@@ -4554,15 +4332,14 @@ impl Hardware {
         self.begin()?;
         // a flush looking one of them up drops what the other had checked
         let (source, target) = loop {
-            // the rows it reads, what is drawn over the rest stays on the GPU
+            // the rows it reads, what's drawn over the rest stays on the GPU
             let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, Some((row, row + rows)))?;
             let target = self.surface(memory, t.output, output_size, output_kind, t.output_tiled)?;
             if self.surfaces[source].checked && self.surfaces[target].checked {
                 break (source, target);
             }
         };
-        // drawn scaled, every size and row is that many times more, and the
-        // pixels averaged stay as many
+        // drawn scaled, every size and row is that many times more, and the pixels averaged stay as many
         let n = self.scale as i32;
         let constants: [i32; 11] = [
             t.copy.0 as i32 * n,
@@ -4578,8 +4355,7 @@ impl Hardware {
             row as i32 * n,
             input_size.1 as i32 * n,
         ];
-        // and in between, from the input's twin into the output's, which
-        // holds what the output did before
+        // and in between, from the input's twin into the output's, which holds what the output did b4
         let twinned = self.twins && (self.surfaces[source].twinned || self.surfaces[target].twinned);
         let twinned = twinned
             && match self.make_twin(target) {
@@ -4601,8 +4377,7 @@ impl Hardware {
         self.surfaces[target].guard_writes(memory);
         self.overdrawn(target, (0, self.surfaces[target].height), None);
         self.capture(target)?;
-        // turned upright for showing at any scale, at the console's own too
-        // that beats the CPU waiting for the GPU and decoding the buffer
+        // turned upright for showing at any scale, at the console's own too, that beats the CPU waiting for the GPU and decoding the buffer
         self.capture_screen(target)?;
         if twinned && self.direct {
             self.upright_image(target, true)?;
@@ -4611,8 +4386,7 @@ impl Hardware {
         Ok(true)
     }
 
-    /// records the transfer shader going over size pixels, from one image
-    /// to another, as the constants say.
+    /// records the transfer shader going over size pixels, from one image to another, like the constants say
     fn dispatch_transfer(&mut self, (source, target): (vk::ImageView, vk::ImageView), constants: [i32; 11], size: (u32, u32)) -> Result<(), String> {
         self.mark(Work::Transfer, false);
         let (layout, pipeline) = self.transfer_pipeline()?;
@@ -4633,8 +4407,7 @@ impl Hardware {
         for (bytes, constant) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(constants) {
             *bytes = constant.to_le_bytes();
         }
-        // SAFETY: recording, outside rendering, on images in the general
-        // layout made for storage
+        // safe bc we're recording, outside rendering, on images in the general layout made for storage
         unsafe {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
@@ -4645,14 +4418,12 @@ impl Hardware {
         Ok(())
     }
 
-    /// the surface a texture is rows of, and the row it starts at, when
-    /// they line up the way the PICA lays both out.
-    /// a color buffer in its own format, or a depth buffer whose samples
-    /// are as wide as the texture's pixels, d24s8 read as rgba8 or d24 as
-    /// rgb8. a texture can reach past a color buffer's last row, as a
-    /// texture's sides are powers of two and the buffer drawn into it need
-    /// not be, Inazuma Eleven GO reads 800 rows drawn as 1024, one holding
-    /// all of it goes first.
+    /// the surface a texture is rows of, and the row it starts at, when they line up like the PICA lays both out
+    /// a color buffer in its own format, or a depth buffer whose samples are as wide as the texture's pixels,
+    /// d24s8 read as rgba8 or d24 as rgb8
+    /// a texture can reach past a color buffer's last row,
+    /// since a texture's sides are powers of two and the buffer drawn into it needn't be,
+    /// Inazuma Eleven GO reads 800 rows drawn as 1024, one holding all of it goes first
     fn texture_source(&self, texture: &DrawnTexture) -> Option<(usize, u32)> {
         let depth = match texture.format {
             ColorFormat::Rgba8 => Some(Kind::Depth(4)),
@@ -4674,16 +4445,15 @@ impl Hardware {
             .max_by_key(|&(i, row)| (row + texture.height <= self.surfaces[i].height, newest(&self.surfaces[i], (row, row + texture.height))))
     }
 
-    /// whether the surface a texture is rows of holds all of its rows.
+    /// does the surface a texture is rows of hold all of its rows
     pub(crate) fn covers(&self, texture: &DrawnTexture) -> bool {
         self.texture_source(texture).is_some_and(|(index, row)| row + texture.height <= self.surfaces[index].height)
     }
 
-    /// whether a texture is rows of a surface the GPU drew and guest memory
-    /// has not got back, which draw then copies on the GPU. rows a fill
-    /// cleared of it hold what memory held then, when memory may have
-    /// changed there since, or another surface drew over them, the texture
-    /// comes from memory once what was drawn is written back.
+    /// is a texture rows of a surface the GPU drew and guest memory didn't get back, draw then copies it on the GPU
+    /// rows a fill cleared of it hold what memory held then,
+    /// when memory may have changed there since or another surface drew over them,
+    /// the texture comes from memory once what was drawn is written back
     pub(crate) fn holds(&self, texture: &DrawnTexture) -> bool {
         let Some((index, row)) = self.texture_source(texture) else { return false };
         let surface = &self.surfaces[index];
@@ -4700,13 +4470,11 @@ impl Hardware {
         surface.dirty.is_some() && !changed && !stale
     }
 
-    /// whether a texture is rows of a color surface guest memory got back
-    /// and has not changed since, which draw then copies on the GPU as it
-    /// does one memory lacks, at the scale it was drawn. a game that reads
-    /// its frame as a texture narrower than it was drawn, which writes the
-    /// frame back, then draws the frame over itself as a texture its own
-    /// width, would otherwise have the console's resolution in memory take
-    /// the place of the scaled frame.
+    /// is a texture rows of a color surface guest memory got back and that hasn't changed since,
+    /// draw then copies it on the GPU like one memory lacks, at the scale it was drawn
+    /// a game that reads its frame as a texture narrower than it was drawn (which writes the frame back) then
+    /// draws the frame over itself as a texture its own width would otherwise have the console's res in memory
+    /// replace the scaled frame
     pub(crate) fn holds_unchanged<M: GpuMemory>(&self, memory: &mut M, texture: &DrawnTexture) -> bool {
         let Some((index, row)) = self.texture_source(texture) else { return false };
         let surface = &self.surfaces[index];
@@ -4716,7 +4484,7 @@ impl Hardware {
         let row_bytes = surface.row_bytes();
         let rows = (surface.height - row).min(texture.height);
         let (at, len) = (surface.addr + row * row_bytes, rows * row_bytes);
-        // memory behind another surface drawn over it says nothing of this one
+        // memory behind another surface drawn over it says nothing about this one
         if (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(at, len)) {
             return false;
         }
@@ -4729,10 +4497,9 @@ impl Hardware {
         surface.shadows(range, &now)
     }
 
-    /// the image of a texture copied from the surface it is part of, copied
-    /// again whenever the surface changed. a texture reaching past the
-    /// surface's last row has the rows past it as memory holds them. a twin
-    /// one is copied from the surface's twin, when it has one.
+    /// the image of a texture copied from the surface it's part of, copied again whenever the surface changed
+    /// a texture reaching past the surface's last row has the rows past it as memory holds them,
+    /// a twin one gets copied from the surface's twin when it has one
     fn copy_texture(&mut self, texture: &DrawnTexture, bound: &BoundTexture, twin: bool) -> Result<vk::ImageView, String> {
         self.mark(Work::Copy, false);
         let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
@@ -4769,8 +4536,7 @@ impl Hardware {
         }
         let (view, image) = (self.copies(twin)[texture].image.view, self.copies(twin)[texture].image.image);
         if memory.is_some() {
-            // the rows past the surface as memory has them, scaled up, the
-            // copy's rows run as memory's do
+            // the rows past the surface as memory has them, scaled up, the copy's rows run like memory's do
             self.texture(bound)?;
             let key = Arc::as_ptr(&bound.texels) as *const u8 as usize;
             let from = self.textures.get(&key).ok_or("a texture reaching past the buffer drawn into it was not uploaded")?.image.image;
@@ -4783,8 +4549,8 @@ impl Hardware {
             };
             let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
             let region = [vk::ImageBlit::default().src_subresource(layers).src_offsets(rect(1)).dst_subresource(layers).dst_offsets(rect(n))];
-            // SAFETY: recording, outside rendering, between two color images
-            // in the general layout made for transfers, both their size
+            // safe bc we're recording, outside rendering,
+            // between two color images in the general layout made for transfers, both their size
             unsafe {
                 self.unfenced = true;
                 self.device.cmd_blit_image(
@@ -4801,9 +4567,8 @@ impl Hardware {
         if let Kind::Depth(bytes) = self.surfaces[source].kind {
             self.copy_depth(source, row, bytes, view, texture, twin)?;
         } else {
-            // the texture's rows run top first, the surface's bottom first,
-            // so the copy flips them, and its pixels round to the format as
-            // memory would have them
+            // the texture's rows run top first, the surface's bottom first, so the copy flips them,
+            // and its pixels round to the format like memory would have them
             let format = format_index(texture.format);
             let n = self.scale;
             let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
@@ -4822,7 +4587,7 @@ impl Hardware {
         Ok(view)
     }
 
-    /// the textures copied from surfaces, or from their twins.
+    /// the textures copied from surfaces, or from their twins
     fn copies(&mut self, twin: bool) -> &mut QuickMap<DrawnTexture, Copied> {
         match twin {
             true => &mut self.twin_copies,
@@ -4830,7 +4595,7 @@ impl Hardware {
         }
     }
 
-    /// a surface's image, or its twin's.
+    /// a surface's image, or its twin's
     fn surface_view(&self, index: usize, twin: bool) -> vk::ImageView {
         let surface = &self.surfaces[index];
         match &surface.twin {
@@ -4839,9 +4604,9 @@ impl Hardware {
         }
     }
 
-    /// records a texture read out of a depth surface, its depth and stencil
-    /// copied into a buffer and then made into the colors their bytes read
-    /// as, or out of its twin.
+    /// records a texture read out of a depth surface,
+    /// its depth and stencil copied into a buffer and then made into the colors their bytes read as,
+    /// or out of its twin
     #[allow(clippy::too_many_arguments)]
     fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture, twin: bool) -> Result<(), String> {
         let n = self.scale;
@@ -4880,9 +4645,9 @@ impl Hardware {
         let floats = self.depth_format == FLOAT_DEPTH_FORMAT;
         let constants = [texture_width as i32, texture_height as i32, width as i32, height as i32, (row * n) as i32, (bytes == 4) as i32, floats as i32];
         let constants: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
-        // SAFETY: recording, outside rendering, from a depth image in the
-        // general layout into a buffer big enough for both aspects, then a
-        // barrier before the shader reads it
+        // safe bc we're recording, outside rendering,
+        // from a depth image in the general layout into a buffer big enough for both aspects,
+        // then a barrier b4 the shader reads it
         unsafe {
             let surface = &self.surfaces[source];
             let image = match &surface.twin {
@@ -4901,7 +4666,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// records a copy of a surface for the host to read later.
+    /// records a copy of a surface for the host to read later
     fn capture(&mut self, index: usize) -> Result<(), String> {
         self.mark(Work::Capture, false);
         let (width, height) = (self.surfaces[index].width, self.surfaces[index].height);
@@ -4928,8 +4693,7 @@ impl Hardware {
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-        // SAFETY: recording, outside rendering, into a buffer the size of
-        // the image, which the host reads only once this batch is done
+        // safe bc we're recording, outside rendering, into a buffer the size of the image, the host only reads it once this batch is done
         unsafe {
             self.unfenced = true;
             self.device.cmd_copy_image_to_buffer(self.commands, source, vk::ImageLayout::GENERAL, capture.buffer.buffer, &region);
@@ -4940,7 +4704,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// records a copy of a scaled surface turned upright, for showing it.
+    /// records a copy of a scaled surface turned upright, for showing it
     fn capture_screen(&mut self, index: usize) -> Result<(), String> {
         if self.direct {
             return self.upright_image(index, false);
@@ -4977,9 +4741,9 @@ impl Hardware {
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-        // SAFETY: recording, outside rendering, from an image in the general
-        // layout into a buffer the size of the screen, which the host reads
-        // only once this batch is done
+        // safe bc we're recording, outside rendering,
+        // from an image in the general layout into a buffer the size of the screen,
+        // the host only reads it once this batch is done
         unsafe {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
@@ -4993,10 +4757,8 @@ impl Hardware {
         Ok(())
     }
 
-    /// records a surface turned upright into the image a presenter sharing
-    /// the device draws it from, or its twin into the twin's. the batch's
-    /// first barrier waits for the presents submitted before, which may
-    /// still read the image.
+    /// records a surface turned upright into the image a presenter sharing the device draws it from, or its twin into the twin's
+    /// the batch's first barrier waits for the presents submitted b4, which may still read the image
     fn upright_image(&mut self, index: usize, twin: bool) -> Result<(), String> {
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
@@ -5041,9 +4803,8 @@ impl Hardware {
                 .image_info(&target),
         ];
         let constants: Vec<u8> = [width as i32, height as i32].iter().flat_map(|c| c.to_le_bytes()).collect();
-        // SAFETY: recording, outside rendering, between two images in the
-        // general layout, the presenter reads the target only in a later
-        // submission, behind a barrier of its own
+        // safe bc we're recording, outside rendering, between two images in the general layout,
+        // the presenter only reads the target in a later submission, behind a barrier of its own
         unsafe {
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
@@ -5054,13 +4815,12 @@ impl Hardware {
         Ok(())
     }
 
-    /// whether screens are shown straight from images on the GPU.
+    /// are screens shown straight from images on the GPU
     pub(crate) fn direct(&self) -> bool {
         self.direct
     }
 
-    /// the image a screen's picture, or the picture in between, is upright
-    /// in, read back, and its width. it waits for the GPU.
+    /// the image a screen's picture (or the in between one) is upright in, read back, and its width, it waits for the GPU
     pub(crate) fn upright_pixels(&mut self, screen: ScreenRef, twin: bool) -> Result<(Vec<u8>, u32), String> {
         let (row_pixels, rows) = screen.size;
         let index = self.surfaces.iter().position(|s| s.addr == screen.addr && s.width == row_pixels && s.height == rows).ok_or("no surface")?;
@@ -5083,15 +4843,14 @@ impl Hardware {
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-        // SAFETY: recording, outside rendering, into a buffer the image fits
+        // safe bc we're recording, outside rendering, into a buffer the image fits
         unsafe {
             self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, buffer.buffer, &[region]);
             self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host));
         }
         self.submit()?;
         self.wait()?;
-        // SAFETY: the GPU is done with the buffer, which is mapped and goes
-        // right after
+        // safe bc the GPU is done w/ the buffer, which is mapped and goes right after
         unsafe {
             if buffer.incoherent {
                 let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
@@ -5104,25 +4863,22 @@ impl Hardware {
         }
     }
 
-    /// the image a screen's picture is upright in, for a presenter sharing
-    /// the device, and where the screen's pixels lie in it. none once a later
-    /// picture took its image. the batch that drew it goes to the GPU first,
-    /// so it runs before whatever the presenter submits next.
+    /// the image a screen's picture is upright in, for a presenter sharing the device,
+    /// and where the screen's pixels lie in it, none once a later picture took its image
+    /// the batch that drew it goes to the GPU first, so it runs b4 whatever the presenter submits next
     pub(crate) fn screen_image(&mut self, screen: ScreenRef) -> Result<Option<crate::GpuScreen>, String> {
         self.upright_screen(screen, false)
     }
 
-    /// a screen's picture or the picture in between, upright RGBA the way
-    /// the screen shows it, and the scale it is at, read back from the GPU,
-    /// which it waits for.
+    /// a screen's picture or the in between one, upright RGBA like the screen shows it, plus the scale it's at,
+    /// read back from the GPU, which it waits for
     pub(crate) fn upright_picture(&mut self, screen: ScreenRef, between: bool) -> Option<Picture> {
         let (pixels, _) = self.upright_pixels(screen, between).ok()?;
         Some((crop(Arc::new(pixels), screen, self.scale), self.scale))
     }
 
-    /// the image the picture in between a screen's picture and the one
-    /// before is upright in, as screen_image has the screen's own, none
-    /// when the transfer that left it left none.
+    /// the image the picture between a screen's picture and the one b4 is upright in,
+    /// like screen_image has the screen's own, none when the transfer that left it left none
     pub(crate) fn between_image(&mut self, screen: ScreenRef) -> Result<Option<crate::GpuScreen>, String> {
         self.upright_screen(screen, true)
     }
@@ -5147,8 +4903,8 @@ impl Hardware {
         if screen.batch >= self.batch {
             self.submit()?;
         }
-        // the rows of the surface the screen shows are columns of the upright
-        // picture, the pixels of each run down it from the bottom of a row
+        // the rows of the surface the screen shows are columns of the upright picture,
+        // the pixels of each run down it from the bottom of a row
         let scale = self.scale;
         let (first, count) = screen.rows;
         let (width, height) = ((rows * scale) as f32, (row_pixels * scale) as f32);
@@ -5162,9 +4918,8 @@ impl Hardware {
     }
 
     /// the newest picture a display transfer left in a buffer for a screen,
-    /// while guest memory still holds what the transfer wrote there, or the
-    /// GPU has not written it back yet. from now on each picture it gets is
-    /// kept as its batch finishes.
+    /// while guest memory still holds what the transfer wrote there or the GPU hasn't written it back yet
+    /// from now on each picture it gets is kept as its batch finishes
     pub(crate) fn screen(&mut self, addr: u32, (width, height): (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
         // the buffer the screen is rows of, maybe some rows into it
         let row_bytes = stride * Kind::Color(format).bytes();
@@ -5195,9 +4950,8 @@ impl Hardware {
         Some(ScreenRef { addr: surface, size, format, batch, rows: (first, height), columns: width })
     }
 
-    /// a screen's picture upright, RGBA the way the screen shows it, and the
-    /// scale it is at, waiting for the GPU to finish it when it has not yet.
-    /// none once a later picture took its buffer.
+    /// a screen's picture upright, RGBA like the screen shows it, plus the scale it's at,
+    /// waiting for the GPU to finish it when it hasn't yet, none once a later picture took its buffer
     pub(crate) fn picture(&mut self, screen: ScreenRef) -> Result<Option<Picture>, String> {
         // a presenter sharing the device has the pictures, the host none
         if self.direct {
@@ -5219,7 +4973,7 @@ impl Hardware {
         if let Some(image) = picture(&self.surfaces, index) {
             return Ok(crop(image));
         }
-        // the buffer holds it until a later picture is drawn over it
+        // the buffer holds it till a later picture gets drawn over it
         if self.surfaces[index].screen.as_ref().is_none_or(|capture| capture.batch != screen.batch) {
             return Ok(None);
         }
@@ -5227,22 +4981,21 @@ impl Hardware {
         if let Some(image) = picture(&self.surfaces, index) {
             return Ok(crop(image));
         }
-        // its batch finished before a screen showed the surface
+        // its batch finished b4 a screen showed the surface
         self.read_picture(index)?;
         Ok(picture(&self.surfaces, index).and_then(crop))
     }
 
-    /// reads the picture a finished batch left in a surface's screen buffer.
+    /// reads the picture a finished batch left in a surface's screen buffer
     fn read_picture(&mut self, index: usize) -> Result<(), String> {
         let Some(capture) = self.surfaces[index].screen.as_mut() else { return Ok(()) };
         let buffer = &capture.buffer;
         if buffer.incoherent {
             let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
-            // SAFETY: the memory is mapped and the GPU is done with it
+            // safe bc the memory is mapped and the GPU is done w/ it
             unsafe { self.device.invalidate_mapped_memory_ranges(&range) }.map_err(vk_error("invalidate memory"))?;
         }
-        // SAFETY: the batch that filled the buffer is done, and nothing
-        // writes it again before this returns
+        // safe bc the batch that filled the buffer is done, and nothing writes it again b4 this returns
         let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
         capture.pictures.push_back((capture.batch, Arc::new(data.to_vec())));
         while capture.pictures.len() > 2 {
@@ -5251,7 +5004,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// the pipeline display transfers run on, made the first time.
+    /// the pipeline display transfers run on, made the first time
     fn transfer_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
         if self.transfer.is_none() {
             let images = [vk::DescriptorType::STORAGE_IMAGE; 2];
@@ -5261,8 +5014,7 @@ impl Hardware {
         Ok((transfer.layout, transfer.pipeline))
     }
 
-    /// the pipeline screens are turned upright into an image with, for a
-    /// presenter sharing the device, made the first time.
+    /// the pipeline screens get turned upright into an image w/, for a presenter sharing the device, made the first time
     fn upright_image_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
         if self.upright_image.is_none() {
             let bindings = [vk::DescriptorType::STORAGE_IMAGE; 2];
@@ -5272,8 +5024,7 @@ impl Hardware {
         Ok((upright.layout, upright.pipeline))
     }
 
-    /// the pipeline scaled screens are turned upright with, made the first
-    /// time.
+    /// the pipeline scaled screens get turned upright w/, made the first time
     fn upright_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
         if self.upright.is_none() {
             let bindings = [vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::STORAGE_BUFFER];
@@ -5283,8 +5034,7 @@ impl Hardware {
         Ok((upright.layout, upright.pipeline))
     }
 
-    /// the pipeline textures are read out of depth buffers with, made the
-    /// first time.
+    /// the pipeline textures get read out of depth buffers w/, made the first time
     fn depth_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
         if self.depth.is_none() {
             let bindings = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::STORAGE_IMAGE];
@@ -5294,11 +5044,9 @@ impl Hardware {
         Ok((depth.layout, depth.pipeline))
     }
 
-    /// a compute pipeline running spirv, with a pushed descriptor per
-    /// binding and push constants of push bytes.
+    /// a compute pipeline running spirv, w/ a pushed descriptor per binding and push constants of push bytes
     fn compute(&self, spirv: &[u8], bindings: &[vk::DescriptorType], push: u32) -> Result<Compute, String> {
-        // SAFETY: plain object creation on our device, with create infos
-        // that live as long as each call
+        // safe bc it's plain object creation on our device, w/ create infos that live as long as each call
         unsafe {
             let words = ash::util::read_spv(&mut Cursor::new(spirv)).map_err(|e| e.to_string())?;
             let shader = self
@@ -5347,25 +5095,24 @@ impl Hardware {
         }
     }
 
-    /// a buffer in the GPU's own memory of at least size bytes for depth
-    /// samples on their way to a texture, grown when it has to be.
+    /// a buffer in the GPU's own memory of at least size bytes for depth samples on their way to a texture, grown when it has to be
     fn samples(&mut self, size: u64) -> Result<vk::Buffer, String> {
         if let Some(samples) = self.samples.as_ref().filter(|samples| samples.size >= size) {
             return Ok(samples.buffer);
         }
-        // the batch before may still use the old one
+        // the batch b4 may still use the old one
         self.submit()?;
         self.wait()?;
         self.begin()?;
         if let Some(old) = self.samples.take() {
-            // SAFETY: the GPU is done with everything that used it
+            // safe bc the GPU is done w/ everything that used it
             unsafe {
                 self.device.destroy_buffer(old.buffer, None);
                 self.device.free_memory(old.memory, None);
             }
         }
         let size = size.next_power_of_two();
-        // SAFETY: plain object creation on our device
+        // safe bc it's plain object creation on our device
         unsafe {
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
             let buffer = self
@@ -5380,9 +5127,8 @@ impl Hardware {
         }
     }
 
-    /// hands the batch being recorded to the GPU without waiting for it.
-    /// recording goes on in another command buffer, once the GPU is done
-    /// with the batch that used it last.
+    /// hands the batch being recorded to the GPU w/o waiting for it
+    /// recording goes on in another command buffer, once the GPU's done w/ the batch that used it last
     fn submit(&mut self) -> Result<(), String> {
         if !self.recording {
             return Ok(());
@@ -5390,14 +5136,14 @@ impl Hardware {
         self.end_rendering();
         self.mark(Work::Other, true);
         if let Some(&pool) = self.timing.as_ref().and_then(|timing| timing.statistics.as_ref()?.get(&self.commands)) {
-            // SAFETY: begun when the batch began, outside rendering
+            // safe bc it was begun when the batch began, outside rendering
             unsafe { self.device.cmd_end_query(self.commands, pool, 0) };
         }
         self.retire_finished()?;
         if self.free.is_empty() {
             self.block(Wait::Room)?;
         }
-        // SAFETY: the command buffer is recording and gets submitted once
+        // safe bc the command buffer is recording and gets submitted once
         unsafe {
             self.device.end_command_buffer(self.commands).map_err(vk_error("end a command buffer"))?;
             let buffers = [self.commands];
@@ -5424,8 +5170,7 @@ impl Hardware {
         self.shading.at = None;
         self.batch += 1;
 
-        // textures nobody drew with for a while go, long after the GPU
-        // last used them
+        // textures nobody drew w/ for a while go, long after the GPU last used them
         let batch = self.batch;
         let stale: Vec<usize> = self.textures.iter().filter(|(_, t)| batch - t.used > 600).map(|(&k, _)| k).collect();
         for key in stale {
@@ -5446,16 +5191,14 @@ impl Hardware {
         Ok(())
     }
 
-    /// whether the pictures take most of the room they may, in bytes or in
-    /// how many there are.
+    /// do the pictures take most of the room they may, in bytes or in how many there are
     fn crowded(&self) -> bool {
         self.replaced_bytes > self.replaced_budget / 8 * 7 || self.replaced.len() > self.replaced_most / 8 * 7
     }
 
-    /// pictures read for textures no longer drawn go rather than wait in
-    /// memory to be uploaded. uploaded ones stay, unless they take most of
-    /// the room they may, when those unused for a second or so go, the
-    /// longest unused first, none a batch in flight may still read.
+    /// pictures read for textures no longer drawn go instead of waiting in memory to be uploaded
+    /// uploaded ones stay, unless they take most of the room they may, then the ones unused for a second or so go,
+    /// longest unused first, none a batch in flight may still read
     fn let_go_of_pictures(&mut self) {
         let batch = self.batch;
         self.waiting.retain(|_, (material, asked)| {
@@ -5486,7 +5229,7 @@ impl Hardware {
         }
     }
 
-    /// waits for the GPU to finish everything handed to it.
+    /// waits for the GPU to finish everything handed to it
     fn wait(&mut self) -> Result<(), String> {
         while !self.in_flight.is_empty() {
             self.block(Wait::Done)?;
@@ -5494,8 +5237,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// waits for a batch, handing it to the GPU first if it is the one
-    /// being recorded.
+    /// waits for a batch, handing it to the GPU first if it's the one being recorded
     fn wait_for(&mut self, batch: u64) -> Result<(), String> {
         if batch == self.batch {
             self.submit()?;
@@ -5506,8 +5248,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// retires the oldest batch in flight, timing the wait for it when the
-    /// GPU's times are being measured.
+    /// retires the oldest batch in flight, timing the wait for it when the GPU's times are being measured
     fn block(&mut self, why: Wait) -> Result<(), String> {
         let start = self.timing.is_some().then(std::time::Instant::now);
         self.retire_oldest()?;
@@ -5519,10 +5260,10 @@ impl Hardware {
         Ok(())
     }
 
-    /// frees the batches the GPU already finished, oldest first.
+    /// frees the batches the GPU already finished, oldest first
     fn retire_finished(&mut self) -> Result<(), String> {
         while let Some(frame) = self.in_flight.front() {
-            // SAFETY: a fence of ours, submitted with its batch
+            // safe bc it's a fence of ours, submitted w/ its batch
             let done = unsafe { self.device.get_fence_status(frame.fence) }.map_err(vk_error("ask the GPU"))?;
             if !done {
                 break;
@@ -5532,11 +5273,10 @@ impl Hardware {
         Ok(())
     }
 
-    /// waits for the oldest batch in flight and frees what it used.
+    /// waits for the oldest batch in flight and frees what it used
     fn retire_oldest(&mut self) -> Result<(), String> {
         let Some(mut frame) = self.in_flight.pop_front() else { return Ok(()) };
-        // SAFETY: the fence belongs to the batch, and the command buffer is
-        // reset only once the GPU is done with it
+        // safe bc the fence belongs to the batch, and the command buffer only gets reset once the GPU is done w/ it
         unsafe {
             self.device.wait_for_fences(&[frame.fence], true, u64::MAX).map_err(vk_error("wait for the GPU"))?;
             self.device.reset_fences(&[frame.fence]).map_err(vk_error("reset a fence"))?;
@@ -5555,8 +5295,7 @@ impl Hardware {
                 self.destroy_buffer(&buffer);
             }
         }
-        // pictures for screens are read out before a later batch can draw
-        // over them
+        // pictures for screens get read out b4 a later batch can draw over them
         for index in 0..self.surfaces.len() {
             let finished = self.surfaces[index].screen.as_ref().is_some_and(|capture| capture.watched && Some(capture.batch) == batch);
             if finished {
@@ -5566,9 +5305,8 @@ impl Hardware {
         Ok(())
     }
 
-    /// writes the given surfaces back to guest memory, from their captures
-    /// when those still hold them, else running the batch and reading them
-    /// back.
+    /// writes the given surfaces back to guest memory, from their captures when those still hold them,
+    /// otherwise running the batch and reading them back
     fn write_back<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
         self.mark(Work::Download, false);
         let (captured, others): (Vec<usize>, Vec<usize>) =
@@ -5585,27 +5323,24 @@ impl Hardware {
             let buffer = &capture.buffer;
             if buffer.incoherent {
                 let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
-                // SAFETY: the memory is mapped and the GPU is done with it
+                // safe bc the memory is mapped and the GPU is done w/ it
                 unsafe { self.device.invalidate_mapped_memory_ranges(&range) }.map_err(vk_error("invalidate memory"))?;
             }
-            // SAFETY: the batch that filled the buffer is done, and nothing
-            // writes it again before this returns
+            // safe bc the batch that filled the buffer is done, and nothing writes it again b4 this returns
             let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
             self.store(memory, i, data);
         }
         Ok(())
     }
 
-    /// runs what the batch recorded, then reads the given surfaces back and
-    /// writes them to guest memory.
+    /// runs what the batch recorded, then reads the given surfaces back and writes them to guest memory
     fn run<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
         self.begin()?;
         self.end_rendering();
 
-        // room for every surface to write back, colors as RGBA, depth as a
-        // word and stencil as a byte per sample. one with no image at the
-        // console's resolution, a depth buffer on a GPU that can't blit them,
-        // comes back at its scaled size and is scaled down here
+        // room for every surface to write back, colors as RGBA, depth as a word and stencil as a byte per sample
+        // one w/ no image at the console's res (a depth buffer on a GPU that can't blit them) comes back at its
+        // scaled size and gets scaled down here
         let scale = self.scale;
         let factor = move |s: &Surface| if scale > 1 && s.native.is_none() && matches!(s.kind, Kind::Depth(_)) { scale } else { 1 };
         let size_of = |s: &Surface| {
@@ -5618,8 +5353,7 @@ impl Hardware {
         let total: u64 = dirty.iter().map(|&i| size_of(&self.surfaces[i])).sum();
         if total > self.readback.as_ref().map_or(0, |b| b.size) {
             if let Some(old) = self.readback.take() {
-                // SAFETY: the old buffer was last used by a batch already
-                // waited for
+                // safe bc the old buffer was last used by a batch already waited for
                 unsafe {
                     self.device.destroy_buffer(old.buffer, None);
                     self.device.free_memory(old.memory, None);
@@ -5657,8 +5391,7 @@ impl Hardware {
                 ],
             };
             let image = s.native.as_ref().unwrap_or(&s.image).image;
-            // SAFETY: recording, outside rendering, into a buffer big enough
-            // for every region
+            // safe bc we're recording, outside rendering, into a buffer big enough for every region
             self.unfenced = true;
             unsafe { self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, readback, &regions) };
             offsets.push(offset);
@@ -5669,7 +5402,7 @@ impl Hardware {
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-        // SAFETY: recording
+        // safe bc we're recording
         unsafe { self.device.cmd_pipeline_barrier2(self.commands, &vk::DependencyInfo::default().memory_barriers(&to_host)) };
 
         self.submit()?;
@@ -5677,13 +5410,12 @@ impl Hardware {
         let Some(readback) = self.readback.as_ref() else { return Ok(()) };
         if readback.incoherent {
             let range = [vk::MappedMemoryRange::default().memory(readback.memory).offset(0).size(vk::WHOLE_SIZE)];
-            // SAFETY: the memory is mapped and the GPU is done with it
+            // safe bc the memory is mapped and the GPU is done w/ it
             unsafe { self.device.invalidate_mapped_memory_ranges(&range) }.map_err(vk_error("invalidate memory"))?;
         }
         let mapped = readback.mapped;
         for (&i, &offset) in dirty.iter().zip(&offsets) {
-            // SAFETY: the GPU finished writing the buffer, and the range was
-            // sized for this surface
+            // safe bc the GPU finished writing the buffer, and the range was sized for this surface
             let data = unsafe { std::slice::from_raw_parts(mapped.add(offset as usize), size_of(&self.surfaces[i]) as usize) };
             match factor(&self.surfaces[i]) {
                 1 => self.store(memory, i, data),
@@ -5697,7 +5429,7 @@ impl Hardware {
         Ok(())
     }
 
-    /// writes what the GPU read back of a surface to guest memory.
+    /// writes what the GPU read back of a surface to guest memory
     fn store<M: GpuMemory>(&mut self, memory: &mut M, index: usize, data: &[u8]) {
         // the drawing goes over some rows of a shadow a pixel stood in for
         self.surfaces[index].shadow();
@@ -5747,11 +5479,10 @@ impl Hardware {
         let addr = s.addr;
         let rows = first as usize * row..last as usize * row;
         let drawn = bytes[rows.clone()].to_vec();
-        // what was written over the buffer since the image last matched it
-        // came after the drawing and stays, the console's GPU had put its
-        // pixels in memory first. the CPU's writes and the files services
-        // read have them written back first, see guard_writes, this keeps
-        // what anything else wrote, but for bytes it left as they were
+        // what got written over the buffer since the image last matched it came after the drawing and stays,
+        // the console's GPU had put its pixels in memory first
+        // the CPU's writes and the files services read get them written back first (see guard_writes),
+        // this keeps what anything else wrote, except bytes it left as they were
         if s.shadow.len() == bytes.len() {
             let mut now = vec![0u8; rows.len()];
             memory.read(addr + rows.start as u32, &mut now);
@@ -5773,9 +5504,8 @@ impl Hardware {
         memory.write(addr + rows.start as u32, &bytes[rows.clone()]);
         let surface = &mut self.surfaces[index];
         if surface.shadow.len() == bytes.len() {
-            // the image still matches what memory held where it did before,
-            // and the rows written hold what it drew, what memory kept
-            // instead shows as a change the next time it is looked up
+            // the image still matches what memory held where it did b4, and the rows written hold what it drew,
+            // what memory kept instead shows as a change the next time it's looked up
             surface.shadow[rows].copy_from_slice(&drawn);
         } else {
             // what memory holds now, the rows drawn and the others as they were
@@ -5786,8 +5516,7 @@ impl Hardware {
         surface.guarded = None;
         surface.write_guarded = None;
         surface.cleared = None;
-        // where a fill wrote, the image is behind memory, which it takes
-        // again before it is used, whatever the shadow came to hold
+        // where a fill wrote, the image is behind memory, it takes that again b4 it's used, whatever the shadow came to hold
         if surface.stale.take().is_some() {
             surface.shadow.clear();
             surface.pixel = None;
@@ -5797,20 +5526,19 @@ impl Hardware {
     }
 }
 
-/// the range of memory to guard for the rows drawn, which joins the rows
-/// guarded before, none when they all were.
+/// the range of memory to guard for the rows drawn, which joins the rows guarded b4, none when they all were
 fn widen(guarded: &mut Option<(u32, u32)>, dirty: Option<(u32, u32)>, addr: u32, row: u32) -> Option<(u32, u32)> {
     let (start, end) = dirty?;
     if guarded.is_some_and(|(from, to)| from <= start && end <= to) {
         return None;
     }
-    // all of it, which overlaps what was guarded before and joins it
+    // all of it, which overlaps what was guarded b4 and joins it
     let (start, end) = guarded.map_or((start, end), |(from, to)| (from.min(start), to.max(end)));
     *guarded = Some((start, end));
     Some((addr + start * row, (end - start) * row))
 }
 
-/// a color format as the transfer shader numbers it, the register's value.
+/// a color format as the transfer shader numbers it, the register's value
 pub(crate) fn format_index(format: ColorFormat) -> i32 {
     match format {
         ColorFormat::Rgba8 => 0,
@@ -5825,7 +5553,7 @@ impl Drop for Hardware {
     fn drop(&mut self) {
         // the compiler first, it uses the cache, the layout and the modules
         let unclaimed = self.compiler.finish();
-        // SAFETY: waits for the GPU before anything it uses goes
+        // safe bc this waits for the GPU b4 anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
             if let Some(path) = &self.kept_pipelines {
@@ -5889,18 +5617,16 @@ impl Drop for Hardware {
                 self.device.destroy_fence(frame.fence, None);
             }
             self.device.destroy_command_pool(self.pool, None);
-            // the device goes with the last of the presenter and this
+            // the device goes w/ the last of the presenter and this
         }
     }
 }
 
-// SAFETY: the mapped pointers belong to buffers only this value uses, and
-// Vulkan handles may move between threads
+// safe bc the mapped ptrs belong to buffers only this value uses, and Vulkan handles may move between threads
 unsafe impl Send for Hardware {}
 
-/// the part of a buffer's upright picture a screen shows. a row of the
-/// buffer is a column of the picture, and a row's first pixels are the
-/// bottom of the screen, a longer row reaches past its top.
+/// the part of a buffer's upright picture a screen shows
+/// a row of the buffer is a column of the picture, and a row's first pixels are the bottom of the screen, a longer row reaches past its top
 fn crop(image: Arc<Vec<u8>>, screen: ScreenRef, scale: u32) -> Arc<Vec<u8>> {
     let (row_pixels, rows) = screen.size;
     let (first, count) = screen.rows;
@@ -5917,7 +5643,7 @@ fn crop(image: Arc<Vec<u8>>, screen: ScreenRef, scale: u32) -> Arc<Vec<u8>> {
     Arc::new(out)
 }
 
-/// the Vulkan logic op for one of the PICA's.
+/// the Vulkan logic op for one of the PICA's
 fn logic_op(op: LogicOp) -> vk::LogicOp {
     match op {
         LogicOp::Clear => vk::LogicOp::CLEAR,
@@ -5939,8 +5665,7 @@ fn logic_op(op: LogicOp) -> vk::LogicOp {
     }
 }
 
-/// texels, rows of width, at n times their size each way, each the square
-/// of them that a nearest blit up makes of it.
+/// texels, rows of width, at n times their size each way, each the square of them a nearest blit up makes of it
 fn scale_up<T: Copy>(texels: &[T], width: u32, height: u32, n: u32) -> Vec<T> {
     let (width, height, n) = (width as usize, height as usize, n as usize);
     let mut scaled = Vec::with_capacity(texels.len() * n * n);
@@ -5954,11 +5679,10 @@ fn scale_up<T: Copy>(texels: &[T], width: u32, height: u32, n: u32) -> Vec<T> {
     scaled
 }
 
-/// a depth buffer read back at n times its size, its words then its
-/// stencil bytes, at its own size, each pixel the one a nearest blit down
-/// takes, the one at the middle of the square it was scaled to. at an even
-/// n the middle falls between two texels, where GPUs' blits pick either
-/// one as their rounding goes, and this takes the one the spec's floor does.
+/// a depth buffer read back at n times its size (its words then its stencil bytes) at its own size,
+/// each pixel the one a nearest blit down takes, the one at the middle of the square it was scaled to
+/// at an even n the middle falls between two texels, where GPUs' blits pick either one as their rounding goes,
+/// and this takes the one the spec's floor does
 fn scale_down_depth(data: &[u8], width: u32, height: u32, n: u32) -> Vec<u8> {
     let (width, height, n) = (width as usize, height as usize, n as usize);
     let scaled = width * n;
@@ -5976,24 +5700,21 @@ fn scale_down_depth(data: &[u8], width: u32, height: u32, n: u32) -> Vec<u8> {
     out
 }
 
-/// the float FLOAT_DEPTH_FORMAT holds a 24-bit depth as, the one nearest
-/// what it stands for, which clearing a depth buffer to it gives in either
-/// format. d24_from_float gives the 24 bits back.
+/// the float FLOAT_DEPTH_FORMAT holds a 24 bit depth as, the one nearest what it stands for,
+/// which clearing a depth buffer to it gives in either format, d24_from_float gives the 24 bits back
 fn float_depth(d24: u32) -> f32 {
     d24 as f32 / 16_777_215.0
 }
 
-/// the 24-bit depth nearest a float one, a half going up, as depth.comp
-/// works it out too, and as DEPTH_FORMAT would hold what was drawn, give or
-/// take how the GPU rounds halves.
+/// the 24 bit depth nearest a float one, a half going up, like depth.comp works it out too,
+/// and like DEPTH_FORMAT would hold what was drawn, give or take how the GPU rounds halves
 fn d24_from_float(depth: f32) -> u32 {
     (depth as f64 * 16_777_215.0 + 0.5).floor().clamp(0.0, 16_777_215.0) as u32
 }
 
-/// whether the renderer can draw on a GPU, Vulkan 1.3, push descriptors,
-/// depth clamping and a depth format, see depth_format.
+/// can the renderer draw on a GPU, Vulkan 1.3, push descriptors, depth clamping and a depth format, see depth_format
 fn renders_on(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
-    // SAFETY: queries on a GPU of the instance
+    // safe bc these are queries on a GPU of the instance
     let (properties, features, extensions) = unsafe {
         (
             instance.get_physical_device_properties(device),
@@ -6008,13 +5729,12 @@ fn renders_on(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
         && push
 }
 
-/// the format a GPU draws depth buffers into, DEPTH_FORMAT, the console's
-/// 24 bits, or where it can't, FLOAT_DEPTH_FORMAT. Vulkan has every GPU do
-/// one of the two, AMD's and Apple's only the floats. ZAKURO_FLOAT_DEPTH set has the
-/// floats wherever the GPU does them, to tell the two apart.
+/// the format a GPU draws depth buffers into, DEPTH_FORMAT (the console's 24 bits) or where it can't, FLOAT_DEPTH_FORMAT
+/// Vulkan makes every GPU do one of the two, AMD's and Apple's only the floats
+/// ZAKURO_FLOAT_DEPTH set has the floats wherever the GPU does them, to tell the two apart
 fn depth_format(instance: &ash::Instance, device: vk::PhysicalDevice) -> Option<vk::Format> {
     let draws_into = |format| {
-        // SAFETY: a query on a GPU of the instance
+        // safe bc it's a query on a GPU of the instance
         let features = unsafe { instance.get_physical_device_format_properties(device, format) }.optimal_tiling_features;
         features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
     };
@@ -6025,18 +5745,16 @@ fn depth_format(instance: &ash::Instance, device: vk::PhysicalDevice) -> Option<
     formats.into_iter().find(|&format| draws_into(format))
 }
 
-/// whether the renderer can draw on a GPU through a family of its queues,
-/// which has to do compute as well, for display transfers.
+/// can the renderer draw on a GPU thru a family of its queues, which has to do compute too, for display transfers
 pub(crate) fn can_render(instance: &ash::Instance, device: vk::PhysicalDevice, family: u32) -> bool {
-    // SAFETY: as above
+    // safe for the same reason
     let families = unsafe { instance.get_physical_device_queue_family_properties(device) };
     let both = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
     families.get(family as usize).is_some_and(|f| f.queue_flags.contains(both)) && renders_on(instance, device)
 }
 
-/// a device the renderer draws with, on a GPU can_render or pick chose,
-/// with the extensions given besides its own. it owns the instance from then
-/// on, destroying it when it goes, which stays the caller's when it fails.
+/// a device the renderer draws w/, on a GPU can_render or pick chose, w/ the extensions given besides its own
+/// it owns the instance from then on and destroys it when it goes, the instance stays the caller's when it fails
 pub(crate) fn render_device(
     entry: &ash::Entry,
     instance: &ash::Instance,
@@ -6049,7 +5767,7 @@ pub(crate) fn render_device(
     let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
     extensions.extend_from_slice(extra);
     extensions.extend(crate::instance::portability_subset(instance, physical).map(std::ffi::CStr::as_ptr));
-    // SAFETY: the physical device came from this instance
+    // safe bc the physical device came from this instance
     let supported = unsafe { instance.get_physical_device_features(physical) };
     let logic_ops = supported.logic_op == vk::TRUE;
     let dynamic = dynamic_state(instance, physical, logic_ops);
@@ -6065,14 +5783,13 @@ pub(crate) fn render_device(
         .extended_dynamic_state3_color_write_mask(true)
         .extended_dynamic_state3_logic_op_enable(dynamic.logic_op);
     let mut logic_op_state = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default().extended_dynamic_state2_logic_op(true);
-    // what the GPU shades counted along with its times
+    // what the GPU shades counted along w/ its times
     let statistics = std::env::var_os("ZAKURO_GPU_TIMES").is_some() && supported.pipeline_statistics_query == vk::TRUE;
     let features = vk::PhysicalDeviceFeatures::default()
         .depth_clamp(true)
         .logic_op(logic_ops)
         .pipeline_statistics_query(statistics);
-    // the cache control, to make a pipeline only when the cache on disk
-    // has it, every Vulkan 1.3 device does
+    // the cache control, to make a pipeline only when the disk cache has it, every Vulkan 1.3 device does
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true)
@@ -6088,21 +5805,20 @@ pub(crate) fn render_device(
     if dynamic.logic_op {
         info = info.push_next(&mut logic_op_state);
     }
-    // SAFETY: the caller checked the device has all of this
+    // safe bc the caller checked the device has all of this
     let device = unsafe { instance.create_device(physical, &info, None) }.map_err(vk_error("create a device"))?;
-    // SAFETY: a queue the device was made with
+    // safe bc it's a queue the device was made w/
     let queue = unsafe { device.get_device_queue(family, 0) };
     let (_entry, instance) = (entry.clone(), instance.clone());
     Ok(SharedDevice { _entry, instance, physical, family, device, queue, logic_ops, statistics, dynamic })
 }
 
-/// which of the blend state the device lets draws set as they go, none
-/// with ZAKURO_STATIC_BLEND set, to compare the two.
+/// which of the blend state the device lets draws set as they go, none w/ ZAKURO_STATIC_BLEND set, to compare the two
 fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_ops: bool) -> Dynamic {
     if std::env::var_os("ZAKURO_STATIC_BLEND").is_some() {
         return Dynamic::default();
     }
-    // SAFETY: the physical device came from this instance
+    // safe bc the physical device came from this instance
     let available = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
     let has = |name: &std::ffi::CStr| available.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
     let (three, two) = (has(ash::ext::extended_dynamic_state3::NAME), has(ash::ext::extended_dynamic_state2::NAME));
@@ -6116,7 +5832,7 @@ fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_o
         if two {
             features = features.push_next(&mut supported2);
         }
-        // SAFETY: as above, with a chain of structures that live as long
+        // safe for the same reason, w/ a chain of structs that live as long
         unsafe { instance.get_physical_device_features2(physical, &mut features) };
     }
     let blend = three
@@ -6131,27 +5847,26 @@ fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_o
     Dynamic { blend, logic_op }
 }
 
-/// a device of the renderer's own, on the GPU pick chooses.
+/// a device of the renderer's own, on the GPU pick chooses
 pub(crate) fn own_device() -> Result<SharedDevice, String> {
     let entry = crate::instance::entry().map_err(|e| format!("no Vulkan loader, {e}"))?;
     let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
     let instance = crate::instance::new(&entry, &app, &[]).map_err(vk_error("create an instance"))?;
     let made = pick(&instance).and_then(|(physical, family)| render_device(&entry, &instance, physical, family, &[]));
     if made.is_err() {
-        // SAFETY: nothing made from the instance is left
+        // safe bc nothing made from the instance is left
         unsafe { instance.destroy_instance(None) };
     }
     made
 }
 
-/// the device to draw with and its graphics queue family, a discrete GPU
-/// when there is one.
+/// the device to draw w/ and its graphics queue family, a discrete GPU when there's one
 fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
-    // SAFETY: queries on an instance we own
+    // safe bc these are queries on an instance we own
     let devices = unsafe { instance.enumerate_physical_devices() }.map_err(vk_error("list the GPUs"))?;
     let mut best: Option<(u32, vk::PhysicalDevice, u32)> = None;
     for device in devices {
-        // SAFETY: as above
+        // safe for the same reason
         let (properties, families) =
             unsafe { (instance.get_physical_device_properties(device), instance.get_physical_device_queue_family_properties(device)) };
         let Some(family) = families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS)) else { continue };
@@ -6175,8 +5890,7 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
 mod tests {
     use super::*;
 
-    /// tables apart in any one entry, in its value or its step, by any
-    /// one bit, never share a hash, and the same entries always do.
+    /// tables apart in any one entry, in its value or its step, by any one bit, never share a hash, and the same entries always do
     #[test]
     fn tables_apart_in_an_entry_hash_apart() {
         let table: [[f32; 2]; 256] = std::array::from_fn(|i| [i as f32 / 4095.0, -(i as f32) / 2047.0]);
@@ -6194,9 +5908,8 @@ mod tests {
         }
     }
 
-    /// a block gathered with the words of the last one staged is read from
-    /// where that went, any other is staged anew, and nothing is read from
-    /// a batch handed over.
+    /// a block gathered w/ the words of the last one staged gets read from where that went,
+    /// any other gets staged fresh, and nothing gets read from a batch handed over
     #[test]
     fn a_block_is_staged_again_only_when_its_words_change() {
         let mut block = Block::default();
@@ -6221,10 +5934,9 @@ mod tests {
         assert_eq!(block.staged(), None, "the batch was handed over");
     }
 
-    /// what a surface keeps of guest memory, through a pixel standing in for
-    /// its shadow or not, is what the plain bytes would be, after uploads of
-    /// memory of one pixel or not, fills over all of it or rows of it, and
-    /// write-backs that have the bytes written out.
+    /// what a surface keeps of guest memory, thru a pixel standing in for its shadow or not,
+    /// is what the plain bytes would be, after uploads of memory of one pixel or not,
+    /// fills over all of it or rows of it, and write backs that have the bytes written out
     #[test]
     fn a_pixel_standing_in_for_the_shadow_keeps_what_the_bytes_would() {
         let mut seed = 3u32;
@@ -6296,7 +6008,7 @@ mod tests {
                         }
                     }
                     _ => {
-                        // a write-back, which reads the bytes and changes rows
+                        // a write back, which reads the bytes and changes rows
                         assert_eq!(*surface.shadow(), bytes.clone().unwrap_or_default(), "{kind:?} at step {step}");
                         if let Some(bytes) = &mut bytes {
                             let at = random(height as usize) * row;
@@ -6325,8 +6037,7 @@ mod tests {
         }
     }
 
-    /// the generic pipelines made at the start are every one a draw can ask
-    /// for while the blend state is dynamic.
+    /// the generic pipelines made at the start are every one a draw can ask for while the blend state is dynamic
     #[test]
     fn the_generic_pipelines_made_at_the_start_are_all_a_draw_needs() {
         let made: QuickSet<PipelineKey> = generic_keys(true).into_iter().collect();
@@ -6337,19 +6048,18 @@ mod tests {
         };
         for _ in 0..1000 {
             let mut fragment: [u32; FRAGMENT_CONSTANTS] = std::array::from_fn(|_| random());
-            // whether the draw is lit
+            // is the draw lit
             fragment[26] &= 1;
             for vertex in [VertexStage::Placed, VertexStage::Interpreted] {
                 let key = PipelineKey { blend: None, logic_op: None, mask: 0xF, depth: random() & 1 != 0, vertex, fragment };
-                // as pipeline_for asks for it
+                // like pipeline_for asks for it
                 assert!(made.contains(&PipelineKey { fragment: generic(&key.fragment), ..key }));
             }
         }
     }
 
-    /// a depth buffer scaled up and then down the way blits would comes back
-    /// the same, and going down takes the middle of each square, the pixel
-    /// a nearest blit takes.
+    /// a depth buffer scaled up and then down the way blits would comes back the same,
+    /// and going down takes the middle of each square, the pixel a nearest blit takes
     #[test]
     fn depth_scaled_up_and_down_comes_back_the_same() {
         let (width, height) = (5u32, 3u32);
@@ -6370,7 +6080,7 @@ mod tests {
             expected.extend_from_slice(&stencil);
             assert_eq!(scale_down_depth(&data, width, height, n), expected, "n {n}");
         }
-        // down, the middle of each square: x * n + n / 2, 4 * 3 + 2 at 4x
+        // down, the middle of each square, x * n + n / 2, 4 * 3 + 2 at 4x
         let n = 4;
         let mut data = vec![0u8; (width * height * n * n * 5) as usize];
         let scaled = width * n;
@@ -6383,9 +6093,8 @@ mod tests {
         assert_eq!(down[(width * height) as usize * 4 + to], 0x5A);
     }
 
-    /// every 24-bit depth held as a float comes back the same, and the
-    /// floats go up as the depths do, so depth tests against them pass and
-    /// fail as against the 24 bits.
+    /// every 24 bit depth held as a float comes back the same, and the floats go up as the depths do,
+    /// so depth tests against them pass and fail like against the 24 bits
     #[test]
     fn a_depth_held_as_a_float_comes_back_the_same() {
         let mut last = -1.0;
@@ -6398,13 +6107,12 @@ mod tests {
         assert_eq!(float_depth(0xFF_FFFF), 1.0);
     }
 
-    /// depth.comp's way of making a float into 24 bits, in floats as the
-    /// GPU works them, gives what d24_from_float does, for every float from
-    /// a half to one, where the two ways part the most, a spread of those
-    /// below, and those past either end.
+    /// depth.comp's way of making a float into 24 bits, in floats like the GPU works them,
+    /// gives what d24_from_float does, for every float from a half to one (where the two ways part the most),
+    /// a spread of those below, and those past either end
     #[test]
     fn the_depth_shader_rounds_floats_as_the_cpu_does() {
-        // as depth.comp has it
+        // like depth.comp has it
         let shader = |depth: f32| -> u32 {
             // !(depth > 0.0)
             if depth.is_nan() || depth <= 0.0 {

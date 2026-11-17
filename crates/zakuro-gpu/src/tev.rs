@@ -1,18 +1,16 @@
-//! the PICA200's texture environment, six configurable combiner stages.
+//! the PICA200's texture environment, six configurable combiner stages
 
-/// where each stage's five registers start.
+/// where each stage's five registers start
 const STAGE_REGISTERS: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
 
-/// register holding which stages write to the buffer that
-/// [Source::PreviousBuffer] reads.
+/// register holding which stages write to the buffer [Source::PreviousBuffer] reads
 const REG_UPDATE_BUFFER: usize = 0x0E0;
-/// register holding the buffer's initial color.
+/// register holding the buffer's initial color
 const REG_BUFFER_COLOR: usize = 0x0FD;
-/// the registers the environment is decoded from, each stage's five, then
-/// the buffer's update bits and its color.
+/// the registers the environment gets decoded from, each stage's five, then the buffer's update bits and its color
 const REGISTERS_READ: usize = 6 * 5 + 2;
 
-/// where one of a stage's three inputs comes from.
+/// where one of a stage's three inputs comes from
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     PrimaryColor,
@@ -41,7 +39,7 @@ impl Source {
     }
 }
 
-/// how the stages fold their inputs together.
+/// how the stages fold their inputs together
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Replace,
@@ -72,7 +70,7 @@ impl Operation {
         }
     }
 
-    /// how many of a stage's three inputs the operation reads.
+    /// how many of a stage's three inputs the operation reads
     fn inputs(self) -> usize {
         match self {
             Operation::Replace => 1,
@@ -82,7 +80,7 @@ impl Operation {
     }
 }
 
-/// one configured stage.
+/// one configured stage
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Stage {
     color_sources: [Source; 3],
@@ -96,23 +94,20 @@ struct Stage {
     alpha_scale: f32,
 }
 
-/// the whole texture environment, decoded from the register file once per
-/// draw rather than per pixel.
+/// the whole texture environment, decoded from the register file once per draw instead of per pixel
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TexEnv {
     stages: [Stage; 6],
-    /// stages that hand the previous stage's result on unchanged.
+    /// stages that hand the previous stage's result on untouched
     passthrough: [bool; 6],
-    /// whether each of the first four stages writes its color and its
-    /// alpha into the buffer later stages read as PreviousBuffer.
+    /// does each of the first four stages write its color and alpha into the buffer later stages read as PreviousBuffer
     update_color: [bool; 4],
     update_alpha: [bool; 4],
     buffer_color: [f32; 4],
 }
 
 impl Stage {
-    /// replace, taking the previous stage's color and alpha as they are,
-    /// at a scale of one, a stage that changes nothing.
+    /// replace, taking the previous stage's color and alpha as is at a scale of one, a stage that changes nothing
     fn is_passthrough(&self) -> bool {
         self.color_op == Operation::Replace
             && self.alpha_op == Operation::Replace
@@ -130,7 +125,7 @@ impl TexEnv {
         TexEnv::decode(&TexEnv::registers_read(registers))
     }
 
-    /// the registers decode takes, in its order.
+    /// the registers decode takes, in its order
     fn registers_read(registers: &[u32]) -> [u32; REGISTERS_READ] {
         let mut read = [0; REGISTERS_READ];
         for (stage, base) in STAGE_REGISTERS.into_iter().enumerate() {
@@ -171,8 +166,7 @@ impl TexEnv {
             }
         });
 
-        // bits 8-11 say which of stages 0-3 write their color into the
-        // buffer, bits 12-15 their alpha.
+        // bits 8 to 11 say which of stages 0 to 3 write their color into the buffer, bits 12 to 15 their alpha
         let update = read[30];
         TexEnv {
             stages,
@@ -183,8 +177,7 @@ impl TexEnv {
         }
     }
 
-    /// whether any stage reads the colors fragment lighting produces, when
-    /// none does there is no point in working them out.
+    /// does any stage read the colors fragment lighting makes, when none does there's no point working them out
     pub fn reads_lighting(&self) -> bool {
         let lit = |source: &Source| matches!(source, Source::PrimaryFragmentColor | Source::SecondaryFragmentColor);
         self.stages.iter().zip(self.passthrough).any(|(stage, passthrough)| {
@@ -195,14 +188,12 @@ impl TexEnv {
         })
     }
 
-    /// runs every stage for one fragment.
-    /// fragment is the primary and secondary color fragment lighting
-    /// produced, when it is on.
+    /// runs every stage for one fragment
+    /// fragment is the primary and secondary color fragment lighting made, when it's on
     pub fn apply(&self, primary: [f32; 4], textures: [[f32; 4]; 4], fragment: Option<([f32; 4], [f32; 4])>) -> [f32; 4] {
         let mut previous = primary;
-        // the buffer lags a stage behind, the first stage reads zero, the
-        // second the configured buffer color, and a stage's update is only
-        // visible to the stage after the next one.
+        // the buffer lags a stage behind, the first stage reads zero, the second the configured buffer color,
+        // and a stage's update is only visible to the stage after the next one
         let mut buffer = [0.0; 4];
         let mut next_buffer = self.buffer_color;
 
@@ -212,7 +203,7 @@ impl TexEnv {
                     match source {
                         Source::PrimaryColor => primary,
                         Source::PrimaryFragmentColor => fragment.map_or(primary, |(diffuse, _)| diffuse),
-                        // without fragment lighting there is no specular term
+                        // w/o fragment lighting there's no specular term
                         Source::SecondaryFragmentColor => fragment.map_or([0.0, 0.0, 0.0, 1.0], |(_, specular)| specular),
                         Source::Texture(unit) => textures[unit.min(3)],
                         Source::PreviousBuffer => buffer,
@@ -230,8 +221,7 @@ impl TexEnv {
 
                 let combined_rgb = combine_rgb(stage.color_op, rgb);
                 let combined_alpha = match stage.color_op {
-                    // this operation writes the dot product to alpha as
-                    // well, ignoring the alpha combiner entirely.
+                    // this op writes the dot product to alpha too, ignoring the alpha combiner entirely
                     Operation::Dot3Rgba => combined_rgb[0],
                     _ => combine_alpha(stage.alpha_op, alpha),
                 };
@@ -259,9 +249,8 @@ impl TexEnv {
     }
 }
 
-/// the texture environment the last draw decoded, and the registers it came
-/// from. most draws keep the combiners of the one before, and comparing the
-/// registers costs far less than decoding them again.
+/// the texture environment the last draw decoded and the registers it came from
+/// most draws keep the combiners of the one b4, and comparing the registers costs way less than decoding them again
 #[derive(Default)]
 pub(crate) struct LastTexEnv {
     read: [u32; REGISTERS_READ],
@@ -269,8 +258,7 @@ pub(crate) struct LastTexEnv {
 }
 
 impl LastTexEnv {
-    /// the texture environment the registers set up, the one kept rather
-    /// than a copy, which is a thousand bytes.
+    /// the texture environment the registers set up, the one kept instead of a copy, which is a KB
     pub(crate) fn read(&mut self, registers: &[u32]) -> &TexEnv {
         let read = TexEnv::registers_read(registers);
         if self.tex_env.is_none() || self.read != read {
@@ -281,7 +269,7 @@ impl LastTexEnv {
     }
 }
 
-/// splits a packed RGBA register value into 0..1 components.
+/// splits a packed RGBA register value into 0..1 components
 fn unpack(value: u32) -> [f32; 4] {
     [
         (value & 0xFF) as f32 / 255.0,
@@ -291,7 +279,7 @@ fn unpack(value: u32) -> [f32; 4] {
     ]
 }
 
-/// a stage's output multiplier, the raw field is a shift, not a factor.
+/// a stage's output multiplier, the raw field is a shift, not a factor
 fn scale_factor(raw: u32) -> f32 {
     match raw & 0x3 {
         1 => 2.0,
@@ -342,7 +330,7 @@ fn combine_rgb(op: Operation, v: [[f32; 3]; 3]) -> [f32; 3] {
         }
         Operation::Subtract => std::array::from_fn(|i| (v[0][i] - v[1][i]).max(0.0)),
         Operation::Dot3Rgb | Operation::Dot3Rgba => {
-            // both inputs are signed values packed into 0..1.
+            // both inputs are signed values packed into 0..1
             let dot = (0..3)
                 .map(|i| (v[0][i] * 2.0 - 1.0) * (v[1][i] * 2.0 - 1.0))
                 .sum::<f32>()
@@ -376,14 +364,12 @@ fn combine_alpha(op: Operation, v: [f32; 3]) -> f32 {
 mod tests {
     use super::*;
 
-    /// registers holding a single stage that just modulates texture 0 with
-    /// the vertex color, the configuration the power-on default describes
-    /// and what the rasterizer used to assume unconditionally.
+    /// registers holding a single stage that just modulates texture 0 w/ the vertex color,
+    /// the config the power on default describes and what the rasterizer used to assume always
     fn modulate_registers() -> Vec<u32> {
         let mut registers = vec![0u32; 0x300];
         for (index, base) in STAGE_REGISTERS.iter().enumerate() {
-            // sources, primary color and texture 0 for the first stage,
-            // previous for the rest, so later stages pass the value along.
+            // sources, primary color and texture 0 for the first stage, previous for the rest, so later stages pass the value along
             registers[*base] = if index == 0 { 0x0003_0003 } else { 0x000F_000F };
             registers[base + 2] = if index == 0 { 0x0001_0001 } else { 0x0000_0000 };
         }
@@ -400,9 +386,8 @@ mod tests {
         assert!((out[3] - 0.5).abs() < 1e-5, "alpha was {}", out[3]);
     }
 
-    /// a stage set to Replace from the vertex color has to leave it
-    /// untouched, that is what an untextured draw configures, and folding
-    /// in a texture there would tint geometry that should be flat.
+    /// a stage set to Replace from the vertex color has to leave it alone, that's what an untextured draw sets up,
+    /// and folding in a texture there would tint geometry that should be flat
     #[test]
     fn a_replace_stage_passes_the_primary_color_through() {
         let mut registers = vec![0u32; 0x300];
@@ -431,7 +416,7 @@ mod tests {
         assert_eq!(scale_factor(3), 1.0);
     }
 
-    /// registers with every stage passing the previous result along.
+    /// registers with every stage passing the previous result along
     fn passthrough_registers() -> Vec<u32> {
         let mut registers = vec![0u32; 0x300];
         for base in STAGE_REGISTERS {
@@ -440,7 +425,7 @@ mod tests {
         registers
     }
 
-    /// a lighting color only counts in an input the operation reads.
+    /// a lighting color only counts in an input the op reads
     #[test]
     fn lighting_is_read_only_through_used_inputs() {
         let mut registers = passthrough_registers();
@@ -459,7 +444,7 @@ mod tests {
         assert_eq!(env.apply(color, [[0.0; 4]; 4], None), color);
     }
 
-    /// stage 0 writes red into the buffer.
+    /// stage 0 writes red into the buffer
     #[test]
     fn the_buffer_reaches_the_stage_after_next() {
         let mut registers = passthrough_registers();
@@ -480,9 +465,9 @@ mod tests {
         assert_eq!(env.apply([0.0; 4], [[0.0; 4]; 4], None), red);
     }
 
-    /// TexEnv::read through registers_read and decode, and the kept one,
-    /// decode what reading the registers straight did before, over random
-    /// words in every register it reads and random registers elsewhere.
+    /// TexEnv::read thru registers_read and decode, and the kept one,
+    /// decode what reading the registers straight did b4,
+    /// over random words in every register it reads and random registers elsewhere
     #[test]
     fn reading_through_the_words_read_decodes_as_before() {
         fn old_read(registers: &[u32]) -> TexEnv {
@@ -543,9 +528,8 @@ mod tests {
         }
     }
 
-    /// the environment kept from the last draw is the one the registers
-    /// set up, through changes to any register it is decoded from and to
-    /// ones it is not.
+    /// the environment kept from the last draw is the one the registers set up,
+    /// thru changes to any register it's decoded from and to ones it isn't
     #[test]
     fn a_kept_environment_follows_the_registers() {
         let mut seed = 7u32;
@@ -558,8 +542,7 @@ mod tests {
         let mut kept = LastTexEnv::default();
         let read: Vec<usize> = STAGE_REGISTERS.iter().flat_map(|&base| base..base + 5).chain([REG_UPDATE_BUFFER, REG_BUFFER_COLOR]).collect();
         for step in 0..2000 {
-            // mostly a register the environment reads, a bit at a time as
-            // titles change them, or now and then one it does not
+            // mostly a register the environment reads, a bit at a time like titles change them, or now and then one it doesn't
             let register = match random() % 8 {
                 0 => (random() % 0x300) as usize,
                 _ => read[(random() as usize) % read.len()],
@@ -572,7 +555,7 @@ mod tests {
         }
     }
 
-    /// color and alpha have separate update bits.
+    /// color and alpha have separate update bits
     #[test]
     fn color_and_alpha_update_the_buffer_separately() {
         let mut registers = passthrough_registers();

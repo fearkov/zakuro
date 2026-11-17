@@ -1,7 +1,7 @@
-//! Download Play as a guest, what the console's Download Play does: the
-//! offers of the hosts in the room, taking part in one, getting the child
-//! when the host sends it, and the passphrase of the network the host puts
-//! up next. the child then runs with that, see Config::wireless_reboot.
+//! Download Play as a guest, what the console's own Download Play does
+//! hosts' offers in the room, joining one, getting the child when the host sends it,
+//! and the passphrase of the network the host puts up next
+//! the child then runs w/ that, see Config::wireless_reboot
 
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,7 @@ use crate::room::{Link, Mac};
 use crate::services::dlp::Offer;
 use crate::services::uds::Wireless;
 
-/// an offer heard from a host, and when last.
+/// an offer heard from a host, and when last
 #[derive(Debug, Clone)]
 pub struct Heard {
     pub host: Mac,
@@ -17,44 +17,42 @@ pub struct Heard {
     pub at: Instant,
 }
 
-/// where the guest is.
+/// where the guest is at
 #[derive(Debug, Clone, PartialEq)]
 pub enum Phase {
-    /// asked to take part, no answer yet.
+    /// asked to join, no answer yet
     Asking,
-    /// taken in, waiting for the host's game to start sending.
+    /// let in, waiting for the host's game to start sending
     Waiting,
-    /// getting the child, so much of it.
+    /// getting the child, this much of it
     Receiving { got: u64, total: u64 },
-    /// has the child, waiting for the game to begin.
+    /// has the child, waiting for the game to start
     Ready,
-    /// the game begins: the child, none when the guest had it, and what it
-    /// runs with.
+    /// game starts, the child (none if the guest had it) and what it runs w/
     Begun { child: Option<Vec<u8>>, reboot: [u8; 16] },
-    /// it went wrong, and why.
+    /// went wrong, and why
     Failed(String),
 }
 
 struct Session {
     host: Mac,
-    /// the guest has the child already, and needs none sent.
+    /// guest already has the child, nothing to send
     has_child: bool,
     received: Vec<u8>,
     phase: Phase,
 }
 
-/// a guest of Download Play in a room.
+/// a Download Play guest in a room
 pub struct Guest {
     link: Link,
     heard: Vec<Heard>,
     session: Option<Session>,
 }
 
-/// an offer not heard again in this long is gone.
+/// an offer not heard again for this long is gone
 const FORGET: Duration = Duration::from_secs(4);
 
-/// the node a guest takes part as, what the host's game shows of it: the
-/// console's number and the player's name.
+/// the node a guest joins as, what the host's game shows, console number and player name
 pub fn node(console_id: u64, nickname: &str) -> Vec<u8> {
     let mut node = vec![0u8; 0x28];
     node[..8].copy_from_slice(&console_id.to_le_bytes());
@@ -69,7 +67,7 @@ impl Guest {
         Guest { link, heard: Vec::new(), session: None }
     }
 
-    /// the offers in the room, in the order first heard.
+    /// offers in the room, first heard first
     pub fn offers(&self) -> &[Heard] {
         &self.heard
     }
@@ -78,16 +76,14 @@ impl Guest {
         self.session.as_ref().map(|session| &session.phase)
     }
 
-    /// asks the host to take part, as node, with the child already at hand
-    /// when has_child.
+    /// asks the host to join as node, has_child means the child's already at hand
     pub fn join(&mut self, host: Mac, node: Vec<u8>, has_child: bool) {
         self.leave();
         self.send(host, &Wireless::DlpJoin { node });
         self.session = Some(Session { host, has_child, received: Vec::new(), phase: Phase::Asking });
     }
 
-    /// ends the session once it is over, the game begun or it failed, and
-    /// gives how it ended.
+    /// ends the session once it's over (game started or failed) and says how it ended
     pub fn end(&mut self) -> Option<Phase> {
         let over = matches!(self.phase(), Some(Phase::Begun { .. } | Phase::Failed(_)));
         self.session.take_if(|_| over).map(|session| session.phase)
@@ -107,7 +103,7 @@ impl Guest {
         }
     }
 
-    /// takes in what the room brought.
+    /// takes in what the room brought
     pub fn poll(&mut self) {
         for (from, body) in self.link.receive() {
             let Ok(message) = postcard::from_bytes::<Wireless>(&body) else { continue };

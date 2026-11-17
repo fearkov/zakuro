@@ -1,4 +1,4 @@
-//! ARM-state instruction decoding.
+//! ARM state instruction decoding
 
 pub mod alu;
 pub mod dataproc;
@@ -48,14 +48,13 @@ pub fn execute<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     }
 }
 
-/// the 0b000 space, register data processing, plus multiplies, synchronization
-/// primitives, extra load/stores and the status-register transfers hiding in
-/// its unused encodings.
+/// the 0b000 space, register data processing plus multiplies, sync primitives,
+/// extra load/stores and the status register transfers hiding in its unused encodings
 fn decode_dataproc_register<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
-    // bits 7 and 4 both set means we are outside the data-processing encoding.
+    // bits 7 and 4 both set means we're outside the data processing encoding
     if op & 0x0000_0090 == 0x0000_0090 {
         if bits(op, 5, 6) == 0 {
-            // multiplies and synchronization.
+            // multiplies and sync
             if bit(op, 24) {
                 return if bit(op, 23) {
                     loadstore::exclusive(cpu, bus, op)
@@ -63,12 +62,11 @@ fn decode_dataproc_register<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Opti
                     loadstore::swap(cpu, bus, op)
                 };
             }
-            // bits 23:21 pick the multiply.
+            // bits 23 to 21 pick the multiply
             return match bits(op, 21, 23) {
                 0b000 | 0b001 => multiply::short(cpu, bus, op),
                 0b010 | 0b100 | 0b101 | 0b110 | 0b111 => multiply::long(cpu, bus, op),
-                // 0b011 is MLS, which arrived in ARMv6T2 and does not exist
-                // on the MP11 cores.
+                // 0b011 is MLS, it showed up in ARMv6T2 and doesn't exist on the MP11 cores
                 _ => Some(Exit::Undefined {
                     pc: cpu.current_pc(),
                     opcode: op,
@@ -78,7 +76,7 @@ fn decode_dataproc_register<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Opti
         return loadstore::extra(cpu, bus, op);
     }
 
-    // the "miscellaneous" hole, opcode field 0b10xx with S clear.
+    // the "miscellaneous" hole, opcode field 0b10xx w/ S clear
     if bits(op, 23, 24) == 0b10 && !bit(op, 20) {
         return decode_misc(cpu, bus, op);
     }
@@ -105,7 +103,7 @@ fn decode_misc<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
         0b0011 => misc::branch_exchange(cpu, bus, op),
         0b0101 => multiply::saturating(cpu, bus, op),
         0b0111 => misc::breakpoint(cpu, bus, op),
-        // 1yx0, the ARMv5TE halfword multiplies.
+        // 1yx0, the ARMv5TE halfword multiplies
         n if n & 0b1001 == 0b1000 => multiply::halfword(cpu, bus, op),
         _ => Some(Exit::Undefined {
             pc: cpu.current_pc(),
@@ -114,11 +112,11 @@ fn decode_misc<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     }
 }
 
-/// the 0b001 space, immediate data processing and MSR with an immediate.
+/// the 0b001 space, immediate data processing and MSR w/ an immediate
 fn decode_dataproc_immediate<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     if bits(op, 23, 24) == 0b10 && !bit(op, 20) {
         if bit(op, 21) {
-            // MSR immediate.
+            // MSR immediate
             return misc::msr(cpu, bus, op);
         }
         return Some(Exit::Undefined {
@@ -129,25 +127,23 @@ fn decode_dataproc_immediate<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Opt
     dataproc::execute(cpu, bus, op)
 }
 
-/// instructions encoded with cond == 0b1111, which on ARMv5 and later means
-/// "unconditional" rather than "never".
+/// instructions encoded w/ cond == 0b1111, which on ARMv5 and later means "unconditional" instead of "never"
 fn unconditional<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     if op & 0xFE00_0000 == 0xFA00_0000 {
         return misc::branch_link_exchange_immediate(cpu, bus, op);
     }
     if op & 0xFFF0_00F0 == 0xF570_0010 {
-        // CLREX, drop any outstanding LDREX reservation.
+        // CLREX, drop any outstanding LDREX reservation
         cpu.exclusive_addr = None;
         return None;
     }
 
     match bits(op, 25, 27) {
-        // CPS and SETEND.
+        // CPS and SETEND
         0b000 => misc::hint_or_cps(cpu, bus, op),
-        // PLD and the cache preload hints, architecturally free to ignore.
+        // PLD and the cache preload hints, architecturally fine to ignore
         0b010 | 0b011 => None,
-        // the "2" variants of the coprocessor instructions behave identically
-        // for the coprocessors this core has.
+        // the "2" variants of the coprocessor instructions act the same for the coprocessors this core has
         0b110 => crate::vfp::coprocessor_load_store(cpu, bus, op),
         0b111 => {
             if bit(op, 4) {

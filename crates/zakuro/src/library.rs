@@ -1,13 +1,13 @@
-//! the games in a folder, with the name and icon each carries.
+//! the games in a folder, w/ the name and icon each carries
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use crate::recompile::Wanted;
 
-/// file endings of games Zakuro opens.
+/// file endings of games Zakuro opens
 const GAME_FILES: [&str; 4] = ["3ds", "cci", "cxi", "cia"];
-/// the icon's side, in pixels.
+/// the icon's side, in pixels
 pub const ICON_SIZE: usize = 48;
 
 pub struct Game {
@@ -15,33 +15,32 @@ pub struct Game {
     pub name: String,
     pub publisher: String,
     pub program_id: u64,
-    /// RGBA.
+    /// RGBA
     pub icon: Option<Vec<u8>>,
-    /// 3dsrecomp installed code for it.
+    /// 3dsrecomp installed code for it
     pub recompiled: bool,
-    /// that code came from an older 3dsrecomp, and recompiling the game
-    /// makes it run better.
+    /// that code came from an older 3dsrecomp, and recompiling the game makes it run better
     pub outdated: bool,
-    /// its mods folder has something in it.
+    /// its mods folder has something in it
     pub modded: bool,
-    /// why it can't be played, when it can't, an encrypted dump say.
+    /// why it can't be played, when it can't, like an encrypted dump
     pub problem: Option<String>,
-    /// its update in the folder, the newest there.
+    /// its update in the folder, the newest one there
     pub update: Option<Addon>,
-    /// its DLC in the folder.
+    /// its DLC in the folder
     pub dlc: Vec<Addon>,
-    /// its Download Play child, decrypted, which it sends guests.
+    /// its Download Play child, decrypted, it sends guests that
     pub dlp_child: Option<Addon>,
 }
 
 impl Game {
-    /// the game as a recompile wants it.
+    /// the game as a recompile wants it
     pub fn wanted(&self) -> Wanted {
         Wanted { program_id: self.program_id, path: self.path.clone() }
     }
 }
 
-/// an update or DLC in the folder, which goes with the game of its id.
+/// an update or DLC in the folder, it goes w/ the game of its id
 #[derive(Debug, Clone)]
 pub struct Addon {
     pub path: PathBuf,
@@ -49,33 +48,30 @@ pub struct Addon {
     pub version: u16,
 }
 
-/// the games in the chosen folder, found in the background.
+/// the games in the chosen folder, found in the background
 #[derive(Default)]
 pub struct Library {
     pub games: Vec<Game>,
-    /// the Download Play children in the folder, decrypted, which let a
-    /// guest play along without the host sending one.
+    /// the Download Play children in the folder, decrypted, they let a guest play along w/o the host sending one
     pub children: Vec<Addon>,
     scanning: Option<Receiver<(Vec<Game>, Vec<Addon>)>>,
-    /// the games found to have outdated code, which comes in after a scan,
-    /// each library having to be opened to tell.
+    /// the games found to have outdated code, which comes in after a scan, each library has to be opened to tell
     checking: Option<Receiver<Vec<u64>>>,
-    /// the games recompiled since that started, which it may have seen as
-    /// they were before.
+    /// the games recompiled since that started, it may have seen them as they were b4
     rebuilt: Vec<u64>,
-    /// set when the games changed and their icons need uploading.
+    /// set when the games changed and their icons need uploading
     pub changed: bool,
-    /// where the games' mods folders are.
+    /// where the games' mods folders are
     data_dir: Option<PathBuf>,
 }
 
 impl Library {
-    /// a library whose games keep their mods under data_dir.
+    /// a library whose games keep their mods under data_dir
     pub fn new(data_dir: Option<PathBuf>) -> Library {
         Library { data_dir, ..Library::default() }
     }
 
-    /// starts looking through folder again.
+    /// starts looking through folder again
     pub fn scan(&mut self, folder: &Path) {
         let (send, receive) = channel();
         let folder = folder.to_owned();
@@ -90,8 +86,7 @@ impl Library {
         self.scanning.is_some()
     }
 
-    /// takes in what a scan found, and which games' code is outdated, once
-    /// each is done.
+    /// takes in what a scan found, and which games' code is outdated, once each is done
     pub fn poll(&mut self) {
         if let Some(receive) = &self.scanning {
             match receive.try_recv() {
@@ -120,8 +115,7 @@ impl Library {
         }
     }
 
-    /// starts looking through the games' recompiled code, away from the
-    /// list, which opening every library would hold up.
+    /// starts looking thru the games' recompiled code away from the list, opening every library would hold it up
     fn check_outdated(&mut self) {
         let recompiled: Vec<u64> = self.games.iter().filter(|game| game.recompiled).map(|game| game.program_id).collect();
         self.rebuilt.clear();
@@ -133,7 +127,7 @@ impl Library {
         self.checking = Some(receive);
     }
 
-    /// the game just got code from this build's 3dsrecomp.
+    /// the game just got code from this build's 3dsrecomp
     pub fn recompiled(&mut self, program_id: u64) {
         self.rebuilt.push(program_id);
         for game in self.games.iter_mut().filter(|game| game.program_id == program_id) {
@@ -143,7 +137,7 @@ impl Library {
     }
 }
 
-/// the games in folder, and the Download Play children.
+/// the games in folder, and the Download Play children
 fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
     let Ok(entries) = std::fs::read_dir(folder) else { return (Vec::new(), Vec::new()) };
     let paths = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| {
@@ -159,7 +153,7 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
             None => games.push(read_or_list_unreadable(&path, data_dir)),
         }
     }
-    // each update and DLC goes with the game of its id, the newest update
+    // each update and DLC goes w/ the game of its id, the newest update
     for addon in addons {
         let kind = zakuro_fs::TitleKind::of(addon.title_id);
         let update = kind == zakuro_fs::TitleKind::Update;
@@ -188,10 +182,8 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
     (games, children)
 }
 
-/// the update, DLC and Download Play child in the folder of the game at
-/// path, the way a scan pairs them, for a game started from the command
-/// line, which starts before the library's scan is in, or from outside the
-/// library's folder.
+/// the update, DLC and Download Play child in the folder of the game at path, the way a scan pairs them
+/// for a game started from the command line (it starts b4 the library's scan is in) or from outside the library's folder
 pub fn addons_beside(path: &Path) -> Option<(Option<Addon>, Vec<Addon>, Option<Addon>)> {
     let program_id = zakuro_fs::Title::load(path).ok()?.program_id();
     // a Download Play child has its game's id, but none of its update or DLC
@@ -219,14 +211,12 @@ pub fn addons_beside(path: &Path) -> Option<(Option<Addon>, Vec<Addon>, Option<A
     Some((update, dlc, dlp_child))
 }
 
-/// the folder a file is in, the one Zakuro runs in for a bare file name,
-/// whose parent is empty.
+/// the folder a file is in, the one Zakuro runs in for a bare file name, whose parent is empty
 fn folder_of(path: &Path) -> &Path {
     path.parent().filter(|folder| !folder.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
 
-/// the update or DLC in the file at path, none when it holds neither, and
-/// why it can't be used when it can't.
+/// the update or DLC in the file at path, none when it holds neither, and why it can't be used when it can't
 fn addon(path: &Path) -> Option<Result<Addon, String>> {
     if !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cia")) {
         return None;
@@ -242,8 +232,7 @@ fn addon(path: &Path) -> Option<Result<Addon, String>> {
     Some(Ok(Addon { path: path.to_owned(), title_id: cia.title_id, version: cia.version }))
 }
 
-/// a game read, or one that made reading it fail on a bug listed as
-/// unreadable, rather than taking the whole library with it.
+/// a game read, or one that made reading fail on a bug listed as unreadable, instead of taking the whole library down w/ it
 fn read_or_list_unreadable(path: &Path, data_dir: Option<&Path>) -> Game {
     std::panic::catch_unwind(|| read_game(path, data_dir)).unwrap_or_else(|_| {
         log::error!("reading {} failed", path.display());
@@ -251,7 +240,7 @@ fn read_or_list_unreadable(path: &Path, data_dir: Option<&Path>) -> Game {
     })
 }
 
-/// a file in the library that can't be played, and why.
+/// a file in the library that can't be played, and why
 fn unplayable(path: &Path, problem: String) -> Game {
     Game {
         path: path.to_owned(),
@@ -302,7 +291,7 @@ fn read_game(path: &Path, data_dir: Option<&Path>) -> Game {
     }
 }
 
-/// what the library says about a file it can't play.
+/// what the library says about a file it can't play
 fn problem(error: &zakuro_fs::FsError) -> String {
     use zakuro_fs::FsError;
     match error {
@@ -319,21 +308,21 @@ fn problem(error: &zakuro_fs::FsError) -> String {
     }
 }
 
-/// the part of a title's icon file the library shows.
+/// the part of a title's icon file the library shows
 pub(crate) struct Smdh {
     pub(crate) name: String,
     publisher: String,
-    /// RGBA, ICON_SIZE square.
+    /// RGBA, ICON_SIZE square
     pub(crate) icon: Vec<u8>,
 }
 
 impl Smdh {
-    /// where the titles start, 16 of them, one per language.
+    /// where the titles start, 16 of them, one per language
     const TITLES: usize = 0x08;
     const TITLE_SIZE: usize = 0x200;
-    /// English, which comes second.
+    /// English, it comes second
     const ENGLISH: usize = 1;
-    /// the 48 pixel icon, RGB565 in 8 by 8 tiles.
+    /// the 48 pixel icon, RGB565 in 8 by 8 tiles
     const LARGE_ICON: usize = 0x24C0;
 
     pub(crate) fn parse(data: &[u8]) -> Option<Smdh> {
@@ -355,7 +344,7 @@ impl Smdh {
     }
 }
 
-/// UTF-16 up to the first zero, with line breaks as spaces.
+/// UTF 16 up to the first zero, w/ line breaks as spaces
 fn utf16(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .as_chunks::<2>()
@@ -367,7 +356,7 @@ fn utf16(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units).replace('\n', " ").trim().to_owned()
 }
 
-/// the icon as RGBA, from RGB565 in 8 by 8 tiles whose pixels go in Z order.
+/// the icon as RGBA, from RGB565 in 8 by 8 tiles whose pixels go in Z order
 fn decode_icon(data: &[u8]) -> Vec<u8> {
     let mut rgba = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
     let tiles = ICON_SIZE / 8;
@@ -437,8 +426,7 @@ mod tests {
         assert_eq!(pixel(8, 0), [0, 255, 0, 255]);
     }
 
-    /// an update and DLC in the folder go with their game, the newest
-    /// update, and one whose game isn't there is listed as such.
+    /// an update and DLC in the folder go w/ their game, the newest update, and one whose game isn't there gets listed as such
     #[test]
     fn updates_and_dlc_go_with_their_game() {
         use zakuro_fs::testing::{cia, ncch};
@@ -482,15 +470,13 @@ mod tests {
         assert_eq!(beside_update.map(|addon| addon.version), Some(0x0410));
         assert_eq!(beside_dlc.iter().map(|addon| addon.title_id).collect::<Vec<_>>(), [dlc]);
         assert_eq!(beside_child.map(|addon| addon.title_id), Some(child));
-        // and the child started on its own, which loads as a title, gets
-        // none of its game's
+        // and the child started on its own (it loads as a title) gets none of its game's
         assert!(zakuro_fs::Title::load(folder.join("child.cia")).is_ok());
         assert!(addons_beside(&folder.join("child.cia")).is_none());
         std::fs::remove_dir_all(folder).unwrap();
     }
 
-    /// a game recompiled while the check for outdated code ran isn't marked
-    /// outdated by what the check saw before that.
+    /// a game recompiled while the check for outdated code ran doesn't get marked outdated by what the check saw b4 that
     #[test]
     fn a_check_from_before_a_recompile_leaves_the_game_alone() {
         let game = |program_id| Game { program_id, recompiled: true, ..unplayable(Path::new("game.3ds"), String::new()) };
@@ -504,7 +490,7 @@ mod tests {
         assert!(library.games[1].outdated);
     }
 
-    /// a bare file name is in the folder Zakuro runs in.
+    /// a bare file name is in the folder Zakuro runs in
     #[test]
     fn a_bare_file_name_is_in_the_current_folder() {
         assert_eq!(folder_of(Path::new("game.3ds")), Path::new("."));

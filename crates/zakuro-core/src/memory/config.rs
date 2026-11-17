@@ -1,14 +1,14 @@
-//! the two read-only pages the kernel exposes to every process.
+//! the two readonly pages the kernel exposes to every process
 
 use zakuro_common::memory_map::{CONFIG_MEM_SIZE, SHARED_PAGE_SIZE};
 use zakuro_common::ConsoleModel;
 
 use crate::kernel::thread::{CPU_CLOCK_HZ, ticks_to_nanos};
 
-/// seconds between the 3DS epoch (1900-01-01) and the Unix epoch.
+/// seconds between the 3DS epoch (1900 01 01) and the unix one
 const EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
 
-/// a plausible MAC. Games only ever show it or hash it.
+/// a plausible MAC, games only ever show it or hash it
 pub const MAC_ADDRESS: [u8; 6] = [0x40, 0xF4, 0x07, 0x00, 0x00, 0x01];
 
 fn write_u32(page: &mut [u8], offset: usize, value: u32) {
@@ -19,7 +19,7 @@ fn write_u64(page: &mut [u8], offset: usize, value: u64) {
     page[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-/// fills the configuration page.
+/// fills the config page
 pub fn init_config_mem(
     page: &mut [u8],
     model: ConsoleModel,
@@ -31,7 +31,7 @@ pub fn init_config_mem(
     assert_eq!(page.len(), CONFIG_MEM_SIZE as usize);
     page.fill(0);
 
-    // report firmware 11.x, which is what every retail console ended on.
+    // report firmware 11.x, where every retail console ended up
     page[0x00] = 0x00; // kernel version revision
     page[0x01] = 0x34; // kernel version minor
     page[0x02] = 0x02; // kernel version major
@@ -39,7 +39,7 @@ pub fn init_config_mem(
     write_u64(page, 0x08, 0); // NS title id
     write_u32(page, 0x10, 0x0000_0002); // syscore version
     page[0x14] = 0x01; // env info, production
-    // unit info bit 0 distinguishes retail from a development unit.
+    // unit info bit 0 tells retail from a dev unit
     page[0x15] = 0x01;
     page[0x16] = 0x00; // previous firm
     write_u32(page, 0x18, 0x0000_F297); // CTR SDK version
@@ -58,7 +58,7 @@ pub fn init_config_mem(
     let _ = model;
 }
 
-/// live state.
+/// live state
 pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, clock: u64) {
     assert_eq!(page.len(), SHARED_PAGE_SIZE as usize);
     page.fill(0);
@@ -74,45 +74,41 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, cl
     page[0x67] = 2; // wifi enabled and connected
 
     set_slider_3d(page, slider_3d);
-    // battery, on the adapter, full and no longer charging
+    // battery on the adapter, full and done charging
     page[0x85] = 1 | 5 << 2;
     page[0xC0] = 0; // no headset
 }
 
-/// the host's local time, in milliseconds since 1900.
+/// the host's local time in millis since 1900
 pub fn host_clock() -> u64 {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    // the console keeps the local time, not UTC
+    // the console keeps local time, not UTC
     let local = chrono::Local::now().offset().local_minus_utc() as i64 * 1000;
     (unix as i64 + local) as u64 + EPOCH_OFFSET_SECONDS * 1000
 }
 
-/// refreshes the clock fields, the clock at boot moved on by the emulated
-/// ticks since. titles extrapolate from it with the tick, so a clock
-/// following the host's would run backwards whenever emulation ran ahead.
+/// refreshes the clock fields, the boot clock moved on by the emulated ticks since
+/// titles extrapolate from it w/ the tick, so following the host's clock would run backwards whenever emulation ran ahead
 pub fn update_datetime(page: &mut [u8], boot_clock: u64, tick: u64) {
     let date_time = boot_clock + ticks_to_nanos(tick) / 1_000_000;
 
     for slot in [0x20usize, 0x40] {
         write_u64(page, slot, date_time);
         write_u64(page, slot + 0x08, tick);
-        // the rate of the ticks, which the SDK divides the ticks since the
-        // update by to get the milliseconds since, as PTM sets it. anything
-        // else makes the clock jump ahead within a frame and back at the
-        // next update, and a title that keeps a daily limit sees its clock
-        // set back
+        // the tick rate, the SDK divides ticks since the update by it to get millis, as PTM sets it
+        // anything else makes the clock jump ahead within a frame and back at the next update
+        // and a title w/ a daily limit sees its clock go back in time
         write_u32(page, slot + 0x10, CPU_CLOCK_HZ as u32);
         write_u32(page, slot + 0x14, 0);
         write_u64(page, slot + 0x18, 0);
     }
 }
 
-/// updates the 3D slider position, which games poll every frame. the byte
-/// after it is set when the 3D LED is forced off, GSPGPU:SetLedForceOff,
-/// which games take as the 3D being off, so it stays clear.
+/// updates the 3D slider position, games poll it every frame
+/// the byte after it gets set when the 3D LED is forced off (GSPGPU:SetLedForceOff), games read that as 3D off, so it stays clear
 pub fn set_slider_3d(page: &mut [u8], value: f32) {
     page[0x80..0x84].copy_from_slice(&value.clamp(0.0, 1.0).to_le_bytes());
     page[0x84] = 0;
@@ -122,9 +118,8 @@ pub fn set_slider_3d(page: &mut [u8], value: f32) {
 mod tests {
     use super::*;
 
-    /// the time a title reads, the way the SDK works it out of the page,
-    /// its selected slot's time plus the ticks since its update times 1000
-    /// over the rate in the slot.
+    /// the time a title reads, like the SDK works it out of the page
+    /// its selected slot's time plus ticks since its update times 1000 over the slot's rate
     fn sdk_time(page: &[u8], tick: u64) -> u64 {
         let slot = 0x20;
         let read = |at: usize, size: usize| page[at..at + size].iter().rev().fold(0u64, |v, b| v << 8 | *b as u64);
@@ -133,8 +128,7 @@ mod tests {
         date_time + (((tick - updated) as i128 * per_tick as i128) >> 32) as u64
     }
 
-    /// a title reads a clock that only ever goes forward, at the same pace
-    /// as the ticks, between the updates once a frame and across them.
+    /// a title reads a clock that only goes forward at the tick's pace, between the once a frame updates and across them
     #[test]
     fn the_clock_titles_read_runs_at_the_ticks_pace() {
         let mut page = vec![0u8; SHARED_PAGE_SIZE as usize];
@@ -151,12 +145,12 @@ mod tests {
             assert!(now >= last, "the clock went back from {last} to {now}");
             last = now;
         }
-        // 150 frames, about 2.5 s
+        // 150 frames, ~2.5 s
         let elapsed = last - boot;
         assert!((2500..=2510).contains(&elapsed), "{elapsed} ms");
     }
 
-    /// the clock starts at the local time, which is what the console shows.
+    /// the clock starts at local time, what the console shows
     #[test]
     fn the_clock_is_local() {
         let utc = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;

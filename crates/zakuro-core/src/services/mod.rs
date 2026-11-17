@@ -1,4 +1,4 @@
-//! high-level service emulation.
+//! high level service emulation
 
 pub mod apt;
 pub mod boss;
@@ -36,12 +36,12 @@ use std::collections::BTreeMap;
 use crate::kernel::ipc::{CommandBuffer, Header};
 use crate::System;
 
-/// where a request is headed.
+/// where a request is headed
 #[derive(Debug, Clone)]
 pub enum Target {
-    /// a connection made with svcConnectToPort, e.g. srv:.
+    /// a connection made w/ svcConnectToPort, like `srv:`
     Port(String),
-    /// a session obtained from srv:GetServiceHandle.
+    /// a session got from srv:GetServiceHandle
     Service { name: String, subhandle: u32 },
 }
 
@@ -62,7 +62,7 @@ impl Target {
     }
 }
 
-/// per-service state that outlives a single request.
+/// per service state that outlives a single request
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct ServiceState {
     pub srv: srv::SrvState,
@@ -81,12 +81,12 @@ pub struct ServiceState {
     pub mic: mic::MicState,
     pub uds: uds::UdsState,
     pub dlp: dlp::DlpState,
-    /// commands we logged as unimplemented, so the log stays readable and the
-    /// diagnostics overlay can show what a title is actually asking for.
+    /// commands we logged as unimplemented, so the log stays readable and the diagnostics overlay can show what a
+    /// title's actually asking for
     pub unimplemented: BTreeMap<(String, u16), u32>,
 }
 
-/// entry point from svcSendSyncRequest.
+/// entry point from svcSendSyncRequest
 pub fn handle_request(system: &mut System, target: Target) {
     let Some(thread) = system.kernel.current() else {
         return;
@@ -135,7 +135,7 @@ pub fn handle_request(system: &mut System, target: Target) {
     }
 }
 
-/// services whose entire job is talking to the internet or to another console.
+/// services whose whole job is talking to the internet or another console
 fn is_network_service(name: &str) -> bool {
     matches!(
         name,
@@ -151,15 +151,13 @@ fn is_network_service(name: &str) -> bool {
     )
 }
 
-/// reply used for a network service we have not implemented, an explicit "not
-/// connected" rather than [unimplemented]'s success-with-zeroes.
+/// reply for a network service we haven't implemented, an explicit "not connected" instead of [unimplemented]'s success w/ zeroes
 fn offline(system: &mut System, buffer: &CommandBuffer, header: Header, service: &str) {
     use zakuro_common::result::errors;
     let command = header.command_id();
     let (name, code) = match service {
-        // a player can switch wireless off at any time, so a title knows
-        // exactly what local wireless says then, a code from another module
-        // is just a failure it never expected.
+        // a player can switch wireless off any time, so a title knows exactly what local wireless says then,
+        // a code from another module is just a failure it never expected
         "nwm::UDS" | "dlp:SRVR" => ("WIRELESS_OFF", errors::UDS_WIRELESS_OFF),
         _ => ("NOT_CONNECTED", errors::NOT_CONNECTED),
     };
@@ -178,7 +176,7 @@ fn offline(system: &mut System, buffer: &CommandBuffer, header: Header, service:
     buffer.reply_error(&mut system.memory, command, code.0);
 }
 
-/// default reply for a command we do not implement, success and zeroes.
+/// default reply for a command we don't implement, success and zeroes
 pub fn unimplemented(system: &mut System, buffer: &CommandBuffer, header: Header, service: &str) {
     let command = header.command_id();
     let count = system
@@ -197,9 +195,8 @@ pub fn unimplemented(system: &mut System, buffer: &CommandBuffer, header: Header
             args.join(", ")
         );
     }
-    // reply with one result word of success and nothing else, with the
-    // words after it zeroed, a title reads its outputs from them anyway and
-    // would find what its request left there
+    // reply w/ one success result word and nothing else, w/ the words after it zeroed
+    // a title reads its outputs from them anyway and would find what its request left there
     buffer.reply(&mut system.memory, command, &[]);
     for index in 2..8 {
         buffer.set(&mut system.memory, index, 0);
@@ -211,8 +208,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::Config;
 
-    /// a system with one running thread, whose TLS holds the command buffer
-    /// a request is read from and replied into.
+    /// a system w/ one running thread, its TLS holds the command buffer a request gets read from and replied into
     pub(crate) fn system_with_thread() -> (System, CommandBuffer) {
         let mut system = System::new(Config::default());
         let id = system
@@ -224,9 +220,9 @@ pub(crate) mod tests {
         (system, buffer)
     }
 
-    /// no library applet is there until the title prepares one, a title
-    /// told one is there cancels it and waits for it to close, Yo-kai Watch
-    /// 2 as it started. the applets a title names are there.
+    /// no library applet is there till the title prepares one,
+    /// a title told one's there cancels it and waits for it to close (Yo-kai Watch 2 at boot)
+    /// the applets a title names are there
     #[test]
     fn a_library_applet_is_there_only_once_prepared() {
         let (mut system, buffer) = system_with_thread();
@@ -246,12 +242,11 @@ pub(crate) mod tests {
         assert_eq!(is_registered(&mut system, 0x400), 1);
     }
 
-    /// local wireless has to fail the way it does with wireless switched
-    /// off, the one failure every title is written to cope with.
+    /// local wireless has to fail like it does w/ wireless switched off, the one failure every title is written to cope w/
     #[test]
     fn local_wireless_reports_wireless_off() {
         let (mut system, buffer) = system_with_thread();
-        // InitializeWithVersion, the header the SDK sends.
+        // InitializeWithVersion, the header the SDK sends
         buffer.set(&mut system.memory, 0, Header::new(0x001B, 12, 2).0);
         assert_eq!(buffer.get(&mut system.memory, 0), 0x001B_0302);
 
@@ -261,7 +256,7 @@ pub(crate) mod tests {
         assert_eq!(buffer.get(&mut system.memory, 1), 0xC941_1002);
     }
 
-    /// what needs the servers keeps its explicit "not connected".
+    /// what needs the servers keeps its explicit "not connected"
     #[test]
     fn other_network_services_report_not_connected() {
         let (mut system, buffer) = system_with_thread();
@@ -276,8 +271,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// SSL sets itself up on the console, which works offline, Pokémon Ultra
-    /// Sun and Moon stop saving when it does not.
+    /// SSL sets itself up on the console, which works offline, Pokémon Ultra Sun and Moon stop saving when it doesn't
     #[test]
     fn ssl_initializes_offline() {
         let (mut system, buffer) = system_with_thread();
@@ -291,7 +285,7 @@ pub(crate) mod tests {
         assert!(system.services.unimplemented.is_empty());
     }
 
-    /// the friend list lives on the console, asking about it works offline.
+    /// the friend list lives on the console, asking about it works offline
     #[test]
     fn friends_answer_offline() {
         let (mut system, buffer) = system_with_thread();
@@ -305,8 +299,7 @@ pub(crate) mod tests {
         assert_eq!(buffer.get(&mut system.memory, 2), 0);
     }
 
-    /// titles wait on the infrared link's events, which have to be real
-    /// ones even with nothing to link to.
+    /// titles wait on the infrared link's events, they have to be real ones even w/ nothing to link to
     #[test]
     fn infrared_events_are_real_handles() {
         let (mut system, buffer) = system_with_thread();
@@ -322,8 +315,7 @@ pub(crate) mod tests {
         assert!(system.services.unimplemented.is_empty());
     }
 
-    /// a title stopping StreetPass waits on the state changed event, which
-    /// has to be a real one the stop signals.
+    /// a title stopping StreetPass waits on the state changed event, it has to be a real one the stop signals
     #[test]
     fn streetpass_stops_and_says_so() {
         let (mut system, buffer) = system_with_thread();
@@ -346,8 +338,7 @@ pub(crate) mod tests {
         assert!(system.services.unimplemented.is_empty());
     }
 
-    /// titles answer sleep queries nothing sent them, which has to succeed
-    /// quietly.
+    /// titles answer sleep queries nobody sent them, that has to succeed quietly
     #[test]
     fn sleep_query_replies_are_acknowledged() {
         let (mut system, buffer) = system_with_thread();
@@ -363,8 +354,7 @@ pub(crate) mod tests {
         assert!(system.services.unimplemented.is_empty());
     }
 
-    /// a library applet nothing can run still answers the way one would, a
-    /// title waiting on it would otherwise wait forever.
+    /// a library applet nothing can run still answers like one would, a title waiting on it would otherwise wait forever
     #[test]
     fn library_applets_answer_and_close() {
         use crate::kernel::ipc::Descriptor;
@@ -376,7 +366,7 @@ pub(crate) mod tests {
         let apt = || Target::service("APT:A".into(), 0);
         let word = |value: u32| value.to_le_bytes();
 
-        // where replies put a parameter's buffer.
+        // where replies put a parameter's buffer
         system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS, &word(Descriptor::static_buffer(0x100, 0)));
         system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS + 4, &word(page + 0xC00));
         let receive = |system: &mut System| {
@@ -387,7 +377,7 @@ pub(crate) mod tests {
             (1..=4).chain([6]).map(|i| buffer.get(&mut system.memory, i)).collect::<Vec<_>>()
         };
 
-        // Initialize(application, attributes), then take the wakeup.
+        // Initialize(application, attributes), then take the wakeup
         buffer.set(&mut system.memory, 0, Header::new(0x0002, 2, 0).0);
         buffer.set(&mut system.memory, 1, 0x300);
         handle_request(&mut system, apt());
@@ -398,8 +388,7 @@ pub(crate) mod tests {
         buffer.set(&mut system.memory, 1, 0x406);
         handle_request(&mut system, apt());
 
-        // SendParameter(application, applet, request) with the capture info,
-        // whose first word is the size of the capture.
+        // SendParameter(application, applet, request) w/ the capture info, its first word is the capture's size
         system.memory.write_bytes(page + 0x800, &word(0x11_8000));
         buffer.set(&mut system.memory, 0, Header::new(0x000C, 4, 4).0);
         for (i, value) in [0x300, 0x406, 2, 0x20, 0, 0, Descriptor::static_buffer(0x20, 0), page + 0x800]
@@ -409,8 +398,7 @@ pub(crate) mod tests {
             buffer.set(&mut system.memory, i as u32 + 1, value);
         }
         handle_request(&mut system, apt());
-        // a glance hands out a handle as well, closing it must leave the
-        // block to whoever receives the answer.
+        // a glance hands out a handle too, closing it must leave the block to whoever gets the answer
         buffer.set(&mut system.memory, 0, Header::new(0x000E, 2, 0).0);
         handle_request(&mut system, apt());
         let glanced = buffer.get(&mut system.memory, 6);
@@ -436,9 +424,8 @@ pub(crate) mod tests {
         assert!(system.services.unimplemented.is_empty());
     }
 
-    /// the Mii selector answers with the console's Mii. a title that saves a
-    /// blank one takes the file for a new one at the next boot, Super Mario
-    /// 3D Land does.
+    /// the Mii selector answers w/ the console's Mii
+    /// a title that saves a blank one takes the file for a new one at the next boot, Super Mario 3D Land does
     #[test]
     fn the_mii_selector_picks_the_consoles_mii() {
         use crate::kernel::ipc::Descriptor;

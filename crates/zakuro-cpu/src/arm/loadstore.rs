@@ -1,14 +1,12 @@
-//! loads and stores, the single-transfer family, the "extra" halfword and
-//! doubleword forms, block transfers and the exclusive/swap primitives.
+//! loads and stores, the single transfer family, the "extra" halfword and doubleword forms,
+//! block transfers and the exclusive/swap primitives
 
 use zakuro_common::bits::{bit, bits};
 
 use super::shifter::{self, ShiftType};
 use crate::{Bus, Cpu, Exit, PC};
 
-// ---------------------------------------------------------------------------
-// Single data transfer, LDR / STR / LDRB / STRB
-// ---------------------------------------------------------------------------
+// single data transfer, LDR / STR / LDRB / STRB
 
 pub fn single<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let rn = bits(op, 16, 19) as usize;
@@ -20,7 +18,7 @@ pub fn single<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 20);
 
     let offset = if bit(op, 25) {
-        // register offset with an immediate shift.
+        // register offset with an immediate shift
         let rm = (op & 0xF) as usize;
         let ty = ShiftType::from_bits(bits(op, 5, 6));
         let amount = bits(op, 7, 11);
@@ -43,20 +41,18 @@ pub fn single<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
         } else {
             bus.read32(addr)
         };
-        // write the base back before the load so that ldr rN, [rN], #imm
-        // ends up with the loaded value, matching hardware.
+        // write the base back b4 the load so ldr rN, [rN], #imm ends up w/ the loaded value, like hardware
         if (!pre_index || writeback) && rn != rd {
             cpu.regs[rn] = offset_addr;
         }
         if rd == PC {
-            // from ARMv5 onwards a load into the PC interworks, bit 0 of the
-            // loaded value selects Thumb.
+            // from ARMv5 on a load into the PC interworks, bit 0 of the loaded value picks Thumb
             cpu.branch_exchange(value);
         } else {
             cpu.set_reg(rd, value);
         }
     } else {
-        // storing r15 writes the instruction's address plus 12 on ARM11.
+        // storing r15 writes the instruction's addr plus 12 on ARM11
         let value = if rd == PC {
             cpu.regs[PC].wrapping_add(4)
         } else {
@@ -74,9 +70,7 @@ pub fn single<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Extra load/store, LDRH / STRH / LDRSB / LDRSH / LDRD / STRD
-// ---------------------------------------------------------------------------
+// extra load/store, LDRH / STRH / LDRSB / LDRSH / LDRD / STRD
 
 pub fn extra<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let rn = bits(op, 16, 19) as usize;
@@ -88,7 +82,7 @@ pub fn extra<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 20);
     let sh = bits(op, 5, 6);
 
-    // ldrd and strd name a register pair, and r15 has no partner.
+    // ldrd and strd name a register pair, and r15 has no partner, sad
     if !load && sh >= 0b10 && rd == PC {
         return Some(Exit::Undefined { pc: cpu.current_pc(), opcode: op });
     }
@@ -129,7 +123,7 @@ pub fn extra<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
             }
             cpu.set_reg(rd, value);
         }
-        // LDRD, loads an even/odd register pair.
+        // LDRD, loads an even/odd register pair
         (0b10, false) => {
             let lo = bus.read32(addr);
             let hi = bus.read32(addr.wrapping_add(4));
@@ -165,9 +159,7 @@ pub fn extra<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Block transfer, LDM / STM
-// ---------------------------------------------------------------------------
+// block transfer, LDM / STM
 
 pub fn block<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let rn = bits(op, 16, 19) as usize;
@@ -180,7 +172,7 @@ pub fn block<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
 
     let base = cpu.regs[rn];
 
-    // an empty list transfers r15 alone and moves the base by 0x40.
+    // an empty list transfers r15 alone and moves the base by 0x40
     let empty = list == 0;
     if empty {
         list = 1 << 15;
@@ -206,13 +198,12 @@ pub fn block<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
         base.wrapping_sub(span)
     };
 
-    // S with r15 loaded means "restore CPSR too", without r15 it means the
-    // transfer uses the User-mode bank.
+    // S w/ r15 loaded means "restore CPSR too", w/o r15 it means the transfer uses the User mode bank
     let transfer_user_bank = user_bank && !(load && bit(op, 15));
 
     let mut addr = lowest;
     if load {
-        // the base register must not be written back if it was loaded.
+        // the base register must not get written back if it was loaded
         let base_in_list = list & (1 << rn) != 0;
         if writeback && !base_in_list {
             cpu.regs[rn] = final_base;
@@ -235,7 +226,7 @@ pub fn block<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
             }
         }
         if writeback && base_in_list {
-            // hardware leaves the loaded value in place.
+            // hardware leaves the loaded value in place
         }
     } else {
         for i in 0..16 {
@@ -247,8 +238,7 @@ pub fn block<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
             } else if i == 15 {
                 cpu.regs[PC].wrapping_add(4)
             } else if i == rn && writeback && (list & ((1 << rn) - 1)) != 0 {
-                // storing the base when it is not the lowest register in the
-                // list stores the written-back value on ARM11.
+                // storing the base when it isn't the lowest register in the list stores the written back value on ARM11
                 final_base
             } else {
                 cpu.regs[i]
@@ -263,9 +253,7 @@ pub fn block<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // SWP / SWPB
-// ---------------------------------------------------------------------------
 
 pub fn swap<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let rn = bits(op, 16, 19) as usize;
@@ -287,9 +275,7 @@ pub fn swap<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// LDREX / STREX (ARMv6, with the B/H/D variants from ARMv6K)
-// ---------------------------------------------------------------------------
+// LDREX / STREX (ARMv6, w/ the B/H/D variants from ARMv6K)
 
 pub fn exclusive<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let load = bit(op, 20);
@@ -297,7 +283,7 @@ pub fn exclusive<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let rn = bits(op, 16, 19) as usize;
     let addr = cpu.regs[rn];
 
-    // the doubleword forms name a register pair, and r15 has no partner.
+    // the doubleword forms name a register pair, and r15 has no partner
     let pair = if load { bits(op, 12, 15) } else { op & 0xF };
     if size == 0b01 && pair as usize == PC {
         return Some(Exit::Undefined { pc: cpu.current_pc(), opcode: op });
@@ -325,8 +311,7 @@ pub fn exclusive<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
         let rm = (op & 0xF) as usize;
         let value = cpu.regs[rm];
 
-        // with a single emulated core the reservation can only be lost to a
-        // context switch, which the kernel signals by clearing it.
+        // w/ a single emulated core the reservation can only get lost to a context switch, which the kernel signals by clearing it
         let succeeded = cpu.exclusive_addr == Some(addr);
         if succeeded {
             match size {

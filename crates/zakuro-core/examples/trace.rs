@@ -1,4 +1,4 @@
-//! cargo run -p zakuro-core --example trace -- <rom> [max-instructions]
+//! `cargo run -p zakuro-core --example trace -- <rom> [max-instructions]`
 
 use std::collections::VecDeque;
 
@@ -38,9 +38,7 @@ fn main() {
             return;
         }
 
-        // executing from an unmapped page means a jump through a pointer
-        // that was never filled in, which is far more informative than the
-        // data faults that follow it.
+        // running from an unmapped page means a jump thru a ptr nobody filled in, way more useful than the data faults after it
         let pc = system.cpu.regs[15];
         if system.memory.mapping_at(pc).is_none() {
             println!("execution left mapped memory at 0x{pc:08X}");

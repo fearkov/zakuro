@@ -1,28 +1,26 @@
-//! where a title ran in the interpreter while it had a recompiled library,
-//! code 3dsrecomp did not find. the addresses go in a file next to the
-//! library, which the next build takes as functions.
+//! where a title ran in the interpreter while it had a recompiled lib, code 3dsrecomp missed
+//! the addrs go in a file next to the lib and the next build takes them as funcs
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-/// how often the addresses go to the file, in frames, a minute.
+/// how often addrs go to the file, in frames, so a minute
 pub const SAVE_EVERY: u64 = 3600;
 
 pub struct Hints {
     path: PathBuf,
-    /// the executable's code, the only place addresses are the same every
-    /// run.
+    /// the exe's code, the only place addrs are the same every run
     text: Range<u32>,
-    /// odd for Thumb.
+    /// odd for Thumb
     seen: BTreeSet<u32>,
     saved: usize,
-    /// the instruction before was interpreted too.
+    /// the previous instr got interpreted too
     interpreting: bool,
 }
 
 impl Hints {
-    /// the hints for a library, with those an earlier run wrote down.
+    /// hints for a lib, plus what an earlier run wrote down
     pub fn new(library: &Path, text: Range<u32>) -> Hints {
         let path = library.with_extension("hints");
         let seen: BTreeSet<u32> = std::fs::read_to_string(&path)
@@ -36,21 +34,19 @@ impl Hints {
         Hints { path, text, seen, saved, interpreting: false }
     }
 
-    /// the library ran some code.
+    /// the lib ran some code
     pub fn library_ran(&mut self) {
         self.interpreting = false;
     }
 
-    /// the library had code but not budget for the whole block, so the
-    /// interpreter goes on through it. what it runs until the library takes
-    /// over again is known code, not missing code.
+    /// the lib had code but not enough budget for the whole block, so the interpreter finishes it
+    /// what it runs till the lib takes over again is known code, not missing code
     pub fn library_declined(&mut self) {
         self.interpreting = true;
     }
 
-    /// the interpreter ran an instruction at pc that the library has no
-    /// code for. where that follows the library's code, missing code starts,
-    /// what it goes on to call the next build finds from there.
+    /// the interpreter ran an instr at pc the lib has no code for
+    /// right after lib code that's where missing code starts, the next build finds whatever it calls from there
     pub fn interpreted(&mut self, pc: u32, thumb: bool) {
         let at = pc & !1;
         if !self.interpreting && self.text.contains(&at) {
@@ -59,7 +55,7 @@ impl Hints {
         self.interpreting = true;
     }
 
-    /// writes the file when there is anything new.
+    /// writes the file when there's anything new
     pub fn save(&mut self) {
         if self.seen.len() == self.saved {
             return;
@@ -84,12 +80,12 @@ mod tests {
     fn what_runs_after_the_library_declines_is_no_hint() {
         let library = std::env::temp_dir().join(format!("zakuro-hints-{}", std::process::id())).join("lib.so");
         let mut hints = Hints::new(&library, 0x0010_0000..0x0020_0000);
-        // the rest of a block the budget did not cover
+        // rest of a block the budget didn't cover
         hints.library_declined();
         hints.interpreted(0x0010_0004, false);
         hints.interpreted(0x0010_0008, false);
         assert!(hints.seen.is_empty());
-        // code the library does not have, right after it ran
+        // code the lib doesn't have, right after it ran
         hints.library_ran();
         hints.interpreted(0x0010_0100, true);
         assert_eq!(hints.seen.iter().copied().collect::<Vec<_>>(), vec![0x0010_0101]);

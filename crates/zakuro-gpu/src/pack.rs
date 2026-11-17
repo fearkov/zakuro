@@ -1,10 +1,9 @@
-//! texture packs, pictures that take the place of a game's textures, laid
-//! out the way Citra and Azahar read them. a pack is a folder of PNGs, in
-//! any folders under it, each named tex1_<width>x<height>_<hash>_<format>
-//! for the texture it replaces, the hash being CityHash64 of that texture,
-//! and a pack.json saying how the hash was taken and which way up the PNGs
-//! are. only textures read from memory are replaced, never one the GPU drew,
-//! and only on the host's GPU.
+//! texture packs, pictures that replace a game's textures, laid out like Citra and Azahar read them
+//! a pack is a folder of PNGs (in any folders under it),
+//! each named tex1_<width>x<height>_<hash>_<format> for the texture it replaces,
+//! the hash being CityHash64 of that texture,
+//! plus a pack.json saying how the hash was taken and which way up the PNGs are
+//! only textures read from memory get replaced, never one the GPU drew, and only on the host's GPU
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,46 +12,41 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::format::morton_interleave;
 use crate::texture::TextureFormat;
 
-/// how a pack's hashes were taken.
+/// how a pack's hashes were taken
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hashing {
-    /// of the texture's bytes as memory holds them, what pack.json's
-    /// use_new_hash asks for.
+    /// of the texture's bytes as memory holds them, what pack.json's use_new_hash asks for
     Bytes,
-    /// of the texture as Citra uploaded it, in rows from the bottom, the
-    /// formats past RGBA4 decoded to RGBA8, what packs without a pack.json
-    /// or with use_new_hash false were made with.
+    /// of the texture as Citra uploaded it, in rows from the bottom, the formats past RGBA4 decoded to RGBA8,
+    /// what packs w/o a pack.json or w/ use_new_hash false were made w/
     Rows,
 }
 
-/// a texture pack, its pictures by the hash of the texture each replaces.
+/// a texture pack, its pictures by the hash of the texture each replaces
 pub struct Pack {
     hashing: Hashing,
     materials: HashMap<u64, Arc<Material>>,
 }
 
-/// one picture of a pack, read from disk once a texture it replaces is
-/// drawn with, and let go of once the GPU has it.
+/// one picture of a pack, read from disk once a texture it replaces gets drawn w/, and dropped once the GPU has it
 pub struct Material {
     hash: u64,
     path: PathBuf,
-    /// whether the rows are stored from the bottom up, so they get turned
-    /// over on reading.
+    /// are the rows stored bottom up, so they get flipped on reading
     flipped: bool,
     state: Mutex<State>,
 }
 
 enum State {
     OnDisk,
-    /// being read, and whether it is still wanted once it has been.
+    /// being read, and if it's still wanted once it has been
     Reading { wanted: bool },
     Read(Arc<Picture>),
-    /// unreadable, or more than the GPU takes, which was said once.
+    /// unreadable, or bigger than the GPU takes, which was said once
     Broken,
 }
 
-/// a picture read, RGBA8 rows from the top, at its own size and then at
-/// each half size down to a texel, one level after another.
+/// a picture read, RGBA8 rows from the top, at its own size then at each half size down to a texel, one level after another
 pub struct Picture {
     pub width: u32,
     pub height: u32,
@@ -60,7 +54,7 @@ pub struct Picture {
     pub levels: Vec<Level>,
 }
 
-/// one size of a picture, where its bytes start in the texels.
+/// one size of a picture, where its bytes start in the texels
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Level {
     pub offset: usize,
@@ -68,12 +62,12 @@ pub struct Level {
     pub height: u32,
 }
 
-/// the largest picture read, as big as any pack's.
+/// the largest picture read, as big as any pack's
 const MAX_SIZE: u32 = 8192;
 
 
 impl Pack {
-    /// the pack in dir, none when it holds no picture.
+    /// the pack in dir, none when it holds no picture
     pub fn open(dir: &Path) -> Option<Pack> {
         if !dir.is_dir() {
             return None;
@@ -81,8 +75,7 @@ impl Pack {
         let mut files = Vec::new();
         let mut scanned = HashSet::from_iter(dir.canonicalize().ok());
         scan(dir, 0, &mut scanned, &mut files);
-        // the pack.json at the top, or for a pack put in with the folders
-        // around it, such as its title id's, the one nearest the top
+        // the pack.json at the top, or for a pack put in w/ the folders around it (like its title id's) the one nearest the top
         let top = dir.join("pack.json");
         let nested = files.iter().filter(|path| path.file_name().is_some_and(|name| name == "pack.json")).min_by_key(|path| path.components().count());
         let config = match nested {
@@ -98,8 +91,7 @@ impl Pack {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
             let Some(hashes) = config.hashes(name, &mut other_formats) else { continue };
             for hash in hashes {
-                // the first file in the order Windows lists them wins, as
-                // in Citra, and packs do hold the same picture twice
+                // the first file in the order Windows lists them wins, like in Citra, and packs do hold the same picture twice
                 match materials.entry(hash) {
                     std::collections::hash_map::Entry::Occupied(_) => duplicates += 1,
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -133,10 +125,8 @@ impl Pack {
     }
 
     /// the picture replacing a texture of these bytes, format and size,
-    /// with rows where the texture is laid out for the hash when the pack
-    /// hashes them as Citra did. the hash pack.json does not ask for is
-    /// tried too, as packs carry Citra's pack.json made for the other one,
-    /// or pictures of both.
+    /// w/ rows where the texture is laid out for the hash when the pack hashes them like Citra did
+    /// the hash pack.json doesn't ask for gets tried too, packs carry Citra's pack.json made for the other one, or pictures of both
     pub fn find(&self, data: &[u8], format: TextureFormat, width: u32, height: u32, rows: &mut Vec<u8>) -> Option<Arc<Material>> {
         let other = match self.hashing {
             Hashing::Bytes => Hashing::Rows,
@@ -147,14 +137,13 @@ impl Pack {
 }
 
 impl Material {
-    /// the hash of the textures it replaces, which tells its pictures apart.
+    /// the hash of the textures it replaces, which tells its pictures apart
     pub fn hash(&self) -> u64 {
         self.hash
     }
 
-    /// the picture once it has been read, and otherwise none, starting to
-    /// read it unless that is under way or failed before. one wider or
-    /// higher than kept is halved down to it, as the GPU draws no finer.
+    /// the picture once it's been read, otherwise none, starting to read it unless that's under way or failed b4
+    /// one wider or taller than kept gets halved down to it, the GPU draws no finer
     pub fn picture(self: &Arc<Self>, kept: u32) -> Option<Arc<Picture>> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *state {
@@ -193,9 +182,8 @@ impl Material {
         };
     }
 
-    /// the GPU has the picture, or no longer draws what it replaces, so the
-    /// memory it took goes, also once a read under way ends, and it is read
-    /// again when it is needed again.
+    /// the GPU has the picture, or no longer draws what it replaces,
+    /// so the memory it took goes (also once a read under way ends), and it gets read again when needed again
     pub fn release(&self) {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *state {
@@ -205,14 +193,13 @@ impl Material {
         }
     }
 
-    /// the GPU can't take the picture, the texture stays as it is.
+    /// the GPU can't take the picture, the texture stays as is
     pub fn refuse(&self) {
         *self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = State::Broken;
     }
 }
 
-/// the threads pictures are read on, half the cores and at most four, so
-/// that the game goes on meanwhile.
+/// the threads pictures get read on, half the cores and at most four, so the game goes on meanwhile
 fn readers() -> &'static rayon::ThreadPool {
     static READERS: OnceLock<rayon::ThreadPool> = OnceLock::new();
     READERS.get_or_init(|| {
@@ -225,20 +212,19 @@ fn readers() -> &'static rayon::ThreadPool {
     })
 }
 
-/// what pack.json says, or what holds without one.
+/// what pack.json says, or what holds without one
 #[derive(Debug, PartialEq)]
 struct Config {
     hashing: Hashing,
-    /// whether the PNGs are stored with their top row first, as dumped,
-    /// pack.json's flip_png_files.
+    /// are the PNGs stored w/ their top row first, as dumped, pack.json's flip_png_files
     upright: bool,
-    /// file names pack.json gives hashes to, besides the hash in a name.
+    /// file names pack.json gives hashes to, besides the hash in a name
     mapped: HashMap<String, Vec<u64>>,
 }
 
 impl Config {
     fn read(path: &Path) -> Config {
-        // without a pack.json the hashes are Citra's from before pack.json
+        // w/o a pack.json the hashes are Citra's from b4 pack.json
         let legacy = Config { hashing: Hashing::Rows, upright: true, mapped: HashMap::new() };
         let text = match std::fs::read(path) {
             Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
@@ -253,8 +239,7 @@ impl Config {
         }
     }
 
-    /// the options missing from a pack.json are those Citra starts with,
-    /// where it would stop.
+    /// the options missing from a pack.json are the ones Citra starts w/, where it would stop
     fn parse(text: &str) -> Result<Config, String> {
         let json: serde_json::Value = serde_json::from_str(&without_comments(text.trim_start_matches('\u{feff}'))).map_err(|error| error.to_string())?;
         let option = |name: &str, default: bool| json["options"][name].as_bool().unwrap_or(default);
@@ -281,16 +266,14 @@ impl Config {
         Ok(Config { hashing, upright: option("flip_png_files", true), mapped })
     }
 
-    /// the hashes a file of the pack replaces textures of, none when it is
-    /// not a color picture Zakuro reads, counting DDS and KTX ones.
+    /// the hashes a file of the pack replaces textures of, none when it isn't a color picture Zakuro reads, counting DDS and KTX ones
     fn hashes(&self, name: &str, other_formats: &mut usize) -> Option<Vec<u64>> {
-        // a name, then the kind of map it is, then the format, as Citra
-        // splits them, the format in lower case
+        // a name, then the kind of map it is, then the format, like Citra splits them, the format in lowercase
         let parts: Vec<&str> = name.split('.').collect();
         if parts.len() < 2 || parts.len() > 3 {
             return None;
         }
-        // in any case, as Citra before Azahar took .PNG, which packs have
+        // in any case, since Citra b4 Azahar took .PNG, which packs have
         match parts[parts.len() - 1].to_ascii_lowercase().as_str() {
             "png" => {}
             "dds" | "ktx" => {
@@ -299,7 +282,7 @@ impl Config {
             }
             _ => return None,
         }
-        // normal maps, which only Citra's OpenGL renderer draws with
+        // normal maps, only Citra's OpenGL renderer draws w/ those
         if parts.len() == 3 && parts[1].eq_ignore_ascii_case("norm") {
             return None;
         }
@@ -313,8 +296,7 @@ impl Config {
     }
 }
 
-/// the hash in a picture's name, tex1_<width>x<height>_<hash>_<format>
-/// with anything after, such as Azahar's _mip0.
+/// the hash in a picture's name, tex1_<width>x<height>_<hash>_<format> w/ anything after, like Azahar's _mip0
 fn name_hash(name: &str) -> Option<u64> {
     // what follows a decimal number text starts with
     fn decimal(text: &str) -> Option<&str> {
@@ -331,14 +313,14 @@ fn name_hash(name: &str) -> Option<u64> {
     Some(hash)
 }
 
-/// the hexadecimal number text starts with.
+/// the hexadecimal number text starts with
 fn leading_hex(text: &str) -> Option<u64> {
     let text = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).unwrap_or(text);
     let end = text.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(text.len());
     u64::from_str_radix(&text[..end], 16).ok()
 }
 
-/// JSON with its // and /* */ comments taken out, which Citra allows.
+/// JSON w/ its // and /* */ comments taken out, which Citra allows
 fn without_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -378,9 +360,9 @@ fn without_comments(text: &str) -> String {
     out
 }
 
-/// every file under dir, each folder's entries in the order Windows lists
-/// them, which decides between pictures of the same hash as in Citra. links
-/// are followed, to a folder not scanned already.
+/// every file under dir, each folder's entries in the order Windows lists them,
+/// which decides between pictures of the same hash like in Citra
+/// links get followed, to a folder not scanned already
 fn scan(dir: &Path, depth: u32, scanned: &mut HashSet<PathBuf>, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<(String, PathBuf)> =
@@ -398,8 +380,7 @@ fn scan(dir: &Path, depth: u32, scanned: &mut HashSet<PathBuf>, files: &mut Vec<
     }
 }
 
-/// a texture's hash as the pack's were taken, none for a texture no pack
-/// can have.
+/// a texture's hash as the pack's were taken, none for a texture no pack can have
 pub fn hash(hashing: Hashing, data: &[u8], format: TextureFormat, width: u32, height: u32, rows: &mut Vec<u8>) -> Option<u64> {
     if matches!(format, TextureFormat::Unknown(_)) {
         return None;
@@ -413,7 +394,7 @@ pub fn hash(hashing: Hashing, data: &[u8], format: TextureFormat, width: u32, he
     }
 }
 
-/// bytes a texel takes laid out as Citra uploaded it.
+/// bytes a texel takes laid out as Citra uploaded it
 fn row_bytes(format: TextureFormat) -> usize {
     match format {
         TextureFormat::Rgb8 => 3,
@@ -422,15 +403,14 @@ fn row_bytes(format: TextureFormat) -> usize {
     }
 }
 
-/// e4 of Citra's color conversions, a 4 bit value made 8 bits.
+/// e4 of Citra's color conversions, a 4 bit value made 8 bits
 fn expand4(value: u8) -> u8 {
     (value & 15) * 17
 }
 
-/// lays a texture out as Citra uploaded it, in rows from the bottom, the
-/// first five formats in their own bytes and the rest decoded to RGBA8 as
-/// Citra decoded them. that differs from texture.rs for HILO8 and for ETC1
-/// colors past the ends of their range, so it is a decoder of its own.
+/// lays a texture out as Citra uploaded it, in rows from the bottom,
+/// the first five formats in their own bytes and the rest decoded to RGBA8 like Citra decoded them
+/// that differs from texture.rs for HILO8 and for ETC1 colors past the ends of their range, so it's a decoder of its own
 fn citra_rows(data: &[u8], format: TextureFormat, width: u32, height: u32, out: &mut Vec<u8>) -> Option<()> {
     let (width, height) = (width as usize, height as usize);
     let size = width * height * format.bits_per_pixel() as usize / 8;
@@ -462,7 +442,7 @@ fn citra_rows(data: &[u8], format: TextureFormat, width: u32, height: u32, out: 
     Some(())
 }
 
-/// where each texel of an 8x8 tile lies, by its place in memory.
+/// where each texel of an 8x8 tile lies, by its place in memory
 const PLACES: [(usize, usize); 64] = {
     let mut places = [(0, 0); 64];
     let mut y = 0;
@@ -477,15 +457,15 @@ const PLACES: [(usize, usize); 64] = {
     places
 };
 
-/// where a tile of a texture starts in rows from the bottom, its first row
-/// of memory the last of its rows there, and the texels across a row.
+/// where a tile of a texture starts in rows from the bottom, its first row of memory the last of its rows there,
+/// and the texels across a row
 fn tile_start(index: usize, (width, height): (usize, usize)) -> usize {
     let tiles_across = width / 8;
     let (left, top) = (index % tiles_across * 8, index / tiles_across * 8);
     (height - 1 - top) * width + left
 }
 
-/// lays out texels that take IN bytes in memory as OUT bytes each.
+/// lays out texels that take IN bytes in memory as OUT bytes each
 fn untile<const IN: usize, const OUT: usize>(data: &[u8], rows: &mut [u8], sizes: (usize, usize), convert: impl Fn([u8; IN]) -> [u8; OUT]) {
     let rows = rows.as_chunks_mut::<OUT>().0;
     for (index, tile) in data.as_chunks::<IN>().0.as_chunks::<64>().0.iter().enumerate() {
@@ -496,7 +476,7 @@ fn untile<const IN: usize, const OUT: usize>(data: &[u8], rows: &mut [u8], sizes
     }
 }
 
-/// the same for 4 bit texels, two to a byte, the first in the low bits.
+/// same for 4 bit texels, two to a byte, the first in the low bits
 fn untile_nibbles(data: &[u8], rows: &mut [u8], sizes: (usize, usize), convert: impl Fn(u8) -> [u8; 4]) {
     let rows = rows.as_chunks_mut::<4>().0;
     for (index, tile) in data.as_chunks::<32>().0.iter().enumerate() {
@@ -509,8 +489,7 @@ fn untile_nibbles(data: &[u8], rows: &mut [u8], sizes: (usize, usize), convert: 
     }
 }
 
-/// the same for ETC1 blocks, four 4x4 ones to a tile, across then down,
-/// each after 8 bytes of 4 bit alphas in ETC1A4.
+/// same for ETC1 blocks, four 4x4 ones to a tile, across then down, each after 8 bytes of 4 bit alphas in ETC1A4
 fn untile_etc1(data: &[u8], rows: &mut [u8], sizes: (usize, usize), alpha: bool) {
     let rows = rows.as_chunks_mut::<4>().0;
     let block_bytes = if alpha { 16 } else { 8 };
@@ -534,12 +513,12 @@ fn untile_etc1(data: &[u8], rows: &mut [u8], sizes: (usize, usize), alpha: bool)
     }
 }
 
-/// how far ETC1's tables move a texel from its half's color.
+/// how far ETC1's tables move a texel from its half's color
 const ETC1_MODIFIERS: [[i32; 2]; 8] = [[2, 8], [5, 17], [9, 29], [13, 42], [18, 60], [24, 80], [33, 106], [47, 183]];
 
-/// the colors the texels of an ETC1 block read as a little-endian word can
-/// take, for each of its halves, by a texel's two bits, the high one moving
-/// the color down. a differential color past 5 bits wraps, as Citra has it.
+/// the colors the texels of an ETC1 block read as a little endian word can take, for each of its halves,
+/// by a texel's two bits, the high one moving the color down
+/// a differential color past 5 bits wraps, like Citra has it
 fn etc1_colors(block: u64) -> [[[u8; 3]; 4]; 2] {
     let differential = block >> 33 & 1 != 0;
     [false, true].map(|second| {
@@ -561,14 +540,13 @@ fn etc1_colors(block: u64) -> [[[u8; 3]; 4]; 2] {
     })
 }
 
-/// a PNG as RGBA8 rows from the top, turned over when stored from the
-/// bottom, halved down to kept, with its smaller sizes after it.
+/// a PNG as RGBA8 rows from the top, flipped when stored from the bottom, halved down to kept, w/ its smaller sizes after it
 fn read_png(path: &Path, flipped: bool, kept: u32) -> Result<Picture, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut decoder = png::Decoder::new_with_limits(std::io::BufReader::new(file), png::Limits { bytes: 1 << 30 });
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
-    // the size first, before memory for the picture is taken
+    // the size first, b4 memory for the picture gets taken
     let (width, height) = (reader.info().width, reader.info().height);
     if width == 0 || height == 0 || width > MAX_SIZE || height > MAX_SIZE {
         return Err(format!("it is {width}x{height}"));
@@ -615,10 +593,9 @@ fn read_png(path: &Path, flipped: bool, kept: u32) -> Result<Picture, String> {
     Ok(Picture { width: top.width, height: top.height, texels, levels })
 }
 
-/// adds the level half the size of above to texels, each of its texels the
-/// average of 2x2 of above's, the colors weighed by their alpha, so that
-/// the color of clear texels, black in most pictures, does not darken the
-/// edges of what shows.
+/// adds the level half the size of above to texels, each of its texels the average of 2x2 of above's,
+/// colors weighed by their alpha, so the color of clear texels (black in most pictures) doesn't darken the edges
+/// of what shows
 fn halve(texels: &mut Vec<u8>, above: Level) -> Level {
     let level = Level { offset: texels.len(), width: (above.width / 2).max(1), height: (above.height / 2).max(1) };
     let (above_width, above_height) = (above.width as usize, above.height as usize);
@@ -649,13 +626,12 @@ fn halve(texels: &mut Vec<u8>, above: Level) -> Level {
     level
 }
 
-/// ZAKURO_TEXTURE_HASHES=<file> writes each texture's hashes there as it is
-/// first seen, its size and format, then by its bytes and as Citra uploaded
-/// it, to check them against a pack's names. ZAKURO_DUMP_TEXTURES=<folder>
-/// saves each one there as Citra names a picture without a pack.json, at
-/// ZAKURO_DUMP_SCALE times its size, as a start for a pack.
+/// ZAKURO_TEXTURE_HASHES=<file> writes each texture's hashes there when first seen, its size and format,
+/// then by its bytes and as Citra uploaded it, to check them against a pack's names
+/// ZAKURO_DUMP_TEXTURES=<folder> saves each one there like Citra names a picture w/o a pack.json,
+/// at ZAKURO_DUMP_SCALE times its size, as a start for a pack
 pub(crate) fn record(data: &[u8], texels: &[[u8; 4]], format: TextureFormat, width: u32, height: u32) {
-    /// the file, the folder, the scale, and the textures already seen.
+    /// the file, the folder, the scale, and the textures already seen
     type Record = Mutex<(Option<std::fs::File>, Option<PathBuf>, u32, std::collections::HashSet<u64>)>;
     static RECORD: OnceLock<Record> = OnceLock::new();
     let record = RECORD.get_or_init(|| {
@@ -704,7 +680,7 @@ pub(crate) fn record(data: &[u8], texels: &[[u8; 4]], format: TextureFormat, wid
     }
 }
 
-/// whether ZAKURO_TEXTURE_HASHES or ZAKURO_DUMP_TEXTURES asks for textures.
+/// does ZAKURO_TEXTURE_HASHES or ZAKURO_DUMP_TEXTURES ask for textures
 pub(crate) fn recording() -> bool {
     static RECORDING: OnceLock<bool> = OnceLock::new();
     *RECORDING.get_or_init(|| std::env::var_os("ZAKURO_TEXTURE_HASHES").is_some() || std::env::var_os("ZAKURO_DUMP_TEXTURES").is_some())
@@ -715,7 +691,7 @@ mod tests {
     use super::*;
 
     /// CityHash64 of (i * 31 + 7) & 0xFF for i below each length, from
-    /// Azahar's own cityhash.cpp.
+    /// Azahar's own cityhash.cpp
     const CITY: [(usize, u64); 13] = [
         (0, 0x9AE16A3B2F90404F),
         (1, 0x57821EFDEE1B7472),
@@ -742,7 +718,7 @@ mod tests {
 
     /// width, height, format and the hashes by bytes and as Citra uploaded
     /// the texture, from Azahar's own texture_codec.h over the bytes of
-    /// next_byte, taken in this order.
+    /// next_byte, taken in this order
     const TEXTURES: [(u32, u32, u32, u64, u64); 42] = [
         (8, 8, 0, 0x8BB17B66492BC46A, 0xF324964DBD8408A5),
         (8, 8, 1, 0xDBED6FE1B7A74F77, 0x18AF200D2597A12B),
@@ -788,7 +764,7 @@ mod tests {
         (32, 8, 13, 0x8435AD8FCD1517DB, 0xF6F414D0595328D2),
     ];
 
-    /// xorshift64*, the bytes the textures above hold.
+    /// xorshift64*, the bytes the textures above hold
     fn next_byte(state: &mut u64) -> u8 {
         *state ^= *state >> 12;
         *state ^= *state << 25;
@@ -871,8 +847,8 @@ mod tests {
         assert!(Pack::open(&dir).is_none());
     }
 
-    /// a pack put in with its title id's folder around it, as packs come,
-    /// still has its pack.json read, and a link back up is not gone round.
+    /// a pack put in w/ its title id's folder around it (how packs come) still gets its pack.json read,
+    /// and a link back up doesn't get gone round
     #[test]
     fn a_pack_in_its_own_folders_finds_its_pack_json() {
         let dir = std::env::temp_dir().join(format!("zakuro-pack-nested-{}", std::process::id()));
@@ -891,7 +867,7 @@ mod tests {
     }
 
     /// a pack whose pack.json asks for one hash finds pictures named for
-    /// the other.
+    /// the other
     #[test]
     fn both_hashes_find_pictures() {
         let data: Vec<u8> = (0..256).map(|i| (i * 7 % 251) as u8).collect();
@@ -908,8 +884,7 @@ mod tests {
         }
     }
 
-    /// a picture let go of while it is read is dropped once read, and one
-    /// wanted again meanwhile is kept.
+    /// a picture dropped while it's being read gets dropped once read, and one wanted again meanwhile is kept
     #[test]
     fn a_picture_let_go_of_while_read_is_not_kept() {
         let path = std::env::temp_dir().join(format!("zakuro-material-{}.png", std::process::id()));
@@ -949,8 +924,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// the clear black around what shows does not darken its edges in the
-    /// smaller sizes.
+    /// the clear black around what shows doesn't darken its edges in the smaller sizes
     #[test]
     fn clear_texels_do_not_darken_the_smaller_sizes() {
         let mut texels = [[255, 255, 255, 255], [0, 0, 0, 0], [255, 255, 255, 255], [0, 0, 0, 0]].concat();
@@ -959,8 +933,7 @@ mod tests {
         assert_eq!(&texels[16..], &[255, 255, 255, 128]);
     }
 
-    /// a picture past the size kept is halved down to it before its
-    /// smaller sizes are made.
+    /// a picture past the size kept gets halved down to it b4 its smaller sizes are made
     #[test]
     fn a_huge_picture_is_halved_to_the_size_kept() {
         let path = std::env::temp_dir().join(format!("zakuro-huge-{}.png", std::process::id()));

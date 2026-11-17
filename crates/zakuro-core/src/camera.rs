@@ -1,37 +1,35 @@
-//! what the console's cameras see, which the frontend gives: the host's
-//! camera, a picture from a file, or nothing.
+//! what the console's cameras see, the frontend picks, host webcam, a picture file, or nothing
 
 use std::sync::Arc;
 
-/// a picture, red, green and blue bytes, a row after another.
+/// a picture, rgb bytes row after row
 #[derive(Debug, Clone, PartialEq)]
 pub struct Picture {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<u8>,
-    /// how it goes into a camera's frame of another shape.
+    /// how it fits a camera frame of another shape
     pub fit: Fit,
 }
 
-/// how a picture goes into a frame of another shape.
+/// how a picture fits a frame of another shape
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
-    /// all of it, the frame white around it, for a picture of a QR code.
+    /// all of it w/ white around, for a QR code pic
     Whole,
-    /// the frame filled, what sticks out cut off, for a camera.
+    /// frame filled, overflow cut off, for a camera
     Fill,
 }
 
-/// where the cameras get their pictures from.
+/// where the cameras get pictures from
 pub trait Camera: Send {
-    /// a title started or stopped capturing, a host's camera may turn on
-    /// only meanwhile.
+    /// a title started or stopped capturing, a webcam may only be on meanwhile
     fn capturing(&mut self, on: bool);
-    /// the latest picture, none while there is none.
+    /// latest picture, none while there's none
     fn picture(&mut self) -> Option<Arc<Picture>>;
 }
 
-/// a picture that never changes, a file's.
+/// a picture that never changes, a file's
 pub struct Still(pub Arc<Picture>);
 
 impl Camera for Still {
@@ -43,20 +41,19 @@ impl Camera for Still {
 }
 
 impl Picture {
-    /// the picture at width by height, fitted as it says, as red, green
-    /// and blue triples.
+    /// the picture at width by height, fitted as it says, as rgb triples
     pub fn scaled(&self, width: u32, height: u32) -> Vec<[u8; 3]> {
         let mut out = vec![[255u8; 3]; (width * height) as usize];
         if self.width == 0 || self.height == 0 || self.rgb.len() < (self.width * self.height * 3) as usize {
             return out;
         }
         let (source_width, source_height) = (self.width as f32, self.height as f32);
-        // how many of the picture's pixels a frame's pixel spans
+        // how many picture pixels one frame pixel spans
         let step = match self.fit {
             Fit::Whole => (source_width / width as f32).max(source_height / height as f32),
             Fit::Fill => (source_width / width as f32).min(source_height / height as f32),
         };
-        // where the frame's top left falls on the picture, the two centered
+        // where the frame's top left lands on the picture, both centered
         let left = (source_width - width as f32 * step) / 2.0;
         let top = (source_height - height as f32 * step) / 2.0;
         let texel = |x: i32, y: i32| {
@@ -73,7 +70,7 @@ impl Picture {
                 if u < -0.5 || u > source_width - 0.5 {
                     continue;
                 }
-                // between the four nearest, by how near
+                // blend the four nearest by distance
                 let (u, v) = (u.clamp(0.0, source_width - 1.0), v.clamp(0.0, source_height - 1.0));
                 let (x0, y0) = (u.floor() as i32, v.floor() as i32);
                 let (x1, y1) = ((x0 + 1).min(self.width as i32 - 1), (y0 + 1).min(self.height as i32 - 1));
@@ -105,7 +102,7 @@ mod tests {
         Picture { width, height, rgb, fit }
     }
 
-    /// at its own size a picture comes back as it is.
+    /// at its own size a picture comes back untouched
     #[test]
     fn a_picture_at_its_size_is_itself() {
         let picture = picture(4, 3, Fit::Whole);
@@ -114,8 +111,7 @@ mod tests {
         assert_eq!(scaled[4 * 2 + 3], [3, 2, 7]);
     }
 
-    /// a square picture whole in a wide frame has white either side, and
-    /// filling it cuts its top and bottom instead.
+    /// a square pic whole in a wide frame gets white on both sides, fill crops top and bottom instead
     #[test]
     fn whole_leaves_white_around_and_fill_cuts() {
         let whole = picture(2, 2, Fit::Whole).scaled(4, 2);

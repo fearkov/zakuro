@@ -1,7 +1,6 @@
 #version 450
 
-// vertices the CPU already shaded, clipped and placed on the target, with
-// w kept so the varyings interpolate with perspective.
+// vertices the CPU already shaded, clipped and placed on the target, w/ w kept so the varyings interpolate w/ perspective
 layout(location = 0) in vec4 position;
 layout(location = 1) in vec4 color;
 layout(location = 2) in vec4 texcoords01;
@@ -12,10 +11,10 @@ layout(location = 5) in vec4 view;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
 layout(location = 2) out vec2 out_texcoord2;
-// the mapped depth before any w-buffer scaling, linear on the screen
+// the mapped depth b4 any w buffer scaling, linear on the screen
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
-// the view vector, and in w texture coordinate set 0's w
+// the view vector, and in w texture coord set 0's w
 layout(location = 5) out vec4 out_view;
 
 void main() {

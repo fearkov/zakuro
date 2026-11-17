@@ -1,7 +1,6 @@
-//! frd:u, the friend list and this console's own friend details. the
-//! console keeps them itself and answers offline too, as one that never
-//! logged in and has no friends. what needs the servers is left to the
-//! offline reply.
+//! frd:u, the friend list and this console's own friend details
+//! the console keeps them itself and answers offline too, as one that never logged in and has no friends (relatable)
+//! whatever needs the servers gets the offline reply
 
 use zakuro_common::result::errors;
 
@@ -9,7 +8,7 @@ use crate::kernel::ipc::{CommandBuffer, Header};
 use crate::services::cfg::REGION_USA;
 use crate::System;
 
-/// the platform a profile names, the 3DS.
+/// the platform a profile names, the 3DS
 const PLATFORM_CTR: u32 = 2;
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
@@ -22,8 +21,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // Logout, AttachToEventNotification, SetNotificationMask and
         // SetClientSdkVersion
         0x0004 | 0x0020 | 0x0021 | 0x0032 => buffer.reply(memory, command, &[]),
-        // GetMyFriendKey, a principal id, padding and a friend code seed,
-        // none of which a console that never logged in has
+        // GetMyFriendKey, a principal id, padding and a friend code seed, a console that never logged in has none of them
         0x0005 => buffer.reply(memory, command, &[0; 4]),
         // GetMyPreference, private, showing neither game
         0x0006 => buffer.reply(memory, command, &[0; 3]),
@@ -35,7 +33,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         // GetMyPresence, into a static buffer that stays as it is
         0x0008 => buffer.reply(memory, command, &[]),
-        // GetMyScreenName, the user's name in eleven UTF-16 units
+        // GetMyScreenName, the user's name in eleven UTF 16 units
         0x0009 => {
             let mut name = [0u8; 24];
             for (i, unit) in "Zakuro".encode_utf16().enumerate() {
@@ -57,7 +55,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         0x000F => buffer.reply(memory, command, &[0; 9]),
         // GetFriendKeyList and GetEventNotification, none
         0x0011 | 0x0022 => buffer.reply(memory, command, &[0]),
-        // lookups on friends the title names, of which it has none to name
+        // lookups on friends the title names, it has none to name
         0x0012..=0x001A => buffer.reply(memory, command, &[]),
         // IsIncludedInFriendList
         0x001B => buffer.reply(memory, command, &[0]),

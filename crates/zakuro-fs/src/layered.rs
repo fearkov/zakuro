@@ -1,9 +1,8 @@
-//! a game's RomFS with a mod laid over it, from the folders Luma3DS and
-//! Citra take mods in. romfs/ holds files that replace the game's or are
-//! added to them, romfs_ext/ holds .ips and .bps patches for the game's
-//! files and .stub files, each taking away the file it is named after.
-//! the game's own file data stays where it is in the ROM, the new tree's
-//! metadata goes in front of it and the mod's files after it.
+//! a game's RomFS w/ a mod laid over it, from the folders Luma3DS and Citra take mods in
+//! romfs/ holds files that replace the game's or get added to them,
+//! romfs_ext/ holds .ips and .bps patches for the game's files plus .stub files,
+//! each removing the file it's named after
+//! the game's own file data stays where it is in the ROM, the new tree's metadata goes in front of it and the mod's files after it
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +10,7 @@ use crate::romfs::RomFs;
 use crate::romfs_build::{self, Dir, File};
 use crate::{patch, FsError};
 
-/// what a mod changed in the RomFS.
+/// what a mod changed in the RomFS
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Changes {
     pub replaced: usize,
@@ -26,29 +25,28 @@ impl Changes {
     }
 }
 
-/// where some of the layered image's bytes come from.
+/// where some of the layered image's bytes come from
 enum Source {
-    /// the ROM image, from this offset.
+    /// the ROM image, from this offset
     Image(u64),
-    /// a file of the mod's.
+    /// a file of the mod's
     Host(PathBuf),
-    /// a patched file, kept whole.
+    /// a patched file, kept whole
     Memory(Vec<u8>),
 }
 
-/// a stretch of the layered image after the metadata.
+/// a stretch of the layered image after the metadata
 struct Piece {
     start: u64,
     size: u64,
     source: Source,
 }
 
-/// a game's RomFS with a mod over it, read like the level-3 image it
-/// stands in for.
+/// a game's RomFS w/ a mod over it, read like the level 3 image it stands in for
 pub struct Layered {
-    /// the header and the metadata tables, up to where the file data starts.
+    /// the header and the metadata tables, up to where the file data starts
     meta: Vec<u8>,
-    /// the file data, in order.
+    /// the file data, in order
     pieces: Vec<Piece>,
     size: u64,
     pub changes: Changes,
@@ -61,8 +59,7 @@ impl std::fmt::Debug for Layered {
 }
 
 impl Layered {
-    /// romfs, a RomFS in image, with the mod in dir over it. None when the
-    /// mod changes nothing in it.
+    /// romfs, a RomFS in image, w/ the mod in dir over it, None when the mod changes nothing in it
     pub fn new(romfs: &RomFs, image: &[u8], dir: &Path) -> Result<Option<Layered>, FsError> {
         let mut tree = Tree::read(romfs)?;
         let content = tree.content();
@@ -81,7 +78,7 @@ impl Layered {
         Ok(Some(tree.layout(romfs, changes)))
     }
 
-    /// how many bytes the layered image has.
+    /// how many bytes the layered image has
     pub fn len(&self) -> u64 {
         self.size
     }
@@ -90,8 +87,7 @@ impl Layered {
         self.size == 0
     }
 
-    /// reads the layered image from offset into out, image being the ROM's
-    /// bytes. how many bytes there were to read.
+    /// reads the layered image from offset into out (image is the ROM's bytes), returns how many bytes there were to read
     pub fn read(&self, image: &[u8], offset: u64, out: &mut [u8]) -> usize {
         if offset >= self.size {
             return 0;
@@ -131,9 +127,8 @@ impl Layered {
         count
     }
 
-    /// the files the mod put in, replacing, patching or adding them, whose
-    /// paths wanted takes, with their bytes. a path goes from where the
-    /// mod's paths start, / separated.
+    /// the files the mod put in (replacing, patching or adding them) whose paths wanted takes, w/ their bytes
+    /// a path goes from where the mod's paths start, / separated
     pub fn modded_files(&self, wanted: impl Fn(&str) -> bool) -> Vec<(String, Vec<u8>)> {
         let mut files = Vec::new();
         let Ok(romfs) = RomFs::parse_level3(&self.meta, 0) else { return files };
@@ -156,8 +151,7 @@ impl Layered {
         files
     }
 
-    /// the size bytes at start in the image, when they are a file the mod
-    /// put there.
+    /// the size bytes at start in the image, when they're a file the mod put there
     fn modded(&self, start: u64, size: u64) -> Option<Vec<u8>> {
         let piece = self.pieces.iter().find(|piece| piece.start == start && piece.size == size)?;
         let mut bytes = vec![0; size as usize];
@@ -170,22 +164,21 @@ impl Layered {
     }
 }
 
-/// a file of the tree being put together.
+/// a file of the tree being put together
 struct Leaf {
     name: String,
     size: u64,
-    /// where its data is from the start of the game's file data, while it
-    /// is the game's.
+    /// where its data is from the start of the game's file data, while it's the game's
     game: Option<u64>,
-    /// what the mod puts in its place.
+    /// what the mod puts in its place
     modded: Option<Source>,
 }
 
-/// the game's tree, with the mod's changes made to it.
+/// the game's tree, with the mod's changes made to it
 struct Tree {
     dirs: Vec<Dir>,
     leaves: Vec<Leaf>,
-    /// where the game's file data ends.
+    /// where the game's file data ends
     game_data: u64,
 }
 
@@ -210,8 +203,7 @@ impl Tree {
         Ok(tree)
     }
 
-    /// the directory a mod's paths start from, the root, or the nameless
-    /// one under it some images keep everything in.
+    /// the dir a mod's paths start from, the root or the nameless one under it some images keep everything in
     fn content(&self) -> usize {
         match self.dirs[0].children.as_slice() {
             &[only] if self.dirs[0].files.is_empty() && self.dirs[only].name.is_empty() => only,
@@ -219,22 +211,21 @@ impl Tree {
         }
     }
 
-    /// the directory named name in parent. names are matched exactly first,
-    /// then ignoring case, as mods made on Windows can have them either way.
+    /// the dir named name in parent, names get matched exactly first then ignoring case, mods made on Windows can have them either way
     fn find_dir(&self, parent: usize, name: &str) -> Option<usize> {
         let children = &self.dirs[parent].children;
         let by = |same: &dyn Fn(&str) -> bool| children.iter().copied().find(|&child| same(&self.dirs[child].name));
         by(&|other| other == name).or_else(|| by(&|other| other.eq_ignore_ascii_case(name)))
     }
 
-    /// the file named name in parent, as a leaf.
+    /// the file named name in parent, as a leaf
     fn find_file(&self, parent: usize, name: &str) -> Option<usize> {
         let files = &self.dirs[parent].files;
         let by = |same: &dyn Fn(&str) -> bool| files.iter().copied().find(|&leaf| same(&self.leaves[leaf].name));
         by(&|other| other == name).or_else(|| by(&|other| other.eq_ignore_ascii_case(name)))
     }
 
-    /// the mod's files in host, over the directory at.
+    /// the mod's files in host, over the directory at
     fn lay(&mut self, host: &Path, at: usize, changes: &mut Changes) -> Result<(), FsError> {
         for (path, name) in entries(host)? {
             if path.is_dir() {
@@ -268,7 +259,7 @@ impl Tree {
         Ok(())
     }
 
-    /// the patches and stubs in host, for the files of the directory at.
+    /// the patches and stubs in host, for the files of the dir at
     fn patch(&mut self, host: &Path, at: usize, game: (&RomFs, &[u8]), changes: &mut Changes) -> Result<(), FsError> {
         for (path, name) in entries(host)? {
             if path.is_dir() {
@@ -311,8 +302,7 @@ impl Tree {
         Ok(())
     }
 
-    /// a leaf's bytes as they are now, a patch goes over what romfs/ put
-    /// there when it put something.
+    /// a leaf's bytes as they are now, a patch goes over what romfs/ put there when it put something
     fn data(&self, leaf: usize, (romfs, image): (&RomFs, &[u8])) -> Result<Vec<u8>, FsError> {
         let leaf = &self.leaves[leaf];
         match (&leaf.modded, leaf.game) {
@@ -328,7 +318,7 @@ impl Tree {
     }
 
     /// the image, the game's file data keeping its offsets and the mod's
-    /// coming after it.
+    /// coming after it
     fn layout(mut self, romfs: &RomFs, changes: Changes) -> Layered {
         let mut end = self.game_data.next_multiple_of(16);
         let mut files = Vec::new();
@@ -363,8 +353,7 @@ fn dir(name: String, parent: usize) -> Dir {
     Dir { name, parent, children: Vec::new(), files: Vec::new(), offset: 0 }
 }
 
-/// the path of name in the directory at path. paths skip the nameless
-/// directories, the root and the one some images keep everything in.
+/// the path of name in the dir at path, paths skip the nameless dirs (the root and the one some images keep everything in)
 fn join(path: &str, name: &str) -> String {
     if path.is_empty() || name.is_empty() {
         format!("{path}{name}")
@@ -373,8 +362,7 @@ fn join(path: &str, name: &str) -> String {
     }
 }
 
-/// a host directory's entries and their names, in order of name, so a
-/// mod lays out the same way every time.
+/// a host dir's entries and their names, sorted by name so a mod lays out the same way every time
 fn entries(host: &Path) -> Result<Vec<(PathBuf, String)>, FsError> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(host)? {
@@ -388,7 +376,7 @@ fn entries(host: &Path) -> Result<Vec<(PathBuf, String)>, FsError> {
     Ok(entries)
 }
 
-/// reads a mod's file from at into out, as much of it as there is.
+/// reads a mod's file from at into out, as much of it as there is
 fn read_host(path: &Path, at: u64, out: &mut [u8]) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -412,7 +400,7 @@ mod tests {
     use super::*;
     use crate::romfs_build::BuildFile;
 
-    /// a folder for one test's mod, empty.
+    /// a folder for one test's mod, empty
     fn folder(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zakuro-mods-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -426,13 +414,13 @@ mod tests {
         std::fs::write(path, data).unwrap();
     }
 
-    /// a game's RomFS, its files at the root as games have them.
+    /// a game's RomFS, its files at the root as games have them
     fn game(files: &[(&str, &[u8])]) -> Vec<u8> {
         let files: Vec<BuildFile> = files.iter().map(|(path, data)| BuildFile { path: (*path).into(), data: data.to_vec() }).collect();
         romfs_build::assemble(&files, false)
     }
 
-    /// the whole layered image, read the way a game reads it.
+    /// the whole layered image, read the way a game reads it
     fn whole(layered: &Layered, image: &[u8]) -> Vec<u8> {
         let mut out = vec![0xAA; layered.len() as usize];
         assert_eq!(layered.read(image, 0, &mut out), out.len());
@@ -479,8 +467,7 @@ mod tests {
         std::fs::remove_dir_all(mods).unwrap();
     }
 
-    /// reads that start and end anywhere get the same bytes as reading the
-    /// whole image, games read in chunks.
+    /// reads that start and end anywhere get the same bytes as reading the whole image, games read in chunks
     #[test]
     fn reads_in_pieces_match_the_whole() {
         let image = game(&[("a.bin", &[1; 100]), ("b.bin", &[2; 37])]);
@@ -516,8 +503,7 @@ mod tests {
         std::fs::remove_dir_all(mods).unwrap();
     }
 
-    /// images that keep everything in a nameless directory under the root
-    /// take a mod's paths from there.
+    /// images that keep everything in a nameless dir under the root take a mod's paths from there
     #[test]
     fn a_nameless_content_directory_takes_the_mod() {
         let image = romfs_build::build(&[BuildFile { path: "US/country.bin".into(), data: vec![1] }]);
@@ -531,9 +517,8 @@ mod tests {
         std::fs::remove_dir_all(mods).unwrap();
     }
 
-    /// the files a mod replaced, patched or added read back by their paths,
-    /// in the game's spelling, and the game's own and those the mod took
-    /// away do not.
+    /// the files a mod replaced, patched or added read back by their paths in the game's spelling,
+    /// and the game's own and the ones the mod removed don't
     #[test]
     fn the_files_a_mod_put_in_read_back_by_path() {
         let image = game(&[

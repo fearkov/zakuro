@@ -1,9 +1,9 @@
-//! small services that need only a handful of commands to keep a title moving.
+//! lil services that only need a handful of commands to keep a title moving
 
 use crate::kernel::ipc::{CommandBuffer, Header};
 use crate::System;
 
-/// what am answers for a title that is not installed.
+/// what am answers for a title that isn't installed
 const TITLE_NOT_FOUND: u32 = 0xD8A0_83FA;
 
 pub fn handle(
@@ -14,19 +14,19 @@ pub fn handle(
 ) -> bool {
     let command = header.command_id();
     match service {
-        // -- Power and shell state ------------------------------------------
+        // power and shell state
         "ptm:u" | "ptm:s" | "ptm:sysm" | "ptm:play" => match command {
-            // GetAdapterState, 1 = plugged in / GetShellState, 1 = open.
+            // GetAdapterState, 1 = plugged in / GetShellState, 1 = open
             0x0005 | 0x0006 => {
                 buffer.reply(&mut system.memory, command, &[1]);
                 true
             }
-            // GetBatteryLevel, 5 = full.
+            // GetBatteryLevel, 5 = full
             0x0007 => {
                 buffer.reply(&mut system.memory, command, &[5]);
                 true
             }
-            // GetBatteryChargeState, not charging.
+            // GetBatteryChargeState, not charging
             0x0008 => {
                 buffer.reply(&mut system.memory, command, &[0]);
                 true
@@ -36,8 +36,7 @@ pub fn handle(
                 buffer.reply(&mut system.memory, command, &[0]);
                 true
             }
-            // GetStepHistory(hours, start time, buffer), no steps in any of
-            // those hours
+            // GetStepHistory(hours, start time, buffer), no steps in any of those hours (couch potato again)
             0x000B => {
                 let hours = buffer.get(&mut system.memory, 1).min(0x8000);
                 let pointer = buffer.get(&mut system.memory, 5);
@@ -48,10 +47,9 @@ pub fn handle(
             _ => false,
         },
 
-        // -- SSL, which works without a network, its connections do not -----
+        // SSL works w/o a network, its connections don't
         "ssl:C" => match command {
-            // Initialize(process id). Pokémon Ultra Sun and Moon set it up
-            // when saving, and stop when it fails
+            // Initialize(process id), Pokémon Ultra Sun and Moon set it up when saving and stop when it fails
             0x0001 => {
                 buffer.reply(&mut system.memory, command, &[]);
                 true
@@ -72,10 +70,9 @@ pub fn handle(
             _ => false,
         },
 
-        // -- Network daemons ------------------------------------------------
+        // network daemons
         "ndm:u" => match command {
-            // EnterExclusiveState / LeaveExclusiveState / SuspendDaemons /
-            // ResumeDaemons / OverrideDefaultDaemons, all no-ops offline.
+            // EnterExclusiveState / LeaveExclusiveState / SuspendDaemons / ResumeDaemons / OverrideDefaultDaemons, all no ops offline
             0x0001 | 0x0002 | 0x0006 | 0x0007 | 0x0008 | 0x0009 | 0x000A | 0x000E | 0x0014 => {
                 buffer.reply(&mut system.memory, command, &[]);
                 true
@@ -83,12 +80,10 @@ pub fn handle(
             _ => false,
         },
 
-        // -- Installed titles -----------------------------------------------
-        // the DLC and the update given with the title are installed, a title
-        // asking about others hears they are not there
+        // installed titles
+        // the DLC and the update given w/ the title are installed, a title asking about others hears they aren't there
         "am:app" => match command {
-            // GetDLCContentInfoCount(media type, title id), every content
-            // the DLC's TMD lists
+            // GetDLCContentInfoCount(media type, title id), every content the DLC's TMD lists
             0x1001 => {
                 let title_id = read_u64(system, buffer, 2);
                 match system.dlc.iter().find(|dlc| dlc.title_id == title_id) {
@@ -100,8 +95,7 @@ pub fn handle(
                 }
                 true
             }
-            // FindDLCContentInfos(media type, title id, count, the indices,
-            // where their infos go)
+            // FindDLCContentInfos(media type, title id, count, the indices, where their infos go)
             0x1002 => {
                 let title_id = read_u64(system, buffer, 2);
                 let count = buffer.get(&mut system.memory, 4);
@@ -120,8 +114,7 @@ pub fn handle(
                 buffer.reply(&mut system.memory, command, &[]);
                 true
             }
-            // ListDLCContentInfos(count, media type, title id, first, where
-            // the infos go), how many it wrote
+            // ListDLCContentInfos(count, media type, title id, first, where the infos go), how many it wrote
             0x1003 => {
                 let count = buffer.get(&mut system.memory, 1) as usize;
                 let title_id = read_u64(system, buffer, 3);
@@ -138,8 +131,7 @@ pub fn handle(
                 buffer.reply(&mut system.memory, command, &[contents.len() as u32]);
                 true
             }
-            // GetDLCTitleInfos and GetPatchTitleInfos(media type, count, the
-            // title ids, where their infos go)
+            // GetDLCTitleInfos and GetPatchTitleInfos(media type, count, the title ids, where their infos go)
             0x1005 | 0x100D => {
                 let count = buffer.get(&mut system.memory, 2);
                 let (ids, out) = (buffer.get(&mut system.memory, 4), buffer.get(&mut system.memory, 6));
@@ -167,8 +159,7 @@ pub fn handle(
                 }
                 true
             }
-            // ListDataTitleTicketInfos(count, title id, first, where they
-            // go), a ticket for each DLC given
+            // ListDataTitleTicketInfos(count, title id, first, where they go), a ticket for each DLC given
             0x1007 => {
                 let count = buffer.get(&mut system.memory, 1);
                 let title_id = read_u64(system, buffer, 2);
@@ -195,9 +186,9 @@ pub fn handle(
             _ => false,
         },
 
-        // -- Wifi connection ------------------------------------------------
+        // wifi connection
         "ac:u" | "ac:i" => match command {
-            // GetWifiStatus, 0 = not connected, which is the truth.
+            // GetWifiStatus, 0 = not connected, which is the truth lol
             0x000D => {
                 buffer.reply(&mut system.memory, command, &[0]);
                 true
@@ -207,7 +198,7 @@ pub fn handle(
                 buffer.reply(&mut system.memory, command, &[0]);
                 true
             }
-            // CloseAsync and friends still have to signal their event.
+            // CloseAsync and friends still have to signal their event
             0x0005 | 0x0008 => {
                 buffer.reply(&mut system.memory, command, &[]);
                 true
@@ -225,9 +216,8 @@ pub fn handle(
             _ => false,
         },
 
-        // -- Accounts, background downloads and http ------------------------
-        // setting a session up works offline, only its requests need the
-        // network
+        // accounts, background downloads and http
+        // setting a session up works offline, only its requests need the network
         "act:u" | "act:a" | "boss:U" | "boss:P" | "http:C" => match command {
             0x0001 => {
                 buffer.reply(&mut system.memory, command, &[]);
@@ -240,8 +230,7 @@ pub fn handle(
     }
 }
 
-/// bytes no one can tell from random, the same for the same moment of a run
-/// so that runs repeat, SplitMix64 from the console's clock.
+/// bytes nobody can tell from random, same for the same moment of a run so runs repeat, SplitMix64 from the console's clock
 fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     let mut next = || {
@@ -259,16 +248,15 @@ fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
-/// the size of AM's description of a title's content.
+/// the size of AM's description of a title's content
 const CONTENT_INFO_SIZE: u32 = 0x18;
 
-/// a u64 the command passes as two words from index.
+/// a u64 the command passes as two words from index
 fn read_u64(system: &mut System, buffer: &CommandBuffer, index: u32) -> u64 {
     buffer.get(&mut system.memory, index) as u64 | (buffer.get(&mut system.memory, index + 1) as u64) << 32
 }
 
-/// writes AM's description of a content at at, its index, type, id and
-/// size, and that it is owned, and there, when the file holds it.
+/// writes AM's description of a content at at (its index, type, id and size), and that it's owned and there when the file holds it
 fn write_content_info(system: &mut System, at: u32, content: &zakuro_fs::Content) {
     use zakuro_cpu::Bus;
     const OWNED: u32 = 0x02;

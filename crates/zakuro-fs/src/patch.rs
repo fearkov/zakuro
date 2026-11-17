@@ -1,9 +1,8 @@
-//! IPS and BPS, the two patch formats 3DS mods ship changes to a file in.
+//! IPS and BPS, the two patch formats 3DS mods ship changes to a file in
 
 use crate::FsError;
 
-/// data with an IPS patch applied, PATCH with 24-bit offsets or IPS32 with
-/// 32-bit ones. a record past the end grows the data.
+/// data w/ an IPS patch applied, PATCH w/ 24 bit offsets or IPS32 w/ 32 bit ones, a record past the end grows the data
 pub fn ips(patch: &[u8], data: &[u8]) -> Result<Vec<u8>, FsError> {
     let wide = patch.starts_with(b"IPS32");
     if !wide && !patch.starts_with(b"PATCH") {
@@ -49,9 +48,8 @@ pub fn ips(patch: &[u8], data: &[u8]) -> Result<Vec<u8>, FsError> {
     }
 }
 
-/// the target a BPS patch makes from source. the patch carries checksums
-/// of both, so one made for another version of the file is turned down
-/// rather than making garbage.
+/// the target a BPS patch makes from source
+/// the patch carries checksums of both, so one made for another version of the file gets turned down instead of making garbage
 pub fn bps(patch: &[u8], source: &[u8]) -> Result<Vec<u8>, FsError> {
     if !patch.starts_with(b"BPS1") || patch.len() < 4 + 12 {
         return Err(FsError::BadPatch("not a BPS patch"));
@@ -97,8 +95,7 @@ pub fn bps(patch: &[u8], source: &[u8]) -> Result<Vec<u8>, FsError> {
                 target.extend_from_slice(source.get(source_at..source_at + length).ok_or_else(cut_short)?);
                 source_at += length;
             }
-            // bytes from earlier in the target, one at a time, as a copy can
-            // overlap what it is making
+            // bytes from earlier in the target, one at a time, since a copy can overlap what it's making
             _ => {
                 target_at = target_at.checked_add_signed(signed(reader.number()?)).ok_or_else(cut_short)?;
                 for _ in 0..length {
@@ -119,7 +116,7 @@ fn cut_short() -> FsError {
     FsError::BadPatch("the patch is cut short")
 }
 
-/// reads BPS's variable-length numbers.
+/// reads BPS's variable length numbers
 struct Reader<'a> {
     patch: &'a [u8],
     at: usize,
@@ -174,7 +171,7 @@ mod tests {
         assert_eq!(ips(&patch, b"abc").unwrap(), b"ab!");
     }
 
-    /// a BPS number, as the format writes them.
+    /// a BPS number, as the format writes them
     fn encode(mut value: usize, out: &mut Vec<u8>) {
         loop {
             let low = (value & 0x7F) as u8;
@@ -189,7 +186,7 @@ mod tests {
     }
 
     /// a BPS patch from source to target made of actions, each its kind,
-    /// its length and what follows it.
+    /// its length and what follows it
     fn bps_patch(source: &[u8], target: &[u8], actions: &[(usize, usize, &[u8])]) -> Vec<u8> {
         let mut patch = b"BPS1".to_vec();
         encode(source.len(), &mut patch);

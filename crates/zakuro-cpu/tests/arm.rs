@@ -1,13 +1,11 @@
-//! ARM-state instruction tests.
+//! ARM state instruction tests
 
 mod common;
 
 use common::{assert_flags, assert_reg, run, run_with, TestBus, CODE_BASE, DATA_BASE, STACK_TOP};
 use zakuro_cpu::{Cpu, Exit};
 
-// ---------------------------------------------------------------------------
-// Data processing
-// ---------------------------------------------------------------------------
+// data processing
 
 #[test]
 fn sub_borrow_clears_carry() {
@@ -54,7 +52,7 @@ fn adc_carries_in() {
 
 #[test]
 fn sbc_borrows_in() {
-    // with carry clear, SBC subtracts an extra one.
+    // with carry clear, SBC subtracts an extra one
     let Some(r) = run_with("sbcs r2, r0, r1", |cpu, _| {
         cpu.regs[0] = 10;
         cpu.regs[1] = 3;
@@ -78,7 +76,7 @@ fn rsc_reverses_the_operands() {
     assert_reg!(r, 2, 7);
 }
 
-/// the immediate rotate only sets the carry when the rotation is non-zero.
+/// the immediate rotate only sets the carry when the rotation isn't zero
 #[test]
 fn immediate_rotate_updates_carry() {
     let Some(r) = run("movs r0, #0x80000000") else {
@@ -96,11 +94,9 @@ fn immediate_without_rotate_preserves_carry() {
     assert_flags!(r, "--C");
 }
 
-// ---------------------------------------------------------------------------
-// The barrel shifter's special cases
-// ---------------------------------------------------------------------------
+// the barrel shifter's special cases
 
-/// LSR #0 encodes LSR #32, the result is zero and carry is the old bit 31.
+/// LSR #0 encodes LSR #32, the result is zero and carry is the old bit 31
 #[test]
 fn lsr_zero_means_thirty_two() {
     let Some(r) = run_with("movs r1, r0, lsr #32", |cpu, _| {
@@ -112,7 +108,7 @@ fn lsr_zero_means_thirty_two() {
     assert_flags!(r, "-ZC");
 }
 
-/// ASR #0 encodes ASR #32, every bit becomes the sign bit.
+/// ASR #0 encodes ASR #32, every bit becomes the sign bit
 #[test]
 fn asr_zero_means_thirty_two() {
     let Some(r) = run_with("movs r1, r0, asr #32", |cpu, _| {
@@ -124,7 +120,7 @@ fn asr_zero_means_thirty_two() {
     assert_flags!(r, "N-C");
 }
 
-/// ROR #0 encodes RRX, a 33-bit rotate through carry.
+/// ROR #0 encodes RRX, a 33 bit rotate thru carry
 #[test]
 fn rrx_rotates_through_carry() {
     let Some(r) = run_with("movs r1, r0, rrx", |cpu, _| {
@@ -137,8 +133,7 @@ fn rrx_rotates_through_carry() {
     assert_flags!(r, "N-C");
 }
 
-/// a register-specified shift of 32 or more is well defined and differs from
-/// the immediate encodings.
+/// a register shift of 32 or more is well defined and differs from the immediate encodings
 #[test]
 fn register_shift_of_thirty_two() {
     let Some(r) = run_with("movs r2, r0, lsl r1", |cpu, _| {
@@ -164,22 +159,19 @@ fn register_shift_of_zero_preserves_carry() {
     assert_flags!(r, "--C");
 }
 
-/// reading r15 as an operand gives the instruction address plus 8, and plus 12
-/// when the shift amount comes from a register.
+/// reading r15 as an operand gives the instruction addr plus 8, and plus 12 when the shift amount comes from a register
 #[test]
 fn pc_reads_include_the_pipeline_offset() {
     let Some(r) = run("mov r0, pc\n mov r1, #0\n mov r2, pc, lsl r1") else {
         return;
     };
-    // first instruction is at CODE_BASE.
+    // first instruction is at CODE_BASE
     assert_reg!(r, 0, CODE_BASE + 8);
-    // third instruction is at CODE_BASE + 8, read as +12.
+    // third instruction is at CODE_BASE + 8, read as +12
     assert_reg!(r, 2, CODE_BASE + 8 + 12);
 }
 
-// ---------------------------------------------------------------------------
-// Multiplies
-// ---------------------------------------------------------------------------
+// multiplies
 
 #[test]
 fn umull_and_smull_differ_in_sign() {
@@ -295,12 +287,9 @@ fn clz_counts_leading_zeros() {
     assert_reg!(r, 2, 32);
 }
 
-// ---------------------------------------------------------------------------
 // ARMv6 media
-// ---------------------------------------------------------------------------
 
-/// RBIT is deliberately absent, it arrived with ARMv6T2 and the MP11 cores
-/// do not have it, so the assembler rejects it for this target.
+/// RBIT is left out on purpose, it showed up in ARMv6T2 and the MP11 cores don't have it, so the assembler rejects it for this target
 #[test]
 fn byte_reversals() {
     let Some(r) = run_with("rev r0, r4\n rev16 r1, r4\n revsh r2, r4", |cpu, _| {
@@ -310,7 +299,7 @@ fn byte_reversals() {
     };
     assert_reg!(r, 0, 0xF033_2211);
     assert_reg!(r, 1, 0x2211_F033);
-    // REVSH swaps the bottom halfword and sign extends, 0x33F0 -> 0xF033
+    // REVSH swaps the bottom halfword and sign extends, 0x33F0 => 0xF033
     assert_reg!(r, 2, 0xFFFF_F033);
 }
 
@@ -328,7 +317,7 @@ fn extends_with_rotation_and_accumulate() {
     assert_reg!(r, 0, 0xFFFF_FFF0);
     assert_reg!(r, 1, 0x0000_00F0);
     assert_reg!(r, 2, 0xFFFF_80F0);
-    // ror #16 gives 0x80F0_1234, low halfword 0x1234, plus 1.
+    // ror #16 gives 0x80F0_1234, low halfword 0x1234, plus 1
     assert_reg!(r, 3, 0x1235);
 }
 
@@ -340,9 +329,9 @@ fn pkhbt_and_pkhtb_pick_opposite_halves() {
     }) else {
         return;
     };
-    // PKHBT, bottom of Rn, top of Rm.
+    // PKHBT, bottom of Rn, top of Rm
     assert_reg!(r, 0, 0xCCCC_BBBB);
-    // PKHTB, top of Rn, bottom of Rm.
+    // PKHTB, top of Rn, bottom of Rm
     assert_reg!(r, 1, 0xAAAA_DDDD);
 }
 
@@ -361,7 +350,7 @@ fn ssat_and_usat_clamp() {
 
 #[test]
 fn sel_uses_the_ge_flags() {
-    // SADD8 sets GE per byte lane, then SEL picks from Rn where GE is set.
+    // SADD8 sets GE per byte lane, then SEL picks from Rn where GE is set
     let Some(r) = run_with("uadd8 r0, r4, r5\n sel r1, r6, r7", |cpu, _| {
         cpu.regs[4] = 0x00FF_00FF;
         cpu.regs[5] = 0x0001_0001;
@@ -370,7 +359,7 @@ fn sel_uses_the_ge_flags() {
     }) else {
         return;
     };
-    // lanes 0 and 2 overflow (0xFF + 1), so GE = 0b0101.
+    // lanes 0 and 2 overflow (0xFF + 1), so GE = 0b0101
     assert_reg!(r, 0, 0x0000_0000);
     assert_reg!(r, 1, 0x1122_3344 & 0xFF00_FF00 | (0xAABB_CCDD & 0x00FF_00FF));
 }
@@ -386,7 +375,7 @@ fn parallel_halfword_add_and_saturating_variants() {
         return;
     };
     assert_reg!(r, 0, 0x0004_0006);
-    // top lane saturates high, bottom lane saturates low.
+    // top lane saturates high, bottom lane saturates low
     assert_reg!(r, 1, 0x7FFF_8000);
 }
 
@@ -398,9 +387,9 @@ fn asx_and_sax_cross_the_halves() {
     }) else {
         return;
     };
-    // SASX, low = lo(Rn) - hi(Rm) = 20 - 3 = 17, high = hi(Rn) + lo(Rm) = 12.
+    // SASX, low = lo(Rn) minus hi(Rm) = 20 minus 3 = 17, high = hi(Rn) + lo(Rm) = 12
     assert_reg!(r, 0, 0x000C_0011);
-    // SSAX, low = lo(Rn) + hi(Rm) = 23, high = hi(Rn) - lo(Rm) = 8.
+    // SSAX, low = lo(Rn) + hi(Rm) = 23, high = hi(Rn) minus lo(Rm) = 8
     assert_reg!(r, 1, 0x0008_0017);
 }
 
@@ -444,9 +433,7 @@ fn usad8_sums_absolute_differences() {
     assert_reg!(r, 0, (0x0A - 1) + (0x14 - 2) + (0x1E - 3) + (0x28 - 4));
 }
 
-// ---------------------------------------------------------------------------
-// Loads and stores
-// ---------------------------------------------------------------------------
+// loads and stores
 
 #[test]
 fn post_indexed_load_writes_the_base_back() {
@@ -460,8 +447,7 @@ fn post_indexed_load_writes_the_base_back() {
     assert_reg!(r, 1, DATA_BASE + 4);
 }
 
-/// LDM where the base is also in the register list must keep the loaded
-/// value rather than the written-back base.
+/// LDM where the base is also in the register list must keep the loaded value, not the written back base
 #[test]
 fn ldm_into_its_own_base_keeps_the_loaded_value() {
     let Some(r) = run_with("ldmia r1!, {r1, r2}", |cpu, bus| {
@@ -519,7 +505,7 @@ fn doubleword_round_trip() {
 
 #[test]
 fn a_register_pair_starting_at_r15_is_undefined() {
-    // ldrd r15, strd r15 and ldrexd r15, there is no register after r15.
+    // ldrd r15, strd r15 and ldrexd r15, there's no register after r15
     for opcode in [0xE1C0_F0D0u32, 0xE1C0_F0F0, 0xE1B0_FF9F] {
         let mut bus = TestBus::default();
         bus.write_bytes(CODE_BASE, &opcode.to_le_bytes());
@@ -532,8 +518,7 @@ fn a_register_pair_starting_at_r15_is_undefined() {
 
 #[test]
 fn block_transfer_addressing_modes() {
-    // all four modes write the same three words, only the base ends up
-    // different, and only DB/IB shift where the first word lands.
+    // all four modes write the same three words, only the base ends up different, and only DB/IB shift where the first word lands
     let Some(r) = run_with(
         "stmia r4!, {r0, r1, r2}\n
          ldmdb r4!, {r5, r6, r7}",
@@ -595,16 +580,14 @@ fn strex_succeeds_only_after_ldrex() {
     ) else {
         return;
     };
-    // the first store has no reservation and must fail.
+    // the first store has no reservation and must fail
     assert_reg!(r, 0, 1);
     assert_reg!(r, 1, 0);
     assert_reg!(r, 2, 0);
     assert_eq!(r.bus.read_u32(DATA_BASE), 0x2222_2222);
 }
 
-// ---------------------------------------------------------------------------
-// Branches
-// ---------------------------------------------------------------------------
+// branches
 
 #[test]
 fn bl_sets_the_link_register() {
@@ -618,7 +601,7 @@ fn bl_sets_the_link_register() {
         return;
     };
     assert_reg!(r, 0, 1);
-    // LR points just past the BL, which is the second instruction.
+    // LR points just past the BL, the second instruction
     assert_reg!(r, 14, CODE_BASE + 4);
 }
 
@@ -654,17 +637,16 @@ fn conditional_execution_skips() {
 fn svc_reports_its_immediate() {
     let Some(r) = run("svc #0x32") else { return };
     assert_eq!(r.exit, zakuro_cpu::Exit::Supervisor(0x32));
-    // the PC must be left pointing at the instruction after the SVC so the
-    // kernel can simply resume.
+    // the PC must be left pointing at the instruction after the SVC so the kernel can just resume
     assert_eq!(r.cpu.regs[15], CODE_BASE + 4);
 }
 
-/// from ARMv5 onwards a load into the PC interworks.
+/// from ARMv5 on a load into the PC interworks
 #[test]
 fn ldr_into_pc_interworks() {
-    // the Thumb instruction sits immediately after the load, and the address
-    // is planted by the test rather than by a relocation, so this exercises
-    // the load itself and not the assembler's Thumb-bit handling.
+    // the Thumb instruction sits right after the load,
+    // and the addr is planted by the test instead of a relocation,
+    // so this tests the load itself and not the assembler's Thumb bit handling
     let thumb_target = CODE_BASE + 4;
     let Some(r) = run_with(
         "ldr pc, [r0]
@@ -681,8 +663,7 @@ fn ldr_into_pc_interworks() {
     assert_reg!(r, 1, 77);
 }
 
-/// the same for LDM, which titles use to return from a function and switch
-/// state in one instruction.
+/// same for LDM, titles use it to return from a function and switch state in one instruction
 #[test]
 fn ldm_into_pc_interworks() {
     let Some(r) = run("

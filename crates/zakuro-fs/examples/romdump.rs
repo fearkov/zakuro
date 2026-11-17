@@ -1,7 +1,6 @@
-//! cargo run -p zakuro-fs --example romdump -- <rom> [files]
+//! `cargo run -p zakuro-fs --example romdump -- <rom> [files]`
 //!
-//! files lists every file in the RomFS with its size and where it is in the
-//! ROM, by the paths a mod's romfs folder takes.
+//! files lists every file in the RomFS w/ its size and where it is in the ROM, by the paths a mod's romfs folder takes
 
 use zakuro_fs::Title;
 

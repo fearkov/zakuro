@@ -1,14 +1,11 @@
-//! maps keyed by small integers, handles and page numbers, hashed by a
-//! multiply rather than SipHash, as the kernel looks a handle up at every
-//! svc. the kernel makes the handles and the pages are physical, nothing
-//! picks keys to collide. the hash is the same every run, and so is the
-//! order the maps go in, which saved states keep.
+//! maps keyed by small ints (handles, page numbers) hashed w/ a multiply instead of SipHash, the kernel looks up a handle on every svc
+//! the kernel makes the handles and pages are physical, nobody picks keys to collide
+//! same hash every run so same map order too, saved states rely on that
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
-/// FxHash's step: the bits so far turned, the next word in, all times an odd
-/// constant, whose high bits hashbrown takes.
+/// FxHash's step, rotate the bits so far, xor the next word in, multiply by an odd constant, hashbrown takes the high bits
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IntHasher(u64);
 
@@ -70,7 +67,7 @@ pub type IntSet<K> = HashSet<K, BuildIntHasher>;
 mod tests {
     use super::*;
 
-    /// handles in a row, as the kernel makes them, all land and come back.
+    /// handles in a row like the kernel makes them all land and come back
     #[test]
     fn handles_in_a_row_come_back() {
         let mut map: IntMap<u32, u32> = IntMap::default();

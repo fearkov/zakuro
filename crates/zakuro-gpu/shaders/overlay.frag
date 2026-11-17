@@ -1,6 +1,6 @@
 #version 450
 // colors come premultiplied and in sRGB, a target that expects linear
-// values gets them converted.
+// values gets them converted
 layout(push_constant) uniform Screen {
     vec2 size;
     uint srgb;

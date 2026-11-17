@@ -1,11 +1,10 @@
 #version 450
 
-// a texture that is rows of a depth buffer, read as colors the way a title
-// reads the buffer's bytes. the depth and the stencil come copied into
-// buffers, a word and a byte per sample, in the image's rows, bottom first.
-// d24s8 samples read as rgba8 give the stencil, then the depth's high,
-// middle and low bytes, d24 samples read as rgb8 give the depth's bytes.
-// a GPU that can't draw 24-bit depth gives 32-bit floats for the words.
+// a texture that's rows of a depth buffer, read as colors like a title reads the buffer's bytes
+// the depth and stencil come copied into buffers, a word and a byte per sample, in the image's rows, bottom first
+// d24s8 samples read as rgba8 give the stencil, then the depth's high, middle and low bytes,
+// d24 samples read as rgb8 give the depth's bytes
+// a GPU that can't draw 24 bit depth gives 32 bit floats for the words
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) readonly buffer Depths { uint depths[]; };
@@ -19,18 +18,17 @@ layout(push_constant) uniform Copy {
     int surface_width;
     int surface_height;
     int source_row;
-    // whether samples carry stencil, and the texture is rgba8
+    // do samples carry stencil, and is the texture rgba8
     int stencil;
-    // whether the words are floats
+    // are the words floats
     int floats;
 } copy;
 
-// the 24 bits nearest a float depth, a half going up, as d24_from_float
-// works them out on the CPU, exactly. depth * 2^24 is exact, and depth *
-// (2^24 - 1) is that less depth. from a half up the product is whole and
-// the depth takes between a half and one off it, below a half the depth is
-// less than the product's step, so it moves the fraction across a half
-// only from above one.
+// the 24 bits nearest a float depth, a half going up, exactly like d24_from_float works them out on the CPU
+// depth * 2^24 is exact, and depth * (2^24 minus 1) is that minus depth
+// from a half up the product is whole and the depth takes between a half and one off it,
+// below a half the depth is less than the product's step,
+// so it only moves the fraction across a half from above one
 uint d24(float depth) {
     if (!(depth > 0.0)) {
         return 0u;

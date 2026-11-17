@@ -38,8 +38,7 @@ gilrs = { version = "0.11.2", features = ["serde-serialize"] }
 [dev-dependencies]
 zakuro-fs = { workspace = true, features = ["testing"] }
 
-# the computer's camera, for the console's, with the frames turned into
-# pictures here rather than by its C decoder
+# the computer's camera, for the console's, w/ the frames turned into pictures here instead of by its C decoder
 [target.'cfg(target_os = "linux")'.dependencies]
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-v4l"] }
 
@@ -47,7 +46,6 @@ nokhwa = { version = "0.10.11", default-features = false, features = ["input-v4l
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-msmf"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# the Switch's Pro Controller read from its own reports, opened shared with
-# the system, which puts it in a mode gilrs reads wrong
+# the Switch's Pro Controller read from its own reports, opened shared w/ the system, which puts it in a mode gilrs reads wrong
 hidapi = { version = "2.6.7", default-features = false, features = ["macos-shared-device"] }
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-avfoundation"] }

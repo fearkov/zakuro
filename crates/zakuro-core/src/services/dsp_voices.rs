@@ -1,32 +1,30 @@
-//! the audio DSP's voices, which play their buffers, report on them, and
-//! give the mixer what they sound like.
+//! the audio DSP's voices, they play their buffers, report on them and hand the mixer what they sound like
 
 use zakuro_cpu::Bus;
 
 use crate::memory::Memory;
 
 pub const VOICES: usize = 24;
-/// samples in one audio frame.
+/// samples in one audio frame
 pub const FRAME_SAMPLES: usize = 160;
 
 const CONFIG_SIZE: u32 = 192;
 const STATUS_SIZE: u32 = 12;
-/// the 16 ADPCM coefficients each voice has.
+/// the 16 ADPCM coefficients each voice has
 const COEFFICIENTS_SIZE: u32 = 32;
-/// region 1 of the shared memory starts this many bytes after region 0.
+/// region 1 of the shared memory starts this many bytes after region 0
 pub const REGION_STRIDE: u32 = 0x2_0000;
 
-/// one frame of stereo samples.
+/// one frame of stereo samples
 pub type Frame = [[i16; 2]; FRAME_SAMPLES];
-/// one frame of an intermediate mix, two left and two right channels, one
-/// channel after the other as the title sees it.
+/// one frame of an intermediate mix, two left and two right channels, one channel after the other like the title sees it
 pub type QuadFrame = [[i32; FRAME_SAMPLES]; 4];
 
-/// the loudest gain mixed the quick way. a sample times three of them, as a
-/// fade between two can reach on the way, is still well within i32.
+/// the loudest gain mixed the quick way
+/// a sample times three of them (a fade between two can get there on the way) is still well within i32
 const QUICK_GAIN: f32 = 16384.0;
 
-/// how far through a frame each of its samples is, for gains fading over it.
+/// how far thru a frame each of its samples is, for gains fading over it
 const PROGRESS: [f32; FRAME_SAMPLES] = {
     let mut progress = [0.0; FRAME_SAMPLES];
     let mut i = 0;
@@ -37,7 +35,7 @@ const PROGRESS: [f32; FRAME_SAMPLES] = {
     progress
 };
 
-/// bits of a configuration's dirty word, which fields the title changed.
+/// bits of a config's dirty word, which fields the title changed
 mod dirty {
     pub const FORMAT: u32 = 1 << 0;
     pub const MONO_OR_STEREO: u32 = 1 << 1;
@@ -52,14 +50,14 @@ mod dirty {
     pub const FILTERS_ENABLED: u32 = 1 << 22;
     pub const SIMPLE_FILTER: u32 = 1 << 23;
     pub const BIQUAD_FILTER: u32 = 1 << 24;
-    /// one bit per intermediate mix from here up.
+    /// one bit per intermediate mix from here up
     pub const GAIN: u32 = 1 << 25;
     pub const SYNC_COUNT: u32 = 1 << 28;
     pub const RESET: u32 = 1 << 29;
     pub const EMBEDDED_BUFFER: u32 = 1 << 30;
 }
 
-/// offsets into one voice's configuration.
+/// offsets into one voice's config
 mod config {
     pub const DIRTY: u32 = 0x00;
     pub const GAIN: u32 = 0x04;
@@ -82,7 +80,7 @@ mod config {
     pub const BUFFER_ID: u32 = 0xBE;
 }
 
-/// addresses of the structures the voices use, in region 0.
+/// addrs of the structs the voices use, in region 0
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub configurations: u32,
@@ -91,7 +89,7 @@ pub struct Layout {
     pub frame_counter: u32,
 }
 
-/// where voices read their samples, physical memory.
+/// where voices read their samples, physical memory
 pub trait SampleMemory {
     fn physical(&mut self, address: u32, length: u32) -> Option<&[u8]>;
 }
@@ -111,7 +109,7 @@ enum Format {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Interpolation {
-    /// the firmware's polyphase filter, played as linear.
+    /// the firmware's polyphase filter, played as linear (close enough)
     Polyphase,
     Linear,
     None,
@@ -125,15 +123,15 @@ struct Buffer {
     stereo: bool,
     looping: bool,
     id: u16,
-    /// the ADPCM history to start from, when the title set it.
+    /// the ADPCM history to start from, when the title set it
     adpcm: Option<[i16; 2]>,
-    /// queued buffers report when they start, the embedded one does not.
+    /// queued buffers report when they start, the embedded one doesn't
     from_queue: bool,
     play_position: u32,
     has_played: bool,
 }
 
-/// the first order filter, y = b0 x + a1 y1, with 15 fraction bits.
+/// the first order filter, y = b0 x + a1 y1, w/ 15 fraction bits
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct SimpleFilter {
     b0: i32,
@@ -147,7 +145,7 @@ impl Default for SimpleFilter {
     }
 }
 
-/// the second order filter, with 14 fraction bits and its feedback negated.
+/// the second order filter, w/ 14 fraction bits and its feedback negated
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct BiquadFilter {
     b: [i32; 3],
@@ -162,8 +160,7 @@ impl Default for BiquadFilter {
     }
 }
 
-/// what an ADPCM buffer was decoded from, its bytes and the coefficients
-/// and history the decoding started with, and the history it left.
+/// what an ADPCM buffer got decoded from, its bytes plus the coefficients and history decoding started w/, and the history it left
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AdpcmSource {
     data: Vec<u8>,
@@ -215,38 +212,37 @@ struct Voice {
     stereo: bool,
     interpolation: Interpolation,
     filters: Filters,
-    /// how loud the voice is in each channel of each intermediate mix.
+    /// how loud the voice is in each channel of each intermediate mix
     gain: [[f32; 4]; 3],
-    /// the gains a mix fades from over the next frame, after they changed.
+    /// the gains a mix fades from over the next frame, after they changed
     ramp: [Option<[f32; 4]>; 3],
     coefficients: [i16; 16],
-    /// the last two ADPCM samples, which the next ones follow on from.
+    /// the last two ADPCM samples, the next ones follow on from them
     history: [i16; 2],
     queue: Vec<Buffer>,
-    /// the buffer being played.
     playing: Option<Buffer>,
-    /// an ADPCM buffer, decoded when it started.
+    /// an ADPCM buffer, decoded when it started
     decoded: Vec<i16>,
-    /// what decoded came from. a looping buffer comes around the same
-    /// again and again, and is not decoded again.
+    /// what decoded came from
+    /// a looping buffer comes around the same again and again and doesn't get decoded again
     decoded_from: Option<AdpcmSource>,
-    /// samples left in the buffer being played, and how long it is.
+    /// samples left in the buffer being played, and how long it is
     remaining: u32,
     length: u32,
-    /// input consumed but not yet a whole sample.
+    /// input consumed but not a whole sample yet
     fraction: f64,
     current_buffer_id: u16,
     last_buffer_id: u16,
-    /// set when a new queued buffer starts, reported once.
+    /// set when a new queued buffer starts, reported once
     buffer_update: bool,
-    /// where in its buffer the voice was at the start of the frame.
+    /// where in its buffer the voice was at the start of the frame
     position: u32,
-    /// what the voice played this frame.
+    /// what the voice played this frame
     #[serde(with = "crate::state::arrays")]
     frame: Frame,
-    /// the buffer ran out on the frame's last sample, so the next one
-    /// waiting follows on from the next frame's first, as on the console,
-    /// rather than after a frame of silence.
+    /// the buffer ran out on the frame's last sample,
+    /// so the next one waiting follows on from the next frame's first like on the console,
+    /// not after a frame of silence
     ran_out_at_frame_end: bool,
 }
 
@@ -282,7 +278,7 @@ impl Default for Voice {
 }
 
 impl Voice {
-    /// starts the next buffer, the lowest id waiting.
+    /// starts the next buffer, the lowest id waiting
     fn dequeue(&mut self, memory: &mut impl SampleMemory) -> bool {
         let Some(index) = (0..self.queue.len()).min_by_key(|&i| self.queue[i].id) else {
             return false;
@@ -294,7 +290,7 @@ impl Voice {
             self.queue.remove(index);
         }
 
-        // only the first time through starts at the play position.
+        // only the first time thru starts at the play position
         let start = if buffer.has_played { 0 } else { buffer.play_position.min(buffer.length) };
         self.length = buffer.length;
         self.remaining = buffer.length - start;
@@ -323,8 +319,7 @@ impl Voice {
         true
     }
 
-    /// decodes an ADPCM buffer on from the history, unless decoded holds it
-    /// already, which leaves the history where decoding it again would.
+    /// decodes an ADPCM buffer on from the history, unless decoded already holds it, which leaves the history where decoding it again would
     fn decode(&mut self, data: &[u8], count: usize) {
         let start = self.history;
         if let Some(source) = &self.decoded_from {
@@ -350,7 +345,7 @@ impl Voice {
         self.decoded_from = None;
     }
 
-    /// plays one audio frame's worth of input.
+    /// plays one audio frame's worth of input
     fn play_frame(&mut self, memory: &mut impl SampleMemory) {
         self.frame = [[0; 2]; FRAME_SAMPLES];
         let follows_on = std::mem::take(&mut self.ran_out_at_frame_end) && !self.queue.is_empty();
@@ -358,9 +353,8 @@ impl Voice {
             if self.dequeue(memory) {
                 return;
             }
-            // out of buffers, the voice switches itself off and reports the
-            // buffer it finished as the last one, with none current. a title
-            // waits on that to know its sound is over.
+            // out of buffers, the voice turns itself off and reports the buffer it finished as the last one w/ none current
+            // a title waits on that to know its sound is over
             self.enabled = false;
             self.buffer_update = true;
             self.last_buffer_id = self.current_buffer_id;
@@ -381,10 +375,9 @@ impl Voice {
         self.filters.process(&mut self.frame[..output]);
     }
 
-    /// plays the buffer at hand into the frame from output on, at least one
-    /// sample and on until the frame is full or the buffer ran out, and
-    /// returns where the frame got to. the samples come straight from the
-    /// buffer's memory when all of it is there.
+    /// plays the buffer at hand into the frame from output on,
+    /// at least one sample and on till the frame is full or the buffer ran out, returns where the frame got to
+    /// the samples come straight from the buffer's memory when all of it is there
     fn play_buffer(&mut self, memory: &mut impl SampleMemory, output: usize) -> usize {
         let Some(buffer) = self.playing else {
             return self.play_from::<false>(output, 0, |_| [0; 2]);
@@ -393,8 +386,7 @@ impl Voice {
         let size = match buffer.format {
             Format::Adpcm => {
                 let decoded = std::mem::take(&mut self.decoded);
-                // the samples up to last, all there unless the title made
-                // the buffer longer, read with no check on each
+                // the samples up to last, all there unless the title made the buffer longer, read w/o checking each
                 let output = match decoded.get(..=last as usize) {
                     Some(samples) => self.play_from::<false>(output, last, |index| [samples[index as usize]; 2]),
                     None => self.play_from::<false>(output, last, |index| {
@@ -431,11 +423,9 @@ impl Voice {
         }
     }
 
-    /// plays input into the frame from output on, read giving the samples
-    /// of the buffer at hand by index, up to last, at least one sample and
-    /// on until the frame is full or the buffer ran out, and returns where
-    /// the frame got to. without STEREO the channels of each input sample
-    /// are the same, and only the first is worked out.
+    /// plays input into the frame from output on (read gives the buffer's samples by index) up to last,
+    /// at least one sample and on till the frame is full or the buffer ran out, returns where the frame got to
+    /// w/o STEREO both channels of each input sample are the same and only the first gets worked out
     fn play_from<const STEREO: bool>(
         &mut self,
         mut output: usize,
@@ -445,8 +435,7 @@ impl Voice {
         let fits = self.rate < (1u32 << 31) as f64;
         loop {
             if fits && self.remaining > 0 && (0.0..1.0).contains(&self.fraction) {
-                // a whole rate from no fraction leaves none, nothing to
-                // interpolate
+                // a whole rate from no fraction leaves none, nothing to interpolate
                 let whole = self.fraction == 0.0 && self.rate == (self.rate as u32) as f64;
                 return if self.interpolation == Interpolation::None || whole {
                     self.play_steady::<STEREO, false>(output, last, read)
@@ -454,8 +443,7 @@ impl Voice {
                     self.play_steady::<STEREO, true>(output, last, read)
                 };
             }
-            // a sample the long way, for a buffer that started spent, a
-            // fraction of one or more or a rate past what u32 counts
+            // a sample the long way, for a buffer that started spent, a fraction of one or more, or a rate past what u32 counts
             let at = self.length - self.remaining;
             let x0 = read(at.min(last));
             self.frame[output] = if self.interpolation == Interpolation::None || self.fraction == 0.0 {
@@ -464,7 +452,7 @@ impl Voice {
                 lerp::<STEREO>(x0, read((at + 1).min(last)), self.fraction)
             };
             output += 1;
-            // each output sample consumes rate input samples
+            // each output sample eats rate input samples
             let input = self.fraction + self.rate;
             let consumed = (input as u32).min(self.remaining);
             self.fraction = (input - consumed as f64).max(0.0);
@@ -475,11 +463,9 @@ impl Voice {
         }
     }
 
-    /// plays on as play_from does, with the fraction below one, which makes
-    /// what each output sample consumes the whole of the rate or one more,
-    /// and leaves the fraction to a subtraction rather than a trip through
-    /// integers. LERP interpolates, which at no fraction gives the input
-    /// sample as it is.
+    /// plays on like play_from, w/ the fraction below one, so each output sample eats the whole of the rate or one more
+    /// and the fraction is left to a subtraction instead of a trip thru integers
+    /// LERP interpolates, which at no fraction gives the input sample as is
     fn play_steady<const STEREO: bool, const LERP: bool>(
         &mut self,
         mut output: usize,
@@ -499,7 +485,7 @@ impl Voice {
             let over = input >= above;
             let consumed = whole + over as u32;
             if consumed >= remaining {
-                // the buffer runs out with this sample
+                // the buffer runs out w/ this sample
                 let consumed = (input as u32).min(remaining);
                 fraction = (input - consumed as f64).max(0.0);
                 remaining -= consumed;
@@ -516,8 +502,7 @@ impl Voice {
         output
     }
 
-    /// adds what the voice played to the intermediate mixes, each fading
-    /// from the gains it had when they just changed.
+    /// adds what the voice played to the intermediate mixes, each fading from the gains it had when they just changed
     fn mix_into(&mut self, mixes: &mut [QuadFrame; 3]) {
         let ramps = std::mem::take(&mut self.ramp);
         if !self.enabled {
@@ -528,9 +513,8 @@ impl Voice {
             for (channel, out) in mix.iter_mut().enumerate() {
                 let (input, gain) = (&inputs[channel & 1], gains[channel]);
                 match from.map(|from| from[channel]) {
-                    // a gain fading to where it was stays put, the same to
-                    // the last bit but for the sign of a zero, which adds
-                    // nothing either way
+                    // a gain fading to where it was stays put, same to the last bit except the sign of a zero,
+                    // which adds nothing either way
                     Some(from) if from != gain => fade(out, input, from, gain),
                     _ if gain == 0.0 => {}
                     _ => add(out, input, gain),
@@ -540,15 +524,14 @@ impl Voice {
     }
 }
 
-/// the sample a fraction of the way from one input to the next, both
-/// channels or, without STEREO, the first for both.
+/// the sample a fraction of the way from one input to the next, both channels or w/o STEREO the first for both
 fn lerp<const STEREO: bool>(x0: [i16; 2], x1: [i16; 2], fraction: f64) -> [i16; 2] {
     let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * fraction) as i16;
     let left = between(x0[0], x1[0]);
     [left, if STEREO { between(x0[1], x1[1]) } else { left }]
 }
 
-/// one sample of a PCM buffer read from memory by itself, both channels.
+/// one sample of a PCM buffer read from memory by itself, both channels
 fn read_pcm(memory: &mut impl SampleMemory, buffer: &Buffer, index: u32) -> [i16; 2] {
     let channels = if buffer.stereo { 2 } else { 1 };
     let at = buffer.address & !3;
@@ -567,13 +550,13 @@ fn read_pcm(memory: &mut impl SampleMemory, buffer: &Buffer, index: u32) -> [i16
     }
 }
 
-/// adds samples to a channel of a mix at a steady gain.
+/// adds samples to a channel of a mix at a steady gain
 fn add(out: &mut [i32; FRAME_SAMPLES], input: &[f32; FRAME_SAMPLES], gain: f32) {
     if gain.abs() <= QUICK_GAIN {
         for (out, sample) in out.iter_mut().zip(input) {
-            // SAFETY: a sample is 32768 at most either way, so the product
-            // is a number within 2^29, which truncates the same as the
-            // saturating cast does, only four at a time where that goes one
+            // safe bc a sample is 32768 at most either way,
+            // so the product fits in 2^29 and truncates the same as the saturating cast,
+            // just four at a time instead of one
             *out += unsafe { (gain * sample).to_int_unchecked::<i32>() };
         }
     } else {
@@ -584,14 +567,13 @@ fn add(out: &mut [i32; FRAME_SAMPLES], input: &[f32; FRAME_SAMPLES], gain: f32) 
 }
 
 /// adds samples to a channel of a mix at a gain going from one value to
-/// another over the frame.
+/// another over the frame
 fn fade(out: &mut [i32; FRAME_SAMPLES], input: &[f32; FRAME_SAMPLES], from: f32, to: f32) {
     let change = to - from;
     if from.abs() <= QUICK_GAIN && to.abs() <= QUICK_GAIN {
         for ((out, sample), progress) in out.iter_mut().zip(input).zip(PROGRESS) {
-            // SAFETY: the change is within two quick gains and the gain on
-            // the way within three, so as in add the product is a number
-            // well within i32
+            // safe bc the change is within two quick gains and the gain on the way within three,
+            // so like in add the product is well within i32
             *out += unsafe { ((from + change * progress) * sample).to_int_unchecked::<i32>() };
         }
     } else {
@@ -601,8 +583,7 @@ fn fade(out: &mut [i32; FRAME_SAMPLES], input: &[f32; FRAME_SAMPLES], from: f32,
     }
 }
 
-/// GC ADPCM, frames of 8 bytes holding a header and 14 samples of 4 bits,
-/// each predicted from the two before it, decoded into samples.
+/// GC ADPCM, 8 byte frames holding a header and 14 samples of 4 bits, each predicted from the two b4 it, decoded into samples
 fn decode_adpcm(data: &[u8], count: usize, coefficients: &[i16; 16], history: &mut [i16; 2], samples: &mut Vec<i16>) {
     samples.clear();
     samples.reserve(count);
@@ -620,7 +601,7 @@ fn decode_adpcm(data: &[u8], count: usize, coefficients: &[i16; 16], history: &m
             yn1 = value;
             value as i16
         };
-        // a whole frame goes without counting each sample
+        // a whole frame goes w/o counting each sample
         if frame.len() == 8 && count - samples.len() >= 14 {
             let mut decoded = [0; 14];
             for (pair, &byte) in decoded.as_chunks_mut().0.iter_mut().zip(&frame[1..]) {
@@ -656,8 +637,7 @@ impl Default for Voices {
 }
 
 impl Voices {
-    /// one audio frame, take in what the title changed, play, report, and
-    /// return the three intermediate mixes the voices made.
+    /// one audio frame, take in what the title changed, play, report, return the three intermediate mixes the voices made
     pub fn tick(&mut self, memory: &mut Memory, layout: Layout) -> [QuadFrame; 3] {
         let read = current_region(memory, layout);
         let write = 1 - read;
@@ -704,8 +684,7 @@ impl Voices {
     }
 }
 
-/// which region the title wrote most recently, allowing for the frame
-/// counters wrapping around.
+/// which region the title wrote last, allowing for the frame counters wrapping around
 pub fn current_region(memory: &mut Memory, layout: Layout) -> u32 {
     let first = memory.read16(layout.frame_counter);
     let second = memory.read16(layout.frame_counter + REGION_STRIDE);
@@ -722,7 +701,7 @@ pub fn current_region(memory: &mut Memory, layout: Layout) -> u32 {
     }
 }
 
-/// reads a 32-bit value the way the DSP stores it, high half first.
+/// reads a 32 bit value the way the DSP stores it, high half first
 fn read_dsp32(memory: &mut Memory, address: u32) -> u32 {
     ((memory.read16(address) as u32) << 16) | memory.read16(address + 2) as u32
 }
@@ -732,8 +711,7 @@ fn write_dsp32(memory: &mut Memory, address: u32, value: u32) {
     memory.write16(address + 2, value as u16);
 }
 
-/// applies whatever the title changed in a voice's configuration, then
-/// clears its dirty flags the way the firmware does.
+/// applies whatever the title changed in a voice's config, then clears its dirty flags like the firmware does
 fn parse_config(voice: &mut Voice, memory: &mut Memory, base: u32, coefficients: u32) {
     let flags = memory.read32(base + config::DIRTY);
     if flags == 0 {
@@ -825,7 +803,7 @@ fn parse_config(voice: &mut Voice, memory: &mut Memory, base: u32, coefficients:
         0
     };
 
-    // the title lengthened the buffer that is already playing.
+    // the title made the buffer that's already playing longer
     if flags & dirty::PARTIAL_EMBEDDED_BUFFER != 0 {
         let length = read_dsp32(memory, base + config::LENGTH);
         let played = voice.length - voice.remaining;
@@ -903,7 +881,7 @@ mod tests {
 
     const BASE: u32 = 0x2000_0000;
 
-    /// physical memory holding one buffer's bytes at BASE.
+    /// physical memory holding one buffer's bytes at BASE
     struct Samples(Vec<u8>);
 
     impl SampleMemory for Samples {
@@ -951,7 +929,7 @@ mod tests {
         assert!(voice.buffer_update, "a queued buffer reports that it started");
     }
 
-    /// at a rate of one, a 320-sample buffer lasts two audio frames.
+    /// at a rate of one a 320 sample buffer lasts two audio frames
     #[test]
     fn a_voice_moves_through_its_buffers_in_real_time() {
         let mut memory = silence();
@@ -965,8 +943,8 @@ mod tests {
         assert_eq!(voice.current_buffer_id, 2);
     }
 
-    /// a buffer that ends on a frame's last sample is followed by the next
-    /// with no silent frame between, a stream of them would stutter.
+    /// a buffer ending on a frame's last sample gets followed by the next w/ no silent frame between,
+    /// a stream of them would stutter otherwise
     #[test]
     fn queued_buffers_play_on_without_a_gap() {
         let mut memory = Samples(1000i16.to_le_bytes().repeat(0x8000));
@@ -1015,8 +993,7 @@ mod tests {
         assert_eq!(voice.current_buffer_id, 9);
     }
 
-    /// a ramp of PCM16 samples, played at half speed, comes out with the
-    /// samples between them filled in.
+    /// a ramp of PCM16 samples played at half speed comes out w/ the samples between them filled in
     #[test]
     fn pcm16_is_read_and_interpolated() {
         let bytes: Vec<u8> = (0..400i16).flat_map(|i| i.wrapping_mul(100).to_le_bytes()).collect();
@@ -1039,7 +1016,7 @@ mod tests {
     }
 
     /// the decoder follows the reference implementation's filter, and one
-    /// buffer's history carries on into the next.
+    /// buffer's history carries on into the next
     #[test]
     fn adpcm_decodes_with_its_coefficients() {
         let mut coefficients = [0i16; 16];
@@ -1054,7 +1031,7 @@ mod tests {
     }
 
     /// an ADPCM buffer comes from the last decoding only when that started
-    /// from the same bytes, coefficients and history, and ran as long.
+    /// from the same bytes, coefficients and history, and ran as long
     #[test]
     fn adpcm_is_decoded_again_unless_nothing_changed() {
         let mut data: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37)).collect();
@@ -1085,8 +1062,7 @@ mod tests {
         }
     }
 
-    /// ADPCM decodes to the bit as it did a sample at a time, frames whole
-    /// or cut short, however many samples are asked for.
+    /// ADPCM decodes to the bit like it did a sample at a time, frames whole or cut short, however many samples are asked for
     #[test]
     fn adpcm_decodes_as_the_sample_at_a_time_reference() {
         let mut random = Random(0xD1B5_4A32_D192_ED03);
@@ -1104,7 +1080,7 @@ mod tests {
     }
 
     /// an embedded buffer plays as long as it says, a sound of a second or
-    /// two is common.
+    /// two is common
     #[test]
     fn an_embedded_buffer_keeps_its_length() {
         use crate::memory::{MemoryState, Permission};
@@ -1137,8 +1113,7 @@ mod tests {
         assert_eq!(sample(&again[0], 0), [1000; 4], "the fade happens once");
     }
 
-    /// the voices as they played and mixed a sample at a time, which the
-    /// faster ways have to match to the bit.
+    /// the voices as they played and mixed a sample at a time, the faster ways have to match it to the bit
     mod reference {
         use super::super::*;
 
@@ -1268,7 +1243,7 @@ mod tests {
             voice.filters.process(&mut voice.frame[..output]);
         }
 
-        /// a mix with the channels of each sample together, as it was.
+        /// a mix w/ each sample's channels together, like it was
         pub type Interleaved = [[i32; 4]; FRAME_SAMPLES];
 
         pub fn interleave(mix: &QuadFrame) -> Interleaved {
@@ -1292,7 +1267,7 @@ mod tests {
         }
     }
 
-    /// a small xorshift generator, the same numbers every run.
+    /// a lil xorshift generator, same numbers every run
     struct Random(u64);
 
     impl Random {
@@ -1315,17 +1290,16 @@ mod tests {
             items[self.below(items.len() as u64) as usize]
         }
 
-        /// somewhere in [0, 1).
+        /// somewhere in [0, 1)
         fn unit(&mut self) -> f64 {
             (self.next() >> 11) as f64 / (1u64 << 53) as f64
         }
     }
 
-    /// bytes of memory the random buffers play from, at BASE.
+    /// bytes of memory the random buffers play from, at BASE
     const MEMORY_SIZE: u32 = 0x4000;
 
-    /// a buffer of any kind a title could queue, now and then not all of it
-    /// in memory or none of it.
+    /// a buffer of any kind a title could queue, sometimes partly in memory or not at all
     fn random_buffer(random: &mut Random) -> Buffer {
         let length = match random.below(6) {
             0 => random.pick(&[0, 1, 2, 3]),
@@ -1351,8 +1325,7 @@ mod tests {
         }
     }
 
-    /// a voice set up the way a title could have it, part way through
-    /// whatever it plays.
+    /// a voice set up like a title could have it, part way thru whatever it plays
     fn random_voice(random: &mut Random) -> Voice {
         let rates = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 32728.0 / 32000.0, 22050.0 / 32728.0, 1e-3, 7.75, 300.0, 3e9, 1e12];
         let mut voice = Voice {
@@ -1367,8 +1340,7 @@ mod tests {
             ran_out_at_frame_end: random.chance(20),
             ..Voice::default()
         };
-        // as loud as a title's coefficients get, louder would overflow the
-        // decoder's sum in a test build
+        // as loud as a title's coefficients get, louder would overflow the decoder's sum in a test build
         for coefficient in &mut voice.coefficients {
             *coefficient = random.next() as i16 >> (3 + random.below(3));
         }
@@ -1386,7 +1358,7 @@ mod tests {
         for _ in 0..random.below(5) {
             voice.queue.push(random_buffer(random));
         }
-        // a buffer lengthened before it started plays silence
+        // a buffer made longer b4 it started plays silence
         if random.chance(5) {
             voice.length = random.below(400) as u32;
             voice.remaining = voice.length;
@@ -1394,7 +1366,7 @@ mod tests {
         voice
     }
 
-    /// asserts two voices are in the same state, to the bit.
+    /// asserts two voices are in the same state, to the bit
     fn assert_same(voice: &Voice, reference: &Voice, context: &str) {
         assert_eq!(voice.frame, reference.frame, "{context}: samples");
         assert_eq!(voice.fraction.to_bits(), reference.fraction.to_bits(), "{context}: fraction");
@@ -1421,9 +1393,8 @@ mod tests {
         assert_eq!(voice.decoded, reference.decoded, "{context}: decoded");
     }
 
-    /// voices play to the bit what they did a sample at a time, whatever
-    /// the format, rate, interpolation and buffers, and the title changing
-    /// things between frames.
+    /// voices play to the bit what they did a sample at a time, whatever the format, rate,
+    /// interpolation and buffers, w/ the title changing stuff between frames
     #[test]
     fn playing_matches_the_sample_at_a_time_reference() {
         let mut random = Random(0x9E37_79B9_7F4A_7C15);
@@ -1437,7 +1408,7 @@ mod tests {
                     voice.queue.push(buffer);
                     reference.queue.push(buffer);
                 }
-                // the title lengthening the buffer playing, as parse_config does
+                // the title making the playing buffer longer, like parse_config does
                 if random.chance(10) {
                     let length = random.below(3000) as u32;
                     for voice in [&mut voice, &mut reference] {
@@ -1449,14 +1420,13 @@ mod tests {
                         }
                     }
                 }
-                // a new rate part way through a buffer, whole ones too
+                // a new rate part way thru a buffer, whole ones too
                 if random.chance(10) {
                     let rate = if random.chance(50) { random.pick(&[1.0, 2.0, 3.0]) } else { random.unit() * 3.0 + 0.01 };
                     voice.rate = rate;
                     reference.rate = rate;
                 }
-                // the title writing over the samples playing, or changing
-                // the coefficients
+                // the title writing over the samples playing or changing the coefficients
                 if let Some(playing) = voice.playing.filter(|_| random.chance(15)) {
                     let at = (playing.address & !3).wrapping_sub(BASE) as u64 + random.below(playing.length as u64 / 2 + 1);
                     if let Some(byte) = memory.0.get_mut(at as usize) {
@@ -1482,8 +1452,7 @@ mod tests {
         }
     }
 
-    /// a buffer running off the end of the DSP's memory goes on into the
-    /// memory after it, read a sample at a time.
+    /// a buffer running off the end of the DSP's memory goes on into the memory after it, read a sample at a time
     #[test]
     fn a_buffer_across_two_memories_plays_from_both() {
         use zakuro_common::memory_map::{DSP_RAM_PADDR, DSP_RAM_SIZE};
@@ -1506,9 +1475,8 @@ mod tests {
         }
     }
 
-    /// what the voices add to the mixes is to the bit what they added a
-    /// sample at a time, steady, fading, fading back to where they were,
-    /// silent and at gains far too loud.
+    /// what the voices add to the mixes matches to the bit what they added a sample at a time
+    /// steady, fading, fading back to where they were, silent and at gains way too loud
     #[test]
     fn mixing_matches_the_sample_at_a_time_reference() {
         let mut random = Random(0x2545_F491_4F6C_DD1D);
@@ -1558,8 +1526,7 @@ mod tests {
                 };
             }
             let mut reference = voice.clone();
-            // far too loud a voice is the only one, it would overflow the
-            // sum in a test build
+            // a way too loud voice has to be alone, it'd overflow the sum in a test build
             let start = if loud { 0 } else { 1 << 28 };
             let mut mixes = [[[0; FRAME_SAMPLES]; 4]; 3];
             for value in mixes.iter_mut().flatten().flatten() {

@@ -1,4 +1,4 @@
-//! gsp::Gpu, the GPU service.
+//! gsp::Gpu, the GPU service
 
 use zakuro_common::memory_map::{FCRAM_PADDR, PAGE_SIZE};
 use zakuro_cpu::Bus;
@@ -7,41 +7,39 @@ use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, SharedMemory};
 use crate::System;
 
-/// size of the GSP shared memory block.
+/// size of the GSP shared memory block
 pub const SHARED_MEMORY_SIZE: u32 = 0x1000;
-/// start of the GX command ring within it.
+/// where the GX command ring starts in it
 const COMMAND_BUFFER_BASE: u32 = 0x800;
 const COMMAND_BUFFER_STRIDE: u32 = 0x200;
 const INTERRUPT_QUEUE_STRIDE: u32 = 0x40;
 
-/// start of the FrameBufferInfo table, one 0x40-byte record per screen per
-/// client, [client][screen].
+/// start of the FrameBufferInfo table, one 0x40 byte record per screen per client, [client][screen]
 const FRAMEBUFFER_INFO_BASE: u32 = 0x200;
 const FRAMEBUFFER_INFO_CLIENT_STRIDE: u32 = 0x80;
 const FRAMEBUFFER_INFO_SCREEN_STRIDE: u32 = 0x40;
-/// offset of framebuf_info[0] within a screen's record, framebuf_info[1]
-/// follows immediately at + 0x1C.
+/// offset of framebuf_info[0] in a screen's record, framebuf_info[1] follows right after at + 0x1C
 const FRAMEBUFFER_ENTRY_BASE: u32 = 0x04;
 const FRAMEBUFFER_ENTRY_STRIDE: u32 = 0x1C;
 
-/// interrupts GSP relays to the client.
+/// interrupts GSP relays to the client
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum InterruptId {
     Psc0 = 0,
     Psc1 = 1,
-    /// top screen vertical blank.
+    /// top screen vblank
     Pdc0 = 2,
-    /// bottom screen vertical blank.
+    /// bottom screen vblank
     Pdc1 = 3,
-    /// display transfer / texture copy finished.
+    /// display transfer / texture copy done
     Ppf = 4,
-    /// command list finished.
+    /// command list done
     P3d = 5,
     Dma = 6,
 }
 
-/// one entry from the GX command ring.
+/// one entry from the GX command ring
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct GxCommand {
     pub id: u8,
@@ -52,23 +50,22 @@ pub struct GxCommand {
 pub struct GspState {
     pub shared_memory_handle: Option<u32>,
     pub shared_memory_address: u32,
-    /// event the client waits on for relayed interrupts.
+    /// event the client waits on for relayed interrupts
     pub interrupt_event: Option<u32>,
     pub interrupt_event_object: Option<crate::kernel::object::ObjectId>,
-    /// which slot in the shared memory this client owns.
+    /// which slot in the shared memory this client owns
     pub thread_index: u32,
-    /// true once a client has taken GPU rights.
+    /// true once a client took GPU rights
     pub has_right: bool,
-    /// commands pulled off the ring that the GPU has not run yet.
+    /// commands pulled off the ring that the GPU hasn't run yet
     pub pending: Vec<GxCommand>,
-    /// the picture each screen has waiting in shared memory for the next
-    /// refresh, as the first look since the last one found it.
+    /// the picture each screen has waiting in shared memory for the next refresh, as the first look since the last one found it
     pub waiting: [Option<(u32, u32)>; 2],
-    /// the ring waits for the next refresh, see outdrawn.
+    /// the ring waits for the next refresh, see outdrawn
     pub held: bool,
 }
 
-/// command ids, straight from 3dbrew's GSP::GPU table.
+/// command ids, straight from 3dbrew's GSP::GPU table
 mod command {
     pub const WRITE_HW_REGS: u16 = 0x0001;
     pub const WRITE_HW_REGS_WITH_MASK: u16 = 0x0002;
@@ -125,8 +122,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // WriteHWRegRepeat(offset, size, <buffer>), writes the same register
-        // repeatedly, which is how command data is fed to the GPU.
+        // WriteHWRegRepeat(offset, size, <buffer>), writes the same register over and over, that's how command data gets fed to the GPU
         WRITE_HW_REG_REPEAT => {
             let offset = buffer.get(&mut system.memory, 1);
             let size = buffer.get(&mut system.memory, 2);
@@ -167,8 +163,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // SetCommandList(address, size, ...), the immediate form of the GX
-        // command with the same name.
+        // SetCommandList(addr, size, ...), the immediate form of the GX command w/ the same name
         SET_COMMAND_LIST => {
             let address = buffer.get(&mut system.memory, 1) & !7;
             let address = virtual_to_physical(system, address);
@@ -192,7 +187,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // the cache maintenance commands, memory is coherent for us.
+        // the cache maintenance commands, memory is coherent for us
         FLUSH_DATA_CACHE | INVALIDATE_DATA_CACHE | STORE_DATA_CACHE => {
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -203,13 +198,12 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
         SET_LCD_FORCE_BLACK => {
-            // a u8, the rest of the word is whatever was there before, OoT3D
-            // leaves a result code's top bytes in it after making its save
+            // a u8, the rest of the word is whatever was there b4, OoT3D leaves a result code's top bytes in it after making its save
             system.lcd_force_black = buffer.get(&mut system.memory, 1) & 0xFF != 0;
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // TriggerCmdReqQueue, run whatever the client queued in shared memory.
+        // TriggerCmdReqQueue, run whatever the client queued in shared memory
         TRIGGER_CMD_REQ_QUEUE => {
             if !outdrawn(system) {
                 process_command_queue(system);
@@ -245,8 +239,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // SetMemoryFill(start0, value0, end0, start1, value1, end1, control0,
-        // control1)
+        // SetMemoryFill(start0, value0, end0, start1, value1, end1, control0, control1)
         SET_MEMORY_FILL => {
             for bank in 0..2u32 {
                 let start = buffer.get(&mut system.memory, 1 + bank * 3);
@@ -271,7 +264,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // configuration knobs with no effect on us.
+        // config knobs that do nothing for us
         SET_AXI_CONFIG_QOS_MODE
         | SET_PERF_LOG_MODE
         | SET_LED_FORCE_OFF
@@ -286,12 +279,11 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[0]);
             true
         }
-        // RegisterInterruptRelayQueue(flags, event handle)
-        //   -> result, thread index, shared memory handle
+        // RegisterInterruptRelayQueue(flags, event handle) => result, thread index, shared memory handle
         REGISTER_INTERRUPT_RELAY_QUEUE => {
             let event = buffer.get(&mut system.memory, 3);
             system.services.gsp.interrupt_event = Some(event);
-            // kept while registered, whatever the title does with its handle
+            // kept while registered, whatever the title does w/ its handle
             let object = system.kernel.resolve(event);
             if let Some(object) = object {
                 system.kernel.objects.add_ref(object);
@@ -303,8 +295,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let handle = ensure_shared_memory(system);
             let index = system.services.gsp.thread_index;
             log::debug!("gsp: registered interrupt relay queue, slot {index}");
-            // 0x2A07 alongside success tells the caller the GPU was already
-            // initialized, so it skips its own first-time setup.
+            // 0x2A07 next to success tells the caller the GPU was already initialized, so it skips its own first time setup
             buffer.set(&mut system.memory, 0, Header::new(id, 2, 2).0);
             buffer.set(&mut system.memory, 1, 0x2A07);
             buffer.set(&mut system.memory, 2, index);
@@ -343,8 +334,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// applies any buffer swap a game has queued in the FrameBufferInfo table for
-/// either screen, the way real GSP does once per vertical blank.
+/// applies any buffer swap a game queued in the FrameBufferInfo table for either screen, like real GSP does once per vblank
 pub fn apply_framebuffer_updates(system: &mut System) {
     let base = system.services.gsp.shared_memory_address;
     if base == 0 {
@@ -370,19 +360,16 @@ pub fn apply_framebuffer_updates(system: &mut System) {
         let format = system.memory.read32(entry + 0x10);
         system.set_framebuffer(screen, index, left, right, stride, format);
 
-        // real GSP clears the flag once it has picked the update up, so a
-        // title that polls it to know its previous frame was consumed keeps
-        // moving instead of assuming GSP is stuck.
+        // real GSP clears the flag once it picked the update up,
+        // so a title polling it to know its last frame got consumed keeps moving instead of thinking GSP is stuck
         system.memory.write32(record, index);
     }
 }
 
-/// whether the title drew past what the screens can show, a picture over
-/// one still waiting for a refresh, so the ring waits for the next one.
-/// the console's GPU takes its time, which paces a title that never waits
-/// for a refresh, and ours finishes at once, Monster Hunter 3 Ultimate drew
-/// twenty pictures for each refresh that no one saw. a title that waits for
-/// a refresh sets one picture for each and is never held.
+/// did the title draw past what the screens can show (a picture over one still waiting for a refresh), then the ring waits for the next one
+/// the console's GPU takes its time, which paces a title that never waits for a refresh, ours finishes at once
+/// Monster Hunter 3 Ultimate drew twenty pictures per refresh that nobody saw lol
+/// a title that waits for a refresh sets one picture for each and is never held
 fn outdrawn(system: &mut System) -> bool {
     let base = system.services.gsp.shared_memory_address;
     if base == 0 || system.services.gsp.held {
@@ -406,8 +393,7 @@ fn outdrawn(system: &mut System) -> bool {
     system.services.gsp.held
 }
 
-/// the screens refresh, taking the pictures set for them, and a ring held
-/// for it runs.
+/// the screens refresh, taking the pictures set for them, and a ring held for it runs
 pub fn refresh(system: &mut System) {
     apply_framebuffer_updates(system);
     system.services.gsp.waiting = [None; 2];
@@ -416,7 +402,7 @@ pub fn refresh(system: &mut System) {
     }
 }
 
-/// decodes the fill width from a memory-fill control word.
+/// decodes the fill width from a memory fill control word
 fn fill_width(control: u32) -> u32 {
     match control & 0x300 {
         0x000 => 2, // 16 bits per pixel
@@ -425,7 +411,7 @@ fn fill_width(control: u32) -> u32 {
     }
 }
 
-/// creates the shared memory block on first use and maps it for the client.
+/// makes the shared memory block on first use and maps it for the client
 fn ensure_shared_memory(system: &mut System) -> u32 {
     if let Some(handle) = system.services.gsp.shared_memory_handle {
         return handle;
@@ -455,13 +441,13 @@ fn ensure_shared_memory(system: &mut System) -> u32 {
     handle
 }
 
-/// address of this client's interrupt queue inside the shared block.
+/// addr of this client's interrupt queue inside the shared block
 fn interrupt_queue_address(system: &System) -> Option<u32> {
     let base = system.services.gsp.shared_memory_address;
     (base != 0).then(|| base + system.services.gsp.thread_index * INTERRUPT_QUEUE_STRIDE)
 }
 
-/// posts an interrupt to the client and signals its event.
+/// posts an interrupt to the client and signals its event
 pub fn signal_interrupt(system: &mut System, interrupt: InterruptId) {
     let Some(queue) = interrupt_queue_address(system) else {
         return;
@@ -471,7 +457,7 @@ pub fn signal_interrupt(system: &mut System, interrupt: InterruptId) {
     let count = system.memory.read8(queue + 1) as u32;
 
     if count >= 0x34 {
-        // the queue is full, hardware sets the error byte and drops it.
+        // the queue's full, hardware sets the error byte and drops it
         system.memory.write8(queue + 2, 1);
         return;
     }
@@ -486,7 +472,7 @@ pub fn signal_interrupt(system: &mut System, interrupt: InterruptId) {
 }
 
 fn write_hw_regs(system: &mut System, offset: u32, size: u32, source: u32, mask: Option<u32>) {
-    // GSP only lets a client touch the GPU register window.
+    // GSP only lets a client touch the GPU register window
     if offset >= 0x420000 || size > 0x80 {
         log::warn!("gsp WriteHWRegs out of range: offset 0x{offset:X} size 0x{size:X}");
         return;
@@ -505,7 +491,7 @@ fn write_hw_regs(system: &mut System, offset: u32, size: u32, source: u32, mask:
     }
 }
 
-/// pulls every queued GX command off the ring and runs it.
+/// pulls every queued GX command off the ring and runs it
 fn process_command_queue(system: &mut System) {
     let base = system.services.gsp.shared_memory_address;
     if base == 0 {
@@ -534,8 +520,7 @@ fn process_command_queue(system: &mut System) {
             data,
         };
 
-        // consume it before running, so a command that re-enters GSP sees a
-        // consistent ring.
+        // consume it b4 running, so a command that reenters GSP sees a consistent ring
         let next_index = (index + 1) % 15;
         system
             .memory
@@ -619,10 +604,9 @@ fn execute_command(system: &mut System, command: GxCommand) {
     }
 }
 
-/// converts an address a title hands the GSP, a virtual one in VRAM or its
-/// linear heap, to the physical one the GPU takes, as the GSP does. the
-/// linear heap at 0x30000000 is above where FCRAM starts, so the GPU can't
-/// tell one from the other itself. anything else goes as it is.
+/// turns an addr a title hands the GSP (virtual, in VRAM or its linear heap) into the physical one the GPU takes, like the GSP does
+/// the linear heap at 0x30000000 is above where FCRAM starts, so the GPU can't tell one from the other by itself
+/// anything else goes as is
 pub fn virtual_to_physical(system: &System, vaddr: u32) -> u32 {
     use zakuro_common::memory_map::*;
     let linear = system.kernel.linear_base;
@@ -636,8 +620,7 @@ pub fn virtual_to_physical(system: &System, vaddr: u32) -> u32 {
     }
 }
 
-/// converts a physical address in a GX command to the linear-heap virtual
-/// address it corresponds to, which is where our memory actually is.
+/// turns a physical addr in a GX command into the linear heap virtual addr it matches, that's where our memory actually is
 pub fn physical_to_virtual(system: &System, paddr: u32) -> u32 {
     if paddr >= FCRAM_PADDR {
         system.kernel.linear_base + (paddr - FCRAM_PADDR)
@@ -648,7 +631,7 @@ pub fn physical_to_virtual(system: &System, paddr: u32) -> u32 {
     }
 }
 
-/// rounds a size up to whole pages, used when mapping the shared block.
+/// rounds a size up to whole pages, used when mapping the shared block
 pub const fn page_align(size: u32) -> u32 {
     (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
@@ -659,9 +642,8 @@ mod tests {
     use crate::memory::{MemoryState, Permission};
     use crate::{Config, System};
 
-    /// maps the GSP shared memory block and points shared_memory_address
-    /// at it, the way svcMapMemoryBlock does for a real title, so a test
-    /// can write into the FrameBufferInfo table the way a game would.
+    /// maps the GSP shared memory block and points shared_memory_address at it like svcMapMemoryBlock does for a
+    /// real title, so a test can write into the FrameBufferInfo table like a game would
     fn system_with_mapped_gsp_shm() -> (System, u32) {
         let mut system = System::new(Config::default());
         ensure_shared_memory(&mut system);
@@ -683,10 +665,9 @@ mod tests {
         (system, vaddr)
     }
 
-    /// SetLcdForceBlack's flag is a u8. OoT3D sends false in a word whose top
-    /// bytes still hold the result code of the reply before, after making
-    /// its save on a first boot, and taking the whole word as the flag left
-    /// the screen black for good.
+    /// SetLcdForceBlack's flag is a u8
+    /// OoT3D sends false in a word whose top bytes still hold the result code of the reply b4 (after making its
+    /// save on a first boot), and taking the whole word as the flag left the screen black for good
     #[test]
     fn force_black_reads_only_the_low_byte() {
         let (mut system, vaddr) = system_with_mapped_gsp_shm();
@@ -700,13 +681,11 @@ mod tests {
         }
     }
 
-    /// this is the exact layout recovered by scanning a running Pokémon Alpha
-    /// Sapphire's GSP shared memory for the physical addresses a real
-    /// display transfer had just written into, a title toggles is_dirty
-    /// and index in the FrameBufferInfo header instead of calling
-    /// SetBufferSwap every frame, and a vblank that does not pick this up
-    /// leaves the screen showing whatever address was configured at launch
-    /// forever, no matter how correctly the rest of the GPU pipeline renders.
+    /// the exact layout found by scanning a running Pokémon Alpha Sapphire's GSP shared memory for the physical
+    /// addrs a real display transfer had just written into
+    /// a title toggles is_dirty and index in the FrameBufferInfo header instead of calling SetBufferSwap every frame
+    /// a vblank that doesn't pick this up leaves the screen stuck on the addr set at launch forever,
+    /// no matter how right the rest of the GPU pipeline renders
     #[test]
     fn picks_up_a_swap_queued_directly_in_shared_memory() {
         let (mut system, vaddr) = system_with_mapped_gsp_shm();
@@ -719,7 +698,7 @@ mod tests {
 
         apply_framebuffer_updates(&mut system);
 
-        // the GPU gets the physical address of the VRAM the title named
+        // the GPU gets the physical addr of the VRAM the title named
         assert_eq!(system.gpu.framebuffers[0].address_left(), 0x1830_0000);
         assert_eq!(system.gpu.framebuffers[0].stride, 720);
         assert_eq!(
@@ -729,10 +708,9 @@ mod tests {
         );
     }
 
-    /// a title that never waits for a refresh sets a picture over one the
-    /// screens have not shown yet, and its commands wait in the ring for
-    /// the next refresh, as with a GPU that takes its time. one that sets a
-    /// picture for each refresh never waits.
+    /// a title that never waits for a refresh sets a picture over one the screens haven't shown yet,
+    /// and its commands wait in the ring for the next refresh like w/ a GPU that takes its time
+    /// one that sets a picture for each refresh never waits
     #[test]
     fn a_picture_over_one_not_shown_holds_the_ring_until_the_refresh() {
         let (mut system, vaddr) = system_with_mapped_gsp_shm();
@@ -742,8 +720,7 @@ mod tests {
             system.memory.write32(record + FRAMEBUFFER_ENTRY_BASE + index * FRAMEBUFFER_ENTRY_STRIDE + 0x04, left);
             system.memory.write32(record, 0x100 | index);
         };
-        // queues a cache flush, which does nothing, and asks for the ring to
-        // run, what it leaves in it waits
+        // queues a cache flush (does nothing) and asks for the ring to run, whatever it leaves in it waits
         let trigger = |system: &mut System| {
             let control = system.memory.read32(ring);
             let (index, count) = (control & 0xFF, (control >> 8) & 0xFF);
@@ -773,9 +750,8 @@ mod tests {
         assert_eq!(trigger(&mut system), 0);
     }
 
-    /// a record with is_dirty clear (the steady state right after a swap
-    /// was applied) must not be re-applied every frame, that would fight a
-    /// title that legitimately wants to hold the same buffer for two frames.
+    /// a record w/ is_dirty clear (the steady state right after a swap got applied) must not get applied again
+    /// every frame, that'd fight a title that legit wants to hold the same buffer for two frames
     #[test]
     fn leaves_a_clean_record_alone() {
         let (mut system, vaddr) = system_with_mapped_gsp_shm();

@@ -1,8 +1,7 @@
-//! nwm::UDS, local wireless. consoles find the networks others put up, join
-//! them and pass data, here through a room rather than the air, see room.
-//! what goes between the consoles is Zakuro's own, none of the 802.11
-//! frames or their encryption, except the beacons a title reads itself. with
-//! no room, wireless is off, as when a player switches it off.
+//! nwm::UDS, local wireless
+//! consoles find the networks others put up, join them and pass data, here thru a room instead of the air (see room)
+//! what goes between consoles is Zakuro's own, none of the 802.11 frames or their encryption, except the beacons a title reads itself
+//! w/o a room wireless is off, like when a player switches it off
 
 use std::collections::VecDeque;
 
@@ -17,7 +16,7 @@ use crate::kernel::thread::{nanos_to_ticks, ThreadId};
 use crate::room::{Mac, BROADCAST};
 use crate::System;
 
-// what GetConnectionStatus reports the console is
+// what GetConnectionStatus says the console is
 const NOT_CONNECTED: u32 = 3;
 const HOST: u32 = 6;
 const CONNECTING: u32 = 7;
@@ -34,19 +33,19 @@ const BROADCAST_NODE: u16 = 0xFFFF;
 const HOST_NODE: u16 = 1;
 const DEFAULT_CHANNEL: u8 = 11;
 const APPLICATION_DATA: usize = 0xC8;
-/// a host's beacon goes out every 100 time units of 1.024 ms.
+/// a host's beacon goes out every 100 time units of 1.024 ms
 const BEACON_NANOS: u64 = 102_400_000;
-/// a scan takes about this long on the console.
+/// a scan takes about this long on the console
 const SCAN_NANOS: u64 = 300_000_000;
-/// joining waits this long for the host.
+/// joining waits this long for the host
 const JOIN_NANOS: u64 = 5_000_000_000;
 const MAX_BINDS: usize = 16;
 const MIN_RECEIVE_BUFFER: u32 = 0x5F4;
 const MAX_SEND: u32 = 0x5C6;
-/// beacons kept between scans, one a host.
+/// beacons kept between scans, one per host
 const MAX_BEACONS: usize = 15;
 const NINTENDO_OUI: [u8; 3] = [0x00, 0x1F, 0x32];
-/// the encrypted data of a beacon split between two tags past this.
+/// the encrypted data of a beacon gets split between two tags past this
 const FIRST_TAG_DATA: usize = 0xFA;
 
 // the results the console gives
@@ -61,48 +60,47 @@ fn result(description: u32, summary: Summary, level: Level) -> u32 {
     ResultCode::new(level, summary, Module::Uds, description).0
 }
 
-/// what one console sends another through the room.
+/// what one console sends another thru the room
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Wireless {
-    /// a host's beacon, as a title reads it from a scan.
+    /// a host's beacon, as a title reads it from a scan
     Beacon { channel: u8, frame: Vec<u8> },
-    /// a console asks to join the network a host has up.
+    /// a console asks to join the network a host has up
     Join { network_id: u32, spectator: bool, passphrase: Vec<u8>, node: Vec<u8> },
-    /// the host takes it in, as a node.
+    /// the host lets it in, as a node
     Welcome { node_id: u16, network: Vec<u8>, peers: Vec<Peer> },
-    /// or turns it away.
+    /// or turns it away
     Refused,
-    /// who is in the network now, whenever that changes.
+    /// who's in the network now, whenever that changes
     Peers(Vec<Peer>),
-    /// a client leaves, or the host ends the network or sends a client away.
+    /// a client leaves, or the host ends the network or kicks a client
     Leave,
-    /// data for a node of a network, or for all of them.
+    /// data for a node of a network, or for all of them
     Data { network_id: u32, channel: u8, from: u16, to: u16, payload: Vec<u8> },
-    /// a Download Play host's offer, every second while it takes guests.
+    /// a Download Play host's offer, every second while it takes guests
     DlpOffer(crate::services::dlp::Offer),
-    /// a guest asks to take part, with its node.
+    /// a guest asks to take part, w/ its node
     DlpJoin { node: Vec<u8> },
-    /// the host takes it in, as a node.
+    /// the host lets it in, as a node
     DlpTaken { node_id: u16 },
-    /// or turns it away, or sends it off.
+    /// or turns it away, or kicks it
     DlpRefused,
-    /// the host starts sending the child.
+    /// the host starts sending the child
     DlpStart,
-    /// whether the guest needs the child sent.
+    /// does the guest need the child sent
     DlpNeed { needs: bool },
-    /// a piece of the child.
+    /// a piece of the child
     DlpPiece { offset: u64, total: u64, data: Vec<u8> },
-    /// the guest has all of the child.
+    /// the guest has the whole child
     DlpReady,
-    /// the game begins, with the passphrase of the network the host puts up
-    /// for the children.
+    /// the game starts, w/ the passphrase of the network the host puts up for the children
     DlpBegin { passphrase: Vec<u8> },
-    /// either side leaves the session.
+    /// either side leaves the session
     DlpLeave,
 }
 
 impl Wireless {
-    /// whether it is Download Play's, which the dlp service takes.
+    /// is it Download Play's, the dlp service takes those
     fn download_play(&self) -> bool {
         matches!(
             self,
@@ -120,7 +118,7 @@ impl Wireless {
     }
 }
 
-/// a node of a network, its address and how its title describes it.
+/// a node of a network, its addr and how its title describes it
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Peer {
     node_id: u16,
@@ -128,7 +126,7 @@ pub(crate) struct Peer {
     node: Vec<u8>,
 }
 
-/// what GetConnectionStatus answers.
+/// what GetConnectionStatus answers
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct Status {
     status: u32,
@@ -157,8 +155,7 @@ impl Status {
         std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
     }
 
-    /// the nodes of a network as the status lists them, what changed told
-    /// apart from what it had.
+    /// the nodes of a network as the status lists them, what changed told apart from what it had
     fn take_peers(&mut self, peers: &[Peer]) {
         let before = self.bitmask;
         self.nodes = [0; MAX_NODES];
@@ -177,10 +174,10 @@ impl Status {
 struct Bind {
     id: u32,
     channel: u8,
-    /// the node it takes data from, any for BROADCAST_NODE.
+    /// the node it takes data from, any for BROADCAST_NODE
     from: u16,
     event: ObjectId,
-    /// what came, from which node, oldest first.
+    /// what came, from which node, oldest first
     queue: VecDeque<(u16, Vec<u8>)>,
 }
 
@@ -191,7 +188,7 @@ struct Beacon {
     frame: Vec<u8>,
 }
 
-/// a title waiting on ConnectNetwork2 for the host to answer.
+/// a title waiting on ConnectNetwork2 for the host to answer
 #[derive(Debug, Serialize, Deserialize)]
 struct Joining {
     thread: ThreadId,
@@ -204,15 +201,14 @@ struct Joining {
 pub struct UdsState {
     initialized: bool,
     status_event: Option<ObjectId>,
-    /// the console's own node, as its title describes it.
+    /// the console's own node, as its title describes it
     node: Vec<u8>,
     status: Status,
-    /// the network hosted or joined, the host's address, and the
-    /// passphrase a host takes.
+    /// the network hosted or joined, the host's addr, and the passphrase a host takes
     network: Vec<u8>,
     host: Option<Mac>,
     passphrase: Vec<u8>,
-    /// the nodes in it, the host first.
+    /// the nodes in it, the host first
     peers: Vec<Peer>,
     binds: Vec<Bind>,
     beacons: VecDeque<Beacon>,
@@ -231,16 +227,14 @@ impl UdsState {
 }
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
-    // with no room wireless is off, the way the offline answer has it,
-    // unless a title already started on it in one
+    // w/o a room wireless is off, like the offline answer has it, unless a title already started on it in one
     if !system.services.uds.initialized && system.room.as_ref().is_none_or(|room| !room.open()) {
         return false;
     }
     let command = header.command_id();
     let word = |system: &mut System, index: u32| buffer.get(&mut system.memory, index);
     match command {
-        // Initialize(size, node, block) / InitializeWithVersion(size, node,
-        // version, block)
+        // Initialize(size, node, block) / InitializeWithVersion(size, node, version, block)
         0x0001 | 0x001B => {
             let node: Vec<u8> = (2..12).flat_map(|i| word(system, i).to_le_bytes()).collect();
             let event = initialize(system, node);
@@ -279,7 +273,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             leave(system);
             reply_result(system, buffer, command, 0);
         }
-        // DisconnectNetwork, which a host may not
+        // DisconnectNetwork, a host may not
         0x000A => {
             if system.services.uds.status.status == HOST {
                 reply_result(system, buffer, command, result(WRONG_STATUS, Summary::InvalidState, Level::Status));
@@ -314,7 +308,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             }
             reply_result(system, buffer, command, 0);
         }
-        // GetConnectionStatus, the changes it reports told only once
+        // GetConnectionStatus, the changes it reports get told only once
         0x000B => {
             let status = system.services.uds.status;
             system.services.uds.status.changed = 0;
@@ -341,7 +335,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let pointer = word(system, 20);
             scan(system, pointer, size, mac.try_into().unwrap());
             reply_result(system, buffer, command, 0);
-            // the radio listens a while before it answers
+            // the radio listens a while b4 it answers
             let tick = system.cpu.cycles;
             system.kernel.sleep_current(nanos_to_ticks(SCAN_NANOS), tick);
         }
@@ -391,7 +385,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 return true;
             }
             let event = system.kernel.objects.insert(KObject::Event(crate::kernel::sync::Event::new(ResetType::OneShot, "UDS bind")));
-            // the service keeps it for the bind's life
+            // the service keeps it for the bind's whole life
             system.kernel.objects.add_ref(event);
             system.services.uds.binds.retain(|bind| bind.id != id);
             system.services.uds.binds.push(Bind { id, channel, from, event, queue: VecDeque::new() });
@@ -445,8 +439,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let channel = if uds.connected() { uds.network.get(6).copied().filter(|&c| c != 0).unwrap_or(DEFAULT_CHANNEL) } else { 0 };
             buffer.reply(&mut system.memory, command, &[channel as u32]);
         }
-        // ConnectNetwork2(type, passphrase size, network, passphrase), which
-        // returns once the host answers
+        // ConnectNetwork2(type, passphrase size, network, passphrase), returns once the host answers
         0x001E => {
             let spectator = word(system, 1) & 0xFF == 2;
             let size = word(system, 2).min(0xFF) as usize;
@@ -456,8 +449,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let passphrase = read(system, pointer, size);
             join(system, buffer, network, passphrase, spectator);
         }
-        // GetNodeInformationList(network, tag 0, tag 1), the nodes a
-        // beacon lists, into the title's static buffer
+        // GetNodeInformationList(network, tag 0, tag 1), the nodes a beacon lists, into the title's static buffer
         0x001F => {
             let pointer = word(system, 2);
             let network = read(system, pointer, NETWORK_SIZE);
@@ -475,8 +467,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let nodes = beacon_nodes(&network, &first, &second);
             reply_static(system, buffer, command, &[], &nodes, nodes.len());
         }
-        // the rest take settings no console here needs, SetMaxSendDelay,
-        // Flush, SetProbeResponseParam, ScanOnConnection and those unnamed
+        // the rest take settings no console here needs, SetMaxSendDelay, Flush, SetProbeResponseParam,
+        // ScanOnConnection and the unnamed ones
         0x0006 | 0x0015 | 0x0016 | 0x0018 | 0x0019 | 0x001C | 0x0020 | 0x0021 | 0x0022 => {
             reply_result(system, buffer, command, 0);
         }
@@ -494,8 +486,7 @@ fn reply_result(system: &mut System, buffer: &CommandBuffer, command: u16, code:
     }
 }
 
-/// replies with words and bytes in the title's first static buffer, as many
-/// as length, zeroes past them. where the bytes went comes back.
+/// replies w/ words and bytes in the title's first static buffer, as many as length, zeroes past them, returns where the bytes went
 fn reply_static(system: &mut System, buffer: &CommandBuffer, command: u16, words: &[u32], bytes: &[u8], length: usize) -> u32 {
     let tls = system.kernel.current().map_or(0, |thread| thread.tls);
     let (destination, capacity) = buffer.static_buffer(&mut system.memory, tls, 0);
@@ -521,7 +512,7 @@ fn read(system: &mut System, pointer: u32, size: usize) -> Vec<u8> {
     bytes
 }
 
-/// the console's own node, with the id it has in the network.
+/// the console's own node, w/ the id it has in the network
 fn node_bytes(peer: &Peer) -> Vec<u8> {
     let mut node = peer.node.clone();
     node.resize(NODE_SIZE, 0);
@@ -543,15 +534,14 @@ fn send(system: &System, to: Mac, message: &Wireless) {
     }
 }
 
-/// starts the service, or starts it over, with the title's node.
+/// starts the service (or starts it over) w/ the title's node
 fn initialize(system: &mut System, node: Vec<u8>) -> ObjectId {
     leave(system);
     let event = match system.services.uds.status_event {
         Some(event) => event,
         None => {
             let event = system.kernel.objects.insert(KObject::Event(crate::kernel::sync::Event::new(ResetType::OneShot, "UDS status")));
-            // signalled whenever the status changes, kept whatever the
-            // title does with its handle
+            // signaled whenever the status changes, kept whatever the title does w/ its handle
             system.kernel.objects.add_ref(event);
             event
         }
@@ -566,7 +556,7 @@ fn initialize(system: &mut System, node: Vec<u8>) -> ObjectId {
     event
 }
 
-/// puts a network up, the console its host and first node.
+/// puts a network up, the console is its host and first node
 fn host(system: &mut System, mut network: Vec<u8>, passphrase: Vec<u8>) -> u32 {
     let Some(mac) = system.room.as_ref().filter(|room| room.open()).map(|room| room.mac()) else {
         return result(NOT_AUTHORIZED, Summary::InvalidState, Level::Status);
@@ -597,8 +587,7 @@ fn host(system: &mut System, mut network: Vec<u8>, passphrase: Vec<u8>) -> u32 {
     0
 }
 
-/// asks the host of a network to take the console in, the title waiting
-/// until it answers or JOIN_NANOS go by.
+/// asks the host of a network to let the console in, the title waits till it answers or JOIN_NANOS go by
 fn join(system: &mut System, buffer: &CommandBuffer, network: Vec<u8>, passphrase: Vec<u8>, spectator: bool) {
     let host: Mac = network[0..6].try_into().unwrap();
     let network_id = u32::from_be_bytes(network[0x18..0x1C].try_into().unwrap());
@@ -623,7 +612,7 @@ fn join(system: &mut System, buffer: &CommandBuffer, network: Vec<u8>, passphras
     log::info!("uds: joining network {network_id:08X} of {}", mac_text(&host));
 }
 
-/// leaves the network the console is in, or ends the one it hosts.
+/// leaves the network the console's in, or ends the one it hosts
 fn leave(system: &mut System) {
     let uds = &system.services.uds;
     match uds.status.status {
@@ -644,7 +633,7 @@ fn leave(system: &mut System) {
     end(system, NOT_CONNECTED, system.services.uds.status.reason);
 }
 
-/// out of the network, the reason given, and the title told.
+/// out of the network, w/ the reason given, and the title gets told
 fn end(system: &mut System, status: u32, reason: u32) {
     let was = system.services.uds.status.status;
     if let Some(joining) = system.services.uds.joining.take() {
@@ -666,7 +655,7 @@ fn end(system: &mut System, status: u32, reason: u32) {
     }
 }
 
-/// a node leaves the network the console hosts.
+/// a node leaves the network the console hosts
 fn drop_peer(system: &mut System, mac: Mac) {
     let uds = &mut system.services.uds;
     let before = uds.peers.len();
@@ -684,7 +673,7 @@ fn drop_peer(system: &mut System, mac: Mac) {
     signal_status(system);
 }
 
-/// tells the clients who is in the network the console hosts.
+/// tells the clients who is in the network the console hosts
 fn tell_peers(system: &mut System) {
     let peers = system.services.uds.peers.clone();
     for peer in peers.iter().filter(|peer| peer.node_id != HOST_NODE) {
@@ -728,8 +717,7 @@ fn send_to(system: &mut System, to: u16, channel: u8, size: u32, flags: u8, poin
     0
 }
 
-/// writes the beacons heard since the last scan, of any host or of the one
-/// asked for, into the title's buffer.
+/// writes the beacons heard since the last scan (of any host or of the one asked for) into the title's buffer
 fn scan(system: &mut System, pointer: u32, size: u32, wanted: Mac) {
     let uds = &mut system.services.uds;
     let mut taken = Vec::new();
@@ -765,10 +753,9 @@ fn scan(system: &mut System, pointer: u32, size: u32, wanted: Mac) {
     system.memory.write_bytes(pointer, &out);
 }
 
-/// a host's beacon, the way a title reads one out of a scan: the fixed
-/// fields of an 802.11 beacon, an SSID of eight zeroes, then Nintendo's
-/// tags, the network's and its nodes'. the nodes go in the clear, only
-/// GetNodeInformationList reads them.
+/// a host's beacon, the way a title reads one out of a scan
+/// the fixed fields of an 802.11 beacon, an SSID of eight zeroes, then Nintendo's tags, the network's and its nodes'
+/// the nodes go in the clear, only GetNodeInformationList reads them
 fn beacon(network: &[u8], peers: &[Peer]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(0x200);
     // up for 15 minutes, every 100 time units, its capabilities
@@ -778,7 +765,7 @@ fn beacon(network: &[u8], peers: &[Peer]) -> Vec<u8> {
     frame.extend_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
     frame.extend_from_slice(&[0xDD, 7, 0x00, 0x1F, 0x32, 20, 0x0A, 0x00, 0x00]);
 
-    // the network, from its OUI on, hashed with its hash zeroed
+    // the network, from its OUI on, hashed w/ its hash zeroed
     let appdata = (network[0x3F] as usize).min(APPLICATION_DATA);
     let mut info = network[0x0C..0x0C + 0x1F].to_vec();
     info.extend_from_slice(&[0; 0x14]);
@@ -790,7 +777,7 @@ fn beacon(network: &[u8], peers: &[Peer]) -> Vec<u8> {
     frame.push(info.len() as u8);
     frame.extend_from_slice(&info);
 
-    // the nodes, the host first, big-endian as the console has them
+    // the nodes, host first, big endian like the console has them
     let max = (network[0x1D] as usize).min(MAX_NODES);
     let mut nodes = vec![0u8; 0x12];
     let mask = peers.iter().filter(|peer| (1..=max as u16).contains(&peer.node_id)).fold(0u16, |mask, peer| mask | 1 << (peer.node_id - 1));
@@ -821,7 +808,7 @@ fn beacon(network: &[u8], peers: &[Peer]) -> Vec<u8> {
     frame
 }
 
-/// the nodes a beacon's tags list, sixteen NodeInfo little-endian.
+/// the nodes a beacon's tags list, sixteen NodeInfo little endian
 fn beacon_nodes(network: &[u8], first: &[u8], second: &[u8]) -> Vec<u8> {
     let mut data = first.get(4..).unwrap_or_default().to_vec();
     data.extend_from_slice(second.get(4..).unwrap_or_default());
@@ -844,7 +831,7 @@ fn mac_text(mac: &Mac) -> String {
     mac.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":")
 }
 
-/// what came through the room, the beacon due, and a join that took too long.
+/// what came thru the room, the beacon due, and a join that took too long
 pub fn tick(system: &mut System) {
     let Some(room) = system.room.clone() else { return };
     for (from, body) in room.receive() {
@@ -877,7 +864,7 @@ pub fn tick(system: &mut System) {
     }
 }
 
-/// what a console sent this one.
+/// what a console sent this one
 fn take(system: &mut System, from: Mac, message: Wireless) {
     let status = system.services.uds.status.status;
     match message {
@@ -987,7 +974,7 @@ fn take(system: &mut System, from: Mac, message: Wireless) {
             }
             let mut events = Vec::new();
             for bind in uds.binds.iter_mut().filter(|bind| bind.channel == channel && (bind.from == BROADCAST_NODE || bind.from == node)) {
-                // a title that stopped pulling does not have them pile up
+                // a title that stopped pulling doesn't get them piling up
                 if bind.queue.len() >= 256 {
                     bind.queue.pop_front();
                 }
@@ -1010,8 +997,7 @@ mod tests {
     use crate::services::tests::system_with_thread;
     use crate::services::{handle_request, Target};
 
-    /// a system in a room, its title's buffers mapped at 0x0800_0000, and a
-    /// static buffer to receive into.
+    /// a system in a room, its title's buffers mapped at 0x0800_0000, plus a static buffer to receive into
     fn console(link: Link) -> (System, CommandBuffer) {
         let (mut system, buffer) = system_with_thread();
         system.room = Some(link);
@@ -1031,7 +1017,7 @@ mod tests {
         buffer.get(&mut system.memory, 1)
     }
 
-    /// lets what was sent arrive, and the consoles take it.
+    /// lets what was sent arrive and the consoles take it
     fn settle(consoles: &mut [&mut System]) {
         for _ in 0..20 {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1051,8 +1037,7 @@ mod tests {
         assert_eq!(request(system, buffer, &words), 0);
     }
 
-    /// one console hosts a network, the other finds it scanning, reads its
-    /// nodes, joins with the passphrase and the two pass data both ways.
+    /// one console hosts a network, the other finds it scanning, reads its nodes, joins w/ the passphrase and the two pass data both ways
     #[test]
     fn two_consoles_meet_and_talk() {
         let (first, second) = Link::pair();
@@ -1061,7 +1046,7 @@ mod tests {
         initialize(&mut host, &host_buffer, 'H');
         initialize(&mut client, &client_buffer, 'C');
 
-        // the network, comm id 0xABCD, id 7, network id 0x11223344, up to 4
+        // the network, comm id 0xABCD, id 7, network id 0x11223344, up to 4 nodes
         let mut network = vec![0u8; NETWORK_SIZE];
         network[0x10..0x14].copy_from_slice(&0xABCDu32.to_be_bytes());
         network[0x14] = 7;
@@ -1073,7 +1058,7 @@ mod tests {
         assert_eq!(request(&mut host, &host_buffer, &[0x001D_0044, 8, Descriptor::static_buffer(0x108, 1), 0x0800_0000, passphrase, 0x0800_0200]), 0);
         assert_eq!(host.services.uds.status.status, HOST);
 
-        // a beacon goes out, and a scan finds it
+        // a beacon goes out and a scan finds it
         settle(&mut [&mut host, &mut client]);
         let mut scan = vec![0x000F_0404, 0x1000];
         scan.extend([0u32; 13]);
@@ -1095,7 +1080,7 @@ mod tests {
         let hash: [u8; 20] = Sha1::digest(&hashed).into();
         assert_eq!(&info[2 + 0x1F..2 + 0x33], &hash);
 
-        // the nodes of the beacon, through GetNodeInformationList
+        // the beacon's nodes, thru GetNodeInformationList
         let tag0 = &info[2 + 0x34..];
         assert_eq!(tag0[0], 0xDD);
         let tag0 = &tag0[2..2 + tag0[1] as usize];
@@ -1119,7 +1104,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([nodes[8], nodes[9]]), 'H' as u16);
         assert_eq!(u16::from_le_bytes([nodes[0x20], nodes[0x21]]), 1);
 
-        // a wrong passphrase is turned away
+        // a wrong passphrase gets turned away
         client.memory.write_bytes(0x0800_0200, b"wrongpass");
         let wrong = [0x001E_0084, 1, 9, Descriptor::static_buffer(0x108, 1), 0x0800_0000, Descriptor::static_buffer(9, 0), 0x0800_0200];
         request(&mut client, &client_buffer, &wrong);
@@ -1168,7 +1153,7 @@ mod tests {
         assert_eq!(client.services.uds.status.status, NOT_CONNECTED);
     }
 
-    /// with no room, wireless is off as it was.
+    /// w/o a room wireless is off like it was
     #[test]
     fn no_room_is_wireless_off() {
         let (mut system, buffer) = system_with_thread();

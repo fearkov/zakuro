@@ -1,19 +1,18 @@
-//! threads and their saved CPU state.
+//! threads and their saved cpu state
 
 use zakuro_common::VAddr;
 use zakuro_cpu::{Cpu, Psr};
 
 use super::object::ObjectId;
 
-/// index into the kernel's thread table.
+/// index into the kernel's thread table
 pub type ThreadId = u32;
 
-/// the ARM11 runs at 268.111856 MHz.
+/// the ARM11 runs at 268.111856 MHz
 pub const CPU_CLOCK_HZ: u64 = 268_111_856;
 
 pub const fn nanos_to_ticks(nanos: u64) -> u64 {
-    // done in two steps to keep the intermediate inside 64 bits for the
-    // multi-second timeouts games use when waiting on network operations.
+    // two steps to keep the middle value in 64 bits for the multi second timeouts games use on network stuff
     (nanos / 1_000_000_000) * CPU_CLOCK_HZ + (nanos % 1_000_000_000) * CPU_CLOCK_HZ / 1_000_000_000
 }
 
@@ -21,7 +20,7 @@ pub const fn ticks_to_nanos(ticks: u64) -> u64 {
     (ticks / CPU_CLOCK_HZ) * 1_000_000_000 + (ticks % CPU_CLOCK_HZ) * 1_000_000_000 / CPU_CLOCK_HZ
 }
 
-/// everything that has to be saved across a context switch.
+/// everything a context switch has to save
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThreadContext {
     pub regs: [u32; 16],
@@ -29,7 +28,7 @@ pub struct ThreadContext {
     pub vfp_regs: [u32; 32],
     pub fpscr: u32,
     pub fpexc: u32,
-    /// CP15 c13,c0,3, points at this thread's TLS page.
+    /// CP15 c13 c0 3, points at this thread's TLS page
     pub tls_pointer: u32,
 }
 
@@ -39,11 +38,10 @@ impl ThreadContext {
         regs[0] = arg;
         regs[13] = stack_top;
         regs[15] = entry & !1;
-        // the kernel sets LR to an address that ends the thread, we recognize
-        // it in the SVC handler instead of needing real code there.
+        // the kernel sets LR to an addr that ends the thread, we catch it in the svc handler instead of needing real code there
         regs[14] = THREAD_EXIT_MAGIC;
 
-        // bit 0 of the entry point selects Thumb, as it does for BX.
+        // bit 0 of the entry picks Thumb, same as BX
         let cpsr = Psr {
             thumb: entry & 1 != 0,
             ..Psr::default()
@@ -75,25 +73,25 @@ impl ThreadContext {
         cpu.vfp.fpscr = self.fpscr;
         cpu.vfp.fpexc = self.fpexc;
         cpu.cp15.thread_id_ro = self.tls_pointer;
-        // a reservation never survives a context switch.
+        // a reservation never survives a context switch
         cpu.exclusive_addr = None;
     }
 }
 
-/// the return address the kernel gives a fresh thread.
+/// return addr the kernel gives a fresh thread
 pub const THREAD_EXIT_MAGIC: u32 = 0xFFFF_FFF0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadStatus {
     Running,
     Ready,
-    /// sleeping until a tick, with no object involved.
+    /// sleeping till a tick, no object involved
     Sleeping,
-    /// waiting on one or more kernel objects.
+    /// waiting on one or more kernel objects
     WaitSync,
-    /// parked on an address arbiter.
+    /// parked on an address arbiter
     WaitArbiter,
-    /// created but not started.
+    /// created but not started
     Dormant,
     Dead,
 }
@@ -112,7 +110,7 @@ pub struct Thread {
     pub id: ThreadId,
     pub name: String,
     pub context: ThreadContext,
-    /// 0 is the highest priority, 0x3F the lowest.
+    /// 0 is the highest priority, 0x3F the lowest
     pub priority: u32,
     pub status: ThreadStatus,
 
@@ -121,28 +119,26 @@ pub struct Thread {
     pub tls: VAddr,
     pub processor_id: i32,
 
-    /// objects this thread is waiting on, and whether all of them are needed.
+    /// objects this thread waits on, and whether it needs all of them
     pub wait_objects: Vec<ObjectId>,
     pub wait_all: bool,
-    /// tick at which a timeout expires. None means wait forever.
+    /// tick a timeout expires at, None waits forever
     pub wakeup_at: Option<u64>,
-    /// the tick the thread last started running after a wait, and whether
-    /// it has waited since.
+    /// tick the thread last started running after a wait, and whether it waited since
     pub running_since: u64,
     pub waited: bool,
-    /// address this thread is parked on, for arbiter waits.
+    /// addr this thread is parked on, for arbiter waits
     pub wait_address: Option<VAddr>,
-    /// set when the wait was satisfied, so the syscall knows what to return.
+    /// set when the wait got satisfied so the syscall knows what to return
     pub wait_result: Option<WaitResult>,
-    /// which syscall is waiting for that result.
+    /// which syscall waits for that result
     pub wait_syscall: Option<WaitSyscall>,
 
-    /// handed to svcGetThreadId.
+    /// what svcGetThreadId hands out
     pub guest_id: u32,
 }
 
-/// which syscall put a thread to sleep, so the scheduler knows how to write
-/// the result back when it wakes.
+/// which syscall put a thread to sleep, so the scheduler knows how to write the result back on wake
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WaitSyscall {
     WaitSynchronization1,
@@ -151,17 +147,16 @@ pub enum WaitSyscall {
     SleepThread,
 }
 
-/// why a blocked thread woke up.
+/// why a blocked thread woke up
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WaitResult {
-    /// the wait succeeded, the value is the index of the object that did it.
+    /// the wait succeeded, value is the index of the object that did it
     Signaled(usize),
     TimedOut,
 }
 
 impl Thread {
-    // every one of these comes from svcCreateThread's arguments, so bundling
-    // them into a struct would only move the same list somewhere else.
+    // every one of these comes from svcCreateThread's args, a struct would just move the same list elsewhere
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ThreadId,
@@ -199,7 +194,7 @@ impl Thread {
         matches!(self.status, ThreadStatus::Ready | ThreadStatus::Running)
     }
 
-    /// clears everything a wait left behind.
+    /// clears everything a wait left behind
     pub fn clear_wait(&mut self) {
         self.wait_objects.clear();
         self.wait_all = false;
@@ -217,7 +212,7 @@ mod tests {
         for nanos in [0u64, 1_000, 1_000_000, 1_000_000_000, 16_666_666] {
             let ticks = nanos_to_ticks(nanos);
             let back = ticks_to_nanos(ticks);
-            // allow a tick of slop, which is 3.7 ns.
+            // allow a tick of slop, 3.7 ns
             assert!(
                 back.abs_diff(nanos) < 10,
                 "{nanos} ns -> {ticks} ticks -> {back} ns"

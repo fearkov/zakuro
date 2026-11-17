@@ -1,4 +1,4 @@
-//! thumb-state instruction tests.
+//! Thumb state instruction tests
 
 mod common;
 
@@ -89,7 +89,7 @@ fn high_register_operations() {
 #[test]
 fn pc_relative_load_uses_the_aligned_pc() {
     // the literal pool entry sits after the code, ldr rN, =value makes the
-    // assembler build it for us.
+    // assembler build it for us
     let Some(r) = run_thumb(
         "ldr r0, .Lpool
          b .Lend
@@ -154,8 +154,7 @@ fn immediate_offsets_scale_by_access_size() {
 
 #[test]
 fn sp_relative_and_load_address() {
-    // adr assembles to the Thumb "add Rd, pc, #imm" form, which reads the
-    // word-aligned PC rather than the raw one.
+    // adr assembles to the Thumb "add Rd, pc, #imm" form, which reads the word aligned PC, not the raw one
     let Some(r) = run_thumb(
         "add r0, sp, #16
          adr r1, .Ltarget
@@ -170,8 +169,7 @@ fn sp_relative_and_load_address() {
     };
     assert_reg!(r, 0, common::STACK_TOP + 16);
     assert_reg!(r, 2, common::STACK_TOP + 16);
-    // five 2-byte instructions precede the label, and .align 2 pads the
-    // odd halfword, so the target sits at CODE_BASE + 12.
+    // five 2 byte instructions come b4 the label and .align 2 pads the odd halfword, so the target sits at CODE_BASE + 12
     assert_reg!(r, 1, CODE_BASE + 12);
 }
 
@@ -198,7 +196,7 @@ fn push_pop_with_lr_and_pc() {
     ) else {
         return;
     };
-    // r1 got the pushed r0 (1), r0 kept the value set inside the subroutine.
+    // r1 got the pushed r0 (1), r0 kept the value set inside the subroutine
     assert_reg!(r, 0, 7);
     assert_reg!(r, 1, 1);
     assert!(r.cpu.cpsr.thumb, "POP {{pc}} must stay in Thumb state");
@@ -296,7 +294,7 @@ fn svc_from_thumb() {
     assert_eq!(r.cpu.regs[15], CODE_BASE + 2);
 }
 
-/// a hand-encoded BLX halfword pair.
+/// a hand encoded BLX halfword pair
 #[test]
 fn blx_halfword_pair() {
     let Some(r) = run_thumb(
@@ -317,7 +315,6 @@ fn blx_halfword_pair() {
     };
     assert!(!r.cpu.cpsr.thumb, "BLX must land in ARM state");
     assert_reg!(r, 0, 55);
-    // LR points just past the pair, with the Thumb bit set so a bx lr
-    // returns to Thumb state.
+    // LR points just past the pair, w/ the Thumb bit set so a bx lr returns to Thumb state
     assert_reg!(r, 14, (CODE_BASE + 8) | 1);
 }

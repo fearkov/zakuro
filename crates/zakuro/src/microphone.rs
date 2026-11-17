@@ -1,6 +1,6 @@
-//! what the console's microphone hears on the computer: its own microphone,
-//! open only while a game listens, and the sound of blowing into it while a
-//! key is held, for games that ask for that.
+//! what the console's mic hears on the computer,
+//! its own mic (only open while a game listens) plus the sound of blowing into it while a key's held,
+//! for games that ask for that
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,40 +11,35 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use zakuro_core::microphone::{Microphone, Noise};
 
-/// how far behind the computer's microphone a game may fall, in seconds,
-/// before the oldest of what it heard goes, down to KEEP.
+/// how far behind the computer's mic a game may fall, in seconds, b4 the oldest of what it heard goes, down to KEEP
 const MOST: f64 = 0.25;
 const KEEP: f64 = 0.05;
-/// how loud blowing is, a breath on a microphone is about as loud as it
-/// gets.
+/// how loud blowing is, a breath on a mic is about as loud as it gets
 const BLOWING: f32 = 0.8;
 
-/// what the computer's microphone heard and the game has not, one channel,
-/// at its own rate.
+/// what the computer's mic heard and the game hasn't, one channel, at its own rate
 #[derive(Default)]
 struct Heard {
     samples: VecDeque<f32>,
-    /// its samples a second, none until it is open.
+    /// its samples a second, none till it's open
     rate: f64,
 }
 
 pub struct HostMicrophone {
-    /// whether to open the computer's microphone, or only blow.
+    /// open the computer's mic, or only blow
     device: bool,
     heard: Arc<Mutex<Heard>>,
-    /// whether the thread reading the microphone should go on, while there
-    /// is one.
+    /// should the thread reading the mic go on, while there's one
     running: Option<Arc<AtomicBool>>,
-    /// where between the first two samples heard the next one read falls.
+    /// where between the first two samples heard the next one read falls
     position: f64,
-    /// held while the blowing key is.
+    /// held while the blowing key is
     blowing: Arc<AtomicBool>,
     noise: Noise,
 }
 
 impl HostMicrophone {
-    /// the computer's microphone when device says so, blowing in any case
-    /// while blowing is set.
+    /// the computer's mic when device says so, blowing in any case while blowing is set
     pub fn new(device: bool, blowing: Arc<AtomicBool>) -> HostMicrophone {
         HostMicrophone {
             device,
@@ -100,10 +95,9 @@ impl Drop for HostMicrophone {
     }
 }
 
-/// fills out with what was heard at rate samples a second, from position
-/// between the first two, between samples where the rates differ and
-/// silence where nothing was heard yet. it drops what is used, and the
-/// oldest when the game fell too far behind, and gives where it got to.
+/// fills out w/ what was heard at rate samples a second, from position between the first two,
+/// between samples where the rates differ and silence where nothing was heard yet
+/// it drops what's used (and the oldest when the game fell too far behind) and gives where it got to
 fn take(heard: &mut Heard, mut position: f64, rate: f64, out: &mut [f32]) -> f64 {
     if heard.rate <= 0.0 || rate <= 0.0 {
         out.fill(0.0);
@@ -118,7 +112,7 @@ fn take(heard: &mut Heard, mut position: f64, rate: f64, out: &mut [f32]) -> f64
     for sample in out.iter_mut() {
         let first = position as usize;
         if first + 1 >= heard.samples.len() {
-            // ran dry, the game is ahead of the microphone
+            // ran dry, the game's ahead of the mic
             *sample = 0.0;
             continue;
         }
@@ -131,8 +125,7 @@ fn take(heard: &mut Heard, mut position: f64, rate: f64, out: &mut [f32]) -> f64
     position - used as f64
 }
 
-/// opens the computer's default microphone and keeps what it hears while
-/// running stays set.
+/// opens the computer's default mic and keeps what it hears while running stays set
 fn listen(heard: &Arc<Mutex<Heard>>, running: &AtomicBool) {
     let host = cpal::default_host();
     let Some(device) = host.default_input_device() else {
@@ -179,7 +172,7 @@ where
     f32: FromSample<T>,
 {
     let channels = (config.channels as usize).max(1);
-    // a second at most waits, the game takes it far sooner
+    // a second at most waits, the game takes it way sooner
     let most = config.sample_rate.0 as usize;
     device
         .build_input_stream(
@@ -209,8 +202,7 @@ mod tests {
         Heard { samples: samples.iter().copied().collect(), rate }
     }
 
-    /// at half its rate every other sample comes through, and what is used
-    /// is dropped, the rest waits for the next read.
+    /// at half its rate every other sample comes thru and what's used gets dropped, the rest waits for the next read
     #[test]
     fn the_microphone_is_read_at_the_games_rate() {
         let mut heard = heard(&[0.0, 0.1, 0.2, 0.3, 0.4, 0.5], 32000.0);
@@ -221,7 +213,7 @@ mod tests {
         assert_eq!(heard.samples[0], 0.4);
     }
 
-    /// at a rate between, the samples fall between the microphone's.
+    /// at a rate between, the samples fall between the mic's
     #[test]
     fn rates_between_fall_between_samples() {
         let mut heard = heard(&[0.0, 1.0, 0.0, 1.0, 0.0], 48000.0);
@@ -232,8 +224,7 @@ mod tests {
         assert_eq!(heard.samples.len(), 1);
     }
 
-    /// a game ahead of the microphone hears silence, and one far behind
-    /// hears only the latest.
+    /// a game ahead of the mic hears silence, and one way behind only hears the latest
     #[test]
     fn ahead_is_silence_and_far_behind_drops_the_oldest() {
         let mut ahead = heard(&[0.5], 100.0);
@@ -249,7 +240,7 @@ mod tests {
         assert_eq!(out, [95.0, 96.0]);
     }
 
-    /// with nothing open, blowing is what the game hears.
+    /// w/ nothing open, blowing is what the game hears
     #[test]
     fn blowing_is_heard_without_a_microphone() {
         let blowing = Arc::new(AtomicBool::new(false));

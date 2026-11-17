@@ -1,4 +1,4 @@
-//! data-processing instructions, the AND/SUB/ADD/MOV family.
+//! data processing instructions, the AND/SUB/ADD/MOV family
 
 use zakuro_common::bits::bits;
 
@@ -6,8 +6,7 @@ use super::alu::*;
 use super::shifter;
 use crate::{Bus, Cpu, Exit, PC};
 
-/// reads Rn, accounting for the extra pipeline step a register-specified
-/// shift introduces.
+/// reads Rn, counting the extra pipeline step a register shift adds
 #[inline(always)]
 fn read_rn(cpu: &Cpu, op: u32) -> u32 {
     let rn = bits(op, 16, 19) as usize;
@@ -27,7 +26,7 @@ pub fn execute<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     let a = read_rn(cpu, op);
     let carry_in = cpu.cpsr.c;
 
-    // comparison opcodes (TST/TEQ/CMP/CMN) never write a register.
+    // compare opcodes (TST/TEQ/CMP/CMN) never write a register
     let is_compare = (0b1000..=0b1011).contains(&opcode);
 
     let (result, carry, overflow, logical) = match opcode {
@@ -75,7 +74,7 @@ pub fn execute<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
 
     if set_flags {
         if rd == PC && !is_compare {
-            // <op>S pc, ... is an exception return, CPSR comes from SPSR.
+            // <op>S pc, ... is an exception return, CPSR comes from SPSR
             cpu.restore_cpsr();
             cpu.set_reg(PC, result);
             return None;

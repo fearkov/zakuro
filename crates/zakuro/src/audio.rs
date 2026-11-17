@@ -1,4 +1,4 @@
-//! the console's sound, played on the host's default output device.
+//! the console's sound, played on the host's default output device
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -6,38 +6,36 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
-/// how much sound to keep waiting, in the console's samples, about 125 ms.
-/// more rides out uneven frames, less answers sooner.
+/// how much sound to keep waiting, in the console's samples, about 125 ms
+/// more rides out uneven frames, less answers sooner
 const TARGET: usize = 4096;
-/// how much a queue that ran dry waits for before it plays again.
+/// how much a queue that ran dry waits for before it plays again
 const RESUME: usize = TARGET / 4;
-/// the queue stretches sound only once it is down to this, about 63 ms.
-/// every stretch splices the sound, so smaller shortfalls are left to DRIFT.
+/// the queue only stretches sound once it's down to this, about 63 ms
+/// every stretch splices the sound, so smaller shortfalls are left to DRIFT
 const STRETCH_BELOW: usize = TARGET / 2;
-/// how much faster or slower than the rates say playback may go to keep
-/// the queue near its target, too little to hear.
+/// how much faster or slower than the rates say playback may go to keep the queue near its target, too little to hear
 const DRIFT: f64 = 0.005;
 
-/// the console's samples waiting to be played.
+/// the console's samples waiting to be played
 struct Queue {
     samples: VecDeque<[f32; 2]>,
-    /// how far the output is between the first two samples.
+    /// how far the output is between the first two samples
     fraction: f64,
-    /// console samples per output sample.
+    /// console samples per output sample
     step: f64,
-    /// ran dry, and waits to fill up before it plays again.
+    /// ran dry, and waits to fill up b4 it plays again
     starved: bool,
-    /// the last sample played, which fades out when the queue runs dry
-    /// instead of stopping short.
+    /// the last sample played, it fades out when the queue runs dry instead of stopping short
     last: [f32; 2],
-    /// times the queue ran dry.
+    /// times the queue ran dry
     underruns: u64,
-    /// how much a queue that ran dry waits for before it plays again.
+    /// how much a queue that ran dry waits for before it plays again
     refill: usize,
 }
 
 impl Queue {
-    /// the next output sample, between two of the console's.
+    /// the next output sample, between two of the console's
     fn next(&mut self) -> [f32; 2] {
         if !self.starved && self.samples.len() < 2 {
             self.starved = true;
@@ -65,17 +63,15 @@ impl Queue {
         out
     }
 
-    /// stops it while the game is stopped, without counting that as running
-    /// dry, and has it fill all the way up before it plays again, so the
-    /// first frames after do not run it dry either.
+    /// stops it while the game's stopped, w/o counting that as running dry,
+    /// and has it fill all the way up b4 it plays again, so the first frames after don't run it dry either
     fn hold(&mut self) {
         self.starved = true;
         self.refill = TARGET;
         self.underruns = 0;
     }
 
-    /// drops what is queued, holding as above, fading out from what played
-    /// last.
+    /// drops what's queued, holding like above, fading out from what played last
     fn clear(&mut self) {
         self.samples.clear();
         self.fraction = 0.0;
@@ -83,29 +79,26 @@ impl Queue {
     }
 }
 
-/// the pieces of sound stretching moves around, about 16 ms, and how far
-/// apart they go out, half of that.
+/// the pieces of sound stretching moves around (about 16 ms) and how far apart they go out, half of that
 const GRAIN: usize = 512;
 const HOP: usize = GRAIN / 2;
-/// how far a piece may shift, about 4 ms, to line up with the one before.
+/// how far a piece may shift (about 4 ms) to line up w/ the one b4
 const SEARCH: usize = 128;
-/// sound gets at most twice as long.
+/// sound gets at most twice as long
 const MOST_STRETCH: f64 = 2.0;
 
-/// time stretching, sound made longer without its pitch changing, for when
-/// the emulation falls behind and the queue would run dry. overlapping
-/// pieces of it go out further apart than they came in, each shifted to
-/// line up with the one before, which is WSOLA.
+/// time stretching, sound made longer w/o its pitch changing, for when the emulation falls behind and the queue would run dry
+/// overlapping pieces of it go out further apart than they came in, each shifted to line up w/ the one b4, that's WSOLA
 struct Stretch {
-    /// what came in and has not gone out yet.
+    /// what came in and hasn't gone out yet
     input: Vec<[f32; 2]>,
-    /// where in input the next piece is due.
+    /// where in input the next piece is due
     position: f64,
-    /// where the last piece came from, none before the first.
+    /// where the last piece came from, none before the first
     last: Option<usize>,
-    /// the last piece's second half, which the next one's first adds to.
+    /// the last piece's second half, the next one's first adds to it
     tail: Vec<[f32; 2]>,
-    /// how much longer sound comes out, eased toward what the queue asks.
+    /// how much longer sound comes out, eased toward what the queue asks
     factor: f64,
     window: Vec<f32>,
 }
@@ -117,7 +110,7 @@ impl Stretch {
         Stretch { input: Vec::new(), position: 0.0, last: None, tail: vec![[0.0; 2]; HOP], factor: 1.0, window }
     }
 
-    /// forgets what came in, to start over on other sound.
+    /// forgets what came in, to start over on other sound
     fn clear(&mut self) {
         self.input.clear();
         self.position = 0.0;
@@ -126,18 +119,17 @@ impl Stretch {
         self.factor = 1.0;
     }
 
-    /// stretches samples by about factor, passing out what is ready.
+    /// stretches samples by about factor, passing out what's ready
     fn process(&mut self, samples: &[[f32; 2]], factor: f64, out: &mut Vec<[f32; 2]>) {
         self.input.extend_from_slice(samples);
         self.factor += (factor - self.factor) * 0.2;
-        // close to not stretching any more, it stops
+        // close to not stretching anymore, it stops
         if factor == 1.0 && self.factor < 1.001 {
             self.factor = 1.0;
         }
         let mono = |s: [f32; 2]| s[0] + s[1];
         loop {
-            // not stretching, each piece follows on from the last, with no
-            // search and so no splice
+            // not stretching, each piece follows on from the last, w/ no search and so no splice
             if let Some(last) = self.last.filter(|_| self.factor == 1.0) {
                 self.position = (last + HOP) as f64;
             }
@@ -146,9 +138,8 @@ impl Stretch {
             if due + SEARCH + GRAIN > self.input.len() || natural + GRAIN > self.input.len() {
                 break;
             }
-            // the piece around where it is due that most looks like the
-            // last one's continuation, which is where it is due when
-            // nothing is stretched
+            // the piece around where it's due that most looks like the last one's continuation,
+            // which is where it's due when nothing is stretched
             let start = if natural == due {
                 due
             } else {
@@ -163,8 +154,7 @@ impl Stretch {
                 };
                 (due.saturating_sub(SEARCH)..=due + SEARCH)
                     .map(|candidate| (score(candidate), candidate))
-                    // a tie, as in silence, goes to the piece nearest the
-                    // natural one
+                    // a tie, like in silence, goes to the piece nearest the natural one
                     .max_by(|(a, x), (b, y)| a.total_cmp(b).then(natural.abs_diff(*y).cmp(&natural.abs_diff(*x))))
                     .map_or(due, |(_, candidate)| candidate)
             };
@@ -180,7 +170,7 @@ impl Stretch {
             self.last = Some(start);
             self.position += HOP as f64 / self.factor;
         }
-        // what no piece can reach any more goes
+        // what no piece can reach anymore goes
         let used = (self.position as usize).min(self.last.unwrap_or(0)).saturating_sub(SEARCH);
         if used > 0 {
             self.input.drain(..used);
@@ -192,14 +182,14 @@ impl Stretch {
 
 pub struct Audio {
     queue: Arc<Mutex<Queue>>,
-    /// 0 to 1, applied as samples come in.
+    /// 0 to 1, applied as samples come in
     volume: std::cell::Cell<f32>,
     stretch: std::cell::RefCell<Stretch>,
     _stream: cpal::Stream,
 }
 
 impl Audio {
-    /// opens the default output for sound made at rate samples a second.
+    /// opens the default output for sound made at rate samples a second
     pub fn open(rate: f64) -> Result<Audio, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("there is no sound output device")?;
@@ -226,20 +216,19 @@ impl Audio {
         Ok(Audio { queue, volume: std::cell::Cell::new(1.0), stretch: std::cell::RefCell::new(Stretch::new()), _stream: stream })
     }
 
-    /// how many times the sound ran dry since the last call.
+    /// how many times the sound ran dry since the last call
     pub fn take_underruns(&self) -> u64 {
         self.queue.lock().map(|mut queue| std::mem::take(&mut queue.underruns)).unwrap_or(0)
     }
 
-    /// stops the sound while the game is stopped, see Queue::hold.
+    /// stops the sound while the game's stopped, see Queue::hold
     pub fn hold(&self) {
         if let Ok(mut queue) = self.queue.lock() {
             queue.hold();
         }
     }
 
-    /// drops the sound queued and half stretched, for a game starting or
-    /// stopping, so none of the last one's plays at the start of the next.
+    /// drops the sound queued and half stretched, for a game starting or stopping, so none of the last one's plays at the start of the next
     pub fn clear(&self) {
         if let Ok(mut queue) = self.queue.lock() {
             queue.clear();
@@ -251,8 +240,7 @@ impl Audio {
         self.volume.set(volume.clamp(0.0, 1.0));
     }
 
-    /// queues what the console played, stretched when the queue runs low
-    /// so that it plays on rather than stops.
+    /// queues what the console played, stretched when the queue runs low so it plays on instead of stopping
     pub fn push(&self, samples: &[[i16; 2]]) {
         let scale = self.volume.get() / 32768.0;
         let samples: Vec<[f32; 2]> = samples.iter().map(|s| s.map(|v| v as f32 * scale)).collect();
@@ -261,15 +249,13 @@ impl Audio {
     }
 }
 
-/// adds what the console played to the queue, stretched by how far the
-/// queue has run down.
+/// adds what the console played to the queue, stretched by how far the queue ran down
 fn enqueue(queue: &mut Queue, stretch: &mut Stretch, samples: &[[f32; 2]]) {
     let short = STRETCH_BELOW.saturating_sub(queue.samples.len()) as f64 / STRETCH_BELOW as f64;
     let mut stretched = Vec::with_capacity(samples.len() * 2);
     stretch.process(samples, (1.0 + short).min(MOST_STRETCH), &mut stretched);
     queue.samples.extend(stretched);
-    // far ahead, after a stall on the output side, it drops the oldest
-    // rather than lag behind the picture
+    // way ahead after a stall on the output side, it drops the oldest instead of lagging behind the picture
     if queue.samples.len() > TARGET * 4 {
         let excess = queue.samples.len() - TARGET;
         queue.samples.drain(..excess);
@@ -322,7 +308,7 @@ mod tests {
         }
     }
 
-    /// a tone at 440 Hz, the console's rate.
+    /// a tone at 440 Hz, the console's rate
     fn tone(count: usize) -> Vec<[f32; 2]> {
         (0..count)
             .map(|i| {
@@ -332,7 +318,7 @@ mod tests {
             .collect()
     }
 
-    /// how many times a sound crosses zero going up, which tells its pitch.
+    /// how many times a sound crosses zero going up, that tells its pitch
     fn rises(samples: &[[f32; 2]]) -> usize {
         samples.windows(2).filter(|w| w[0][0] < 0.0 && w[1][0] >= 0.0).count()
     }
@@ -352,8 +338,7 @@ mod tests {
         }
     }
 
-    /// a sound that repeats nowhere, with a stretch of silence in the
-    /// middle, so where any piece of it came from is clear.
+    /// a sound that repeats nowhere, w/ a stretch of silence in the middle, so where any piece of it came from is clear
     fn noise_with_a_pause(count: usize) -> Vec<[f32; 2]> {
         let mut x = 1u32;
         (0..count)
@@ -365,8 +350,7 @@ mod tests {
             .collect()
     }
 
-    /// a queue a little short of its target is left to DRIFT, its sound goes
-    /// in as it came, with no splice.
+    /// a queue a bit short of its target is left to DRIFT, its sound goes in as it came, w/ no splice
     #[test]
     fn a_queue_a_little_short_is_not_stretched() {
         let mut queue = queue(TARGET - 1000, 1.0);
@@ -386,8 +370,7 @@ mod tests {
         }
     }
 
-    /// once the queue is full again the stretcher stops, and the sound
-    /// follows on as it came in, silence included, with no splice.
+    /// once the queue's full again the stretcher stops, and the sound follows on as it came in, silence included, w/ no splice
     #[test]
     fn stretching_stops_cleanly() {
         let input = noise_with_a_pause(60_000);
@@ -397,13 +380,12 @@ mod tests {
             stretch.process(chunk, if i < 20 { 1.5 } else { 1.0 }, &mut out);
         }
         assert_eq!(stretch.factor, 1.0);
-        // where the last of it came from, found in noise, which matches in
-        // one place only
+        // where the last of it came from, found in noise, which only matches in one place
         let end = &out[out.len() - 10_000..];
         let from = (0..input.len() - end.len())
             .find(|&at| end.iter().zip(&input[at..]).take(64).all(|(a, b)| (a[0] - b[0]).abs() < 1e-4))
             .expect("the end is somewhere in the input");
-        // and the input in a row back from there, through the end of the pause
+        // and the input in a row back from there, thru the end of the pause
         let tail = &out[out.len() - 28_000..];
         let start = from - 18_000;
         assert!(start < 33_000, "it covers the pause");
@@ -447,8 +429,7 @@ mod tests {
         assert_eq!(queue.next(), [0.0, -0.0], "it starts again from where it stopped");
     }
 
-    /// stopped while the game is, it does not count running dry, and plays
-    /// again only once it is full.
+    /// stopped while the game is, it doesn't count running dry and only plays again once it's full
     #[test]
     fn a_held_queue_waits_to_fill_up_and_counts_nothing() {
         let mut queue = queue(0, 1.0);
@@ -461,7 +442,7 @@ mod tests {
         queue.samples.extend((0..TARGET).map(|_| [1.0, 1.0]));
         assert_eq!(queue.next(), [1.0, 1.0]);
         assert_eq!(queue.underruns, 0);
-        // running dry later is counted, and waits for the usual amount
+        // running dry later gets counted, and waits for the usual amount
         queue.samples.clear();
         queue.next();
         assert_eq!(queue.underruns, 1);
@@ -469,8 +450,7 @@ mod tests {
         assert_eq!(queue.next(), [1.0, 1.0]);
     }
 
-    /// a game starting or stopping drops what the last one queued, and the
-    /// new sound plays once there is enough of it.
+    /// a game starting or stopping drops what the last one queued, and the new sound plays once there's enough of it
     #[test]
     fn a_cleared_queue_plays_none_of_the_old_sound() {
         let mut queue = queue(TARGET, 1.0);
@@ -481,10 +461,9 @@ mod tests {
         assert_eq!(queue.underruns, 0);
     }
 
-    /// how far behind the picture the sound is, in ms, after each second of
-    /// a minute where the console makes exactly as much sound as the output
-    /// plays, but a frame now and then comes late and the next ones catch up,
-    /// as when the emulation hitches.
+    /// how far behind the picture the sound is, in ms,
+    /// after each second of a minute where the console makes exactly as much sound as the output plays,
+    /// but now and then a frame comes late and the next ones catch up, like when the emulation hitches
     fn latency_with_hitches() -> Vec<f64> {
         const CONSOLE: f64 = 32728.498;
         const OUTPUT: f64 = 48000.0;
@@ -495,8 +474,7 @@ mod tests {
         let mut at = 0;
         let mut late: Vec<[f32; 2]> = Vec::new();
         for frame in 0..3600usize {
-            // a frame's worth of sound, held back every 45th frame for three
-            // frames' time
+            // a frame's worth of sound, held back every 45th frame for three frames' time
             let count = (CONSOLE * (frame + 1) as f64 / 60.0) as usize - (CONSOLE * frame as f64 / 60.0) as usize;
             let mut chunk: Vec<[f32; 2]> = (0..count).map(|i| tone[(at + i) % tone.len()]).collect();
             at += count;

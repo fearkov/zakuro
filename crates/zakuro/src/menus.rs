@@ -1,4 +1,4 @@
-//! the library, the menu over a game and the settings, drawn with egui.
+//! the library, the menu over a game and the settings, drawn w/ egui
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,34 +15,32 @@ use crate::settings::{
     game_key, CameraSource, Filter, GameSettings, Keys, Language, MicrophoneSource, Orientation, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape,
 };
 
-/// what the user asked for.
+/// what the user asked for
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Play(PathBuf),
-    /// recompile these games of the library, one after the other.
+    /// recompile these games of the library, one after another
     Recompile(Vec<Wanted>),
-    /// download a compiler, then recompile these games of the library with
-    /// it.
+    /// download a compiler, then recompile these games of the library w/ it
     DownloadCompiler(Vec<Wanted>),
-    /// show the mods folder of the game with this program id.
+    /// show the mods folder of the game w/ this program id
     Mods(u64),
-    /// stop recompiling the game with this id, or waiting to.
+    /// stop recompiling the game w/ this id, or waiting to
     CancelRecompile(u64),
-    /// leave only the game recompiling now, none of those waiting.
+    /// leave only the game recompiling now, none of those waiting
     CancelWaiting,
     ChooseFolder,
     ChooseBackground,
-    /// pick the picture the cameras see.
+    /// pick the picture the cameras see
     ChooseCameraPicture,
-    /// save the game's state to the slot chosen, or load it from there.
+    /// save the game's state to the chosen slot, or load it from there
     SaveState,
     LoadState,
-    /// open a room and join it, join another's, or leave the one joined.
+    /// open a room and join it, join someone else's, or leave the one joined
     HostRoom,
     JoinRoom,
     LeaveRoom,
-    /// take part in the Download Play offer at this place in the list, or
-    /// leave the one taken part in.
+    /// take part in the Download Play offer at this place in the list, or leave the one taken part in
     DlpJoin(usize),
     DlpLeave,
     Rescan,
@@ -50,78 +48,74 @@ pub enum Action {
     Reset,
     Library,
     Fullscreen,
-    /// copy what a report on the game wants.
+    /// copy what a report on the game needs
     CopyReport,
     Quit,
-    /// the settings changed, to save and apply.
+    /// the settings changed, to save and apply
     Settings,
-    /// close the game's keyboard with this text and the button pressed.
+    /// close the game's keyboard w/ this text and the button pressed
     Keyboard(String, usize),
-    /// turn the running game's cheat at this index on or off.
+    /// turn the running game's cheat at this index on or off
     Cheat(usize, bool),
-    /// add a cheat, its name and its code, to the running game.
+    /// add a cheat, its name and its code, to the running game
     AddCheat(String, String),
-    /// read the running game's cheats from their file again.
+    /// read the running game's cheats from their file again
     ReloadCheats,
-    /// show the cheats folder.
+    /// show the cheats folder (no judgment)
     CheatsFolder,
 }
 
 #[derive(Default)]
 pub struct Menus {
-    /// the menu over a running game.
+    /// the menu over a running game
     pub menu_open: bool,
-    /// the cheats window, and the cheat being written in it.
+    /// the cheats window, and the cheat being written in it
     pub cheats_open: bool,
     cheat_name: String,
     cheat_code: String,
     pub settings_open: bool,
-    /// the game whose own settings are open, its id and its name.
+    /// the game whose own settings are open, its id and its name
     pub game_settings: Option<(u64, String)>,
-    /// the binding waiting for a key, by its place in Keys::all_mut.
+    /// the binding waiting for a key, by its place in Keys::all_mut
     pub rebinding: Option<usize>,
-    /// the controller binding waiting for a button, by its place in
-    /// PadButtons::all_mut.
+    /// the controller binding waiting for a button, by its place in PadButtons::all_mut
     pub rebinding_pad: Option<usize>,
-    /// something to tell the user, until they close it.
+    /// something to tell the user, till they close it
     pub message: Option<String>,
-    /// something to tell the user for a moment, over the game, and since
-    /// when.
+    /// something to tell the user for a moment, over the game, and since when
     pub toast: Option<(String, std::time::Instant)>,
-    /// the slot states are saved to and loaded from, 1 to 9.
+    /// the slot states get saved to and loaded from, 1 to 9
     pub slot: u8,
-    /// the multiplayer window, and the password typed in it.
+    /// the multiplayer window, and the password typed in it
     pub multiplayer_open: bool,
     pub room_password: String,
-    /// the icons of the games offered for Download Play.
+    /// the icons of the games offered for Download Play
     dlp_icons: HashMap<u64, egui::TextureHandle>,
-    /// a report on the game, to copy from the message it goes with, and
-    /// from no other.
+    /// a report on the game, to copy from the message it goes w/, and from no other
     pub report: Option<(String, String)>,
-    /// what is being typed into the game's keyboard, and what it asked for.
+    /// what's being typed into the game's keyboard, and what it asked for
     typing: Option<(Request, String)>,
-    /// the library's games to recompile once the player agrees to download
-    /// a compiler for them.
+    /// the library's games to recompile once the player agrees to download a compiler for them
     pub compiler_offer: Option<Vec<Wanted>>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
     background: Background,
 }
 
-/// the room the player is in, as the multiplayer window shows it.
+/// the room the player is in, as the multiplayer window shows it
 pub struct RoomView {
     pub name: String,
-    /// each member's nickname and the game they play.
+    /// each member's nickname and the game they play
     pub members: Vec<(String, String)>,
-    /// the port of the room this program holds open, when it is its own.
+    /// the port of the room this program holds open, when it's its own
     pub port: Option<u16>,
-    /// Download Play, while no game runs.
+    /// Download Play, while no game runs
     pub download_play: Option<DlpView>,
 }
 
-/// the Download Play offers in the room, and where the guest is.
+/// the Download Play offers in the room, and where the guest is
 pub struct DlpView {
     pub offers: Vec<OfferView>,
-    /// what the guest is doing, and how far along, while it takes part.
+    /// what the guest is doing, and how far along, while it takes part
     pub doing: Option<(String, Option<f32>)>,
 }
 
@@ -129,29 +123,28 @@ pub struct OfferView {
     pub child: u64,
     pub title: String,
     pub host: String,
-    /// RGBA, ICON_SIZE square.
+    /// RGBA, ICON_SIZE square
     pub icon: Option<Vec<u8>>,
     pub guests: u8,
     pub most: u8,
-    /// why the player can't take part, when they can't.
+    /// why the player can't take part, when they can't
     pub blocked: Option<String>,
 }
 
-/// the picture behind the library, decoded away from the interface.
+/// the picture behind the library, decoded away from the UI
 #[derive(Default)]
 struct Background {
-    /// the file shown or being read.
+    /// the file shown or being read
     path: Option<PathBuf>,
     texture: Option<egui::TextureHandle>,
     loading: Option<Receiver<Result<egui::ColorImage, String>>>,
 }
 
-/// the longest side a background is kept at, bigger ones are scaled down.
+/// the longest side a background gets kept at, bigger ones get scaled down
 const BACKGROUND_SIDE: u32 = 2560;
 
 impl Background {
-    /// the texture for path, starting to read it when it changed, none until
-    /// it is ready or when there is no picture.
+    /// the texture for path, starting to read it when it changed, none till it's ready or when there's no picture
     fn get(&mut self, ctx: &egui::Context, path: Option<&Path>) -> Result<Option<&egui::TextureHandle>, String> {
         if self.path.as_deref() != path {
             self.path = path.map(Path::to_owned);
@@ -190,8 +183,7 @@ fn decode(path: &Path) -> Result<egui::ColorImage, String> {
     Ok(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
 }
 
-/// the part of a picture that fills an area without stretching it, cutting
-/// off what sticks out on either side.
+/// the part of a picture that fills an area w/o stretching it, cutting off what sticks out on either side
 fn cover(area: Vec2, picture: [usize; 2]) -> egui::Rect {
     let (width, height) = (picture[0].max(1) as f32, picture[1].max(1) as f32);
     let area_ratio = area.x / area.y.max(1.0);
@@ -207,13 +199,12 @@ fn cover(area: Vec2, picture: [usize; 2]) -> egui::Rect {
 }
 
 impl Menus {
-    /// whether something is open that stops the game while it is.
+    /// is something open that stops the game while it is
     pub fn over_game(&self) -> bool {
         self.menu_open || self.settings_open || self.game_settings.is_some()
     }
 
-    /// the library, filling the window. waiting are the games waiting for
-    /// their turn to recompile.
+    /// the library, filling the window, waiting are the games waiting for their turn to recompile
     pub fn library(&mut self, ui: &mut egui::Ui, library: &Library, settings: &Settings, jobs: &[Job], waiting: &[Wanted]) -> Vec<Action> {
         let mut actions = Vec::new();
         if library.changed {
@@ -294,8 +285,7 @@ impl Menus {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for game in &library.games {
                     let job = jobs.iter().find(|job| job.program_id == game.program_id);
-                    // over a picture, each game gets a backing to keep it
-                    // readable
+                    // over a picture, each game gets a backing to keep it readable
                     let mut frame = egui::Frame::group(ui.style());
                     if background.is_some() {
                         frame = frame.fill(ui.visuals().panel_fill.gamma_multiply(0.85));
@@ -393,8 +383,7 @@ impl Menus {
         actions
     }
 
-    /// what goes over a running game, the menu when it is open and the
-    /// frame rate when asked for.
+    /// what goes over a running game, the menu when it's open and the frame rate when asked for
     #[allow(clippy::too_many_arguments)]
     pub fn game(
         &mut self,
@@ -436,7 +425,7 @@ impl Menus {
                 });
         }
         if let Some(fps) = fps {
-            // clicks go through to the screen under it
+            // clicks go thru to the screen under it
             egui::Area::new(egui::Id::new("fps")).fixed_pos(egui::pos2(8.0, 8.0)).interactable(false).show(&ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.label(RichText::new(format!("{fps:.0} fps")).monospace());
@@ -522,8 +511,7 @@ impl Menus {
         actions
     }
 
-    /// the cheats window over a game, when open, its cheats by name, whether
-    /// each is on, and their notes.
+    /// the cheats window over a game, when open, its cheats by name, if each is on, and their notes
     pub fn cheats(&mut self, ctx: &egui::Context, cheats: &[(String, bool, String, bool)]) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut open = self.cheats_open;
@@ -543,8 +531,7 @@ impl Menus {
                 ui.label(RichText::new("Enhancements").strong());
                 for (index, (name, enabled, notes, _)) in cheats.iter().enumerate().filter(|(_, cheat)| cheat.3) {
                     checkbox(ui, index, name, *enabled, "");
-                    // what it does to the game and who made it, in sight
-                    // before it is turned on
+                    // what it does to the game and who made it, in sight b4 it gets turned on
                     ui.indent(index, |ui| ui.label(RichText::new(notes).weak().small()));
                 }
                 ui.separator();
@@ -577,8 +564,7 @@ impl Menus {
         actions
     }
 
-    /// the multiplayer window, when open: the room the player is in, or
-    /// joining one and opening one.
+    /// the multiplayer window, when open, the room the player's in, or joining one and opening one
     pub fn multiplayer(&mut self, ctx: &egui::Context, settings: &mut Settings, room: Option<&RoomView>) -> Vec<Action> {
         let mut actions = Vec::new();
         let before = settings.clone();
@@ -692,14 +678,12 @@ impl Menus {
         actions
     }
 
-    /// the settings window, when open. own says the running game has
-    /// settings of its own, which go over these.
+    /// the settings window, when open, own says the running game has settings of its own, which go over these
     pub fn settings(&mut self, ctx: &egui::Context, settings: &mut Settings, own: bool) -> Vec<Action> {
         let mut actions = Vec::new();
         let before = settings.clone();
         let mut open = self.settings_open;
-        // taller than a screen has room for, so it scrolls, and it can be
-        // dragged to any size that fits
+        // taller than a screen has room for, so it scrolls, and it can be dragged to any size that fits
         let room = ctx.content_rect().height() - 16.0;
         egui::Window::new("Settings")
             .id(egui::Id::new("settings"))
@@ -871,7 +855,7 @@ impl Menus {
         actions
     }
 
-    /// the window of what a game has of its own, when open.
+    /// the window of what a game has of its own, when open
     pub fn game_settings(&mut self, ctx: &egui::Context, settings: &mut Settings) -> Vec<Action> {
         let mut actions = Vec::new();
         let Some((program_id, name)) = self.game_settings.clone() else { return actions };
@@ -926,9 +910,8 @@ impl Menus {
         actions
     }
 
-    /// a message box, when there is something to tell.
-    /// the keyboard a game opened to have text typed in, it waits until a
-    /// button closes it.
+    /// a message box, when there's something to tell
+    /// the keyboard a game opened to get text typed in, it waits till a button closes it
     pub fn keyboard(&mut self, ctx: &egui::Context, request: &Request) -> Option<Action> {
         let fresh = self.typing.as_ref().is_none_or(|(asked, _)| asked != request);
         if fresh {
@@ -970,8 +953,7 @@ impl Menus {
         action
     }
 
-    /// asks whether to download a compiler, there being none to recompile
-    /// with.
+    /// asks whether to download a compiler, since there's none to recompile w/
     pub fn compiler_offer(&mut self, ctx: &egui::Context) -> Option<Action> {
         let games = self.compiler_offer.clone()?;
         let size = crate::zig::download_size().map_or_else(String::new, |size| format!(", {} MB to download and around 400 MB once unpacked", size / 1_000_000));
@@ -999,8 +981,7 @@ impl Menus {
 
     pub fn message(&mut self, ctx: &egui::Context) {
         let Some(text) = self.message.clone() else { return };
-        // a line of recompiles that all fail makes it long, and it scrolls
-        // to keep the OK that closes it on the screen
+        // a line of recompiles that all fail makes it long, and it scrolls to keep the OK that closes it on the screen
         let room = (ctx.content_rect().height() - 120.0).max(60.0);
         egui::Window::new("Zakuro")
             .id(egui::Id::new("message"))
@@ -1024,9 +1005,9 @@ impl Menus {
     }
 }
 
-/// a row of a game's own settings. ticked, the game has a value of its own,
-/// starting from the general one. unticked, it follows the general one,
-/// which shows greyed out.
+/// a row of a game's own settings
+/// ticked, the game has a value of its own, starting from the general one
+/// unticked, it follows the general one, which shows greyed out
 fn own<T: Clone>(ui: &mut egui::Ui, own: &mut Option<T>, general: &T, row: impl FnOnce(&mut egui::Ui, &mut T)) {
     ui.horizontal(|ui| {
         let mut ticked = own.is_some();
@@ -1136,13 +1117,13 @@ fn language(ui: &mut egui::Ui, value: &mut Language) {
         .on_hover_text("The console's system language, which titles pick their localised text and files by. It changes with the next game started, or Reset.");
 }
 
-/// what runs the game's code.
+/// what runs the game's code
 fn code(ui: &mut egui::Ui, recompiled: &mut bool) {
     ui.radio_value(recompiled, true, "Recompiled code when there is some");
     ui.radio_value(recompiled, false, "Interpreter only");
 }
 
-/// a line a GameOverlay keeps over the game, in the bottom right corner.
+/// a line a GameOverlay keeps over the game, in the bottom right corner
 pub fn corner(ctx: &egui::Context, text: &str) {
     egui::Area::new(egui::Id::new("overlay corner"))
         .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-8.0, -8.0))
@@ -1154,8 +1135,7 @@ pub fn corner(ctx: &egui::Context, text: &str) {
         });
 }
 
-/// the games that aren't recompiling or waiting to, each once, the same
-/// game being in the folder twice as a .3ds and a .cci say.
+/// the games that aren't recompiling or waiting to, each once, the same game being in the folder twice as a .3ds and a .cci say
 fn idle(games: impl Iterator<Item = Wanted>, jobs: &[Job], waiting: &[Wanted]) -> Vec<Wanted> {
     let busy = |id: u64| waiting.iter().any(|wanted| wanted.program_id == id) || jobs.iter().any(|job| job.program_id == id && !job.stage().finished());
     let mut idle: Vec<Wanted> = Vec::new();
@@ -1167,7 +1147,7 @@ fn idle(games: impl Iterator<Item = Wanted>, jobs: &[Job], waiting: &[Wanted]) -
     idle
 }
 
-/// a recompile's progress bar with where it is.
+/// a recompile's progress bar w/ where it is
 fn progress(ui: &mut egui::Ui, job: &Job) {
     let stage = job.stage();
     let text = match &stage {
@@ -1183,7 +1163,7 @@ fn progress(ui: &mut egui::Ui, job: &Job) {
     ui.add(egui::ProgressBar::new(stage.fraction()).desired_width(220.0).text(format!("{text}, {minutes}:{seconds:02}")));
 }
 
-/// a key as a person would call it.
+/// a key as a person would call it
 pub fn key_name(key: KeyCode) -> String {
     let name = format!("{key:?}");
     for prefix in ["Key", "Digit", "Arrow"] {
@@ -1222,8 +1202,7 @@ mod tests {
         assert!(decode(Path::new("/nowhere/at/all.png")).is_err());
     }
 
-    /// the settings stay inside a short screen, scrolling in it instead of
-    /// running past its bottom.
+    /// the settings stay inside a short screen, scrolling in it instead of running past its bottom
     #[test]
     fn the_settings_fit_a_short_screen() {
         let ctx = egui::Context::default();
@@ -1241,8 +1220,7 @@ mod tests {
         assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
     }
 
-    /// runs a frame of a panel with one row of a game's settings, clicking
-    /// where the row starts when asked to.
+    /// runs a frame of a panel w/ one row of a game's settings, clicking where the row starts when asked to
     fn frame_of_a_row(ctx: &egui::Context, click: bool, mut row: impl FnMut(&mut egui::Ui)) {
         let at = egui::pos2(16.0, 16.0);
         let mut events = vec![egui::Event::PointerMoved(at)];
@@ -1256,8 +1234,7 @@ mod tests {
         ctx.run_ui(input, |ui| drop(panel.show(ui, |ui| row(ui)))).drop_without_applying_deltas();
     }
 
-    /// ticking a row gives the game the general value to start from, and
-    /// unticking it has the game follow the general setting again.
+    /// ticking a row gives the game the general value to start from, and unticking it has the game follow the general setting again
     #[test]
     fn ticking_a_row_gives_the_game_a_value_of_its_own() {
         let ctx = egui::Context::default();
@@ -1269,8 +1246,7 @@ mod tests {
         }
     }
 
-    /// a game's settings go in the file only while it has some of its own,
-    /// and fit a short screen as the general ones do.
+    /// a game's settings only go in the file while it has some of its own, and fit a short screen like the general ones do
     #[test]
     fn a_games_settings_fit_a_short_screen() {
         let ctx = egui::Context::default();
@@ -1289,7 +1265,7 @@ mod tests {
         assert!(settings.per_game.is_empty(), "opening the window gives the game nothing");
     }
 
-    /// however long a message gets, its OK stays on the screen.
+    /// however long a message gets, its OK stays on the screen
     #[test]
     fn a_long_message_can_still_be_closed() {
         let ctx = egui::Context::default();
@@ -1303,7 +1279,7 @@ mod tests {
         assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
     }
 
-    /// a game in line, or having its turn, isn't offered again.
+    /// a game in line, or having its turn, doesn't get offered again
     #[test]
     fn games_already_in_line_are_left_out() {
         let wanted = |program_id, path: &str| Wanted { program_id, path: path.into() };

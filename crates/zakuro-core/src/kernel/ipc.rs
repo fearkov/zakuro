@@ -1,11 +1,11 @@
-//! IPC command buffers.
+//! IPC command buffers
 
 use zakuro_common::memory_map::{TLS_IPC_COMMAND_BUFFER, TLS_IPC_STATIC_BUFFERS};
 use zakuro_common::VAddr;
 
 use crate::memory::Memory;
 
-/// the header word at the start of every command.
+/// header word at the start of every command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header(pub u32);
 
@@ -29,16 +29,16 @@ impl Header {
     }
 }
 
-/// a parsed translate descriptor.
+/// a parsed translate descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Descriptor {
-    /// one or more handles follow.
+    /// one or more handles follow
     Handles { count: u32, close: bool },
-    /// the sender's process handle is substituted in.
+    /// the sender's process handle gets swapped in
     CurrentProcessId,
-    /// points at one of the receiver's static buffers.
+    /// points at one of the receiver's static buffers
     StaticBuffer { size: u32, buffer_id: u32 },
-    /// a read/write window into the sender's address space.
+    /// a rw window into the sender's address space
     MappedBuffer { size: u32, permission: u32 },
     Unknown(u32),
 }
@@ -68,8 +68,7 @@ impl Descriptor {
         }
     }
 
-    /// a descriptor that copies handles, the receiver gets its own, and the
-    /// sender keeps its copies.
+    /// a descriptor copying handles, receiver gets its own and the sender keeps theirs
     pub const fn handles(count: u32) -> u32 {
         (count - 1) << 26
     }
@@ -83,7 +82,7 @@ impl Descriptor {
     }
 }
 
-/// read/write access to a thread's command buffer.
+/// rw access to a thread's command buffer
 pub struct CommandBuffer {
     base: VAddr,
 }
@@ -113,8 +112,7 @@ impl CommandBuffer {
         Header(self.get(memory, 0))
     }
 
-    /// writes a standard reply, the same command id, values.len() normal
-    /// parameters, and a leading result code of zero.
+    /// writes a standard reply, same command id, values.len() normal params, and a leading 0 result
     pub fn reply(&self, memory: &mut Memory, command_id: u16, values: &[u32]) {
         self.set(
             memory,
@@ -127,13 +125,13 @@ impl CommandBuffer {
         }
     }
 
-    /// writes a reply carrying an error code and nothing else.
+    /// a reply w/ an error code and nothing else
     pub fn reply_error(&self, memory: &mut Memory, command_id: u16, code: u32) {
         self.set(memory, 0, Header::new(command_id, 1, 0).0);
         self.set(memory, 1, code);
     }
 
-    /// writes a reply whose translate section moves a handle to the caller.
+    /// a reply whose translate section moves a handle to the caller
     pub fn reply_with_handle(&self, memory: &mut Memory, command_id: u16, handle: u32) {
         self.set(memory, 0, Header::new(command_id, 1, 2).0);
         self.set(memory, 1, 0);
@@ -141,7 +139,7 @@ impl CommandBuffer {
         self.set(memory, 3, handle);
     }
 
-    /// the static buffer descriptor the receiver published for slot id.
+    /// the static buffer descriptor the receiver published for slot id
     pub fn static_buffer(&self, memory: &mut Memory, tls: VAddr, id: u32) -> (VAddr, u32) {
         use zakuro_cpu::Bus;
         let base = tls + TLS_IPC_STATIC_BUFFERS + id * 8;
@@ -161,7 +159,7 @@ mod tests {
         assert_eq!(h.command_id(), 1);
         assert_eq!(h.normal_params(), 2);
         assert_eq!(h.translate_params(), 2);
-        // this is the exact header libctru builds for srv:'s GetServiceHandle.
+        // the exact header libctru builds for srv:'s GetServiceHandle
         assert_eq!(Header::new(0x0005, 4, 0).0, 0x0005_0100);
     }
 

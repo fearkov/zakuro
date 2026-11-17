@@ -1,30 +1,28 @@
-//! the Switch's Pro Controller, and the ones made like it, in the mode
-//! macOS puts it in. its full reports, 0x30 and the like, are not what its
-//! HID descriptor says, and reading them by it takes the report's timer for
-//! buttons, which then count up on their own, and leans the left stick up.
-//! on macOS such a controller is read here, straight from its reports, and
-//! gilrs's reading of it is left out while they come. nothing is sent to
-//! it, the system goes on driving it.
+//! the Switch's Pro Controller, and the ones made like it, in the mode macOS puts it in
+//! its full reports (0x30 and such) aren't what its HID descriptor says,
+//! and reading them by it takes the report's timer for buttons, which then count up on their own,
+//! and leans the left stick up
+//! on macOS such a controller gets read here, straight from its reports, and gilrs's reading of it is left out while they come
+//! nothing gets sent to it, the system keeps driving it
 
-// the reports are read on macOS alone, elsewhere only the tests parse them
+// the reports only get read on macOS, elsewhere only the tests parse them
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use gilrs::Button;
 
 pub const NINTENDO: u16 = 0x057E;
 pub const PRO_CONTROLLER: u16 = 0x2009;
-/// what the controllers made like it go by.
+/// what the controllers made like it go by
 const NAME: &str = "Pro Controller";
 
-/// whether a controller is a Pro Controller, or made like one, by its ids
-/// or its name.
+/// is a controller a Pro Controller, or made like one, by its ids or its name
 pub fn is_pro_controller(vendor: Option<u16>, product: Option<u16>, name: &str) -> bool {
     (vendor == Some(NINTENDO) && product == Some(PRO_CONTROLLER)) || name == NAME
 }
 
-/// the buttons in a full report, the byte after the report id each is in,
-/// its bit and the button it is, by where it sits as gilrs names them. the
-/// Switch's A, B, X and Y are where the 3DS has them.
+/// the buttons in a full report, the byte after the report id each is in, its bit and the button it is,
+/// by where it sits as gilrs names them
+/// the Switch's A, B, X and Y are where the 3DS has them
 const BUTTONS: [(usize, u8, Button); 17] = [
     (3, 0x01, Button::West),
     (3, 0x02, Button::North),
@@ -45,14 +43,12 @@ const BUTTONS: [(usize, u8, Button); 17] = [
     (5, 0x80, Button::LeftTrigger2),
 ];
 
-/// a stick at rest, in the 12 bits each of its axes takes.
+/// a stick at rest, in the 12 bits each of its axes takes
 const CENTER: f32 = 2048.0;
-/// how far a stick is taken to go until it is seen to go further, short of
-/// any controller's, so that a full push reaches the edge.
+/// how far a stick is taken to go till it's seen going further, short of any controller's, so a full push reaches the edge
 const FIRST_REACH: f32 = 1000.0;
 
-/// what a full report says: the buttons held, and the left and right
-/// sticks, x and y from -1 to 1, up positive.
+/// what a full report says, the buttons held plus the left and right sticks, x and y from -1 to 1, up positive
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Report {
     pub buttons: Vec<Button>,
@@ -60,8 +56,7 @@ pub struct Report {
     pub right: [f32; 2],
 }
 
-/// how far each stick axis has been seen to go from the center, which a
-/// full push of it is.
+/// how far each stick axis has been seen going from the center, a full push of it is that
 #[derive(Debug, Clone)]
 pub struct Calibration {
     reach: [f32; 4],
@@ -82,16 +77,14 @@ impl Calibration {
     }
 }
 
-/// what a report says, none when it is not a full one.
+/// what a report says, none when it isn't a full one
 pub fn parse(report: &[u8], calibration: &mut Calibration) -> Option<Report> {
-    // the full reports, the standard one, the ones with more after it and a
-    // subcommand's reply, have the buttons and sticks in the same place
+    // the full reports (the standard one, the ones w/ more after it and a subcommand's reply) have the buttons and sticks in the same place
     if !matches!(report.first(), Some(0x21 | 0x30 | 0x31 | 0x32 | 0x33)) || report.len() < 12 {
         return None;
     }
     let buttons = BUTTONS.iter().filter(|&&(at, bit, _)| report[at] & bit != 0).map(|&(.., button)| button).collect();
-    // two axes of 12 bits in three bytes, the second's low four bits after
-    // the first's eight
+    // two axes of 12 bits in three bytes, the second's low four bits after the first's eight
     let stick = |at: usize| {
         let (a, b, c) = (report[at] as u16, report[at + 1] as u16, report[at + 2] as u16);
         (a | (b & 0x0F) << 8, b >> 4 | c << 4)
@@ -104,7 +97,7 @@ pub fn parse(report: &[u8], calibration: &mut Calibration) -> Option<Report> {
     })
 }
 
-/// the Pro Controllers read from their reports, the latest of each.
+/// the Pro Controllers read from their reports, the latest of each
 #[derive(Default)]
 pub struct Controllers {
     #[cfg(target_os = "macos")]
@@ -118,8 +111,7 @@ impl Controllers {
         controllers
     }
 
-    /// starts looking for them, on macOS only, where the system puts them
-    /// in the mode gilrs cannot read.
+    /// starts looking for them, on macOS only, where the system puts them in the mode gilrs can't read
     fn watch(&self) {
         #[cfg(target_os = "macos")]
         {
@@ -130,12 +122,11 @@ impl Controllers {
         }
     }
 
-    /// the latest report of each controller sending full reports now.
+    /// the latest report of each controller sending full reports now
     pub fn reports(&self) -> Vec<Report> {
         #[cfg(target_os = "macos")]
         {
-            // a controller whose reports stopped, gone or back to the
-            // simple mode gilrs reads, is gilrs's again
+            // a controller whose reports stopped (gone, or back to the simple mode gilrs reads) is gilrs's again
             let fresh = std::time::Duration::from_millis(500);
             if let Ok(latest) = self.latest.lock() {
                 return latest.values().filter(|(_, at)| at.elapsed() < fresh).map(|(report, _)| report.clone()).collect();
@@ -156,8 +147,7 @@ mod reader {
 
     type Latest = Arc<Mutex<BTreeMap<String, (Report, Instant)>>>;
 
-    /// opens each Pro Controller as it shows up, shared with the system and
-    /// gilrs, and reads it on a thread of its own.
+    /// opens each Pro Controller as it shows up, shared w/ the system and gilrs, and reads it on a thread of its own
     pub fn watch(latest: &Latest) {
         let mut api = match hidapi::HidApi::new() {
             Ok(api) => api,
@@ -200,7 +190,7 @@ mod reader {
         }
     }
 
-    /// reads a controller until it goes away.
+    /// reads a controller till it goes away
     fn read(device: hidapi::HidDevice, path: &str, latest: &Latest, alive: &AtomicBool) {
         let mut calibration = Calibration::default();
         let mut buffer = [0u8; 64];
@@ -231,7 +221,7 @@ mod reader {
 mod tests {
     use super::*;
 
-    /// a full report with the buttons and the two sticks given.
+    /// a full report w/ the buttons and the two sticks given
     fn report(timer: u8, buttons: [u8; 3], left: (u16, u16), right: (u16, u16)) -> Vec<u8> {
         let stick = |(x, y): (u16, u16)| [x as u8, ((x >> 8) & 0x0F) as u8 | ((y & 0x0F) << 4) as u8, (y >> 4) as u8];
         let mut bytes = vec![0x30, timer, 0x8E];
@@ -242,9 +232,8 @@ mod tests {
         bytes
     }
 
-    /// the report's timer counting up is no button, which is what read by
-    /// the descriptor counts up as buttons 1 to 8, and the sticks at rest
-    /// are at rest.
+    /// the report's timer counting up is no button (read by the descriptor it counts up as buttons 1 to 8),
+    /// and the sticks at rest are at rest
     #[test]
     fn the_timer_is_no_button() {
         let mut calibration = Calibration::default();
@@ -254,8 +243,7 @@ mod tests {
         }
     }
 
-    /// A on the right byte, minus and home on the shared one, up and ZL on
-    /// the left one.
+    /// A on the right byte, minus and home on the shared one, up and ZL on the left one
     #[test]
     fn buttons_come_out_where_they_sit() {
         let mut calibration = Calibration::default();
@@ -263,8 +251,7 @@ mod tests {
         assert_eq!(parsed.buttons, [Button::East, Button::Select, Button::Mode, Button::DPadUp, Button::LeftTrigger2]);
     }
 
-    /// a stick pushed up and right reads up and right, a full push reaches
-    /// the edge, and one pushed further later is the new edge.
+    /// a stick pushed up and right reads up and right, a full push reaches the edge, and one pushed further later is the new edge
     #[test]
     fn sticks_lean_the_way_they_are_pushed() {
         let mut calibration = Calibration::default();
@@ -275,7 +262,7 @@ mod tests {
         assert_eq!(parsed.left, [1.0, 0.75]);
     }
 
-    /// the simple mode's reports are gilrs's to read.
+    /// the simple mode's reports are gilrs's to read
     #[test]
     fn simple_reports_are_left_alone() {
         let mut calibration = Calibration::default();

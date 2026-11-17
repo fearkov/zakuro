@@ -1,19 +1,18 @@
-//! cecd:u, StreetPass. the daemon is there and does what it is told, but
-//! never meets another console.
+//! cecd:u, StreetPass, the daemon is there and does what it's told but never meets anyone, forever alone
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, ObjectId};
 use crate::kernel::sync::ResetType;
 use crate::System;
 
-/// the daemon's states as GetCecdState reports them.
+/// daemon states as GetCecdState reports them
 const WORKING: u32 = 0;
 const IDLE: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CecdState {
     state: u32,
-    /// the info changed and state changed events.
+    /// info changed and state changed events
     events: Option<[ObjectId; 2]>,
 }
 
@@ -27,8 +26,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     let command = header.command_id();
     let reply = |system: &mut System, values: &[u32]| buffer.reply(&mut system.memory, command, values);
     match command {
-        // Start and Stop, a title waits for the state changed event after
-        // either before it goes on
+        // Start and Stop, a title waits for the state changed event after either b4 it goes on
         0x000B | 0x000C => {
             system.services.cecd.state = if command == 0x000B { WORKING } else { IDLE };
             let changed = events(system)[1];
@@ -40,7 +38,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let state = system.services.cecd.state;
             reply(system, &[state]);
         }
-        // GetCecInfoEventHandle and GetChangeStateEventHandle
+        // GetCecInfoEventHandle, GetChangeStateEventHandle
         0x000F | 0x0010 => {
             let object = events(system)[command as usize - 0x000F];
             let handle = system.kernel.handles.create(&mut system.kernel.objects, object, "cecd:u event");
@@ -49,27 +47,23 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 2, Descriptor::handles(1));
             buffer.set(&mut system.memory, 3, handle);
         }
-        // OpenAndRead, the title's streetpass inbox for this run: this
-        // console never meets another, so the box reads empty. the
-        // success-with-no-message is the offline box's own answer, a game
-        // like A Link Between Worlds asks at every boot. the word after the
-        // result is how many bytes were read, the request's title id if it
-        // is left as it came.
+        // OpenAndRead, the title's StreetPass inbox for this run, this console never meets another so it reads empty
+        // success w/ no message is the offline box's own answer, A Link Between Worlds asks every boot
+        // the word after the result is bytes read, the request's title id if left as it came
         0x0012 => reply(system, &[0]),
         _ => return false,
     }
     true
 }
 
-/// the events, made the first time a title asks for one.
+/// the events, made the first time a title asks for one
 fn events(system: &mut System) -> [ObjectId; 2] {
     if let Some(events) = system.services.cecd.events {
         return events;
     }
     let events = ["cecd:u:InfoEvent", "cecd:u:ChangeStateEvent"].map(|name| {
         let object = system.kernel.objects.insert(KObject::Event(crate::kernel::sync::Event::new(ResetType::OneShot, name)));
-        // the service keeps them, a title closing its handles must not take
-        // them away
+        // the service keeps them, a title closing its handles must not take them away
         system.kernel.objects.add_ref(object);
         object
     });
@@ -83,8 +77,7 @@ mod tests {
     use crate::services::tests::system_with_thread;
     use crate::services::{handle_request, Target};
 
-    /// a game like A Link Between Worlds opens the run's inbox at boot:
-    /// offline, it reads empty and nothing lands in the unimplemented log.
+    /// A Link Between Worlds opens the run's inbox at boot, offline it reads empty and nothing hits the unimplemented log
     #[test]
     fn the_inbox_reads_empty_offline() {
         let (mut system, buffer) = system_with_thread();

@@ -1,4 +1,4 @@
-//! PICA200 GPU emulation.
+//! PICA200 GPU emulation
 
 pub mod backend;
 pub mod blend;
@@ -29,18 +29,17 @@ pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
 #[cfg(feature = "vulkan")]
 pub use device::SharedDevice;
 
-/// how the GPU reaches guest memory.
+/// how the GPU reaches guest memory
 pub trait GpuMemory {
     fn read(&mut self, addr: u32, out: &mut [u8]);
     fn write(&mut self, addr: u32, data: &[u8]);
 
-    /// the bytes read would find at addr, straight from memory when they
-    /// sit together there, to look at without copying them.
+    /// the bytes read would find at addr, straight from memory when they sit together there, to look at w/o copying them
     fn slice(&mut self, _addr: u32, _len: usize) -> Option<&[u8]> {
         None
     }
 
-    /// the same bytes to write in place, where slice finds them.
+    /// the same bytes to write in place, where slice finds them
     fn slice_mut(&mut self, _addr: u32, _len: usize) -> Option<&mut [u8]> {
         None
     }
@@ -51,41 +50,38 @@ pub trait GpuMemory {
         u32::from_le_bytes(buf)
     }
 
-    /// translates a GPU physical address to whatever address read/write
-    /// expect. GX commands and registers all carry physical addresses.
+    /// translates a GPU physical addr to whatever addr read/write expect, GX commands and registers all carry physical addrs
     fn translate(&self, paddr: u32) -> u32 {
         paddr
     }
 
-    /// the host GPU drew over a range that memory gets only when something
-    /// asks for it, so the CPU's reads there have to ask first.
+    /// the host GPU drew over a range that memory only gets when something asks for it, so the CPU's reads there have to ask first
     fn guard(&mut self, _addr: u32, _len: u32) {}
 
-    /// the same for the CPU's writes there.
+    /// the same for the CPU's writes there
     fn guard_writes(&mut self, _addr: u32, _len: u32) {}
 
-    /// how many times something wrote memory through write or slice_mut so
-    /// far, for the walk ahead of a command list to tell whether the
-    /// vertices it read are still there. none where nothing counts, which
-    /// keeps that walk off.
+    /// how many times something wrote memory thru write or slice_mut so far,
+    /// for the walk ahead of a command list to tell if the vertices it read are still there
+    /// none where nothing counts, which keeps that walk off
     fn writes(&self) -> Option<u64> {
         None
     }
 
-    /// watches a range for writes of anything from now on, the CPU's, a
-    /// service's or the GPU's own, and gives what unchanged takes to tell
-    /// whether one came since. none where nothing watches.
+    /// watches a range for writes of anything from now on (the CPU's,
+    /// a service's or the GPU's own) and gives what unchanged takes to tell if one came since,
+    /// none where nothing watches
     fn watch(&mut self, _addr: u32, _len: u32) -> Option<u64> {
         None
     }
 
-    /// whether nothing wrote over a range since watch gave watch.
+    /// did nothing write over a range since watch gave watch
     fn unchanged(&mut self, _addr: u32, _len: u32, _watch: u64) -> bool {
         false
     }
 }
 
-/// what one LCD controller holds.
+/// what one LCD controller holds
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct FramebufferConfig {
     pub address_a_left: u32,
@@ -94,12 +90,12 @@ pub struct FramebufferConfig {
     pub address_b_right: u32,
     pub stride: u32,
     pub format: u32,
-    /// 0 selects the first pair of addresses, 1 the second.
+    /// 0 picks the first pair of addrs, 1 the second
     pub active: u32,
 }
 
 impl FramebufferConfig {
-    /// address of the buffer currently being scanned out.
+    /// addr of the buffer being scanned out now
     pub fn address_left(&self) -> u32 {
         if self.active == 0 {
             self.address_a_left
@@ -117,98 +113,92 @@ impl FramebufferConfig {
     }
 
     /// the low three bits of the format register pick the color format, the
-    /// rest configures the controller.
+    /// rest configures the controller
     pub fn color_format(&self) -> ColorFormat {
         ColorFormat::from_raw(self.format & 7)
     }
 
-    /// true when the framebuffer is interleaved for stereoscopic output.
+    /// true when the framebuffer is interleaved for stereoscopic output
     pub fn is_stereo(&self) -> bool {
         let right = self.address_right();
         right != 0 && right != self.address_left()
     }
 }
 
-/// vertices a title sends one attribute at a time, by selecting fixed attribute
-/// 15 and writing to the fixed attribute data registers.
+/// vertices a title sends one attribute at a time, by picking fixed attribute 15 and writing to the fixed attribute data registers
 #[derive(Default)]
 struct Immediate {
-    /// the vertex being assembled.
+    /// the vertex being assembled
     attributes: [shader::Vec4; 16],
     next_attribute: usize,
-    /// finished vertices, drawn together before the next change of state.
+    /// finished vertices, drawn together b4 the next state change
     vertices: Vec<[shader::Vec4; 16]>,
 }
 
-/// a screen's picture, upright RGBA, and the scale it is at.
+/// a screen's picture, upright RGBA, and the scale it's at
 pub type Picture = (std::sync::Arc<Vec<u8>>, u32);
 
 /// the picture a display transfer left for a screen, drawn scaled by the
-/// host's GPU, to be shown once the GPU finishes it.
+/// host's GPU, to be shown once the GPU finishes it
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenRef {
-    /// the buffer the transfer drew, its address and size.
+    /// the buffer the transfer drew, its address and size
     pub(crate) addr: u32,
     pub(crate) size: (u32, u32),
     pub(crate) format: ColorFormat,
     pub(crate) batch: u64,
-    /// the rows of it the screen shows, the first and how many, and how
-    /// many pixels of each row, a buffer can have longer rows than the
-    /// screen and start the screen a few rows in.
+    /// the rows of it the screen shows (the first and how many) and how many pixels of each row,
+    /// a buffer can have longer rows than the screen and start the screen a few rows in
     pub(crate) rows: (u32, u32),
     pub(crate) columns: u32,
 }
 
 pub struct Gpu {
-    /// external registers, 0x1EF00000 upwards, indexed by word.
+    /// external registers, 0x1EF00000 up, indexed by word
     pub external: Box<[u32]>,
-    /// PICA internal registers, written by command lists.
+    /// PICA internal registers, written by command lists
     pub internal: Box<[u32]>,
-    /// the vertex shader unit, its program, uniforms and upload cursors.
+    /// the vertex shader unit, its program, uniforms and upload cursors
     pub vertex_shader: shader::ShaderUnit,
-    /// the unit that runs geometry shaders, when the pipeline uses one.
+    /// the unit that runs geometry shaders, when the pipeline uses one
     pub geometry_shader: shader::ShaderUnit,
-    /// values for attributes no array feeds, set through the fixed
-    /// attribute registers.
+    /// values for attributes no array feeds, set thru the fixed attribute registers
     fixed_attributes: [shader::Vec4; 16],
     fixed_attribute_staging: [u32; 3],
     fixed_attribute_words: usize,
-    /// vertices sent through the same registers in immediate mode.
+    /// vertices sent thru the same registers in immediate mode
     immediate: Immediate,
-    /// where a command list asked execution to continue, as (physical
-    /// address, size in bytes), taken once the current command finishes.
+    /// where a command list asked execution to continue, as (physical addr, size in bytes), taken once the current command finishes
     pending_jump: Option<(u32, u32)>,
 
-    /// one config per screen, index 0 is the top screen, 1 the bottom.
+    /// one config per screen, index 0 is the top screen, 1 the bottom
     pub framebuffers: [FramebufferConfig; 2],
 
-    /// counters for the diagnostics overlay.
+    /// counters for the diagnostics overlay
     pub command_lists: u64,
     pub draw_calls: u64,
     pub fills: u64,
     pub transfers: u64,
-    /// vertices actually rasterized, as opposed to draw calls issued, a
-    /// draw call with a degenerate vertex count still counts as a call.
+    /// vertices actually rasterized, not draw calls issued, a draw call w/ a degenerate vertex count still counts as a call
     pub vertices_drawn: u64,
-    /// host time spent running command lists and display transfers.
+    /// host time spent running command lists and display transfers
     pub busy: std::time::Duration,
-    /// decoded textures and the lighting tables, kept across draws.
+    /// decoded textures and the lighting tables, kept across draws
     resources: raster::Resources,
-    /// frame interpolation's record of the draws, none while it is off.
+    /// frame interpolation's record of the draws, none while it's off
     interpolation: Option<interpolation::Interpolation>,
-    /// the copy of the registers and shader units that walks each command
-    /// list ahead of the real walk, see scout.
+    /// the copy of the registers and shader units that walks each command list ahead of the real walk, see scout
     scout: Option<Box<Gpu>>,
-    /// whether this is that copy.
+    /// is this that copy
     scouting: bool,
     /// the vertex work of each draw the walk ahead got to, in order, none
-    /// for one it handed out nothing for.
+    /// for one it handed out nothing for
     ahead: std::collections::VecDeque<Option<raster::Handed>>,
 }
 
-/// number of external register words we track (0x1EF00000..0x1EF04000).
+/// number of external register words we track (0x1EF00000 to 0x1EF04000)
 const EXTERNAL_REGISTER_WORDS: usize = 0x1000;
-/// PICA internal register file size.
+/// PICA internal register file size
 const INTERNAL_REGISTER_WORDS: usize = 0x300;
 
 impl Default for Gpu {
@@ -244,9 +234,9 @@ impl Gpu {
         }
     }
 
-    // -- external registers -------------------------------------------------
+    // external registers
 
-    /// offset is the byte offset GSP uses, where zero means 0x1EB00000.
+    /// offset is the byte offset GSP uses, zero means 0x1EB00000
     pub fn write_external(&mut self, gsp_offset: u32, value: u32) {
         let Some(index) = external_index(gsp_offset) else {
             return;
@@ -270,7 +260,7 @@ impl Gpu {
             .unwrap_or(0)
     }
 
-    /// mirrors the LCD registers into our framebuffer state.
+    /// mirrors the LCD registers into our framebuffer state
     fn on_external_write(&mut self, byte_offset: usize, value: u32) {
         for (screen, base) in [(0usize, LCD_TOP_BASE), (1, LCD_BOTTOM_BASE)] {
             let relative = byte_offset.wrapping_sub(base);
@@ -288,7 +278,7 @@ impl Gpu {
         }
     }
 
-    /// gsp::SetBufferSwap.
+    /// gsp::SetBufferSwap
     pub fn set_framebuffer(
         &mut self,
         screen: u32,
@@ -323,9 +313,9 @@ impl Gpu {
         }
     }
 
-    // -- fill and transfer engines -----------------------------------------
+    // fill and transfer engines
 
-    /// MemoryFill, writes a repeating pattern over a physical range.
+    /// MemoryFill, writes a repeating pattern over a physical range
     pub fn memory_fill<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -351,8 +341,7 @@ impl Gpu {
         log::debug!(
             "memory fill: 0x{start:08X}..0x{end:08X} with 0x{value:08X} ({width}-byte pattern)"
         );
-        // in place where memory is in one piece, a frame's fills are
-        // megabytes, else over the range in the last fill's buffer
+        // in place where memory's in one piece (a frame's fills are megabytes), otherwise over the range in the last fill's buffer
         let mut buffer = std::mem::take(&mut self.resources.fill);
         match memory.slice_mut(address, length) {
             Some(range) => pattern::fill(range, pattern),
@@ -377,7 +366,7 @@ impl Gpu {
     }
 
     /// DisplayTransfer, copies a rectangle between buffers, converting format
-    /// and tiling on the way.
+    /// and tiling on the way
     pub fn display_transfer<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -390,15 +379,15 @@ impl Gpu {
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
 
-        // flag layout, from the transfer engine's register,
-        //   bit 0      flip the input vertically
-        //   bit 1      linear to tiled, tiled to linear without it
-        //   bit 2      crop the input's lines to the output's width
-        //   bit 3      raw copy, no format conversion
-        //   bit 5      keep the layout, tiled or linear on both sides
-        //   bits 8-10  input color format
-        //   bits 12-14 output color format
-        //   bits 24-25 downscale
+        // flag layout, from the transfer engine's register
+        //   bit 0         flip the input vertically
+        //   bit 1         linear to tiled, tiled to linear w/o it
+        //   bit 2         crop the input's lines to the output's width
+        //   bit 3         raw copy, no format conversion
+        //   bit 5         keep the layout, tiled or linear on both sides
+        //   bits 8 to 10  input color format
+        //   bits 12 to 14 output color format
+        //   bits 24 to 25 downscale
         let flip_vertically = flags & 1 != 0;
         let input_linear = flags & (1 << 1) != 0;
         let output_tiled = input_linear != (flags & (1 << 5) != 0);
@@ -421,10 +410,8 @@ impl Gpu {
         let copy_width = output_width.min(input_width / scale_x);
         let copy_height = output_height.min(input_height / scale_y);
 
-        // flipped and cropped, the console starts the output as many bytes
-        // later as the lines cropped off take, all but the last one. titles
-        // count on it, Tales of the Abyss hands it its framebuffers that much
-        // earlier
+        // flipped and cropped, the console starts the output as many bytes later as the cropped lines take, all but the last one
+        // titles count on it, Tales of the Abyss hands it its framebuffers that much earlier
         let crop = flags & (1 << 2) != 0;
         let skew = if flip_vertically && crop {
             input_width.saturating_sub(output_dimensions & 0xFFFF) * output_height.saturating_sub(1) * output_bpp as u32
@@ -478,11 +465,10 @@ impl Gpu {
         let mut input = vec![0u8; (input_width * input_height) as usize * input_bpp];
         memory.read(input_base, &mut input);
         let mut output = vec![0u8; (output_width * output_height) as usize * output_bpp];
-        // preserve whatever was already there outside the copied rectangle.
+        // keep whatever was already there outside the copied rectangle
         memory.read(output_base, &mut output);
 
-        // halving a tiled RGBA8 buffer into another, which titles do to a
-        // frame every frame for their effects, goes a tile at a time
+        // halving a tiled RGBA8 buffer into another (titles do it to a frame every frame for their effects) goes a tile at a time
         let whole_tiles = [copy_width, copy_height, input_width, output_width].iter().all(|n| n % 8 == 0);
         if input_format == ColorFormat::Rgba8
             && output_format == ColorFormat::Rgba8
@@ -503,8 +489,7 @@ impl Gpu {
         let trace_pixels = std::env::var("ZAKURO_TRACE_PIXELS").is_ok();
         let mut distinct = std::collections::HashSet::new();
 
-        // the input's rows are read from the first, a flip writes them from
-        // the output's last row up
+        // the input's rows get read from the first, a flip writes them from the output's last row up
         for y in 0..copy_height {
             let out_y = if flip_vertically { output_height - 1 - y } else { y };
             for x in 0..copy_width {
@@ -561,7 +546,7 @@ impl Gpu {
         self.transfers += 1;
     }
 
-    /// TextureCopy, a raw byte copy with a stride, no format conversion.
+    /// TextureCopy, a raw byte copy w/ a stride, no format conversion
     pub fn texture_copy<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -587,7 +572,7 @@ impl Gpu {
 
         let (mut src, mut dst) = (input, output);
 
-        // a zero width means one contiguous run.
+        // a zero width means one contiguous run
         if input_width == 0 || output_width == 0 {
             let mut buffer = vec![0u8; size as usize];
             memory.read(src, &mut buffer);
@@ -609,10 +594,9 @@ impl Gpu {
         self.transfers += 1;
     }
 
-    // -- command lists ------------------------------------------------------
+    // command lists
 
-    /// walks a command list, applying its register writes and dispatching any
-    /// draw it triggers to the software rasterizer.
+    /// walks a command list, applying its register writes and sending any draw it triggers to the software rasterizer
     pub fn process_command_list<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -626,20 +610,16 @@ impl Gpu {
             self.scout(memory, paddr, size);
         }
         self.run_command_list(memory, renderer, paddr, size);
-        // work the real walk did not take is left undone, or finishes on
-        // its own where a thread started on it
+        // work the real walk didn't take is left undone, or finishes on its own where a thread started on it
         self.ahead.clear();
         self.busy += start.elapsed();
     }
 
-    /// walks a command list ahead of the real walk, on a copy of the
-    /// registers, shader units and fixed attributes, reading each draw's
-    /// vertices and handing them to other threads to shade, clip and place
-    /// on the screen. the real walk takes that work at the same draw when
-    /// it finds the draw as the walk ahead saw it, so the threads shade
-    /// while it goes on through the list, see raster::hand_out. the copy
-    /// draws nothing and writes no memory, the tables it keeps only move
-    /// their index registers on as the real ones do.
+    /// walks a command list ahead of the real walk, on a copy of the registers, shader units and fixed attributes,
+    /// reading each draw's vertices and handing them to other threads to shade, clip and place on the screen
+    /// the real walk takes that work at the same draw when it finds the draw like the walk ahead saw it,
+    /// so the threads shade while it goes on thru the list (see raster::hand_out)
+    /// the copy draws nothing and writes no memory, the tables it keeps only move their index registers on like the real ones do
     fn scout<M: GpuMemory>(&mut self, memory: &mut M, paddr: u32, size: u32) {
         let mut scout = self.scout.take().unwrap_or_else(|| Box::new(Gpu { scouting: true, ..Gpu::new() }));
         scout.internal.copy_from_slice(&self.internal);
@@ -656,13 +636,10 @@ impl Gpu {
         self.scout = Some(scout);
     }
 
-    /// draws on the host's GPU from now on, rather than in software, and
-    /// says which GPU that is.
-    /// scale is how many times the console's resolution it draws at, for
-    /// sharper pictures. on the device of a Vulkan presenter, when it gives
-    /// one, the screens are shown straight from the images drawn. the
-    /// pipelines compiled are kept for the next time the game with the
-    /// title id given runs.
+    /// draws on the host's GPU from now on instead of in software, and says which GPU that is
+    /// scale is how many times the console's res it draws at, for sharper pictures
+    /// on the device of a Vulkan presenter (when it gives one) the screens get shown straight from the images drawn
+    /// the compiled pipelines are kept for the next time the game w/ the given title id runs
     #[cfg(feature = "vulkan")]
     pub fn enable_hardware_renderer(
         &mut self,
@@ -683,9 +660,8 @@ impl Gpu {
         Ok(name)
     }
 
-    /// draws the texture pack's pictures in place of the textures they
-    /// replace, or no pack's. only the host's GPU draws them, so a pack
-    /// waits for enable_hardware_renderer, and says whether it is drawn.
+    /// draws the texture pack's pictures in place of the textures they replace, or no pack's
+    /// only the host's GPU draws them, so a pack waits for enable_hardware_renderer, and says if it's drawn
     pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
         #[cfg(feature = "vulkan")]
         let pack = pack.filter(|_| self.resources.hardware.is_some());
@@ -696,8 +672,7 @@ impl Gpu {
         drawn
     }
 
-    /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer
-    /// having worked, rather than in software.
+    /// is the 3D drawn on the host's GPU (enable_hardware_renderer worked) instead of in software
     pub fn draws_on_gpu(&self) -> bool {
         #[cfg(feature = "vulkan")]
         if self.resources.hardware.is_some() {
@@ -706,8 +681,7 @@ impl Gpu {
         false
     }
 
-    /// whether the screens the host's GPU draws are shown straight from it,
-    /// by a presenter sharing its device, see screen_image.
+    /// are the screens the host's GPU draws shown straight from it by a presenter sharing its device, see screen_image
     pub fn shows_directly(&self) -> bool {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_ref() {
@@ -716,8 +690,8 @@ impl Gpu {
         false
     }
 
-    /// where a screen's picture is on the GPU, for a presenter sharing the
-    /// device to draw it straight from, the batch that drew it submitted.
+    /// where a screen's picture is on the GPU, for a presenter sharing the device to draw it straight from,
+    /// w/ the batch that drew it submitted
     pub fn screen_image(&mut self, screen: ScreenRef) -> Option<GpuScreen> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -731,10 +705,8 @@ impl Gpu {
         None
     }
 
-    /// draws a picture in between each two of the title's own from now on,
-    /// see interpolation, or stops, and says whether it does. the pictures
-    /// in between are shown straight from the host's GPU, by a presenter
-    /// sharing its device.
+    /// draws a picture in between each two of the title's own from now on (see interpolation) or stops, and says if it does
+    /// the in between pictures get shown straight from the host's GPU by a presenter sharing its device
     pub fn set_interpolation(&mut self, on: bool) -> bool {
         let on = on && self.shows_directly();
         if !on {
@@ -744,13 +716,12 @@ impl Gpu {
         on
     }
 
-    /// whether frame interpolation is on.
+    /// whether frame interpolation is on
     pub fn interpolates(&self) -> bool {
         self.interpolation.is_some()
     }
 
-    /// draws the pictures in between from the next draw on, while the
-    /// title keeps drawing a picture every other refresh, or stops.
+    /// draws the in between pictures from the next draw on, while the title keeps drawing a picture every other refresh, or stops
     pub fn set_twins(&mut self, twins: bool) {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -760,14 +731,12 @@ impl Gpu {
         let _ = twins;
     }
 
-    /// the title's frame is done, its draws are the ones the next frame's
-    /// match, and how they matched the frame before's.
+    /// the title's frame is done, its draws are the ones the next frame's match, plus how they matched the frame b4's
     pub fn frame_done(&mut self) -> Option<Matches> {
         self.interpolation.as_mut().map(interpolation::Interpolation::frame_done)
     }
 
-    /// where the picture in between a screen's picture and the one before
-    /// is, as screen_image has the screen's, none when there is none.
+    /// where the picture between a screen's picture and the one b4 is, like screen_image has the screen's, none when there's none
     pub fn between_image(&mut self, screen: ScreenRef) -> Option<GpuScreen> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -781,9 +750,8 @@ impl Gpu {
         None
     }
 
-    /// a screen's picture or the picture in between, upright RGBA the way
-    /// the screen shows it, and the scale it is at, read back from the GPU
-    /// showing the screens for saving it. it waits for the GPU.
+    /// a screen's picture or the in between one, upright RGBA like the screen shows it, plus the scale it's at,
+    /// read back from the GPU showing the screens for saving it, it waits for the GPU
     pub fn upright_picture(&mut self, screen: ScreenRef, between: bool) -> Option<Picture> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -794,8 +762,7 @@ impl Gpu {
         None
     }
 
-    /// how many times the console's resolution the host's GPU draws at, 1
-    /// when drawing in software.
+    /// how many times the console's res the host's GPU draws at, 1 when drawing in software
     pub fn scale(&self) -> u32 {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_ref() {
@@ -804,10 +771,9 @@ impl Gpu {
         1
     }
 
-    /// the newest picture the host's GPU drew for a screen's buffer, at the
-    /// scale it draws at, while guest memory still holds the same picture.
-    /// size is the pixels of a row the screen shows and its rows, stride the
-    /// pixels a row takes in memory.
+    /// the newest picture the host's GPU drew for a screen's buffer, at the scale it draws at,
+    /// while guest memory still holds the same picture
+    /// size is the pixels of a row the screen shows and its rows, stride the pixels a row takes in memory
     pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -818,8 +784,7 @@ impl Gpu {
         None
     }
 
-    /// a screen's picture upright, RGBA the way the screen shows it, and the
-    /// scale it is at, once the GPU finished it.
+    /// a screen's picture upright, RGBA like the screen shows it, plus the scale it's at, once the GPU finished it
     pub fn scaled_picture(&mut self, screen: ScreenRef) -> Option<Picture> {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -833,8 +798,8 @@ impl Gpu {
         None
     }
 
-    /// makes guest memory right over a range something other than a draw
-    /// is about to read or write, the host GPU keeps what it draws until then.
+    /// makes guest memory right over a range something other than a draw is about to read or write,
+    /// the host GPU keeps what it draws till then
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -846,9 +811,8 @@ impl Gpu {
         let _ = (memory, addr, len);
     }
 
-    /// makes guest memory hold what the host GPU drew of the depth buffers
-    /// over a range, for the CPU reading there. the CPU reads color buffers
-    /// as memory holds them.
+    /// makes guest memory hold what the host GPU drew of the depth buffers over a range, for the CPU reading there
+    /// the CPU reads color buffers as memory holds them
     pub fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
@@ -867,12 +831,10 @@ impl Gpu {
         paddr: u32,
         size: u32,
     ) {
-        // into the last list's buffer, a list a few times a frame, large
-        // when draws upload their uniforms, would have a new block each time
+        // into the last list's buffer, a list a few times a frame (big when draws upload their uniforms) would get a new block each time
         let mut words = std::mem::take(&mut self.resources.words);
         read_command_buffer(memory, paddr, size, &mut words);
-        // buffers jump into each other, and a buffer jumping to itself
-        // would never end, real lists stay far below this.
+        // buffers jump into each other, and a buffer jumping to itself would never end, real lists stay way below this
         let mut jumps = 0u32;
         self.pending_jump = None;
 
@@ -887,9 +849,8 @@ impl Gpu {
             let extra = ((header >> 20) & 0xFF) as usize;
             let consecutive = header & 0x8000_0000 != 0;
 
-            // no real PICA register lives anywhere near this index (the whole
-            // internal file is 0x300 words), seeing one would mean a desync in
-            // the parsing above.
+            // no real PICA register lives anywhere near this index (the whole internal file is 0x300 words),
+            // seeing one would mean a desync in the parsing above
             if register >= self.internal.len() {
                 log::debug!(
                     "command list stops at word {}/{}: register 0x{register:04X} is out of range",
@@ -904,15 +865,14 @@ impl Gpu {
             self.run_command(memory, renderer, register, mask, consecutive, data, burst);
             index += burst.len();
 
-            // each command is padded so its total length (the base pair plus
-            // extra words) is a multiple of two, an odd extra needs one
-            // more word to reach that, an even one is already there.
+            // each command is padded so its total length (the base pair plus extra words) is a multiple of two,
+            // an odd extra needs one more word to get there, an even one already is
             if !extra.is_multiple_of(2) {
                 index += 1;
             }
             index = index.min(words.len());
 
-            // a jump replaces the list being executed.
+            // a jump replaces the list being executed
             if let Some((address, size)) = self.pending_jump.take() {
                 jumps += 1;
                 if jumps > 0x10000 {
@@ -929,11 +889,9 @@ impl Gpu {
         self.command_lists += 1;
     }
 
-    /// one command, its first word and the burst after it, all to one
-    /// register or on through the ones after it. what titles send most,
-    /// runs of state and runs for one of the ports, goes in one go, anything
-    /// else a write at a time. lists are mostly these, and a write at a time
-    /// took longer than the rest of the list.
+    /// one command, its first word and the burst after it, all to one register or on thru the ones after it
+    /// what titles send most (runs of state and runs for one of the ports) goes in one go, anything else a write at a time
+    /// lists are mostly these, and a write at a time took longer than the rest of the list
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn run_command<M: GpuMemory>(
@@ -946,8 +904,7 @@ impl Gpu {
         first: u32,
         burst: &[u32],
     ) {
-        // the registers from the first on that only hold state take their
-        // words right here
+        // the registers from the first on that only hold state take their words right here
         let plain = PLAIN_UNTIL[register] as usize - register;
         if plain > 0 {
             self.flush_immediate(memory);
@@ -965,7 +922,7 @@ impl Gpu {
             for (slot, &value) in slots[1..].iter_mut().zip(burst) {
                 *slot = (*slot & !bits) | (value & bits);
             }
-            // whatever the burst runs on into a write at a time
+            // whatever the burst runs on into goes a write at a time
             for (i, &value) in burst.iter().enumerate().skip(count - 1) {
                 self.write_internal(memory, renderer, register + 1 + i, value, mask);
             }
@@ -981,11 +938,10 @@ impl Gpu {
         }
     }
 
-    /// a command writing whole words that all go to one port, a shader
-    /// unit's float uniforms, program or operand descriptors, or one of the
-    /// tables, taken as one run. false when it is not one. a float uniform
-    /// upload can start at the index register and run on into the data
-    /// registers, and only the last of several words to the index counts.
+    /// a command writing whole words that all go to one port (a shader unit's float uniforms,
+    /// program or operand descriptors, or one of the tables) taken as one run, false when it isn't one
+    /// a float uniform upload can start at the index register and run on into the data registers,
+    /// and only the last of several words to the index counts
     fn write_port<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -1022,8 +978,7 @@ impl Gpu {
                     }
                     SHADER_PROGRAM_DATA..=SHADER_PROGRAM_DATA_END if end <= SHADER_PROGRAM_DATA_END => {
                         self.flush_immediate(memory);
-                        // as in write_internal, the geometry unit takes the
-                        // vertex shader's program and descriptors too
+                        // like in write_internal, the geometry unit takes the vertex shader's program and descriptors too
                         let mirror = vertex && self.internal[REG_VS_COM_MODE] & 1 == 0;
                         let (unit, other) = self.units(vertex);
                         for &word in words() {
@@ -1071,8 +1026,7 @@ impl Gpu {
             }
             _ => return false,
         }
-        // the registers keep the last word each took, nothing the ports do
-        // reads them
+        // the registers keep the last word each took, nothing the ports do reads them
         if consecutive {
             self.internal[register] = first;
             self.internal[register + 1..=last].copy_from_slice(burst);
@@ -1082,7 +1036,7 @@ impl Gpu {
         true
     }
 
-    /// the vertex shader unit and the geometry one, or the other way round.
+    /// the vertex shader unit and the geometry one, or the other way round
     fn units(&mut self, vertex: bool) -> (&mut shader::ShaderUnit, &mut shader::ShaderUnit) {
         if vertex {
             (&mut self.vertex_shader, &mut self.geometry_shader)
@@ -1091,9 +1045,9 @@ impl Gpu {
         }
     }
 
-    /// decodes the programs a draw runs. the geometry unit gets the vertex
-    /// shader's uploads too, and decoding hashes a whole program, so it is
-    /// left alone while the geometry stage is off.
+    /// decodes the programs a draw runs
+    /// the geometry unit gets the vertex shader's uploads too, and decoding hashes a whole program,
+    /// so it's left alone while the geometry stage is off
     fn prepare_shaders(&mut self) {
         self.vertex_shader.prepare();
         if self.internal[REG_GEOSTAGE_CONFIG] & 0x3 == 2 {
@@ -1101,8 +1055,7 @@ impl Gpu {
         }
     }
 
-    /// draws any immediate-mode vertices still waiting. every write but the
-    /// attribute data asks, and there seldom are any.
+    /// draws any immediate mode vertices still waiting, every write except the attribute data asks, and there rarely are any
     #[inline]
     fn flush_immediate<M: GpuMemory>(&mut self, memory: &mut M) {
         if !self.immediate.vertices.is_empty() {
@@ -1110,9 +1063,8 @@ impl Gpu {
         }
     }
 
-    /// draws what the registers describe, the vertices of the arrays in
-    /// order or the ones the index buffer picks. kept out of write_internal,
-    /// where every write paid for the stack a draw needs.
+    /// draws what the registers describe, the vertices of the arrays in order or the ones the index buffer picks
+    /// kept out of write_internal, where every write paid for the stack a draw needs
     #[inline(never)]
     fn draw<M: GpuMemory>(&mut self, memory: &mut M, renderer: &mut dyn Renderer, indexed: bool) {
         if self.scouting {
@@ -1176,13 +1128,12 @@ impl Gpu {
         self.vertices_drawn += vertices as u64;
     }
 
-    /// trades the vertex shader's float uniforms for the ones given, the
-    /// draw in between's, and back.
+    /// swaps the vertex shader's float uniforms for the ones given (the in between draw's) and back
     fn swap_uniforms(&mut self, uniforms: &mut interpolation::Uniforms) {
         std::mem::swap(&mut *self.vertex_shader.float_uniforms, uniforms);
     }
 
-    /// draws the immediate-mode vertices waiting, see flush_immediate.
+    /// draws the immediate mode vertices waiting, see flush_immediate
     #[inline(never)]
     fn draw_immediate<M: GpuMemory>(&mut self, memory: &mut M) {
         let vertices = std::mem::take(&mut self.immediate.vertices);
@@ -1215,27 +1166,23 @@ impl Gpu {
             return;
         }
 
-        // immediate-mode vertices are drawn with the state they were sent
-        // under, so anything else touching a register draws them first.
+        // immediate mode vertices get drawn w/ the state they were sent under, so anything else touching a register draws them first
         if !(REG_FIXED_ATTRIBUTE_DATA..=REG_FIXED_ATTRIBUTE_DATA_END).contains(&register) {
             self.flush_immediate(memory);
         }
 
-        // the mask selects which bytes of the register the write touches, a set
-        // bit writes that byte.
+        // the mask picks which bytes of the register the write touches, a set bit writes that byte
         let write_mask = BYTE_MASKS[mask as usize & 0xF];
         let old = self.internal[register];
         let new = (old & !write_mask) | (value & write_mask);
         self.internal[register] = new;
 
-        // a register given an effect here has to leave plain() too, or the
-        // commands run_command takes in one go skip it
+        // a register given an effect here has to leave plain() too, or the commands run_command takes in one go skip it
         match register {
             REG_DRAW_ARRAYS | REG_DRAW_ELEMENTS => self.draw(memory, renderer, register == REG_DRAW_ELEMENTS),
 
             REG_CMDBUF_JUMP0 | REG_CMDBUF_JUMP1 => {
-                // every 3D model lives behind one of these jumps. spent way too long
-                // wondering why the professor wasn't there, fml
+                // every 3D model lives behind one of these jumps, spent way too long wondering why the professor wasn't there, fml
                 let channel = register - REG_CMDBUF_JUMP0;
                 let size = (self.internal[REG_CMDBUF_SIZE0 + channel] & 0x1F_FFFF) * 8;
                 let address = (self.internal[REG_CMDBUF_ADDR0 + channel] & 0x1FFF_FFFF) * 8;
@@ -1251,8 +1198,7 @@ impl Gpu {
                 self.fixed_attribute_words += 1;
                 if self.fixed_attribute_words == 3 {
                     self.fixed_attribute_words = 0;
-                    // packed like float uniforms, four 24-bit floats in
-                    // three words, w first.
+                    // packed like float uniforms, four 24 bit floats in three words, w first
                     let [a, b, c] = self.fixed_attribute_staging;
                     let attribute = [
                         shader::isa::decode_float24(c & 0x00FF_FFFF),
@@ -1263,13 +1209,11 @@ impl Gpu {
                     let index = (self.internal[REG_FIXED_ATTRIBUTE_INDEX] & 0xF) as usize;
                     if index < 15 {
                         self.fixed_attributes[index] = attribute;
-                        // the index moves on so consecutive attributes can
-                        // be set in one burst.
+                        // the index moves on so consecutive attributes can be set in one burst
                         self.internal[REG_FIXED_ATTRIBUTE_INDEX] =
                             (self.internal[REG_FIXED_ATTRIBUTE_INDEX] & !0xF) | (index as u32 + 1);
                     } else {
-                        // immediate mode, attributes arrive in order, and
-                        // the last one completes a vertex.
+                        // immediate mode, attributes arrive in order and the last one completes a vertex
                         let immediate = &mut self.immediate;
                         immediate.attributes[immediate.next_attribute] = attribute;
                         let last = (self.internal[REG_VS_ATTRIBUTE_COUNT] & 0xF) as usize;
@@ -1298,9 +1242,7 @@ impl Gpu {
             REG_VS_BLOCK..=REG_VS_BLOCK_END => {
                 let offset = register - REG_VS_BLOCK;
                 configure_shader(&mut self.vertex_shader, offset, new);
-                // the geometry shader unit takes the vertex shader's program
-                // and descriptors as well, unless the title configures it on
-                // its own.
+                // the geometry shader unit takes the vertex shader's program and descriptors too, unless the title sets it up on its own
                 let program = matches!(
                     offset,
                     SHADER_PROGRAM_INDEX..=SHADER_PROGRAM_DATA_END
@@ -1322,8 +1264,7 @@ impl Gpu {
     }
 }
 
-/// pattern over bytes, from the start again each time it ends, the copies
-/// doubling.
+/// pattern over bytes, from the start again each time it ends, the copies doubling
 fn repeat(pattern: &[u8], bytes: &mut [u8]) {
     let first = pattern.len().min(bytes.len());
     bytes[..first].copy_from_slice(&pattern[..first]);
@@ -1335,7 +1276,7 @@ fn repeat(pattern: &[u8], bytes: &mut [u8]) {
     }
 }
 
-/// reads a command buffer as words, into words.
+/// reads a command buffer as words, into words
 fn read_command_buffer<M: GpuMemory>(memory: &mut M, paddr: u32, size: u32, words: &mut Vec<u32>) {
     let addr = memory.translate(paddr);
     words.clear();
@@ -1352,8 +1293,7 @@ fn read_command_buffer<M: GpuMemory>(memory: &mut M, paddr: u32, size: u32, word
 const REG_GS_BLOCK_END: usize = REG_GS_BLOCK + SHADER_BLOCK_SIZE - 1;
 const REG_VS_BLOCK_END: usize = REG_VS_BLOCK + SHADER_BLOCK_SIZE - 1;
 
-/// the bits of a register each of the sixteen byte masks of a command
-/// writes, a set bit of the mask writing that byte.
+/// the bits of a register each of the sixteen byte masks of a command writes, a set mask bit writes that byte
 const BYTE_MASKS: [u32; 16] = {
     let mut masks = [0; 16];
     let mut mask = 0;
@@ -1370,8 +1310,7 @@ const BYTE_MASKS: [u32; 16] = {
     masks
 };
 
-/// for each register, the first one from it on that a write does more to
-/// than store the value, the writes of a command up to there only store.
+/// for each register, the first one from it on that a write does more to than store the value, a command's writes up to there only store
 static PLAIN_UNTIL: [u16; INTERNAL_REGISTER_WORDS] = {
     let mut until = [0; INTERNAL_REGISTER_WORDS];
     let mut end = INTERNAL_REGISTER_WORDS;
@@ -1386,8 +1325,7 @@ static PLAIN_UNTIL: [u16; INTERNAL_REGISTER_WORDS] = {
     until
 };
 
-/// whether a write to a register only stores the value, the ones that do
-/// more are the arms of write_internal and configure_shader.
+/// does a write to a register only store the value, the ones that do more are the arms of write_internal and configure_shader
 const fn plain(register: usize) -> bool {
     match register {
         REG_DRAW_ARRAYS | REG_DRAW_ELEMENTS | REG_CMDBUF_JUMP0 | REG_CMDBUF_JUMP1 => false,
@@ -1401,9 +1339,8 @@ const fn plain(register: usize) -> bool {
     }
 }
 
-/// whether a write to a shader unit's register at an offset changes the
-/// unit, the vertex unit's program and descriptor ones the geometry unit
-/// too.
+/// does a write to a shader unit's register at an offset change the unit,
+/// the vertex unit's program and descriptor ones change the geometry unit too
 const fn configures_shader(offset: usize) -> bool {
     matches!(
         offset,
@@ -1416,7 +1353,7 @@ const fn configures_shader(offset: usize) -> bool {
     )
 }
 
-/// applies a write to one of a shader unit's configuration registers.
+/// applies a write to one of a shader unit's configuration registers
 fn configure_shader(unit: &mut shader::ShaderUnit, offset: usize, value: u32) {
     match offset {
         SHADER_BOOL_UNIFORMS => unit.bool_uniforms = (value & 0xFFFF) as u16,
@@ -1443,10 +1380,9 @@ fn morton(x: u32, y: u32, width: u32, bytes_per_pixel: usize) -> usize {
     format::morton_offset(x, y, width, bytes_per_pixel as u32) as usize
 }
 
-/// the top left of a tiled RGBA8 buffer halved each way into another, size
-/// pixels of the output, each the rounded average of four, as the transfer
-/// does it a pixel at a time. the four follow one another in their tile, and
-/// a tile of the input makes a quarter of one of the output.
+/// the top left of a tiled RGBA8 buffer halved each way into another, size pixels of the output,
+/// each the rounded average of four, like the transfer does it a pixel at a time
+/// the four follow one another in their tile, and a tile of the input makes a quarter of one of the output
 fn halve_tiles(input: &[u8], input_width: u32, output: &mut [u8], output_width: u32, (width, height): (u32, u32)) {
     for y in (0..height).step_by(8) {
         for x in (0..width).step_by(8) {
@@ -1467,10 +1403,9 @@ fn halve_tiles(input: &[u8], input_width: u32, output: &mut [u8], output_width: 
     }
 }
 
-/// converts a GSP register offset to an index into our external register file.
+/// turns a GSP register offset into an index into our external register file
 fn external_index(gsp_offset: u32) -> Option<usize> {
-    // GSP offsets are relative to 0x1EB00000, but the GPU's registers start at
-    // 0x1EF00000, so the first 0x400000 bytes are other hardware.
+    // GSP offsets are relative to 0x1EB00000 but the GPU's registers start at 0x1EF00000, so the first 0x400000 bytes are other hardware
     let byte_offset = gsp_offset.checked_sub(0x0040_0000)?;
     Some(byte_offset as usize / 4)
 }
@@ -1479,7 +1414,7 @@ fn external_index(gsp_offset: u32) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// guest memory as one flat block starting at address zero.
+    /// guest memory as one flat block starting at addr zero
     #[derive(Clone)]
     struct FlatMemory(Vec<u8>);
 
@@ -1495,7 +1430,7 @@ mod tests {
         }
     }
 
-    /// the inverse of [shader::isa::decode_float24], for normal values.
+    /// the inverse of [shader::isa::decode_float24], for normal values
     fn float24(value: f32) -> u32 {
         if value == 0.0 {
             return 0;
@@ -1506,7 +1441,7 @@ mod tests {
         (sign << 23) | (exponent << 16) | ((bits >> 7) & 0xFFFF)
     }
 
-    /// packs a vector the way the fixed attribute registers take it.
+    /// packs a vector like the fixed attribute registers take it
     fn pack(v: [f32; 4]) -> [u32; 3] {
         let [x, y, z, w] = v.map(float24);
         [(w << 8) | (z >> 16), ((z & 0xFFFF) << 16) | (y >> 8), ((y & 0xFF) << 24) | x]
@@ -1514,8 +1449,7 @@ mod tests {
 
     const COLOR_BUFFER: u32 = 0x1000;
 
-    /// A GPU set up to draw an 8x8 RGBA8 target with a shader that passes
-    /// v0 through as the position and v1 as the color.
+    /// a GPU set up to draw an 8x8 RGBA8 target w/ a shader that passes v0 thru as the position and v1 as the color
     fn gpu_for_immediate_draws(memory: &mut FlatMemory, renderer: &mut dyn Renderer) -> Gpu {
         let mut gpu = Gpu::new();
         let mov = 0x13 << 26;
@@ -1529,13 +1463,13 @@ mod tests {
         write(REG_SHADER_OUTPUT_TOTAL, 2);
         write(REG_SHADER_OUTPUT_MAP, 0x0302_0100); // o0 = position
         write(REG_SHADER_OUTPUT_MAP + 1, 0x0B0A_0908); // o1 = color
-        write(REG_VS_INPUT_REGISTER_MAP_LOW, 0x10); // attribute n -> vn
+        write(REG_VS_INPUT_REGISTER_MAP_LOW, 0x10); // attribute n => vn
         write(REG_VS_ATTRIBUTE_COUNT, 1); // two attributes per vertex
         write(REG_VIEWPORT_WIDTH, float24(4.0));
         write(REG_VIEWPORT_HEIGHT, float24(4.0));
         write(REG_COLOR_BUFFER_ADDRESS, COLOR_BUFFER >> 3);
         write(REG_FRAMEBUFFER_DIMENSIONS, 8 | (7 << 12) | 1 << 24);
-        // color writes allowed, all four channels.
+        // color writes allowed, all four channels
         write(REG_COLOR_BUFFER_WRITE, 0xF);
         write(REG_DEPTH_COLOR_MASK, 0xF << 8);
         write(REG_LOGIC_OP, 3);
@@ -1551,7 +1485,7 @@ mod tests {
     }
 
     /// halving tiled RGBA8 a tile at a time gives what averaging each
-    /// pixel's four from their Morton places does.
+    /// pixel's four from their Morton places does
     #[test]
     fn halving_tiles_matches_halving_pixels() {
         let (input_width, input_height, output_width) = (64u32, 32u32, 48u32);
@@ -1589,13 +1523,13 @@ mod tests {
 
         gpu.write_internal(&mut memory, &mut renderer, REG_FIXED_ATTRIBUTE_INDEX, 0xF, 0xF);
         let red = [1.0, 0.0, 0.0, 1.0];
-        // one triangle big enough to cover the whole target.
+        // one triangle big enough to cover the whole target
         for position in [[-1.0, -1.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0]] {
             send_vertex(&mut gpu, &mut memory, &mut renderer, &[position, red]);
         }
         assert_eq!(gpu.draw_calls, 0, "nothing is drawn until the state moves on");
 
-        // leaving immediate mode is an ordinary register write.
+        // leaving immediate mode is an ordinary register write
         gpu.write_internal(&mut memory, &mut renderer, 0x245, 1, 0xF);
         assert_eq!(gpu.draw_calls, 1);
         assert_eq!(gpu.vertices_drawn, 3);
@@ -1613,14 +1547,14 @@ mod tests {
         gpu.write_internal(&mut memory, &mut renderer, REG_FIXED_ATTRIBUTE_INDEX, 2, 0xF);
         send_vertex(&mut gpu, &mut memory, &mut renderer, &[[0.5, 0.25, 0.0, 1.0]]);
         assert_eq!(gpu.fixed_attributes[2], [0.5, 0.25, 0.0, 1.0]);
-        // the index moves on to the next attribute.
+        // the index moves on to the next attribute
         assert_eq!(gpu.internal[REG_FIXED_ATTRIBUTE_INDEX] & 0xF, 3);
         gpu.write_internal(&mut memory, &mut renderer, 0x245, 1, 0xF);
         assert_eq!(gpu.draw_calls, 0);
     }
 
-    /// a point goes in, the geometry shader emits a triangle covering the
-    /// whole target from it, the way particle systems expand their points.
+    /// a point goes in and the geometry shader emits a triangle covering the whole target from it,
+    /// like particle systems expand their points
     #[test]
     fn a_geometry_shader_expands_a_point() {
         let mut memory = FlatMemory(vec![0; 0x2000]);
@@ -1669,8 +1603,7 @@ mod tests {
         }
     }
 
-    /// unless the geometry unit is configured separately, it runs the same
-    /// program the vertex shader was given.
+    /// unless the geometry unit gets set up separately it runs the same program the vertex shader got
     #[test]
     fn the_geometry_unit_mirrors_the_vertex_program_by_default() {
         let mut memory = FlatMemory(vec![0; 0x100]);
@@ -1687,14 +1620,14 @@ mod tests {
         assert_eq!(gpu.geometry_shader.program[..2], [0x1234_5678, 0]);
     }
 
-    /// one register write, as a command list encodes it.
+    /// one register write, as a command list encodes it
     fn command(register: usize, value: u32) -> [u32; 2] {
         [value, register as u32 | (0xF << 16)]
     }
 
-    /// the main list jumps into a sub-buffer through channel 0, and the
-    /// sub-buffer jumps back to the rest of the main list through
-    /// channel 1, commands on both sides of the jump run.
+    /// the main list jumps into a sub buffer thru channel 0,
+    /// the sub buffer jumps back to the rest of the main list thru channel 1,
+    /// and commands on both sides of the jump run
     #[test]
     fn command_buffers_jump_into_each_other() {
         const MAIN: u32 = 0x100;
@@ -1713,7 +1646,7 @@ mod tests {
             command(REG_CMDBUF_ADDR0 + 1, RETURN >> 3),
             command(REG_CMDBUF_SIZE0 + 1, 8 >> 3),
             command(REG_CMDBUF_JUMP0, 1),
-            // never reached, the jump leaves this list for good.
+            // never reached, the jump leaves this list for good
             command(0x0101, 0xDEAD),
         ]
         .concat();
@@ -1736,8 +1669,7 @@ mod tests {
         assert_eq!(gpu.internal[0x0101], 0, "a jump does not return");
     }
 
-    /// flat memory that hands its bytes out in one piece, and nothing
-    /// else, to see a fill go in place.
+    /// flat memory that hands its bytes out in one piece and nothing else, to see a fill go in place
     struct WholeMemory(Vec<u8>);
 
     impl GpuMemory for WholeMemory {
@@ -1758,9 +1690,8 @@ mod tests {
         }
     }
 
-    /// a fill repeats its pattern over the range, two and three byte ones
-    /// too, in place where memory is in one piece and through a copy where
-    /// it is not, and leaves the rest alone.
+    /// a fill repeats its pattern over the range, two and three byte ones too,
+    /// in place where memory's in one piece and thru a copy where it isn't, and leaves the rest alone
     #[test]
     fn fills_repeat_their_pattern() {
         for (width, pattern) in [(2, &[0x11u8, 0x22][..]), (3, &[0x11, 0x22, 0x33]), (4, &[0x11, 0x22, 0x33, 0x44])] {
@@ -1777,8 +1708,7 @@ mod tests {
         }
     }
 
-    /// float uniforms sent in a burst, to one data register or along all
-    /// of them, land as the words do one at a time.
+    /// float uniforms sent in a burst, to one data register or along all of them, land like the words do one at a time
     #[test]
     fn a_burst_of_uniforms_lands_like_single_writes() {
         let data = REG_VS_BLOCK + SHADER_UNIFORM_DATA;
@@ -1805,8 +1735,7 @@ mod tests {
         assert_eq!(gpu.internal[data..data + 4], wide);
     }
 
-    /// a renderer that keeps every call it gets, to hold two runs against
-    /// each other.
+    /// a renderer that keeps every call it gets, to hold two runs against each other
     #[derive(Default)]
     struct Recorder(Vec<Call>);
 
@@ -1835,8 +1764,7 @@ mod tests {
         }
     }
 
-    /// the renderer hears whether a draw takes its vertices through the
-    /// index buffer, which the walker below cannot tell apart from a swap.
+    /// the renderer hears if a draw takes its vertices thru the index buffer, the walker below can't tell that apart from a swap
     #[test]
     fn draw_commands_say_whether_they_are_indexed() {
         let list = [command(REG_DRAW_ARRAYS, 1), command(REG_DRAW_ELEMENTS, 1)].concat();
@@ -1858,8 +1786,7 @@ mod tests {
         assert_eq!(indexed, [false, true]);
     }
 
-    /// a command list run as it was before commands went in one go, a
-    /// write_internal for every word, to hold run_command_list against.
+    /// a command list run like b4 commands went in one go, a write_internal for every word, to hold run_command_list against
     fn run_word_by_word(gpu: &mut Gpu, memory: &mut FlatMemory, renderer: &mut dyn Renderer, paddr: u32, size: u32) {
         gpu.resources.textures.begin_list();
         let mut words = Vec::new();
@@ -1905,8 +1832,7 @@ mod tests {
         gpu.command_lists += 1;
     }
 
-    /// everything about a GPU a command list can change, and memory, by
-    /// name, floats as their bits.
+    /// everything about a GPU a command list can change, and memory, by name, floats as their bits
     fn state(gpu: &Gpu, memory: &FlatMemory) -> Vec<(String, Vec<u64>)> {
         fn floats<'a>(values: impl IntoIterator<Item = &'a f32>) -> Vec<u64> {
             values.into_iter().map(|value| value.to_bits() as u64).collect()
@@ -1974,12 +1900,11 @@ mod tests {
         parts
     }
 
-    /// where the lists of these tests go in memory.
+    /// where the lists of these tests go in memory
     const LIST: u32 = 0x2000;
 
-    /// runs a list both ways, from GPUs and memory set up the same, and
-    /// asserts they end up the same, the renderer's calls too. the GPU
-    /// that ran it in one go is left over.
+    /// runs a list both ways from GPUs and memory set up the same and asserts they end up the same, the renderer's calls too
+    /// the GPU that ran it in one go is left over
     fn run_both(setup: &dyn Fn(&mut FlatMemory, &mut dyn Renderer) -> Gpu, memory: &FlatMemory, list: &[u32], context: &str) -> Gpu {
         let mut ends = Vec::new();
         let mut gpus = Vec::new();
@@ -2012,7 +1937,7 @@ mod tests {
         gpus.swap_remove(0)
     }
 
-    /// a command, its words and the padding after them, a word nothing reads.
+    /// a command, its words and the padding after them, a word nothing reads
     fn push_command(list: &mut Vec<u32>, register: usize, mask: u32, consecutive: bool, words: &[u32]) {
         let (first, rest) = words.split_first().expect("a command has a word");
         let header = register as u32 | (mask << 16) | ((rest.len() as u32) << 20) | ((consecutive as u32) << 31);
@@ -2023,7 +1948,7 @@ mod tests {
         }
     }
 
-    /// a little random number generator, the same numbers every run.
+    /// a lil random number generator, same numbers every run
     struct Random(u64);
 
     impl Random {
@@ -2045,12 +1970,11 @@ mod tests {
         }
     }
 
-    /// where a short list for jumps to go to sits, see busy_gpu.
+    /// where a short list for jumps to go to sits, see busy_gpu
     const TARGET: u32 = 0x800;
 
-    /// a value for a register that keeps draws empty, sends jumps to the
-    /// short list at TARGET and keeps the fixed attributes out of
-    /// immediate mode.
+    /// a value for a register that keeps draws empty,
+    /// sends jumps to the short list at TARGET and keeps the fixed attributes out of immediate mode
     fn tame(register: usize, value: u32) -> u32 {
         match register {
             REG_VERTEX_COUNT => 0,
@@ -2061,8 +1985,7 @@ mod tests {
         }
     }
 
-    /// a GPU holding all sorts of state from a seed, its shader units part
-    /// way through uploads, with a short list at TARGET for jumps.
+    /// a GPU holding all sorts of state from a seed, its shader units partway thru uploads, w/ a short list at TARGET for jumps
     fn busy_gpu(seed: u64, memory: &mut FlatMemory) -> Gpu {
         let mut random = Random(seed);
         memory.0[TARGET as usize..][..8].copy_from_slice(&[0x5555_5555u32, 0x000F_0010].map(u32::to_le_bytes).concat());
@@ -2084,9 +2007,8 @@ mod tests {
         gpu
     }
 
-    /// every register, with every shape of command, alone, in bursts, in
-    /// runs on through the ones after it, with masks, gives what writing
-    /// each word on its own gives, from a GPU holding state.
+    /// every register, w/ every shape of command (alone, in bursts, in runs on thru the ones after it,
+    /// w/ masks) gives what writing each word on its own gives, from a GPU holding state
     #[test]
     fn every_register_takes_commands_as_single_writes() {
         // mask, extra words, consecutive
@@ -2115,8 +2037,7 @@ mod tests {
         }
     }
 
-    /// a word for the program port that keeps the program harmless, moves
-    /// into the first outputs, no-ops and ends.
+    /// a word for the program port that keeps the program harmless, moves into the first outputs, no ops and ends
     fn instruction(random: &mut Random) -> u32 {
         match random.below(4) {
             0 => 0x21 << 26,
@@ -2125,8 +2046,7 @@ mod tests {
         }
     }
 
-    /// words for a run of registers in a shader unit's block from an
-    /// offset, harmless instructions where they land on the program port.
+    /// words for a run of registers in a shader unit's block from an offset, harmless instructions where they land on the program port
     fn block_words(random: &mut Random, offset: usize, count: usize, consecutive: bool) -> Vec<u32> {
         (0..count)
             .map(|i| {
@@ -2140,8 +2060,7 @@ mod tests {
             .collect()
     }
 
-    /// a command list of the shapes titles send, the ones that go in one
-    /// go and others, with immediate-mode vertices between them.
+    /// a command list of the shapes titles send, the ones that go in one go and others, w/ immediate mode vertices between them
     fn random_list(random: &mut Random) -> Vec<u32> {
         let mut list = Vec::new();
         for _ in 0..1 + random.below(24) {
@@ -2149,8 +2068,7 @@ mod tests {
             let block = if random.chance(70) { REG_VS_BLOCK } else { REG_GS_BLOCK };
             let consecutive = random.chance(40);
             match random.below(12) {
-                // state no draw here reads, alone, in bursts and in runs,
-                // some of them past the last register
+                // state no draw here reads, alone, in bursts and in runs, some of them past the last register
                 0 => {
                     let (start, end) = [(0x000, 0x03F), (0x200, 0x227), (0x2DE, 0x2FF)][random.below(3)];
                     let register = start + random.below(end - start + 1);
@@ -2159,8 +2077,7 @@ mod tests {
                     let words = random.words(count);
                     push_command(&mut list, register, mask, consecutive, &words);
                 }
-                // float uniforms, the index and then the data, which can
-                // run on past the data registers
+                // float uniforms, the index and then the data, it can run on past the data registers
                 1 => {
                     let index = random.next() & 0x8000_007F;
                     push_command(&mut list, block + SHADER_UNIFORM_INDEX, 0xF, false, &[index]);
@@ -2249,7 +2166,7 @@ mod tests {
                     let words = random.words(count);
                     push_command(&mut list, REG_VS_BLOCK - 2, mask, true, &words);
                 }
-                // a uniform upload with the data in single commands
+                // a uniform upload w/ the data in single commands
                 _ => {
                     push_command(&mut list, block + SHADER_UNIFORM_INDEX, 0xF, false, &[random.next() & 0x8000_007F]);
                     for _ in 0..random.below(9) {
@@ -2257,8 +2174,7 @@ mod tests {
                     }
                 }
             }
-            // vertices sent one attribute at a time, drawn before whatever
-            // comes next, a vertex left half sent now and then
+            // vertices sent one attribute at a time, drawn b4 whatever comes next, now and then a vertex left half sent
             if random.chance(30) {
                 let mut words = Vec::new();
                 for _ in 0..1 + random.below(6) {
@@ -2268,8 +2184,7 @@ mod tests {
                     words.extend(pack(color));
                 }
                 words.truncate(words.len() - if random.chance(20) { random.below(6) } else { 0 });
-                // without the index again they join the vertices before
-                // unless the command between drew those
+                // w/o the index again they join the vertices b4 unless the command between drew those
                 if random.chance(50) {
                     push_command(&mut list, REG_FIXED_ATTRIBUTE_INDEX, 0xF, false, &[0xF]);
                 }
@@ -2279,9 +2194,8 @@ mod tests {
         list
     }
 
-    /// lists of random commands of every shape, with immediate-mode
-    /// vertices between them, whole and cut short anywhere, give what
-    /// writing each word on its own gives.
+    /// lists of random commands of every shape w/ immediate mode vertices between them,
+    /// whole and cut short anywhere, give what writing each word on its own gives
     #[test]
     fn random_lists_run_as_single_writes() {
         let mut random = Random(2);
@@ -2295,8 +2209,7 @@ mod tests {
         }
     }
 
-    /// a list with every shape that goes in one go, cut after each word,
-    /// ends as it does a word at a time.
+    /// a list w/ every shape that goes in one go, cut after each word, ends like it does a word at a time
     #[test]
     fn a_list_cut_anywhere_runs_as_single_writes() {
         let mut list = Vec::new();
@@ -2318,14 +2231,12 @@ mod tests {
         }
     }
 
-    /// vertices sent in immediate mode are drawn before each shape of
-    /// command that goes in one go, not with the ones sent after it.
+    /// vertices sent in immediate mode get drawn b4 each shape of command that goes in one go, not w/ the ones sent after it
     #[test]
     fn every_shape_draws_the_vertices_waiting_first() {
         let mov = 0x13 << 26;
         let identity = 0xF | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
-        // register, mask, consecutive and the words of a command that
-        // leaves the drawing as it was
+        // register, mask, consecutive and the words of a command that leaves the drawing as it was
         let shapes: [(usize, u32, bool, &[u32]); 17] = [
             (0x0010, 0xF, false, &[1]),
             (0x0010, 0x0, false, &[1]),
@@ -2364,8 +2275,7 @@ mod tests {
         }
     }
 
-    /// a run of state ending at a jump, the way titles call their models,
-    /// takes the jump, and commands of every shape run on both sides of it.
+    /// a run of state ending at a jump (how titles call their models) takes the jump, and commands of every shape run on both sides of it
     #[test]
     fn a_run_of_state_ending_in_a_jump_takes_it() {
         const SUB: u32 = 0x2800;
@@ -2373,7 +2283,7 @@ mod tests {
         let mut sub = Vec::new();
         push_command(&mut sub, REG_VS_BLOCK + SHADER_UNIFORM_INDEX, 0xF, true, &[0x8000_0004, 1, 2, 3, 4]);
         push_command(&mut sub, 0x0030, 0xF, true, &[5, 6, 7]);
-        // jumps back through channel 1, a run of state on the way
+        // jumps back thru channel 1, a run of state on the way
         push_command(&mut sub, REG_CMDBUF_SIZE0, 0xF, true, &[0, 1, 0, RETURN >> 3, 0, 1]);
         push_command(&mut sub, 0x0031, 0xF, false, &[0xDEAD]);
         let mut back = Vec::new();
@@ -2402,7 +2312,7 @@ mod tests {
         assert_eq!(gpu.vertex_shader.float_uniforms[4].map(f32::to_bits), [4, 3, 2, 1]);
     }
 
-    /// the byte masks a command can carry, a set bit for each byte written.
+    /// the byte masks a command can carry, a set bit for each byte written
     #[test]
     fn byte_masks_cover_the_bytes_their_bits_name() {
         for (mask, bits) in BYTE_MASKS.iter().enumerate() {
@@ -2423,17 +2333,15 @@ mod tests {
             }
         }
         let mut gpu = Gpu::new();
-        // linear in and out, RGBA8, 2x2 downscale, the output's size counts
-        // input pixels
+        // linear in and out, RGBA8, 2x2 downscale, the output's size counts input pixels
         let flags = (1 << 1) | (1 << 5) | (2 << 24);
         gpu.display_transfer(&mut memory, 0x100, 0x180, 4 | (2 << 16), 4 | (2 << 16), flags);
         let red_at = |i: usize| ColorFormat::Rgba8.decode(&memory.0[0x180 + i * 4..0x184 + i * 4])[0];
         assert_eq!([red_at(0), red_at(1)], [50, 100]);
     }
 
-    /// a flipped transfer cropping its input's lines writes its output as
-    /// many bytes later as the cropped lines take but the last, the address
-    /// Tales of the Abyss gives is that far before its framebuffer.
+    /// a flipped transfer cropping its input's lines writes its output as many bytes later as the cropped lines
+    /// take except the last, the addr Tales of the Abyss gives is that far b4 its framebuffer
     #[test]
     fn a_flipped_cropped_transfer_starts_its_output_later() {
         let mut memory = FlatMemory(vec![0; 0x400]);

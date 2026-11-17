@@ -1,9 +1,9 @@
-//! arrays longer than serde takes, written as sequences.
+//! arrays longer than serde takes, written as sequences
 
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// an array of any length, its items one after another.
+/// an array of any length, its items one after another
 pub fn serialize<S: Serializer, T: Serialize, const N: usize>(array: &[T; N], serializer: S) -> Result<S::Ok, S::Error> {
     serializer.collect_seq(array.iter())
 }
@@ -14,8 +14,7 @@ pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>, const N: usiz
     items.try_into().map_err(|_| D::Error::invalid_length(length, &"as many items as the array has"))
 }
 
-/// arrays of arrays of arrays, the mixes of the DSP, their innermost items
-/// one after another.
+/// arrays of arrays of arrays (the DSP's mixes), their innermost items one after another
 pub mod nested {
     use super::*;
 

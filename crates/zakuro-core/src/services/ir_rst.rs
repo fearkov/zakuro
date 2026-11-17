@@ -1,5 +1,4 @@
-//! ir:rst, the New 3DS's ZL, ZR and C-stick, which a title reads from a block
-//! laid out like HID's pad section, updated as often as it asks.
+//! ir:rst, the New 3DS's ZL, ZR and C stick, a title reads them from a block laid out like HID's pad section, updated as often as it asks
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, ObjectId, SharedMemory};
@@ -8,35 +7,33 @@ use crate::kernel::thread::CPU_CLOCK_HZ;
 use crate::services::hid::{self, PadState};
 use crate::System;
 
-/// the block, a page, of which the layout takes 0x98 bytes.
+/// the block, a page, the layout takes 0x98 bytes of it
 const SHARED_MEMORY_SIZE: u32 = 0x1000;
-/// where the ring of entries starts, past the ticks and the index.
+/// where the ring of entries starts, past the ticks and the index
 const ENTRIES: u32 = 0x18;
 const ENTRY_COUNT: u32 = 8;
-/// how far the C-stick reports each way.
+/// how far the C stick reports each way
 const C_STICK_RANGE: f32 = 0x9C as f32;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct IrRstState {
-    /// the block and its physical address, and the event each update
-    /// signals, made when a title first asks, which may be before it
-    /// initializes.
+    /// the block and its physical addr, plus the event each update signals, made when a title first asks (maybe b4 it initializes)
     memory: Option<(ObjectId, u32)>,
     event: Option<ObjectId>,
-    /// ticks between updates, none while not initialized.
+    /// ticks between updates, none while not initialized
     period: Option<u64>,
     next_update: u64,
-    /// the entry the next update writes.
+    /// the entry the next update writes
     next: u32,
     previous: PadState,
-    /// the tick entry 0 was last written at, and the one before.
+    /// the tick entry 0 was last written at, and the one b4
     reset_ticks: (u64, u64),
 }
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     let command = header.command_id();
     match command {
-        // GetHandles -> the block and the update event
+        // GetHandles => the block and the update event
         0x0001 => {
             let (memory, event) = resources(system);
             let kernel = &mut system.kernel;
@@ -49,7 +46,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 4, event);
             true
         }
-        // Initialize(update period in ms, raw C-stick)
+        // Initialize(update period in ms, raw C stick)
         0x0002 => {
             let milliseconds = buffer.get(&mut system.memory, 1).max(1) as u64;
             resources(system);
@@ -67,8 +64,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // what the console reads of the C-stick's own chip, nothing
-        // titles act on
+        // what the console reads of the C stick's own chip, nothing titles act on
         0x0004..=0x0009 => {
             buffer.reply(&mut system.memory, command, &[0, 0]);
             true
@@ -77,7 +73,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// the block and the event, made the first time they are asked for.
+/// the block and the event, made the first time they're asked for
 fn resources(system: &mut System) -> (ObjectId, ObjectId) {
     if let (Some((memory, _)), Some(event)) = (system.services.ir_rst.memory, system.services.ir_rst.event) {
         return (memory, event);
@@ -106,8 +102,7 @@ fn resources(system: &mut System) -> (ObjectId, ObjectId) {
     (memory, event)
 }
 
-/// writes an entry when one is due, the buttons and the stick as the
-/// frontend last gave them.
+/// writes an entry when one is due, the buttons and stick as the frontend last gave them
 pub fn tick(system: &mut System) {
     let state = &system.services.ir_rst;
     let (Some(period), Some((_, base)), Some(event)) = (state.period, state.memory, state.event) else { return };
@@ -157,9 +152,8 @@ mod tests {
     use crate::services::tests::system_with_thread;
     use crate::services::{handle_request, Target};
 
-    /// once initialized, each period an entry goes in the block with ZL, ZR
-    /// and the C-stick's place and direction, and what changed since the
-    /// one before.
+    /// once initialized, each period an entry goes in the block w/ ZL, ZR and the C stick's place and direction,
+    /// plus what changed since the one b4
     #[test]
     fn the_c_stick_and_zl_and_zr_reach_the_block() {
         let (mut system, buffer) = system_with_thread();

@@ -1,4 +1,4 @@
-//! ldr:ro, the dynamic module loader.
+//! ldr:ro, the dynamic module loader
 
 use crate::cro::CroError;
 use crate::kernel::ipc::{CommandBuffer, Header};
@@ -16,14 +16,14 @@ mod command {
     pub const LOAD_CRO_NEW: u16 = 0x0009;
 }
 
-/// 0xD9012402, the module is not a valid CRO.
+/// 0xD9012402, the module isn't a valid CRO
 const ERROR_NOT_LOADED: u32 = 0xD901_2402;
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     use command::*;
     let id = header.command_id();
     match id {
-        // initialize(crs buffer, size, address, <process>)
+        // Initialize(crs buffer, size, addr, <process>)
         INITIALIZE => {
             let source = buffer.get(&mut system.memory, 1);
             let size = buffer.get(&mut system.memory, 2);
@@ -40,14 +40,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
 
-        // the certificate tables are a signature check we do not perform.
+        // the certificate tables are a signature check we don't do
         LOAD_CRR | UNLOAD_CRR => {
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
 
-        // LoadCRO(buffer, address, size, data segment, 0, data size,
-        //         bss segment, bss size, auto link, fix level, crr, <process>)
+        // LoadCRO(buffer, addr, size, data segment, 0, data size, bss segment, bss size, auto link, fix level, crr, <process>)
         LOAD_CRO | LOAD_CRO_NEW => {
             let source = buffer.get(&mut system.memory, 1);
             let address = buffer.get(&mut system.memory, 2);
@@ -110,7 +109,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
 
-        // a module is linked as it loads, so these have nothing left to do.
+        // a module gets linked as it loads, so these have nothing left to do
         LINK_CRO | UNLINK_CRO | SHUTDOWN => {
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -120,12 +119,10 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// gives a module memory of its own at the address the title wants to run
-/// it from, a copy of its buffer, and returns that address. ldr:ro takes the
-/// buffer's pages away from the title while the module is loaded, what the
-/// title writes to the buffer meanwhile, like a module's data it puts back
-/// on unloading, must not reach a module running from memory the title
-/// has since given to another.
+/// gives a module its own memory at the addr the title wants to run it from, a copy of its buffer, and returns that addr
+/// ldr:ro takes the buffer's pages away from the title while the module's loaded,
+/// so whatever the title writes to the buffer meanwhile (like a module's data it puts back on unloading) must not
+/// reach a module running from memory the title has since handed to another
 fn copy_in(system: &mut System, address: u32, source: u32, size: u32) -> u32 {
     use crate::memory::{MemoryRegion, MemoryState, Permission};
     if address == 0 || address == source {
@@ -143,9 +140,9 @@ fn copy_in(system: &mut System, address: u32, source: u32, size: u32) -> u32 {
     address
 }
 
-/// puts the module as ldr:ro left it into the title's buffer as well, the
-/// title copies the module's data, relocated, out of its buffer once
-/// LoadCRO returns, and on the console the two are the same memory then.
+/// puts the module as ldr:ro left it into the title's buffer too,
+/// the title copies the module's data (relocated) out of its buffer once LoadCRO returns,
+/// and on the console both are the same memory by then
 fn copy_back(system: &mut System, address: u32, size: u32) {
     let Some(copy) = system.cro.copies.get(&address).copied() else { return };
     let mut bytes = vec![0u8; size as usize];
@@ -153,8 +150,7 @@ fn copy_back(system: &mut System, address: u32, size: u32) {
     system.memory.write_bytes(copy.buffer, &bytes);
 }
 
-/// keeps what fixing left of a module and lets the rest of its memory go,
-/// the title maps the next module over it.
+/// keeps what fixing left of a module and lets the rest of its memory go, the title maps the next module over it
 fn shrink(system: &mut System, address: u32, fixed: u32) {
     use crate::memory::{MemoryState, Permission};
     let Some(copy) = system.cro.copies.get_mut(&address) else { return };
@@ -171,8 +167,7 @@ fn shrink(system: &mut System, address: u32, fixed: u32) {
     system.memory.phys.free(tail);
 }
 
-/// hands an unloaded module back to the title in its buffer, the part
-/// fixing left, as ldr:ro left it, and lets its memory go.
+/// hands an unloaded module back to the title in its buffer (the part fixing left, as ldr:ro left it) and lets its memory go
 fn copy_out(system: &mut System, address: u32) {
     let Some(copy) = system.cro.copies.remove(&address) else { return };
     let mut bytes = vec![0u8; copy.fixed.min(copy.block.size) as usize];
@@ -182,8 +177,7 @@ fn copy_out(system: &mut System, address: u32) {
     system.memory.phys.free(copy.block);
 }
 
-/// makes the module visible at the address the title wants to run it from,
-/// and returns that address.
+/// makes the module visible at the addr the title wants to run it from and returns that addr
 fn place(system: &mut System, address: u32, source: u32, size: u32) -> u32 {
     if address == 0 || address == source {
         return source;

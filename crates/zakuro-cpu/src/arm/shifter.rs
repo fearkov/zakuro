@@ -1,5 +1,4 @@
-//! the ARM barrel shifter, shared by data processing and register-offset
-//! addressing modes.
+//! the ARM barrel shifter, shared by data processing and register offset addressing
 
 use zakuro_common::bits::bits;
 
@@ -25,7 +24,7 @@ impl ShiftType {
     }
 }
 
-/// applies a shift whose amount came from an immediate field.
+/// applies a shift whose amount came from an immediate field
 #[inline(always)]
 pub fn shift_by_immediate(ty: ShiftType, value: u32, amount: u32, carry_in: bool) -> (u32, bool) {
     match ty {
@@ -37,7 +36,7 @@ pub fn shift_by_immediate(ty: ShiftType, value: u32, amount: u32, carry_in: bool
             }
         }
         ShiftType::Lsr => {
-            // LSR #0 encodes LSR #32.
+            // LSR #0 encodes LSR #32
             if amount == 0 {
                 (0, value >> 31 != 0)
             } else {
@@ -45,7 +44,7 @@ pub fn shift_by_immediate(ty: ShiftType, value: u32, amount: u32, carry_in: bool
             }
         }
         ShiftType::Asr => {
-            // ASR #0 encodes ASR #32.
+            // ASR #0 encodes ASR #32
             if amount == 0 {
                 let sign = (value as i32) >> 31;
                 (sign as u32, value >> 31 != 0)
@@ -57,7 +56,7 @@ pub fn shift_by_immediate(ty: ShiftType, value: u32, amount: u32, carry_in: bool
             }
         }
         ShiftType::Ror => {
-            // ROR #0 encodes RRX, a 33-bit rotate through the carry flag.
+            // ROR #0 encodes RRX, a 33 bit rotate thru the carry flag
             if amount == 0 {
                 let result = ((carry_in as u32) << 31) | (value >> 1);
                 (result, value & 1 != 0)
@@ -68,7 +67,7 @@ pub fn shift_by_immediate(ty: ShiftType, value: u32, amount: u32, carry_in: bool
     }
 }
 
-/// applies a shift whose amount came from the bottom byte of a register.
+/// applies a shift whose amount came from the bottom byte of a register
 #[inline(always)]
 pub fn shift_by_register(ty: ShiftType, value: u32, amount: u32, carry_in: bool) -> (u32, bool) {
     let amount = amount & 0xFF;
@@ -100,8 +99,7 @@ pub fn shift_by_register(ty: ShiftType, value: u32, amount: u32, carry_in: bool)
         ShiftType::Ror => {
             let rotate = amount & 31;
             if rotate == 0 {
-                // a multiple of 32, the value is unchanged but carry comes
-                // from the top bit.
+                // a multiple of 32, the value stays the same but carry comes from the top bit
                 (value, value >> 31 != 0)
             } else {
                 (value.rotate_right(rotate), (value >> (rotate - 1)) & 1 != 0)
@@ -110,14 +108,13 @@ pub fn shift_by_register(ty: ShiftType, value: u32, amount: u32, carry_in: bool)
     }
 }
 
-/// decodes the "shifter operand" of a data-processing instruction, returning
-/// the operand and the carry it produces.
+/// decodes the "shifter operand" of a data processing instruction, returns the operand and the carry it makes
 #[inline(always)]
 pub fn decode_operand(cpu: &Cpu, op: u32) -> (u32, bool) {
     let carry_in = cpu.cpsr.c;
 
     if op & (1 << 25) != 0 {
-        // immediate, an 8-bit value rotated right by twice a 4-bit field.
+        // immediate, an 8 bit value rotated right by twice a 4 bit field
         let imm = op & 0xFF;
         let rotate = bits(op, 8, 11) * 2;
         if rotate == 0 {
@@ -134,7 +131,7 @@ pub fn decode_operand(cpu: &Cpu, op: u32) -> (u32, bool) {
             let amount = bits(op, 7, 11);
             shift_by_immediate(ty, cpu.regs[rm], amount, carry_in)
         } else {
-            // register-specified shift.
+            // register shift
             let rs = bits(op, 8, 11) as usize;
             let value = if rm == PC {
                 cpu.regs[PC].wrapping_add(4)

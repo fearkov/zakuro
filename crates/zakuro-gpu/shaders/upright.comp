@@ -1,10 +1,9 @@
 #version 450
 
-// a scaled screen's picture turned upright for showing it. the surface has a
-// row per column of the screen, rows bottom first and each running up the
-// screen, the buffer gets the screen's rows top first, a packed rgba8 word
-// per pixel. built with TO_IMAGE it writes an image instead, rows top first,
-// which a presenter sharing the device draws straight from.
+// a scaled screen's picture turned upright for showing
+// the surface has a row per screen column, rows bottom first and each running up the screen,
+// the buffer gets the screen's rows top first, one packed rgba8 word per pixel
+// built w/ TO_IMAGE it writes an image instead, rows top first, a presenter sharing the device draws straight from it
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, rgba8) uniform readonly image2D source;

@@ -1,17 +1,15 @@
-//! 3DS result codes.
+//! 3DS result codes
 //!
-//! a result is a packed 32-bit value, with the level in bits 27-31, the
-//! summary in 21-26, the module in 10-17 and the description in 0-9.
+//! a result packs level in bits 27 to 31, summary in 21 to 26, module in 10 to 17 and description in 0 to 9
 //!
-//! Userland checks the sign bit for failure, but games also compare against
-//! exact values, so the individual fields have to be right.
+//! userland checks the sign bit for failure but games also compare exact values, so every field has to be right
 
 use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResultCode(pub u32);
 
-/// result of an HLE operation, either a value or a 3DS error code.
+/// an HLE op's result, a value or a 3DS error code
 pub type ResultValue<T> = Result<T, ResultCode>;
 
 pub const RESULT_SUCCESS: ResultCode = ResultCode(0);
@@ -212,12 +210,11 @@ impl fmt::Display for ResultCode {
     }
 }
 
-/// error codes the HLE kernel and services return often enough to be worth
-/// naming.
+/// error codes the HLE kernel and services return often enough to deserve names
 pub mod errors {
     use super::*;
 
-    // --- Kernel -----------------------------------------------------------
+    // kernel
     /// 0xD8E007F7
     pub const INVALID_HANDLE: ResultCode =
         ResultCode::new(Level::Permanent, Summary::InvalidArgument, Module::Kernel, 1015);
@@ -231,7 +228,7 @@ pub mod errors {
     pub const INVALID_ENUM_VALUE: ResultCode =
         ResultCode::new(Level::Permanent, Summary::InvalidArgument, Module::Kernel, 5);
 
-    // --- OS ---------------------------------------------------------------
+    // os
     /// 0xE0E01BF5
     pub const INVALID_ADDRESS: ResultCode =
         ResultCode::new(Level::Usage, Summary::InvalidArgument, Module::Os, 1013);
@@ -247,30 +244,30 @@ pub mod errors {
     /// 0xE0E01BFD
     pub const OUT_OF_RANGE: ResultCode =
         ResultCode::new(Level::Usage, Summary::InvalidArgument, Module::Os, 1021);
-    /// 0x09401BFE, svcWaitSynchronization timing out is *not* a failure.
+    /// 0x09401BFE, svcWaitSynchronization timing out is *not* a failure
     pub const TIMEOUT: ResultCode =
         ResultCode::new(Level::Info, Summary::StatusChanged, Module::Os, 1022);
-    /// 0xC920181A, the other end of a session went away.
+    /// 0xC920181A, the other end of a session went away
     pub const SESSION_CLOSED: ResultCode =
         ResultCode::new(Level::Status, Summary::Canceled, Module::Os, 26);
     /// 0xE0E0181E
     pub const PORT_NAME_TOO_LONG: ResultCode =
         ResultCode::new(Level::Usage, Summary::InvalidArgument, Module::Os, 30);
 
-    // --- FS ---------------------------------------------------------------
+    // fs
     /// 0xC8804478
     pub const FS_NOT_FOUND: ResultCode =
         ResultCode::new(Level::Status, Summary::NotFound, Module::Fs, 120);
     /// 0xC8804470
     pub const FS_FILE_NOT_FOUND: ResultCode =
         ResultCode::new(Level::Status, Summary::NotFound, Module::Fs, 112);
-    /// 0xC8804471, a directory on the way to the file is missing.
+    /// 0xC8804471, a dir on the way to the file is missing
     pub const FS_PATH_NOT_FOUND: ResultCode =
         ResultCode::new(Level::Status, Summary::NotFound, Module::Fs, 113);
-    /// 0xC8A04478, what opening extra data that was never created gives.
+    /// 0xC8A04478, what opening extra data that never got created gives
     pub const FS_NOT_FOUND_INVALID_STATE: ResultCode =
         ResultCode::new(Level::Status, Summary::InvalidState, Module::Fs, 120);
-    /// 0xC8A04554, a save archive that was never formatted.
+    /// 0xC8A04554, a save archive that was never formatted
     pub const FS_NOT_FORMATTED: ResultCode =
         ResultCode::new(Level::Status, Summary::InvalidState, Module::Fs, 340);
     /// 0xC82044B4
@@ -282,7 +279,7 @@ pub mod errors {
     /// 0xC92044F0
     pub const FS_DIRECTORY_NOT_EMPTY: ResultCode =
         ResultCode::new(Level::Status, Summary::Canceled, Module::Fs, 240);
-    /// 0xE0C04702, a file where a directory was expected, or the reverse.
+    /// 0xE0C04702, a file where a dir was expected or vice versa
     pub const FS_UNEXPECTED_FILE_OR_DIRECTORY: ResultCode =
         ResultCode::new(Level::Usage, Summary::NotSupported, Module::Fs, 770);
     /// 0xE0E046BE
@@ -298,20 +295,17 @@ pub mod errors {
     pub const FS_NOT_IMPLEMENTED: ResultCode =
         ResultCode::new(Level::Permanent, Summary::Internal, Module::Fs, 44);
 
-    // --- UDS --------------------------------------------------------------
-    /// 0xC9411002, what nwm::UDS answers on a console whose wireless is
-    /// switched off, and to anything sent to it before it was initialized.
+    // uds
+    /// 0xC9411002, what nwm::UDS answers when the console's wireless is off, and to anything sent b4 it got initialized
     pub const UDS_WIRELESS_OFF: ResultCode =
         ResultCode::new(Level::Status, Summary::StatusChanged, Module::Uds, 2);
 
-    /// generic "this HLE stub does not exist yet".
+    /// generic "this HLE stub doesn't exist yet"
     pub const UNIMPLEMENTED: ResultCode =
         ResultCode::new(Level::Permanent, Summary::NotSupported, Module::Common, 1023);
 
-    /// not a real hardware code either, but a deliberately chosen one, "this
-    /// online feature is unavailable" for the network-facing services we have
-    /// not implemented (frd:u, boss:U, http:C, ...). local wireless answers
-    /// with [UDS_WIRELESS_OFF] instead.
+    /// not a real hw code either, a hand picked "this online feature is unavailable"
+    /// for the network services we never did (frd:u, boss:U, http:C and co), local wireless answers [UDS_WIRELESS_OFF] instead
     pub const NOT_CONNECTED: ResultCode =
         ResultCode::new(Level::Status, Summary::NotFound, Module::Ac, 12);
 }
@@ -336,8 +330,7 @@ mod tests {
         assert!(!RESULT_SUCCESS.is_error());
     }
 
-    /// games compare against these literals, so a typo in the enum combination
-    /// would be a silent behavior change. Pin every one.
+    /// games compare against these literals, so a typo in the enum combo would be a silent behavior change, pin every one
     #[test]
     fn well_known_codes_match_hardware() {
         use errors::*;

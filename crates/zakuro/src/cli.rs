@@ -1,32 +1,30 @@
-//! command line parsing.
+//! command line parsing
 
 use zakuro_gpu::RendererKind;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// the game to start, none to open the library.
+    /// the game to start, none to open the library
     pub rom: Option<String>,
-    /// the settings' choice when not given.
+    /// the settings' choice when not given
     pub renderer: Option<RendererKind>,
-    /// window scale relative to the console's 400x480 combined screens, the
-    /// settings' when not given.
+    /// window scale relative to the console's 400x480 combined screens, the settings' when not given
     pub scale: Option<u32>,
-    /// run without a window for this many frames, then report.
+    /// run w/o a window for this many frames, then report
     pub headless: Option<u64>,
     pub profile: bool,
     pub new3ds: bool,
-    /// skip loading a ROM entirely and just paint both screens solid colors.
+    /// skip loading a ROM entirely and just paint both screens solid colors
     pub test_pattern: bool,
-    /// a library of recompiled code for the title, or a directory of them.
+    /// a library of recompiled code for the title, or a directory of them
     pub recompiled: Option<String>,
-    /// draw on the host GPU rather than in software, the settings' choice
-    /// when not given.
+    /// draw on the host GPU instead of in software, the settings' choice when not given
     pub hardware_rasterizer: Option<bool>,
-    /// where saves live, instead of the usual place.
+    /// where saves live, instead of the usual place
     pub data: Option<String>,
-    /// interpret everything, whatever recompiled code there is.
+    /// interpret everything, whatever recompiled code there is
     pub interpreter: bool,
-    /// play no sound.
+    /// play no sound (shh)
     pub mute: bool,
 }
 
@@ -131,7 +129,7 @@ pub fn parse() -> Result<Options, String> {
             "--mute" => options.mute = true,
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
-            // macOS hands an app it hasn't run before a process number
+            // macOS hands an app it hasn't run b4 a process number
             other if cfg!(target_os = "macos") && other.starts_with("-psn_") => {}
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}'"));

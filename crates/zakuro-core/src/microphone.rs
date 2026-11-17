@@ -1,25 +1,21 @@
-//! what the console's microphone hears, which the frontend gives: the
-//! host's microphone, a sound from a file, noise, or nothing.
+//! what the console's mic hears, the frontend picks, host mic, a sound file, noise or nothing
 
 use std::sync::Arc;
 
-/// where the microphone's sound comes from.
+/// where the mic's sound comes from
 pub trait Microphone: Send {
-    /// a title started or stopped sampling, a host's microphone may be open
-    /// only meanwhile.
+    /// a title started or stopped sampling, a host mic may only be open meanwhile
     fn sampling(&mut self, on: bool);
-    /// what was heard since the last call, out.len() samples at rate a
-    /// second, from -1 to 1, silence where nothing was.
+    /// what got heard since the last call, out.len() samples at rate per sec in ±1, silence where there was nothing
     fn read(&mut self, rate: f64, out: &mut [f32]);
 }
 
-/// a sound played over and over while a title samples, from its start each
-/// time sampling starts.
+/// a sound looped while a title samples, from its start each time sampling starts
 pub struct Recording {
     samples: Arc<[f32]>,
-    /// its samples a second.
+    /// its samples per sec
     rate: f64,
-    /// where in it the next sample is read, in its samples.
+    /// where the next sample gets read, in its samples
     position: f64,
 }
 
@@ -28,7 +24,7 @@ impl Recording {
         Recording { samples: samples.into(), rate, position: 0.0 }
     }
 
-    /// the sound of a WAV of 16-bit samples, its channels together.
+    /// a 16 bit WAV's sound w/ its channels mixed together
     pub fn from_wav(bytes: &[u8]) -> Option<Recording> {
         let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
         let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
@@ -94,9 +90,9 @@ impl Microphone for Recording {
     }
 }
 
-/// white noise, which is how blowing into a microphone sounds to a game.
+/// white noise, how blowing into a mic sounds to a game
 pub struct Noise {
-    /// how loud, from 0 to 1.
+    /// how loud, 0 to 1
     pub level: f32,
     seed: u32,
 }
@@ -106,9 +102,9 @@ impl Noise {
         Noise { level, seed: 1 }
     }
 
-    /// the next of its samples.
+    /// its next sample
     pub fn sample(&mut self) -> f32 {
-        // a linear congruential generator, the same noise every run
+        // an LCG, same noise every run
         self.seed = self.seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         ((self.seed >> 8) as f32 / (1 << 23) as f32 - 1.0) * self.level
     }
@@ -128,8 +124,7 @@ impl Microphone for Noise {
 mod tests {
     use super::*;
 
-    /// a WAV of two channels comes out as one, at its rate, and a recording
-    /// read at twice its rate falls between its samples.
+    /// a stereo WAV comes out mono at its rate, and reading at twice its rate lands between samples
     #[test]
     fn a_wav_reads_back_at_any_rate() {
         let mut wav = Vec::new();
@@ -157,7 +152,7 @@ mod tests {
         assert_eq!(out, [0.5, 0.125, -0.25, 0.125]);
     }
 
-    /// noise stays within its level and is not silence.
+    /// noise stays within its level and isn't silence
     #[test]
     fn noise_is_as_loud_as_asked() {
         let mut noise = Noise::new(0.5);

@@ -1,4 +1,4 @@
-//! arithmetic primitives shared by the ARM and Thumb decoders.
+//! arithmetic bits shared by the ARM and Thumb decoders
 
 #[inline(always)]
 pub fn add_with_flags(a: u32, b: u32) -> (u32, bool, bool) {
@@ -16,7 +16,7 @@ pub fn adc_with_flags(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
     (result, carry, overflow)
 }
 
-/// ARM subtraction, the carry flag means "no borrow".
+/// ARM subtraction, the carry flag means "no borrow"
 #[inline(always)]
 pub fn sub_with_flags(a: u32, b: u32) -> (u32, bool, bool) {
     let result = a.wrapping_sub(b);
@@ -35,7 +35,7 @@ pub fn sbc_with_flags(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
     (result, carry, overflow)
 }
 
-/// signed saturation to 32 bits, used by QADD and friends.
+/// signed saturation to 32 bits, for QADD and friends
 #[inline(always)]
 pub fn saturate_i32(value: i64) -> (u32, bool) {
     if value > i32::MAX as i64 {
@@ -47,7 +47,7 @@ pub fn saturate_i32(value: i64) -> (u32, bool) {
     }
 }
 
-/// signed saturation to bits bits (SSAT).
+/// signed saturation to bits bits (SSAT)
 #[inline(always)]
 pub fn signed_saturate(value: i64, bits: u32) -> (u32, bool) {
     let max = (1i64 << (bits - 1)) - 1;
@@ -61,7 +61,7 @@ pub fn signed_saturate(value: i64, bits: u32) -> (u32, bool) {
     }
 }
 
-/// unsigned saturation to bits bits (USAT).
+/// unsigned saturation to bits bits (USAT)
 #[inline(always)]
 pub fn unsigned_saturate(value: i64, bits: u32) -> (u32, bool) {
     let max = if bits >= 32 {

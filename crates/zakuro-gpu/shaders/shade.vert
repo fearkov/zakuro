@@ -1,17 +1,16 @@
 #version 450
 
-// the PICA200's vertex shader, run on the GPU. each vertex interprets the
-// title's program the way the CPU's shader interpreter does, then hands the
-// fragment stages what the rasterizer would have, clipping and perspective
-// left to the GPU. the PICA clips z to -w..0, which the position turns
-// into Vulkan's 0..w.
+// the PICA200's vertex shader, run on the GPU
+// each vertex interprets the title's program like the CPU's shader interpreter does,
+// then hands the fragment stages what the rasterizer would have, clipping and perspective left to the GPU
+// the PICA clips z to -w..0, the position turns that into Vulkan's 0..w
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
 layout(location = 2) out vec2 out_texcoord2;
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
-// the view vector, and in w texture coordinate set 0's w
+// the view vector, and in w texture coord set 0's w
 layout(location = 5) out vec4 out_view;
 
 layout(std430, set = 0, binding = 5) readonly buffer Program {
@@ -26,18 +25,17 @@ layout(std430, set = 0, binding = 6) readonly buffer Shading {
     uint bools;
     uint entry;
     uint pad[2];
-    // per semantic component, the output register times four plus the
-    // component, or none, position xyzw, color rgba, texture coordinates
-    // 0, 1 and 2 uv, quaternion xyzw and view xyz
+    // per semantic component, the output register times four plus the component, or none
+    // position xyzw, color rgba, texture coords 0, 1 and 2 uv, quaternion xyzw and view xyz
     uint semantics[24];
     // x, the depth map's scale, y, its offset
     vec4 depth_map;
     // left, bottom, width and height
     vec4 viewport;
-    // per input register, the byte its attribute starts at in the first
-    // vertex, the bytes from a vertex to the next, and the attribute's
-    // offset in its vertex | type << 8 | components << 16, no components
-    // reading the default alone
+    // per input register, the byte its attribute starts at in the first vertex,
+    // the bytes from one vertex to the next,
+    // and the attribute's offset in its vertex | type << 8 | components << 16,
+    // no components reading the default alone
     uvec4 attributes[16];
     // what each register reads where its attribute gives no component
     vec4 defaults[16];
@@ -67,13 +65,13 @@ uint block_start[BLOCKS];
 bool block_loop[BLOCKS];
 int blocks = 0;
 
-// zero rather than NaN for zero times infinity
+// zero instead of NaN for zero times infinity
 float multiply(float a, float b) {
     float product = a * b;
     return isnan(product) && !isnan(a) && !isnan(b) ? 0.0 : product;
 }
 
-// a float as Rust casts it, saturating, NaN being zero
+// a float like Rust casts it, saturating, NaN is zero
 int to_int(float value) {
     return isnan(value) ? 0 : int(clamp(value, -2147483648.0, 2147483520.0));
 }
@@ -95,8 +93,7 @@ uint byte_at(uint at) {
     return (vertex_bytes[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu;
 }
 
-// the little-endian word from a byte of the arrays on, which can run into
-// the word after
+// the little endian word from a byte of the arrays on, it can run into the word after
 uint word_at(uint at) {
     uint shift = (at & 3u) * 8u;
     uint low = vertex_bytes[at >> 2u];
@@ -106,8 +103,7 @@ uint word_at(uint at) {
     return (low >> shift) | (vertex_bytes[(at >> 2u) + 1u] << (32u - shift));
 }
 
-// a component of a type, a signed byte, a byte, a signed short or a
-// float, whose bits come as they are
+// a component of a type (a signed byte, a byte, a signed short or a float, whose bits come as is)
 float component(uint at, uint type) {
     if (type == 0u) {
         float value = float(byte_at(at));
@@ -148,8 +144,7 @@ vec4 input_register(uint r) {
     return value;
 }
 
-// a register's value, the wide ones reaching the uniforms, offset by an
-// address register when index says so
+// a register's value, the wide ones reaching the uniforms, offset by an addr register when index says so
 vec4 source(uint register, uint index) {
     if (register < 0x10u) {
         return inputs[register];
@@ -164,7 +159,7 @@ vec4 source(uint register, uint index) {
     return uniform_index >= 0 && uniform_index < 96 ? floats[uniform_index] : vec4(0.0);
 }
 
-// a source with its descriptor's swizzle and negation
+// a source w/ its descriptor's swizzle and negation
 vec4 operand(uint descriptor, uint which, uint register, uint index) {
     uint shift = which == 1u ? 5u : (which == 2u ? 14u : 23u);
     uint pattern = (descriptor >> shift) & 0xFFu;
@@ -179,7 +174,7 @@ vec4 operand(uint descriptor, uint which, uint register, uint index) {
 }
 
 void write_masked(uint register, uint mask, vec4 value) {
-    // the mask's most significant bit selects x
+    // the mask's most significant bit picks x
     for (uint component = 0u; component < 4u; component++) {
         if ((mask & (8u >> component)) == 0u) {
             continue;
@@ -275,8 +270,7 @@ void arithmetic(uint word, uint opcode) {
     case 0x0Au:
     case 0x1Bu: result = vec4(lessThan(a, b)); break;
     case 0x0Bu: result = floor(a); break;
-    // written so NaN behaves as on hardware, max(0, NaN) is NaN but
-    // max(NaN, 0) is 0
+    // written so NaN acts like on hardware, max(0, NaN) is NaN but max(NaN, 0) is 0
     case 0x0Cu:
         result = vec4(a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y, a.z > b.z ? a.z : b.z, a.w > b.w ? a.w : b.w);
         break;
@@ -319,10 +313,9 @@ void multiply_add(uint word, uint opcode) {
 
 void run() {
     uint pc = entry;
-    // a program that never ends is a decoding bug, cap it rather than hang
+    // a program that never ends is a decoding bug, cap it instead of hanging
     for (uint budget = 0u; budget < 0x10000u; budget++) {
-        // finishing a block, go round a loop again, or return to whatever
-        // follows it, several blocks can end at the same address
+        // finishing a block, go round a loop again or return to whatever follows it, several blocks can end at the same addr
         while (blocks > 0 && pc == block_end[blocks - 1]) {
             int top = blocks - 1;
             address.z += block_increment[top];
@@ -385,7 +378,7 @@ void run() {
                 }
             }
         } else if (opcode == 0x21u || opcode == 0x2Au || opcode == 0x2Bu) {
-            // nop, and the geometry shader's emits, which a vertex has none of
+            // nop, and the geometry shader's emits, a vertex has none of those
         } else {
             arithmetic(word, opcode);
         }
@@ -393,8 +386,7 @@ void run() {
     }
 }
 
-// a semantic component's value, the default for one no register carries,
-// zero for one past the registers the output mask enables
+// a semantic component's value, the default for one no register carries, zero for one past the registers the output mask turns on
 float semantic(uint which, float missing) {
     uint slot = semantics[which];
     if (slot == NONE) {
@@ -417,15 +409,13 @@ void main() {
     run();
 
     vec4 position = vec4(semantic(0u, 0.0), semantic(1u, 0.0), semantic(2u, 0.0), semantic(3u, 0.0));
-    // the PICA places vertices on a sixteenth of a pixel, halves to even
-    // the way translated programs place them too
+    // the PICA places vertices on a 16th of a pixel, halves to even, like translated programs place them too
     if (position.w > 1e-5) {
         vec2 window = viewport.xy + (position.xy / position.w * 0.5 + 0.5) * viewport.zw;
         window = roundEven(window * 16.0) / 16.0;
         position.xy = ((window - viewport.xy) / viewport.zw * 2.0 - 1.0) * position.w;
     }
-    // z on an end of the range the PICA draws when it misses one only by
-    // rounding, as clip_triangle has it
+    // z on an end of the range the PICA draws when it only misses one by rounding, like clip_triangle has it
     float z_over_w = position.z / position.w;
     if (z_over_w > 0.0 && z_over_w < 1e-8) {
         position.z = 0.0;

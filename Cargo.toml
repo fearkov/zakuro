@@ -37,15 +37,14 @@ parking_lot = "0.12"
 opt-level = 1
 debug = true
 
-# The emulator is unusably slow in a plain debug build; give the hot crates -O2
-# even in dev profile.
+# a plain debug build is unusably slow, so the hot crates get O2 even in dev
 [profile.dev.package.zakuro-cpu]
 opt-level = 3
 [profile.dev.package.zakuro-gpu]
 opt-level = 3
 [profile.dev.package.zakuro-core]
 opt-level = 2
-# translated vertex shaders compile through it as games run
+# translated vertex shaders compile thru it while games run
 [profile.dev.package.naga]
 opt-level = 3
 

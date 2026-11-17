@@ -1,11 +1,11 @@
-//! dsp::DSP, the audio DSP.
+//! dsp::DSP, the audio DSP
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::ObjectId;
 use crate::kernel::sync::ResetType;
 use crate::System;
 
-/// command ids from the DSP service table.
+/// command ids from the DSP service table
 mod command {
     pub const RECV_DATA: u16 = 0x0001;
     pub const RECV_DATA_IS_READY: u16 = 0x0002;
@@ -35,19 +35,19 @@ mod command {
     pub const GET_IS_DSP_OCCUPIED: u16 = 0x0021;
 }
 
-/// the pipe a title uses to drive the audio firmware.
+/// the pipe a title drives the audio firmware thru
 const PIPE_AUDIO: u32 = 2;
-/// the pipe its AAC decoder takes requests on.
+/// the pipe its AAC decoder takes requests on
 const PIPE_BINARY: u32 = 3;
 const PIPE_COUNT: usize = 8;
 
-/// what the title writes to the audio pipe to change the firmware's state.
+/// what the title writes to the audio pipe to change the firmware's state
 const STATE_INITIALIZE: u8 = 0;
 const STATE_SHUTDOWN: u8 = 1;
 const STATE_WAKEUP: u8 = 2;
 const STATE_SLEEP: u8 = 3;
 
-/// addresses in DSP data memory of the structures the firmware exposes.
+/// addrs in DSP data memory of the structs the firmware exposes
 mod layout {
     pub const FRAME_COUNTER: u16 = 0xBFFF;
     pub const SOURCE_CONFIGURATIONS: u16 = 0x9E92;
@@ -70,26 +70,25 @@ mod layout {
 pub struct DspState {
     pub component_loaded: bool,
     pub running: bool,
-    /// the event the firmware signals, which the service keeps however many
-    /// handles to it the title opens and closes.
+    /// the event the firmware signals, the service keeps it no matter how many handles to it the title opens and closes
     pub semaphore_event_object: Option<ObjectId>,
-    /// events registered for the three DSP interrupts.
+    /// events registered for the three DSP interrupts
     pub interrupt_events: Vec<ObjectId>,
     pub semaphore_mask: u32,
-    /// what GetSemaphore reports.
+    /// what GetSemaphore reports
     pub semaphore_value: u32,
-    /// data waiting to be read out of each pipe.
+    /// data waiting to be read out of each pipe
     pipes: [Vec<u8>; PIPE_COUNT],
-    /// the 24 voices the audio firmware plays.
+    /// the 24 voices the audio firmware plays
     voices: super::dsp_voices::Voices,
     mixer: super::dsp_mixer::Mixer,
-    /// what came out of the speakers since the frontend last took it.
+    /// what came out of the speakers since the frontend last took it
     #[serde(skip)]
     pub output: Vec<[i16; 2]>,
     pub(crate) aac: super::dsp_aac::Aac,
 }
 
-/// the most output kept for a frontend that is not taking it, a second.
+/// the most output kept for a frontend that isn't taking it, about a second's worth
 const MAX_OUTPUT: usize = 32_768;
 
 impl DspState {
@@ -99,8 +98,7 @@ impl DspState {
         }
     }
 
-    /// queues the reply the real firmware sends after initialization, the
-    /// count of structures it exposes, then where each one lives.
+    /// queues the reply real firmware sends after init, how many structs it exposes, then where each one lives
     fn write_struct_addresses(&mut self) {
         const ADDRESSES: [u16; 15] = [
             layout::FRAME_COUNTER,
@@ -145,7 +143,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     use command::*;
     let id = header.command_id();
     match id {
-        // RecvData(register) -> the DSP's reply.
+        // RecvData(register) => the DSP's reply
         RECV_DATA => {
             let value = if system.services.dsp.running { 0 } else { 1 };
             buffer.reply(&mut system.memory, id, &[value]);
@@ -171,8 +169,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[0]);
             true
         }
-        // ConvertProcessAddressFromDspDram(address) -> the same address in the
-        // caller's space. DSP memory is mapped one to one for us.
+        // ConvertProcessAddressFromDspDram(addr) => the same addr in the caller's space, DSP memory is mapped one to one for us
         CONVERT_PROCESS_ADDRESS_FROM_DSP_DRAM => {
             let address = buffer.get(&mut system.memory, 1);
             let converted =
@@ -229,7 +226,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         LOAD_COMPONENT => {
             system.services.dsp.component_loaded = true;
             log::info!("dsp: the title uploaded a firmware component; using the HLE audio path");
-            // the second word says whether the component was accepted.
+            // the second word says if the component got accepted
             buffer.set(&mut system.memory, 0, Header::new(id, 2, 2).0);
             buffer.set(&mut system.memory, 1, 0);
             buffer.set(&mut system.memory, 2, 1);
@@ -250,7 +247,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // RegisterInterruptEvents(interrupt, channel, event handle)
         REGISTER_INTERRUPT_EVENTS => {
             let handle = buffer.get(&mut system.memory, 4);
-            // kept until the title is done, whatever it does with its handle
+            // kept till the title's done, whatever it does w/ its handle
             if let Some(object) = system.kernel.resolve(handle) {
                 if !system.services.dsp.interrupt_events.contains(&object) {
                     system.kernel.objects.add_ref(object);
@@ -260,10 +257,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // GetSemaphoreEventHandle -> the event the audio thread waits on, in
-        // a handle of the title's own each time, as a handle copied over is.
-        // a title that closed its handle when it let the DSP go asks again
-        // after loading it anew, and the old number is gone by then
+        // GetSemaphoreEventHandle => the event the audio thread waits on,
+        // in a fresh handle of the title's own each time like a copied handle is
+        // a title that closed its handle when it let the DSP go asks again after loading it anew, and the old number is gone by then
         GET_SEMAPHORE_EVENT_HANDLE => {
             let handle = match system.services.dsp.semaphore_event_object {
                 Some(object) => system.kernel.handles.duplicate_object(&mut system.kernel.objects, object, "DSP:semaphore"),
@@ -287,7 +283,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // no headphones are plugged into an emulator.
+        // no headphones plugged into an emulator lol
         GET_HEADPHONE_STATUS => {
             buffer.reply(&mut system.memory, id, &[0]);
             true
@@ -304,9 +300,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// handles a write to a pipe.
 fn write_pipe(system: &mut System, channel: u32, data: &[u8]) {
-    // a request for the AAC decoder, answered at once
+    // a request for the AAC decoder, answered right away
     if channel == PIPE_BINARY && !data.is_empty() {
         let answer = super::dsp_aac::answer(system, data);
         system.services.dsp.pipes[PIPE_BINARY as usize] = answer.to_vec();
@@ -332,18 +327,17 @@ fn write_pipe(system: &mut System, channel: u32, data: &[u8]) {
         STATE_SLEEP => system.services.dsp.running = false,
         other => log::debug!("dsp: unknown audio pipe state change {other}"),
     }
-    // the firmware answers every state change by signalling the semaphore.
+    // the firmware answers every state change by signaling the semaphore
     signal_semaphore(system);
 }
 
-/// converts a DSP data-memory address into the address the ARM side sees.
+/// DSP data memory addr => the addr the ARM side sees
 fn dsp_dram_to_arm(address: u16) -> u32 {
     zakuro_common::memory_map::DSP_RAM_VADDR + ((address as u32) << 1) + 0x40000
 }
 
-/// runs one audio frame of the firmware, plays the voices through their
-/// buffers and publishes their statuses, which is how a title's sound
-/// library knows its audio is moving, then mixes what they played.
+/// runs one audio frame of the firmware, plays the voices thru their buffers and publishes their statuses (that's
+/// how a title's sound library knows its audio is moving), then mixes what they played
 pub fn advance(system: &mut System) {
     if !system.services.dsp.running {
         return;
@@ -370,12 +364,10 @@ pub fn advance(system: &mut System) {
     }
 }
 
-/// signals the DSP's interrupt events, as the firmware does at the end of
-/// every audio frame.
+/// signals the DSP's interrupt events, like the firmware does at the end of every audio frame
 pub fn signal_semaphore(system: &mut System) {
-    // real firmware always reports the requested mask back as "satisfied" when
-    // it signals the event, a driver that reads 0 here after waking up sees a
-    // spurious wakeup and goes straight back to sleep.
+    // real firmware always reports the requested mask back as satisfied when it signals the event
+    // a driver that reads 0 here after waking up sees a spurious wakeup and goes right back to sleep
     system.services.dsp.semaphore_value = system.services.dsp.semaphore_mask;
 
     if let Some(object) = system.services.dsp.semaphore_event_object {
@@ -394,7 +386,7 @@ mod tests {
     use crate::kernel::ipc::Header;
     use crate::{Config, System};
 
-    /// the command ids are pinned by the exact headers a title sends.
+    /// the command ids are pinned by the exact headers a title sends
     #[test]
     fn command_ids_match_the_headers_titles_send() {
         assert_eq!(Header::new(LOAD_COMPONENT, 3, 2).0, 0x0011_00C2);
@@ -404,10 +396,8 @@ mod tests {
         assert_eq!(Header::new(READ_PIPE_IF_POSSIBLE, 3, 2).0, 0x0010_00C2);
     }
 
-    /// real firmware reports the mask a driver registered with
-    /// SetSemaphoreMask back as satisfied whenever it fires the semaphore
-    /// event, and a driver that reads back 0 here treats the wakeup as
-    /// spurious.
+    /// real firmware reports the mask a driver registered w/ SetSemaphoreMask back as satisfied whenever it fires
+    /// the semaphore event, a driver reading back 0 treats the wakeup as spurious
     #[test]
     fn signalling_the_semaphore_reports_the_registered_mask() {
         let mut system = System::new(Config::default());
@@ -426,9 +416,8 @@ mod tests {
         buffer.get(&mut system.memory, 3)
     }
 
-    /// a title that closed its semaphore handle when it let the DSP go, and
-    /// asks for it again once it loaded the DSP anew, gets a handle of its
-    /// own to the same event, not the number it closed.
+    /// a title that closed its semaphore handle when it let the DSP go and asks again after loading it anew gets a
+    /// fresh handle to the same event, not the number it closed
     #[test]
     fn a_closed_semaphore_handle_is_not_given_back() {
         let (mut system, buffer) = crate::services::tests::system_with_thread();

@@ -1,4 +1,4 @@
-//! OpenGL presentation backend.
+//! OpenGL presentation backend
 
 use std::collections::HashMap;
 
@@ -24,10 +24,8 @@ void main() {
 }
 "#;
 
-// a screen bigger than the window shows it is averaged over every texel a
-// pixel covers, the way the Vulkan presenter does it. shown samples one of
-// the pictures, the shaders put together from it draw one screen, or the
-// top screen's two pictures in one for 3D.
+// a screen bigger than the window shows it gets averaged over every texel a pixel covers, like the Vulkan presenter does
+// shown samples one of the pictures, the shaders built from it draw one screen, or the top screen's two pictures in one for 3D
 const SAMPLE: &str = r#"#version 330 core
 in vec2 uv;
 out vec4 color;
@@ -69,8 +67,7 @@ void main() {
 }
 "#;
 
-// as the Vulkan presenter's shader does it, with rows counted from the top
-// of the window, which OpenGL counts from the bottom.
+// like the Vulkan presenter's shader does, w/ rows counted from the top of the window, OpenGL counts them from the bottom (ofc it does)
 const STEREO_MAIN: &str = r#"
 uniform sampler2D right_eye;
 // 1 red and cyan, 2 alternate rows, whether the eyes swap, and the
@@ -121,7 +118,7 @@ void main() {
 }
 "#;
 
-/// what draws the overlay.
+/// what draws the overlay
 struct GlOverlay {
     program: glow::Program,
     vertex_array: glow::VertexArray,
@@ -133,15 +130,13 @@ struct GlOverlay {
 pub struct GlPresenter {
     gl: glow::Context,
     program: glow::Program,
-    /// what draws the top screen's two pictures in one, for 3D.
+    /// what draws the top screen's two pictures in one, for 3D
     stereo_program: glow::Program,
     vertex_array: glow::VertexArray,
     overlay: GlOverlay,
-    /// index 0 is the top screen, 1 the bottom, 2 the top one's picture
-    /// for the right eye.
+    /// index 0 is the top screen, 1 the bottom, 2 the top one's picture for the right eye
     textures: [glow::Texture; 3],
-    /// dimensions each texture was last allocated at, so uploads can use
-    /// tex_sub_image_2d when nothing changed.
+    /// the size each texture was last allocated at, so uploads can use tex_sub_image_2d when nothing changed
     sizes: [(u32, u32); 3],
     window: (u32, u32),
     arrangement: ScreenLayout,
@@ -153,12 +148,11 @@ pub struct GlPresenter {
 }
 
 impl GlPresenter {
-    /// loader resolves OpenGL function names, as the windowing library
-    /// provides.
+    /// loader resolves OpenGL function names, like the windowing library provides
     ///
     /// # Safety
     ///
-    /// A current OpenGL 3.3 context must be bound on this thread.
+    /// a current OpenGL 3.3 context must be bound on this thread
     pub unsafe fn new(
         loader: impl FnMut(&str) -> *const std::ffi::c_void,
         window: (u32, u32),
@@ -179,8 +173,7 @@ impl GlPresenter {
             let texture = unsafe { gl.create_texture() }.map_err(PresentError::Backend)?;
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                // linear, the screens come drawn at up to four times the
-                // console's resolution and get shrunk as often as grown
+                // linear, the screens come drawn at up to 4x the console's res and get shrunk as often as grown
                 gl.tex_parameter_i32(
                     glow::TEXTURE_2D,
                     glow::TEXTURE_MIN_FILTER,
@@ -257,7 +250,7 @@ impl GlPresenter {
         }
     }
 
-    /// the program, and the uniforms the two programs share.
+    /// the program, plus the uniforms both programs share
     fn use_program(&self, program: glow::Program) {
         let gl = &self.gl;
         unsafe {
@@ -275,7 +268,7 @@ impl GlPresenter {
     }
 
     fn set_viewport(&self, viewport: Viewport) {
-        // OpenGL's origin is the bottom left, so the y coordinate flips.
+        // OpenGL's origin is the bottom left, so y flips
         let y = self.window.1 as f32 - viewport.y - viewport.height;
         unsafe { self.gl.viewport(viewport.x as i32, y as i32, viewport.width as i32, viewport.height as i32) };
     }
@@ -291,7 +284,7 @@ impl GlPresenter {
         }
     }
 
-    /// the top screen's two pictures in one, as the stereo mode mixes them.
+    /// the top screen's two pictures in one, like the stereo mode mixes them
     fn draw_both(&self, viewport: Viewport) {
         let gl = &self.gl;
         let program = self.stereo_program;
@@ -415,7 +408,7 @@ impl Drop for GlPresenter {
 impl GlOverlay {
     /// # Safety
     ///
-    /// the context has to be current.
+    /// the context has to be current
     unsafe fn new(gl: &glow::Context) -> Result<GlOverlay, PresentError> {
         unsafe {
             let program = link_program(gl, OVERLAY_VERTEX_SHADER, OVERLAY_FRAGMENT_SHADER)?;
@@ -439,7 +432,7 @@ impl GlOverlay {
 
     /// # Safety
     ///
-    /// the context has to be current.
+    /// the context has to be current
     unsafe fn draw(&mut self, gl: &glow::Context, overlay: &Overlay, window: (u32, u32)) {
         unsafe {
             for texture in &overlay.textures {

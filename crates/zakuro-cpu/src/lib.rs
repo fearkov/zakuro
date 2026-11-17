@@ -1,4 +1,4 @@
-//! ARM11 MPCore (ARMv6K) CPU emulation.
+//! ARM11 MPCore (ARMv6K) CPU emulation
 
 pub mod arm;
 pub mod cp15;
@@ -10,7 +10,7 @@ pub use cp15::Cp15;
 pub use psr::{check_condition, Mode, Psr};
 pub use vfp::Vfp;
 
-/// everything the CPU can reach outside itself.
+/// everything the CPU can reach outside itself
 pub trait Bus {
     fn read8(&mut self, addr: u32) -> u8;
     fn read16(&mut self, addr: u32) -> u16;
@@ -20,7 +20,7 @@ pub trait Bus {
     fn write16(&mut self, addr: u32, value: u16);
     fn write32(&mut self, addr: u32, value: u32);
 
-    /// instruction fetch.
+    /// instruction fetch
     #[inline(always)]
     fn fetch32(&mut self, addr: u32) -> u32 {
         self.read32(addr)
@@ -32,18 +32,18 @@ pub trait Bus {
     }
 }
 
-/// why [Cpu::run] returned.
+/// why [Cpu::run] returned
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
-    /// the cycle budget ran out. Nothing special happened.
+    /// the cycle budget ran out, nothing special happened
     Timeout,
-    /// an svc #imm was executed.
+    /// an svc #imm was executed
     Supervisor(u32),
-    /// an instruction the CPU does not implement.
+    /// an instruction the CPU doesn't implement
     Undefined { pc: u32, opcode: u32 },
-    /// bkpt executed.
+    /// bkpt executed
     Breakpoint { pc: u32, imm: u32 },
-    /// [Cpu::halt] was called from inside an instruction handler.
+    /// [Cpu::halt] was called from inside an instruction handler
     Halted,
 }
 
@@ -51,33 +51,32 @@ pub const PC: usize = 15;
 pub const LR: usize = 14;
 pub const SP: usize = 13;
 
-/// all of it kept in a saved state.
+/// all of it kept in a save state
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
-    /// r0-r15 for the current mode.
+    /// r0 to r15 for the current mode
     pub regs: [u32; 16],
     pub cpsr: Psr,
     pub spsr: Psr,
 
-    /// banked r13/r14 for the privileged modes, plus the FIQ r8-r12 bank.
+    /// banked r13/r14 for the privileged modes, plus the FIQ r8 to r12 bank
     banked_sp_lr: [[u32; 2]; 6],
     banked_spsr: [Psr; 6],
     fiq_r8_r12: [u32; 5],
-    /// user-mode r8-r12, parked here while the core is in FIQ mode.
+    /// user mode r8 to r12, parked here while the core's in FIQ mode
     user_r8_r12: [u32; 5],
 
     pub vfp: Vfp,
     pub cp15: Cp15,
 
-    /// address reserved by LDREX, or None.
+    /// addr reserved by LDREX, or None
     pub exclusive_addr: Option<u32>,
 
-    /// set by a handler when it writes r15, so the fetch loop knows not to
-    /// advance the PC itself.
+    /// set by a handler when it writes r15, so the fetch loop knows not to advance the PC itself
     branched: bool,
     halted: bool,
 
-    /// free-running instruction counter, used for scheduling.
+    /// free running instruction counter, used for scheduling
     pub cycles: u64,
 }
 
@@ -87,9 +86,8 @@ impl Default for Cpu {
     }
 }
 
-/// what running code can see of the core: every register in every bank,
-/// the flags, VFP and the exclusive monitor, without the cycle count, to
-/// tell whether running some code left it as it was.
+/// what running code can see of the core, every register in every bank, the flags, VFP and the exclusive monitor,
+/// w/o the cycle count, to tell if running some code left it as it was
 #[derive(Clone, PartialEq, Eq)]
 pub struct Snapshot {
     regs: [u32; 16],
@@ -121,7 +119,7 @@ impl Cpu {
         }
     }
 
-    /// the core as running code sees it, see Snapshot.
+    /// the core as running code sees it, see Snapshot
     pub fn snapshot(&self) -> Snapshot {
         let [b0, b1, b2, b3, b4, b5] = self.banked_spsr;
         let mut vfp = [0u32; 34];
@@ -140,15 +138,14 @@ impl Cpu {
         }
     }
 
-    // -- register access ----------------------------------------------------
+    // register access
 
     #[inline(always)]
     pub fn reg(&self, index: usize) -> u32 {
         self.regs[index]
     }
 
-    /// writes a register, routing r15 through the branch path so every
-    /// instruction that can write the PC gets correct behavior for free.
+    /// writes a register, routing r15 thru the branch path so every instruction that can write the PC gets it right for free
     #[inline(always)]
     pub fn set_reg(&mut self, index: usize, value: u32) {
         if index == PC {
@@ -158,14 +155,14 @@ impl Cpu {
         }
     }
 
-    /// branch to addr, keeping the current instruction set.
+    /// branch to addr, keeping the current instruction set
     #[inline(always)]
     pub fn branch(&mut self, addr: u32) {
         self.regs[PC] = if self.cpsr.thumb { addr & !1 } else { addr & !3 };
         self.branched = true;
     }
 
-    /// interworking branch, bit 0 of addr selects Thumb.
+    /// interworking branch, bit 0 of addr picks Thumb
     #[inline(always)]
     pub fn branch_exchange(&mut self, addr: u32) {
         self.cpsr.thumb = addr & 1 != 0;
@@ -173,7 +170,7 @@ impl Cpu {
         self.branched = true;
     }
 
-    /// address of the instruction currently executing.
+    /// addr of the instruction running now
     #[inline(always)]
     pub fn current_pc(&self) -> u32 {
         self.regs[PC].wrapping_sub(if self.cpsr.thumb { 4 } else { 8 })
@@ -191,8 +188,7 @@ impl Cpu {
         self.halted = false;
     }
 
-    /// sets up the CPU to start executing at entry with stack sp, as the
-    /// kernel does when it creates a thread.
+    /// sets up the CPU to start running at entry w/ stack sp, like the kernel does when it makes a thread
     pub fn reset_to(&mut self, entry: u32, sp: u32) {
         self.regs = [0; 16];
         self.regs[SP] = sp;
@@ -204,7 +200,7 @@ impl Cpu {
         self.halted = false;
     }
 
-    // -- mode switching -----------------------------------------------------
+    // mode switching
 
     fn bank_index(mode: Mode) -> Option<usize> {
         match mode {
@@ -217,14 +213,14 @@ impl Cpu {
         }
     }
 
-    /// swaps the banked registers when the mode field of CPSR changes.
+    /// swaps the banked registers when the mode field of CPSR changes
     pub fn switch_mode(&mut self, new_mode: Mode) {
         let old_mode = self.cpsr.mode;
         if old_mode == new_mode {
             return;
         }
 
-        // save the outgoing bank.
+        // save the outgoing bank
         if let Some(i) = Self::bank_index(old_mode) {
             self.banked_sp_lr[i] = [self.regs[SP], self.regs[LR]];
             self.banked_spsr[i] = self.spsr;
@@ -237,7 +233,7 @@ impl Cpu {
             self.user_r8_r12.copy_from_slice(&self.regs[8..13]);
         }
 
-        // load the incoming one.
+        // load the incoming one
         if let Some(i) = Self::bank_index(new_mode) {
             self.regs[SP] = self.banked_sp_lr[i][0];
             self.regs[LR] = self.banked_sp_lr[i][1];
@@ -255,8 +251,7 @@ impl Cpu {
         self.cpsr.mode = new_mode;
     }
 
-    /// reads a register from the User-mode bank regardless of the current
-    /// mode, for LDM/STM with the S bit.
+    /// reads a register from the User mode bank whatever the current mode, for LDM/STM w/ the S bit
     pub fn read_user_reg(&self, index: usize) -> u32 {
         match index {
             8..=12 if self.cpsr.mode == Mode::Fiq => self.user_r8_r12[index - 8],
@@ -268,7 +263,7 @@ impl Cpu {
         }
     }
 
-    /// writes a register in the User-mode bank regardless of the current mode.
+    /// writes a register in the User mode bank whatever the current mode
     pub fn write_user_reg(&mut self, index: usize, value: u32) {
         match index {
             8..=12 if self.cpsr.mode == Mode::Fiq => self.user_r8_r12[index - 8] = value,
@@ -280,17 +275,16 @@ impl Cpu {
         }
     }
 
-    /// restores CPSR from SPSR, as MOVS pc, lr and friends do.
+    /// restores CPSR from SPSR, like MOVS pc, lr and friends do
     pub fn restore_cpsr(&mut self) {
         let spsr = self.spsr;
         self.switch_mode(spsr.mode);
         self.cpsr = spsr;
     }
 
-    // -- execution ----------------------------------------------------------
+    // execution
 
-    /// runs up to budget instructions, returning early on anything the
-    /// caller has to deal with.
+    /// runs up to budget instructions, returning early on anything the caller has to deal w/
     pub fn run<B: Bus>(&mut self, bus: &mut B, budget: u64) -> Exit {
         let end = self.cycles.wrapping_add(budget);
         while self.cycles < end {
@@ -304,9 +298,9 @@ impl Cpu {
         Exit::Timeout
     }
 
-    /// executes exactly one instruction. always inlined, a call for every
-    /// instruction the interpreter runs costs it about a tenth, and the
-    /// compiler's choice flips with unrelated changes to its callers.
+    /// runs exactly one instruction
+    /// always inlined, a call for every instruction the interpreter runs costs it about a tenth,
+    /// and the compiler's choice flips w/ unrelated changes to its callers
     #[inline(always)]
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Option<Exit> {
         self.cycles += 1;
@@ -335,7 +329,7 @@ impl Cpu {
         }
     }
 
-    // -- flag helpers -------------------------------------------------------
+    // flag helpers
 
     #[inline(always)]
     pub fn set_nz(&mut self, value: u32) {

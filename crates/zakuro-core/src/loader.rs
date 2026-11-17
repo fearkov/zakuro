@@ -1,4 +1,4 @@
-//! turning a ROM into a running process.
+//! turns a ROM into a running process
 
 use zakuro_common::memory_map::*;
 use zakuro_common::ConsoleModel;
@@ -15,14 +15,12 @@ pub enum LoadError {
     ShortCodeImage,
 }
 
-/// whether a title id is the same game's, its update's or its DLC's, which
-/// share the low half.
+/// is a title id the same game's, its update's or its DLC's (they share the low half)
 fn same_game(title_id: u64, program_id: u64) -> bool {
     title_id & 0xFFFF_FFFF == program_id & 0xFFFF_FFFF
 }
 
-/// runs the title with the update at path, when it is the title's, and
-/// says whether it is.
+/// runs the title w/ the update at path if it's the title's, says whether it is
 pub fn attach_update(title: &mut Title, path: &std::path::Path) -> bool {
     match zakuro_fs::Update::load(path) {
         Ok(update) if same_game(update.title_id, title.program_id()) => {
@@ -41,7 +39,7 @@ pub fn attach_update(title: &mut Title, path: &std::path::Path) -> bool {
     }
 }
 
-/// the DLC at paths that is the title's.
+/// the DLC at paths that belongs to the title
 fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> {
     let mut found = Vec::new();
     for path in paths {
@@ -58,8 +56,7 @@ fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> 
     found
 }
 
-/// the main thread's stack ends where the shared-memory region begins, which
-/// is what the retail kernel does.
+/// the main thread's stack ends where the shared memory region starts, like the retail kernel does
 const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 
 pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
@@ -77,8 +74,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         MemoryType::Base => memory::MemoryRegion::Base,
     };
 
-    // a title marked New3DS-only has to run as one, and a New 3DS is one
-    // all the way through
+    // a title marked new 3DS only has to run as one, and a new 3DS is one all the way thru
     if title.ncch.platform() == 2 {
         config.new3ds = true;
     }
@@ -86,8 +82,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         config.model = ConsoleModel::New3ds;
     }
 
-    // the console's region follows the title's own, so a European or
-    // Japanese dump finds its localised files instead of the Americas'.
+    // the console's region follows the title's, so a european or japanese dump finds its localized files instead of the americas'
     config.region = crate::services::cfg::region_for_product_code(&title.ncch.product_code);
 
     let mut system = System::new(config);
@@ -122,7 +117,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
 
     system.kernel.heap_top = HEAP_VADDR;
 
-    // the main thread starts at the beginning of .text.
+    // the main thread starts at the beginning of .text
     let entry = exheader.text.address;
     let priority = exheader.main_thread_priority as u32;
     let main = system.kernel.create_thread(
@@ -150,8 +145,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             );
         } else {
             match crate::recompiled::Library::linked(linked) {
-                // code a mod or the update changed would go on running as it
-                // was recompiled, and crash where the update moved things
+                // code a mod or the update changed would keep running as recompiled and crash where the update moved stuff
                 Ok(library) if (modded || updated) && !library.checks_itself() => log::warn!(
                     "{} changed the game's code and the code linked in can't tell where, which a program 3dsrecomp port makes now can, interpreting everything",
                     if modded { "a mod" } else { "the update" }
@@ -172,9 +166,8 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     } else if let Some(path) = system.config.recompiled.clone().or_else(|| installed(&system, &title)) {
         let path = if path.is_dir() { path.join(recomp_abi::library_name(title.program_id())) } else { path };
         match crate::recompiled::Library::open(&path) {
-            // code a mod or the update changed would go on running as it was
-            // recompiled. a library that can't tell is older than recompiling
-            // with the update, it was made from the game without it
+            // code a mod or the update changed would keep running as recompiled
+            // a lib that can't tell is older than recompiling w/ the update, it was made from the game w/o it
             Ok(library) if (modded || updated) && !library.checks_itself() => log::warn!(
                 "{} changed the game's code and {} can't tell where, which code recompiled again can, interpreting everything",
                 if modded { "a mod" } else { "the update" },
@@ -230,12 +223,10 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     Ok(system)
 }
 
-/// switches a running game to the library at path, which 3dsrecomp has just
-/// built for it, between two steps, when no recompiled code is running. the
-/// old library goes first, so that the new file is the one loaded even where
-/// it took the old one's place, then the new one is checked against memory
-/// and told where the modules already loaded are, as at boot. the game goes
-/// on from where it was. an error says why it can't.
+/// swaps a running game to the lib at path 3dsrecomp just built, between two steps while no recompiled code runs
+/// the old lib goes first so the new file is the one loaded even where it took the old one's place
+/// then the new one gets checked against memory and told where loaded modules are, like at boot
+/// the game carries on from where it was, an error says why it can't
 pub fn swap_recompiled(system: &mut System, path: &std::path::Path) -> Result<(), String> {
     if system.config.linked.is_some() || !system.config.find_recompiled {
         return Err("the game runs code linked in, or a library given to it, or nothing but the interpreter".to_owned());
@@ -268,14 +259,13 @@ pub fn swap_recompiled(system: &mut System, path: &std::path::Path) -> Result<()
     Ok(())
 }
 
-/// where the executable's code is.
+/// where the exe's code is
 fn exheader_text(title: &Title) -> std::ops::Range<u32> {
     let text = &title.exheader.text;
     text.address..text.address + text.num_pages * PAGE_SIZE
 }
 
-/// the library 3dsrecomp build installed for the title, when the system is
-/// to look for one.
+/// the lib `3dsrecomp build` installed for the title, when the system should look for one
 fn installed(system: &System, title: &Title) -> Option<std::path::PathBuf> {
     if !system.config.find_recompiled {
         return None;
@@ -313,7 +303,7 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
     let clock = system.boot_clock;
     memory::config::init_shared_page(system.memory.phys.shared_page_mut(), model, slider, clock);
 
-    // both pages are read-only to the guest and live in AXI WRAM.
+    // both pages are readonly to the guest and live in AXI WRAM
     system.memory.map(
         CONFIG_MEM_VADDR,
         AXI_WRAM_PADDR,
@@ -329,7 +319,7 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
         MemoryState::Static,
     );
 
-    // VRAM is mapped into every process.
+    // VRAM gets mapped into every process
     system.memory.map(
         VRAM_VADDR,
         VRAM_PADDR,
@@ -337,7 +327,7 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
         Permission::RW,
         MemoryState::Static,
     );
-    // so is the DSP's memory.
+    // so does the DSP's memory
     system.memory.map(
         DSP_RAM_VADDR,
         DSP_RAM_PADDR,
@@ -347,7 +337,7 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
     );
 }
 
-/// maps the code segments, saying whether a mod changed them.
+/// maps the code segments, says whether a mod changed them
 fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
     let (code, modded) = crate::mods::code(title, system.config.data_dir.as_deref())?;
     let exheader = &title.exheader;
@@ -386,17 +376,14 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
             MemoryState::Code,
         );
 
-        // zero the whole mapped region first so the padding between the
-        // segment's real size and its page-aligned size is defined.
+        // zero the whole mapped region first so the padding between the real size and the page aligned one is defined
         system.memory.zero_physical(block.addr, mapped_size);
 
         let start = source_offset as usize;
         let end = start + info.size as usize;
         code.get(start..end).ok_or(LoadError::ShortCodeImage)?;
-        // the image's bytes to the end of the segment's pages, as the console
-        // loads them, a mod's code among them in what padded the segment.
-        // the write has to go to physical memory, .text and .rodata are about
-        // to be visible to the guest without write permission.
+        // the image's bytes to the end of the segment's pages like the console loads them, a mod's code included in the padding
+        // writes go to physical memory, .text and .rodata are about to show up to the guest w/o write permission
         let paged = &code[start..code.len().min(start + mapped_size as usize)];
         system.memory.write_physical(block.addr, paged);
 
@@ -407,8 +394,7 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
         );
     }
 
-    // BSS starts right where .data's bytes end, in the rest of its last page,
-    // and must start zeroed. what does not fit there gets pages of its own.
+    // BSS starts right where .data's bytes end in the rest of its last page, zeroed, what doesn't fit gets its own pages
     let bss_start = exheader.data.address + exheader.data.num_pages * PAGE_SIZE;
     let bss_end = exheader.data.address + exheader.data.size + exheader.bss_size;
     if bss_end > bss_start {
@@ -427,9 +413,8 @@ fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
         );
         system.memory.zero_physical(block.addr, bss_size);
         log::debug!("mapped .bss at 0x{bss_start:08X}, 0x{bss_size:X} bytes");
-        // the image goes on past .data's pages into the BSS, flat, as Luma3DS
-        // and Citra lay it, where mods made with Magikoopa put their code, in
-        // BSS their exheader.bin makes bigger
+        // the image runs on past .data's pages into the BSS flat, like Luma3DS and Citra lay it
+        // where Magikoopa mods put their code, in a BSS their exheader.bin makes bigger
         let past_data = ((exheader.text.num_pages + exheader.rodata.num_pages + exheader.data.num_pages) * PAGE_SIZE) as usize;
         if let Some(tail) = code.get(past_data..).filter(|tail| !tail.is_empty()) {
             let fits = tail.len().min(bss_size as usize);
@@ -467,17 +452,16 @@ fn map_stack(system: &mut System, stack_size: u32) {
 mod tests {
     use super::*;
 
-    /// the id of the game the tests make, which no real game has.
+    /// the test game's id, no real game has it
     const PROGRAM_ID: u64 = 0x0004_0000_0FF3_DE01;
 
     fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
         out[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
-    /// writes a decrypted .cxi whose code is all text and that has no RomFS.
+    /// writes a decrypted .cxi whose code is all text and has no RomFS
     fn rom(test: &str, code: &[u8]) -> std::path::PathBuf {
-        // the NCCH header, the exheader after it, and the ExeFS at 0x600
-        // with .code its only file
+        // NCCH header, exheader after it, ExeFS at 0x600 w/ .code as its only file
         let mut out = vec![0; 0x800];
         put(&mut out, 0x100, b"NCCH");
         put(&mut out, 0x118, &PROGRAM_ID.to_le_bytes());
@@ -492,15 +476,14 @@ mod tests {
         path
     }
 
-    /// a mod's code past .data, in a BSS its exheader.bin makes bigger, is
-    /// in memory once the game loads, the way Magikoopa's mods put it.
+    /// a mod's code past .data, in a BSS its exheader.bin grows, is in memory once the game loads, like Magikoopa mods put it
     #[test]
     fn code_a_mod_puts_past_data_lands_in_the_bss() {
         let rom = rom("bss-code", &[0; 8]);
         let data_dir = std::env::temp_dir().join(format!("zakuro-loader-{}-bss-code", std::process::id()));
         let mods = crate::mods::dir(&data_dir, PROGRAM_ID);
         std::fs::create_dir_all(&mods).unwrap();
-        // the text in one page, then two pages of BSS right after it
+        // the text in one page, then two BSS pages right after
         let mut exheader = vec![0; 0x400];
         put(&mut exheader, 0x10, &[0x0010_0000u32, 1, 8].map(u32::to_le_bytes).concat());
         put(&mut exheader, 0x20, &[0x0010_1000u32, 0, 0].map(u32::to_le_bytes).concat());
@@ -526,8 +509,7 @@ mod tests {
         std::fs::remove_file(rom).unwrap();
     }
 
-    /// a game given its update runs the update's code, and has its DLC,
-    /// and an update or DLC of another game is left out.
+    /// a game given its update runs the update's code and has its DLC, an update or DLC of another game gets left out
     #[test]
     fn a_game_runs_with_its_update_and_dlc() {
         use zakuro_fs::testing::{cia, ncch, write};
@@ -551,9 +533,8 @@ mod tests {
         }
     }
 
-    /// a game with an enhancement for its build has it among its cheats,
-    /// on when the player turned it on, and an old kernel's game gets its
-    /// linear heap at 0x14000000.
+    /// a game w/ an enhancement for its build has it among its cheats, on when the player turned it on
+    /// and an old kernel's game gets its linear heap at 0x14000000
     #[test]
     fn a_game_has_the_enhancements_for_its_build() {
         use zakuro_fs::testing::{ncch, write};

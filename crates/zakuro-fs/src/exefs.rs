@@ -1,5 +1,4 @@
-//! ExeFS, a flat, ten-entry archive holding .code, banner, icon and
-//! occasionally logo.
+//! ExeFS, a flat ten entry archive holding .code, banner, icon and sometimes logo
 
 use crate::reader::Reader;
 use crate::FsError;
@@ -10,7 +9,7 @@ pub const MAX_FILES: usize = 10;
 #[derive(Debug, Clone)]
 pub struct ExeFsEntry {
     pub name: String,
-    /// offset from the start of the ExeFS *data*, i.e. after the 0x200 header.
+    /// offset from the start of the ExeFS *data*, so after the 0x200 header
     pub offset: u64,
     pub size: u64,
     pub hash: [u8; 32],
@@ -32,7 +31,7 @@ impl ExeFs {
             if name.is_empty() && size == 0 {
                 continue;
             }
-            // hashes are stored in reverse order at the end of the header.
+            // hashes are stored in reverse order at the end of the header
             let mut hash = [0u8; 32];
             hash.copy_from_slice(r.bytes(0x200 - (i + 1) * 0x20, 0x20)?);
             entries.push(ExeFsEntry {

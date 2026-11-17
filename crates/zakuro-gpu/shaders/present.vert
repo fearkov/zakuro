@@ -1,5 +1,5 @@
 #version 450
-// A single oversized triangle covers the viewport with no vertex buffer.
+// one oversized triangle covers the viewport w/ no vertex buffer (the big triangle trick)
 layout(location = 0) out vec2 uv;
 layout(push_constant) uniform Attributes {
     layout(offset = 0) int orientation;

@@ -1,5 +1,4 @@
-//! ARMv6 media instructions, parallel arithmetic, packing, saturation,
-//! extension, byte reversal and the dual-multiply family.
+//! ARMv6 media instructions, parallel arithmetic, packing, saturation, extension, byte reversal and the dual multiply family
 
 use zakuro_common::bits::{bit, bits};
 
@@ -11,11 +10,11 @@ pub fn execute<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     let op2 = bits(op, 5, 7);
 
     match op1 >> 3 {
-        // 000xx signed and 001xx unsigned parallel add/subtract.
+        // 000xx signed and 001xx unsigned parallel add/subtract
         0b00 => parallel(cpu, op, op1, op2),
-        // 01xxx packing, saturation, extension and reversal.
+        // 01xxx packing, saturation, extension and reversal
         0b01 => pack_sat_extend(cpu, op, op1, op2),
-        // 10xxx signed multiplies.
+        // 10xxx signed multiplies
         0b10 => dual_multiply(cpu, op, op1),
         _ => {
             if op1 == 0b11000 && op2 == 0b000 {
@@ -34,12 +33,9 @@ fn undefined(cpu: &Cpu, op: u32) -> Option<Exit> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Parallel add/subtract
-// ---------------------------------------------------------------------------
+// parallel add/subtract
 
-/// signed and unsigned halfword/byte lanes, in plain, saturating (Q/UQ)
-/// and halving (SH/UH) flavours.
+/// signed and unsigned halfword/byte lanes, in plain, saturating (Q/UQ) and halving (SH/UH) flavors
 fn parallel(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
     let rd = bits(op, 12, 15) as usize;
     let rn = bits(op, 16, 19) as usize;
@@ -57,7 +53,7 @@ fn parallel(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
 
     let mut ge = 0u8;
     let result = match op2 {
-        // halfword lanes. ASX and SAX cross the operand halves.
+        // halfword lanes, ASX and SAX cross the operand halves
         0b000..=0b011 => {
             let (a_lo, a_hi) = (a as u16, (a >> 16) as u16);
             let (b_lo, b_hi) = (b as u16, (b >> 16) as u16);
@@ -65,7 +61,7 @@ fn parallel(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
                 0b001 | 0b010 => (b_hi, b_lo),
                 _ => (b_lo, b_hi),
             };
-            // ADD16, add both.
+            // ADD16, add both
             let (sub_lo, sub_hi) = match op2 {
                 0b000 => (false, false),
                 0b001 => (true, false),
@@ -83,7 +79,7 @@ fn parallel(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
             }
             (lo as u32) | ((hi as u32) << 16)
         }
-        // byte lanes, only ADD8 and SUB8 exist.
+        // byte lanes, only ADD8 and SUB8 exist
         0b100 | 0b111 => {
             let sub = op2 == 0b111;
             let mut out = 0u32;
@@ -102,7 +98,7 @@ fn parallel(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
     };
 
     cpu.regs[rd] = result;
-    // only the plain forms update the GE flags, Q and H variants leave them.
+    // only the plain forms update the GE flags, Q and H variants leave them
     if !saturating && !halving {
         cpu.cpsr.ge = ge;
     }
@@ -124,7 +120,7 @@ fn lane16(a: u16, b: u16, sub: bool, signed: bool, saturating: bool, halving: bo
             a as i32 + b as i32
         };
         // unsigned GE means "no borrow" for a subtract and "carry out" for an
-        // add.
+        // add
         let ge = if sub { r >= 0 } else { r > 0xFFFF };
         (r, ge)
     };
@@ -175,9 +171,7 @@ fn lane8(a: u8, b: u8, sub: bool, signed: bool, saturating: bool, halving: bool)
     (value, ge)
 }
 
-// ---------------------------------------------------------------------------
-// Pack, saturate, extend, reverse, select
-// ---------------------------------------------------------------------------
+// pack, saturate, extend, reverse, select
 
 fn pack_sat_extend(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
     match (op1 & 0b111, op2) {
@@ -196,8 +190,7 @@ fn pack_sat_extend(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
             cpu.regs[rd] = ((rm & 0x00FF_00FF) << 8) | ((rm & 0xFF00_FF00) >> 8);
             None
         }
-        // RBIT arrived with ARMv6T2, but implementing it costs nothing and
-        // keeps hand-written assembly working.
+        // RBIT showed up in ARMv6T2, but it costs nothing and keeps handwritten asm working
         (0b111, 0b001) if op1 == 0b01111 => {
             let (rd, rm) = dest_source(cpu, op);
             cpu.regs[rd] = rm.reverse_bits();
@@ -209,9 +202,9 @@ fn pack_sat_extend(cpu: &mut Cpu, op: u32, op1: u32, op2: u32) -> Option<Exit> {
             cpu.regs[rd] = swapped as u16 as i16 as i32 as u32;
             None
         }
-        // SSAT16 / USAT16.
+        // SSAT16 / USAT16
         (0b010, 0b001) | (0b110, 0b001) => saturate16(cpu, op, op1 & 0b100 != 0),
-        // SSAT (op1 = 010xx) and USAT (op1 = 011xx), both with op2 = xx0.
+        // SSAT (op1 = 010xx) and USAT (op1 = 011xx), both with op2 = xx0
         (_, o) if o & 1 == 0 && matches!(op1 >> 2 & 0b111, 0b010 | 0b011) => {
             saturate32(cpu, op, op1 & 0b00100 != 0)
         }
@@ -232,7 +225,7 @@ fn pkh(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let shift = bits(op, 7, 11);
 
     cpu.regs[rd] = if bit(op, 6) {
-        // PKHTB, bottom half comes from Rm shifted right arithmetically.
+        // PKHTB, bottom half comes from Rm shifted right arithmetically
         let amount = if shift == 0 { 32 } else { shift };
         let low = if amount >= 32 {
             ((b as i32) >> 31) as u32
@@ -241,7 +234,7 @@ fn pkh(cpu: &mut Cpu, op: u32) -> Option<Exit> {
         };
         (low & 0xFFFF) | (a & 0xFFFF_0000)
     } else {
-        // PKHBT, top half comes from Rm shifted left.
+        // PKHBT, top half comes from Rm shifted left
         (a & 0xFFFF) | ((b << shift) & 0xFFFF_0000)
     };
     None
@@ -266,7 +259,7 @@ fn select(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-/// the sign- and zero-extension family.
+/// the sign and zero extension family
 fn extend(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     let rd = bits(op, 12, 15) as usize;
     let rn = bits(op, 16, 19) as usize;
@@ -274,8 +267,7 @@ fn extend(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     let accumulate = rn != 15;
     let acc = cpu.regs[rn];
 
-    // two of these operate on packed halfword pairs and so accumulate
-    // lane-wise rather than as a single 32-bit add.
+    // two of these work on packed halfword pairs and so accumulate lane by lane instead of as one 32 bit add
     let (value, packed) = match op1 & 0b111 {
         0b000 => {
             // SXTAB16 / SXTB16
@@ -306,12 +298,12 @@ fn extend(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
 fn saturate32(cpu: &mut Cpu, op: u32, unsigned: bool) -> Option<Exit> {
     let rd = bits(op, 12, 15) as usize;
     let b = cpu.regs[(op & 0xF) as usize];
-    // USAT saturates to sat_imm bits, SSAT to sat_imm + 1.
+    // USAT saturates to sat_imm bits, SSAT to sat_imm + 1
     let sat_bits = bits(op, 16, 20) + if unsigned { 0 } else { 1 };
     let shift_amount = bits(op, 7, 11);
 
     let shifted = if bit(op, 6) {
-        // ASR, where an encoded zero means 32.
+        // ASR, where an encoded zero means 32
         let amount = if shift_amount == 0 { 32 } else { shift_amount };
         if amount >= 32 {
             ((b as i32) >> 31) as i64
@@ -354,9 +346,7 @@ fn saturate16(cpu: &mut Cpu, op: u32, unsigned: bool) -> Option<Exit> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Signed dual multiplies
-// ---------------------------------------------------------------------------
+// signed dual multiplies
 
 fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     let rd = bits(op, 16, 19) as usize;
@@ -365,7 +355,7 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     let rm = (op & 0xF) as usize;
 
     let a = cpu.regs[rm];
-    // the M bit swaps the halves of the second operand.
+    // the M bit swaps the halves of the second operand
     let b = if bit(op, 5) {
         cpu.regs[rs].rotate_right(16)
     } else {
@@ -376,7 +366,7 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     let a_hi = (a >> 16) as i16 as i64;
     let b_lo = b as i16 as i64;
     let b_hi = (b >> 16) as i16 as i64;
-    // bit 6 selects the subtracting variant (SMLSD / SMLSLD).
+    // bit 6 selects the subtracting variant (SMLSD / SMLSLD)
     let subtract = bit(op, 6);
     let dual = if subtract {
         a_lo * b_lo - a_hi * b_hi
@@ -385,8 +375,7 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     };
 
     match op1 {
-        // SMLAD / SMUAD / SMLSD / SMUSD. the sum wraps, an overflow only
-        // sets Q.
+        // SMLAD / SMUAD / SMLSD / SMUSD, the sum wraps, an overflow only sets Q
         0b10000 => {
             let sum = if ra == 15 {
                 dual
@@ -396,16 +385,16 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
             cpu.regs[rd] = sum as u32;
             cpu.cpsr.q |= sum != sum as i32 as i64;
         }
-        // SMLALD / SMLSLD accumulate into the RdHi:RdLo pair.
+        // SMLALD / SMLSLD accumulate into the (RdHi, RdLo) pair
         0b10100 => {
             let acc = ((cpu.regs[rd] as u64) << 32 | cpu.regs[ra] as u64) as i64;
             let sum = acc.wrapping_add(dual) as u64;
             cpu.regs[ra] = sum as u32;
             cpu.regs[rd] = (sum >> 32) as u32;
         }
-        // SMMUL / SMMLA / SMMLS keep the top 32 bits of a full 64-bit product.
+        // SMMUL / SMMLA / SMMLS keep the top 32 bits of a full 64 bit product
         0b10101 => {
-            // bit 5 is the rounding bit here, and bit 6 selects SMMLS.
+            // bit 5 is the rounding bit here, and bit 6 selects SMMLS
             let round = bit(op, 5);
             let product = (a as i32 as i64) * (cpu.regs[rs] as i32 as i64);
             let acc = if ra == 15 {
@@ -428,7 +417,7 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
     None
 }
 
-/// USAD8 / USADA8, sum of absolute byte differences.
+/// USAD8 / USADA8, sum of absolute byte differences
 fn usad8(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let rd = bits(op, 16, 19) as usize;
     let ra = bits(op, 12, 15) as usize;

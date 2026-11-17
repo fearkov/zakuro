@@ -1,9 +1,8 @@
-//! backwards LZSS ("BLZ") decompression, used by the CTR SDK for ExeFS .code
-//! when the exheader sets the CompressExefsCode flag.
+//! backwards LZSS ("BLZ") decompression, the CTR SDK uses it for ExeFS .code when the exheader sets the CompressExefsCode flag
 
 use crate::FsError;
 
-/// reads the footer to work out how big the decompressed image is.
+/// reads the footer to figure out how big the decompressed image is
 pub fn decompressed_size(compressed: &[u8]) -> Result<usize, FsError> {
     if compressed.len() < 8 {
         return Err(FsError::BadLz77("buffer shorter than the footer"));
@@ -12,15 +11,15 @@ pub fn decompressed_size(compressed: &[u8]) -> Result<usize, FsError> {
     Ok(compressed.len() + add_size)
 }
 
-/// decompresses a BLZ stream.
+/// decompresses a BLZ stream
 pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, FsError> {
     let out_size = decompressed_size(compressed)?;
     let compressed_size = compressed.len();
 
     let footer = read_u32(compressed, compressed_size - 8);
-    // high byte, how many bytes at the end are footer + padding.
+    // high byte, how many bytes at the end are footer + padding
     let footer_size = ((footer >> 24) & 0xFF) as usize;
-    // low 24 bits, distance from the end back to where the payload starts.
+    // low 24 bits, distance from the end back to where the payload starts
     let payload_span = (footer & 0x00FF_FFFF) as usize;
 
     if footer_size > compressed_size || payload_span > compressed_size {
@@ -30,8 +29,7 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, FsError> {
     let mut out = vec![0u8; out_size];
     out[..compressed_size].copy_from_slice(compressed);
 
-    // index walks backwards through the compressed bytes, out_pos walks
-    // backwards through the destination.
+    // index walks backwards thru the compressed bytes, out_pos walks backwards thru the destination
     let mut index = compressed_size - footer_size;
     let stop_index = compressed_size - payload_span;
     let mut out_pos = out_size;
@@ -52,8 +50,7 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, FsError> {
                 index -= 2;
                 let raw = u16::from_le_bytes([compressed[index], compressed[index + 1]]) as usize;
                 let run_len = ((raw >> 12) & 0xF) + 3;
-                // the stored offset is relative to the current output cursor,
-                // biased by 2 because a run is never shorter than that.
+                // the stored offset is relative to the current output cursor, biased by 2 bc a run is never shorter than that
                 let run_off = (raw & 0x0FFF) + 2;
 
                 if out_pos < run_len {

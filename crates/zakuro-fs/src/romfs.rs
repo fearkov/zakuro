@@ -1,9 +1,9 @@
-//! RomFS, the read-only filesystem holding a game's assets.
+//! RomFS, the read only filesystem holding a game's assets
 
 use crate::reader::Reader;
 use crate::FsError;
 
-/// offsets into the RomFS image of the four metadata tables.
+/// offsets into the RomFS image of the four metadata tables
 #[derive(Debug, Clone, Copy)]
 pub struct Level3Header {
     pub dir_hash_offset: u32,
@@ -17,7 +17,7 @@ pub struct Level3Header {
     pub file_data_offset: u32,
 }
 
-/// marker used by the metadata tables for "no such entry".
+/// marker the metadata tables use for "no such entry"
 pub const INVALID: u32 = 0xFFFF_FFFF;
 
 #[derive(Debug, Clone)]
@@ -33,16 +33,16 @@ pub struct DirEntry {
 pub struct FileEntry {
     pub parent: u32,
     pub next_sibling: u32,
-    /// offset from the start of the file-data region.
+    /// offset from the start of the file data region
     pub data_offset: u64,
     pub data_size: u64,
     pub name: String,
 }
 
-/// a parsed RomFS.
+/// a parsed RomFS
 #[derive(Debug, Clone)]
 pub struct RomFs {
-    /// offset of the level-3 image from the start of the backing file.
+    /// offset of the level 3 image from the start of the backing file
     pub base: u64,
     pub header: Level3Header,
     dir_meta: Vec<u8>,
@@ -50,8 +50,7 @@ pub struct RomFs {
 }
 
 impl RomFs {
-    /// walks the IVFC header to find where the level-3 image (the actual
-    /// directory tree) starts, relative to the IVFC header.
+    /// walks the IVFC header to find where the level 3 image (the actual dir tree) starts, relative to the IVFC header
     pub fn level3_offset(data: &[u8]) -> Result<u64, FsError> {
         let r = Reader::new(data);
         r.magic(0x00, b"IVFC")?;
@@ -59,8 +58,7 @@ impl RomFs {
             return Err(FsError::BadRomFs("unexpected IVFC version"));
         }
         let master_hash_size = r.u32(0x08)? as u64;
-        // levels start at 0x0C with a 0x18 stride, +0x10 within a level is its
-        // block size as a power of two.
+        // levels start at 0x0C w/ a 0x18 stride, +0x10 in a level is its block size as a power of two
         let lvl3_block_log2 = r.u32(0x0C + 2 * 0x18 + 0x10)?;
         if lvl3_block_log2 > 31 {
             return Err(FsError::BadRomFs("absurd level 3 block size"));
@@ -68,16 +66,14 @@ impl RomFs {
         Ok(align_up(0x60 + master_hash_size, 1u64 << lvl3_block_log2))
     }
 
-    /// data is the whole backing image, romfs_offset points at the IVFC
-    /// header inside it.
+    /// data is the whole backing image, romfs_offset points at the IVFC header inside it
     pub fn parse(data: &[u8], romfs_offset: u64) -> Result<RomFs, FsError> {
         let ivfc = Reader::new(data).at(romfs_offset as usize)?;
         let level3_rel = Self::level3_offset(ivfc.bytes(0, ivfc.len().min(0x1000))?)?;
         Self::parse_level3(data, romfs_offset + level3_rel)
     }
 
-    /// parses an image that is already the level-3 directory structure, with no
-    /// IVFC hash tree in front of it.
+    /// parses an image that's already the level 3 dir structure, w/ no IVFC hash tree in front of it
     pub fn parse_level3(data: &[u8], base: u64) -> Result<RomFs, FsError> {
         let r = Reader::new(data).at(base as usize)?;
         let header_len = r.u32(0x00)?;
@@ -142,7 +138,7 @@ impl RomFs {
         })
     }
 
-    /// children of dir, as (offset, entry) pairs.
+    /// children of dir, as (offset, entry) pairs
     pub fn subdirs(&self, dir: &DirEntry) -> Vec<(u32, DirEntry)> {
         let mut out = Vec::new();
         let mut cursor = dir.first_child;
@@ -175,12 +171,11 @@ impl RomFs {
         out
     }
 
-    /// resolves a /-separated path to a file entry.
+    /// resolves a / separated path to a file entry
     pub fn lookup(&self, path: &str) -> Result<FileEntry, FsError> {
         let mut dir = self.root()?;
-        // an image's contents normally hang off a nameless directory under
-        // the root rather than off the root itself, and a path never spells
-        // that level out, so step through it.
+        // an image's contents usually hang off a nameless dir under the root, not off the root itself,
+        // and a path never spells that level out, so step thru it
         if let Some((_, nameless)) = self
             .subdirs(&dir)
             .into_iter()
@@ -207,12 +202,12 @@ impl RomFs {
             .ok_or_else(|| FsError::PathNotFound(path.to_owned()))
     }
 
-    /// absolute offset of a file's bytes in the backing image.
+    /// absolute offset of a file's bytes in the backing image
     pub fn file_data_offset(&self, file: &FileEntry) -> u64 {
         self.base + self.header.file_data_offset as u64 + file.data_offset
     }
 
-    /// number of entries, for logging and sanity checks.
+    /// number of entries, for logging and sanity checks
     pub fn count_entries(&self) -> (usize, usize) {
         let mut dirs = 0usize;
         let mut files = 0usize;

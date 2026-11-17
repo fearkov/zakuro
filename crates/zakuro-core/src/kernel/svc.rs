@@ -1,4 +1,4 @@
-//! supervisor call dispatch.
+//! supervisor call dispatch
 
 use zakuro_common::memory_map::*;
 use zakuro_common::result::errors;
@@ -11,7 +11,7 @@ use super::thread::{nanos_to_ticks, ThreadStatus, WaitResult, WaitSyscall, THREA
 use crate::memory::{MemoryState, Permission};
 use crate::System;
 
-// MemOp, as libctru defines it.
+// MemOp, as libctru defines it
 const MEMOP_FREE: u32 = 1;
 const MEMOP_RESERVE: u32 = 2;
 const MEMOP_ALLOC: u32 = 3;
@@ -21,7 +21,7 @@ const MEMOP_PROTECT: u32 = 6;
 const MEMOP_OP_MASK: u32 = 0xFF;
 const MEMOP_LINEAR_FLAG: u32 = 0x1_0000;
 
-/// reports a handle a syscall could not resolve.
+/// reports a handle a syscall couldn't resolve
 fn invalid_handle(system: &mut System, handle: u32, what: &str) -> u32 {
     log::warn!(
         "{what}: handle 0x{handle:X} does not exist (called from 0x{:08X})",
@@ -30,15 +30,14 @@ fn invalid_handle(system: &mut System, handle: u32, what: &str) -> u32 {
     errors::INVALID_HANDLE.0
 }
 
-/// whether recompiled code can have an svc run in place, from inside the
-/// code. the ones that map memory, start or end threads or the process,
-/// reach services, which load code, or that nothing implements stop the
-/// code, and the step runs them.
+/// can recompiled code run an svc in place from inside the code
+/// ones that map memory, start or end threads or the process,
+/// reach services (they load code) or aren't implemented stop the code and the step runs them
 pub fn in_place(number: u32) -> bool {
     matches!(number, 0x02 | 0x0A..=0x0C | 0x11 | 0x13..=0x1D | 0x21..=0x25 | 0x27 | 0x28 | 0x2A | 0x2B | 0x35 | 0x37..=0x3A | 0x3D | 0x54..=0x56)
 }
 
-/// runs one supervisor call.
+/// runs one supervisor call
 pub fn dispatch(system: &mut System, number: u32) {
     if log::log_enabled!(log::Level::Trace) {
         let thread = system
@@ -97,7 +96,7 @@ pub fn dispatch(system: &mut System, number: u32) {
         0x3A => get_resource_limit_current_values(system),
         0x3C => svc_break(system),
         0x3D => output_debug_string(system),
-        // cache maintenance.
+        // cache maintenance
         0x54..=0x56 => {
             system.cpu.regs[0] = 0;
         }
@@ -116,12 +115,9 @@ pub fn dispatch(system: &mut System, number: u32) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Memory
-// ---------------------------------------------------------------------------
+// memory
 
-/// svcControlMemory, r0 = operation, r1 = addr0, r2 = addr1, r3 = size,
-/// r4 = permission. Returns the mapped address in r1.
+/// svcControlMemory, r0 = op, r1 = addr0, r2 = addr1, r3 = size, r4 = permission, mapped addr comes back in r1
 fn control_memory(system: &mut System) {
     let operation = system.cpu.regs[0];
     let addr0 = system.cpu.regs[1];
@@ -148,9 +144,7 @@ fn control_memory(system: &mut System) {
                 system.cpu.regs[0] = errors::OUT_OF_MEMORY.0;
                 return;
             };
-            // the whole point of the linear heap is that the guest can derive
-            // a physical address from a virtual one, so the mapping offset
-            // must match exactly.
+            // the whole point of the linear heap is the guest deriving physical addrs from virtual ones, so the offset must match exactly
             let vaddr = system.kernel.linear_base + (block.addr - FCRAM_PADDR);
             system.memory.map(
                 vaddr,
@@ -192,9 +186,8 @@ fn control_memory(system: &mut System) {
             system.cpu.regs[1] = base;
         }
         MEMOP_FREE => {
-            // the pages behind the range go back, from where it starts in each
-            // heap or linear mapping it covers, a heap shrunk from its end
-            // gives back its end
+            // the pages behind the range go back, from where it starts in each heap or linear mapping it covers
+            // a heap shrunk from its end gives back its end
             let end = addr0 as u64 + size as u64;
             let freed: Vec<crate::memory::PhysicalBlock> = system
                 .memory
@@ -218,7 +211,7 @@ fn control_memory(system: &mut System) {
             system.cpu.regs[1] = addr0;
         }
         MEMOP_MAP => {
-            // mirror the pages backing addr1 at addr0.
+            // mirror addr1's pages at addr0
             if let Some(mapping) = system.memory.mapping_at(addr1).copied() {
                 let offset = addr1 - mapping.base;
                 system.memory.map(
@@ -241,7 +234,7 @@ fn control_memory(system: &mut System) {
             system.cpu.regs[1] = addr0;
         }
         MEMOP_PROTECT | MEMOP_RESERVE => {
-            // nothing enforces permissions yet, so these are accepted as-is.
+            // nothing enforces permissions yet, so accepted as is
             system.cpu.regs[0] = 0;
             system.cpu.regs[1] = addr0;
         }
@@ -252,7 +245,7 @@ fn control_memory(system: &mut System) {
     }
 }
 
-/// svcQueryMemory, r2 = address.
+/// svcQueryMemory, r2 = addr
 fn query_memory(system: &mut System) {
     let addr = system.cpu.regs[2];
     let info = system.memory.query(addr);
@@ -264,16 +257,13 @@ fn query_memory(system: &mut System) {
     system.cpu.regs[5] = 0;
 }
 
-/// svcCreateMemoryBlock, r0 = other permission, r1 = address, r2 = size,
-/// r3 = own permission. Returns the handle in r1.
+/// svcCreateMemoryBlock, r0 = other permission, r1 = addr, r2 = size, r3 = own permission, handle comes back in r1
 fn create_memory_block(system: &mut System) {
     let addr = system.cpu.regs[1];
     let size = system.cpu.regs[2];
 
-    // an address of zero asks the kernel to take the pages from the BASE
-    // region instead of the caller's address space, or from the bottom of
-    // the caller's own region, where its linear heap is, when its exheader
-    // says shared device memory
+    // addr 0 asks the kernel for pages from the BASE region instead of the caller's space
+    // or from the bottom of the caller's own region (where its linear heap is) when its exheader says shared device memory
     let region = if system.kernel.shared_device_memory {
         system.kernel.memory_region
     } else {
@@ -318,8 +308,7 @@ fn create_memory_block(system: &mut System) {
     system.cpu.regs[1] = handle;
 }
 
-/// svcMapMemoryBlock, r0 = handle, r1 = address, r2 = own permission,
-/// r3 = other permission.
+/// svcMapMemoryBlock, r0 = handle, r1 = addr, r2 = own permission, r3 = other permission
 fn map_memory_block(system: &mut System) {
     let handle = system.cpu.regs[0];
     let addr = system.cpu.regs[1];
@@ -336,13 +325,11 @@ fn map_memory_block(system: &mut System) {
 
     let (paddr, size, own) = (block.paddr, block.size, block.address);
     let addr = if addr == 0 && own != 0 {
-        // a block the system keeps somewhere, as the shared font, goes where
-        // it already is, the address the title was told
+        // a block the system keeps somewhere (like the shared font) goes where it already is, the addr the title was told
         own
     } else if addr == 0 {
-        // let the kernel choose, the first place in the shared memory region
-        // the whole block fits, a big one mapped over the next block along
-        // would hide it
+        // let the kernel choose, the first spot in the shared memory region where the whole block fits
+        // a big one mapped over the next block would hide it
         let pages = size.div_ceil(PAGE_SIZE);
         let free = |at: u32| (0..pages).all(|page| system.memory.mapping_at(at + page * PAGE_SIZE).is_none());
         let mut candidate = SHARED_MEMORY_VADDR;
@@ -366,16 +353,14 @@ fn map_memory_block(system: &mut System) {
         String::new()
     };
 
-    // the services that publish a shared block need to know where the guest
-    // put it, because that is where they write their state each frame.
+    // services publishing a shared block need to know where the guest put it, that's where they write their state each frame
     match name.as_str() {
         "GSP" => system.services.gsp.shared_memory_address = addr,
         "HID" => {
             system.services.hid.shared_memory_address = addr;
             system.services.hid.shared_memory_paddr = paddr;
         }
-        // a font's internal pointers are absolute, so they only mean
-        // anything once the guest has chosen where the block lives.
+        // a font's internal ptrs are absolute, they only mean anything once the guest picked where the block lives
         "SharedFont" => crate::services::shared_font::relocate(&mut system.memory, addr, paddr),
         _ => {}
     }
@@ -396,12 +381,9 @@ fn unmap_memory_block(system: &mut System) {
     system.cpu.regs[0] = 0;
 }
 
-// ---------------------------------------------------------------------------
-// Threads
-// ---------------------------------------------------------------------------
+// threads
 
-/// svcCreateThread, r0 = priority, r1 = entry, r2 = argument,
-/// r3 = stack top, r4 = processor id. Returns the handle in r1.
+/// svcCreateThread, r0 = priority, r1 = entry, r2 = arg, r3 = stack top, r4 = processor id, handle comes back in r1
 fn create_thread(system: &mut System) {
     let priority = system.cpu.regs[0];
     let entry = system.cpu.regs[1];
@@ -417,7 +399,7 @@ fn create_thread(system: &mut System) {
         priority,
         processor_id,
     );
-    // the new thread's TLS page has to exist before it runs.
+    // the new thread's TLS page has to exist b4 it runs
     system.map_tls_page(id);
 
     let handle = system.kernel.thread_handle(id);
@@ -446,30 +428,26 @@ fn exit_process(system: &mut System) {
     system.exited = true;
 }
 
-/// how long a yielding thread steps aside when others are ready, about a
-/// scheduler time slice.
+/// how long a yielding thread steps aside when others are ready, about a scheduler slice
 const YIELD_TICKS: u64 = 20_000;
 
-/// svcSleepThread, r0:r1 = nanoseconds as a signed 64-bit value.
+/// svcSleepThread, (r0, r1) = nanos as a signed 64 bit value
 fn sleep_thread(system: &mut System) {
     let nanos = (system.cpu.regs[0] as u64) | ((system.cpu.regs[1] as u64) << 32);
     let tick = system.cpu.cycles;
-    // a zero sleep is a yield, and while other threads are ready the
-    // kernel runs them for a while even when their priority is lower,
+    // a zero sleep is a yield, and while others are ready the kernel runs them a bit even at lower priority
     // titles polling a worker thread that way would spin forever otherwise
     let ticks = if nanos != 0 {
         nanos_to_ticks(nanos)
     } else if system.kernel.others_ready() {
         YIELD_TICKS
     } else if system.kernel.next_event().is_some_and(|at| at <= tick) {
-        // a thread or a timer is due, and the pass at the yield wakes it on
-        // time
+        // a thread or timer is due, the pass at the yield wakes it on time
         0
     } else {
-        // nobody else can take the core, so a zero yield is a no-op: the
-        // thread keeps it, and no scheduling pass is due. titles that poll
-        // this way in a tight loop were paying a full pass per iteration.
-        // it still let the core go, as the pass would have counted it
+        // nobody else can take the core so a zero yield is a no op, the thread keeps it and no pass is due
+        // titles polling like this in a tight loop paid a full pass per iteration
+        // it still let go of the core, as the pass would have counted it
         if let Some(thread) = system.kernel.current_mut() {
             thread.running_since = tick;
         }
@@ -525,11 +503,9 @@ fn resolve_thread(system: &mut System, handle: u32) -> Option<super::thread::Thr
     }
 }
 
-// ---------------------------------------------------------------------------
-// Synchronisation
-// ---------------------------------------------------------------------------
+// sync
 
-/// svcCreateMutex, r1 = initially locked. Returns the handle in r1.
+/// svcCreateMutex, r1 = initially locked, handle comes back in r1
 fn create_mutex(system: &mut System) {
     let initially_locked = system.cpu.regs[1] != 0;
     let mut mutex = sync::Mutex::new("Mutex");
@@ -564,7 +540,7 @@ fn release_mutex(system: &mut System) {
     }
 }
 
-/// svcCreateSemaphore, r1 = initial count, r2 = maximum count.
+/// svcCreateSemaphore, r1 = initial count, r2 = max count
 fn create_semaphore(system: &mut System) {
     let initial = system.cpu.regs[1] as i32;
     let max = system.cpu.regs[2] as i32;
@@ -584,7 +560,7 @@ fn create_semaphore(system: &mut System) {
     system.cpu.regs[1] = handle;
 }
 
-/// svcReleaseSemaphore, r1 = handle, r2 = release count.
+/// svcReleaseSemaphore, r1 = handle, r2 = release count
 fn release_semaphore(system: &mut System) {
     let handle = system.cpu.regs[1];
     let count = system.cpu.regs[2] as i32;
@@ -603,7 +579,7 @@ fn release_semaphore(system: &mut System) {
     }
 }
 
-/// svcCreateEvent, r1 = reset type. Returns the handle in r1.
+/// svcCreateEvent, r1 = reset type, handle comes back in r1
 fn create_event(system: &mut System) {
     let reset_type = ResetType::from_raw(system.cpu.regs[1]);
     let (_, handle) = system.kernel.create_event(reset_type, "Event");
@@ -633,7 +609,7 @@ fn clear_event(system: &mut System) {
     }
 }
 
-/// svcCreateTimer, r1 = reset type.
+/// svcCreateTimer, r1 = reset type
 fn create_timer(system: &mut System) {
     let reset_type = ResetType::from_raw(system.cpu.regs[1]);
     let object = system.kernel.objects.insert(KObject::Timer(sync::Timer {
@@ -652,8 +628,7 @@ fn create_timer(system: &mut System) {
     system.cpu.regs[1] = handle;
 }
 
-/// svcSetTimer, r0 = handle, r2:r3 = initial delay, r1:r4 = interval, both
-/// in nanoseconds, a negative one taken as zero.
+/// svcSetTimer, r0 = handle, (r2, r3) = initial delay, (r1, r4) = interval, both nanos, negative counts as zero
 fn set_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
     let nanos = |low: u32, high: u32| ((low as u64) | ((high as u64) << 32)) as i64;
@@ -711,8 +686,7 @@ fn create_address_arbiter(system: &mut System) {
     system.cpu.regs[1] = handle;
 }
 
-/// svcArbitrateAddress, r0 = handle, r1 = address, r2 = type, r3 = value,
-/// r4:r5 = timeout in nanoseconds, a negative one waiting for good.
+/// svcArbitrateAddress, r0 = handle, r1 = addr, r2 = type, r3 = value, (r4, r5) = timeout in nanos, negative waits for good
 fn arbitrate_address(system: &mut System) {
     let handle = system.cpu.regs[0];
     let address = system.cpu.regs[1];
@@ -736,8 +710,7 @@ fn arbitrate_address(system: &mut System) {
     );
 
     if kind == ArbitrationType::Signal {
-        // wake up to value threads parked on this address, a negative value
-        // means all of them.
+        // wake up to value threads parked on this addr, negative means all of them
         let mut woken = 0;
         let unlimited = value < 0;
         let mut to_wake = Vec::new();
@@ -748,9 +721,8 @@ fn arbitrate_address(system: &mut System) {
                 if addr != address {
                     return true;
                 }
-                // a thread whose wait timed out, or that ended since, left its
-                // entry behind, it goes without counting, a dead thread must
-                // never run again
+                // a thread whose wait timed out or that ended since left its entry behind
+                // it goes w/o counting, a dead thread must never run again
                 let parked = &threads[thread as usize];
                 if parked.status != ThreadStatus::WaitArbiter || parked.wait_address != Some(address) || to_wake.contains(&thread) {
                     return false;
@@ -774,8 +746,7 @@ fn arbitrate_address(system: &mut System) {
         return;
     }
 
-    // the waiting forms compare the word at address against value and only
-    // sleep when it is smaller.
+    // the waiting forms compare the word at addr against value and only sleep when it's smaller
     let current = system.memory.read32(address) as i32;
     if current >= value {
         return;
@@ -804,7 +775,7 @@ fn arbitrate_address(system: &mut System) {
     system.kernel.reschedule_pending = true;
 }
 
-/// svcWaitSynchronization1, r0 = handle, r2:r3 = timeout in nanoseconds.
+/// svcWaitSynchronization1, r0 = handle, (r2, r3) = timeout in nanos
 fn wait_synchronization1(system: &mut System) {
     let handle = system.cpu.regs[0];
     system.kernel.catch_up_timers(system.cpu.cycles);
@@ -836,12 +807,11 @@ fn wait_synchronization1(system: &mut System) {
     let tick = system.cpu.cycles;
     let ticks = (signed_timeout > 0).then(|| nanos_to_ticks(timeout));
     system.kernel.begin_wait(vec![object], false, ticks, tick);
-    // the result registers are filled in when the wait completes.
+    // result regs get filled in when the wait completes
     system.kernel.thread_mut(thread_id).wait_syscall = Some(WaitSyscall::WaitSynchronization1);
 }
 
-/// svcWaitSynchronizationN, r0 = timeout low, r1 = handle array, r2 = count,
-/// r3 = wait-for-all, r4 = timeout high.
+/// svcWaitSynchronizationN, r0 = timeout low, r1 = handle array, r2 = count, r3 = wait for all, r4 = timeout high
 fn wait_synchronization_n(system: &mut System) {
     system.kernel.catch_up_timers(system.cpu.cycles);
     let handles_ptr = system.cpu.regs[1];
@@ -896,9 +866,7 @@ fn wait_synchronization_n(system: &mut System) {
     system.kernel.thread_mut(thread_id).wait_syscall = Some(WaitSyscall::WaitSynchronizationN);
 }
 
-// ---------------------------------------------------------------------------
-// Handles, ports and services
-// ---------------------------------------------------------------------------
+// handles, ports and services
 
 fn close_handle(system: &mut System) {
     let handle = system.cpu.regs[0];
@@ -929,7 +897,7 @@ fn duplicate_handle(system: &mut System) {
     }
 }
 
-/// svcConnectToPort, r1 = pointer to the port name.
+/// svcConnectToPort, r1 = ptr to the port name
 fn connect_to_port(system: &mut System) {
     let name_ptr = system.cpu.regs[1];
     let name = system.memory.read_cstring(name_ptr, 12);
@@ -947,7 +915,7 @@ fn connect_to_port(system: &mut System) {
     system.cpu.regs[1] = handle;
 }
 
-/// svcSendSyncRequest, r0 = session handle.
+/// svcSendSyncRequest, r0 = session handle
 fn send_sync_request(system: &mut System) {
     let handle = system.cpu.regs[0];
     let Some(object) = system.kernel.resolve(handle) else {
@@ -976,44 +944,38 @@ fn send_sync_request(system: &mut System) {
 
     system.cpu.regs[0] = 0;
     crate::services::handle_request(system, target);
-    // on the console a service runs in a process of its own and the thread
-    // waits for its reply, while the threads below it run. Star Fox 64 3D
-    // marks a job running once the more urgent thread doing it is made,
-    // which has to be waiting on its first request by then, or the job is
-    // done before it is marked and stays running forever
+    // on the console a service runs in its own process and the thread waits for its reply while lower threads run
+    // Star Fox 64 3D marks a job running once the more urgent thread doing it is made
+    // which must already be waiting on its first request by then, else the job's done b4 it's marked and stays running forever
     if system.kernel.current().is_some_and(|thread| thread.status == ThreadStatus::Running) {
         let tick = system.cpu.cycles;
         system.kernel.sleep_current(REQUEST_TICKS, tick);
     }
 }
 
-/// how long a request to a service keeps the thread waiting, what Citra
-/// measured for one to GSP on a New 3DS.
+/// how long a service request keeps the thread waiting, what Citra measured for one to GSP on a new 3DS
 pub(crate) const REQUEST_TICKS: u64 = nanos_to_ticks(39_000);
 
-// ---------------------------------------------------------------------------
-// Information
-// ---------------------------------------------------------------------------
+// info
 
 fn get_system_tick(system: &mut System) {
     let tick = system.cpu.cycles;
     system.cpu.regs[0] = tick as u32;
     system.cpu.regs[1] = (tick >> 32) as u32;
-    // the call itself takes this long on the console, two in a row read
-    // ticks this far apart. a title spinning on the clock until a frame's
-    // time is up would otherwise spin many times longer
+    // the call itself takes this long on the console, two in a row read ticks this far apart
+    // a title spinning on the clock till a frame's time is up would spin way longer otherwise
     system.cpu.cycles += SYSTEM_TICK_COST;
 }
 
-/// ticks between two svcGetSystemTick calls in a row on the console.
+/// ticks between two back to back svcGetSystemTick calls on the console
 pub(crate) const SYSTEM_TICK_COST: u64 = 150;
 
-/// svcGetSystemInfo, r1 = type, r2 = parameter.
+/// svcGetSystemInfo, r1 = type, r2 = param
 fn get_system_info(system: &mut System) {
     let kind = system.cpu.regs[1];
     let param = system.cpu.regs[2];
     let value: u64 = match (kind, param) {
-        // memory usage of each FCRAM region.
+        // memory usage of each FCRAM region
         (0, 0) => system
             .memory
             .phys
@@ -1027,7 +989,7 @@ fn get_system_info(system: &mut System) {
             .phys
             .region_used(crate::memory::MemoryRegion::Base) as u64,
         (2, 0) => system.kernel.live_thread_count() as u64,
-        // kernel version.
+        // kernel version
         (26, _) => 0,
         _ => {
             log::debug!("svcGetSystemInfo({kind}, {param}) is not implemented");
@@ -1039,17 +1001,16 @@ fn get_system_info(system: &mut System) {
     system.cpu.regs[2] = (value >> 32) as u32;
 }
 
-/// svcGetProcessInfo, r1 = process handle, r2 = type.
+/// svcGetProcessInfo, r1 = process handle, r2 = type
 fn get_process_info(system: &mut System) {
     let kind = system.cpu.regs[2];
     let value: u64 = match kind {
-        // total memory the process has committed.
+        // total memory the process committed
         2 => system
             .memory
             .phys
             .region_used(system.kernel.memory_region) as u64,
-        // what turns a linear heap address into a physical one, titles
-        // work out the addresses the GPU jumps to with it
+        // turns a linear heap addr into a physical one, titles work out the addrs the GPU jumps to w/ it
         20 => 0x2000_0000u32.wrapping_sub(system.kernel.linear_base) as u64,
         _ => 0,
     };
@@ -1076,7 +1037,7 @@ fn get_resource_limit(system: &mut System) {
     system.cpu.regs[1] = handle;
 }
 
-/// resource limit names, as svcGetResourceLimitLimitValues indexes them.
+/// resource limit names, as svcGetResourceLimitLimitValues indexes them
 const RESOURCE_PRIORITY: u32 = 0;
 const RESOURCE_COMMIT: u32 = 1;
 const RESOURCE_THREAD: u32 = 2;
@@ -1132,9 +1093,7 @@ fn get_resource_limit_current_values(system: &mut System) {
     resource_limit_values(system, true);
 }
 
-// ---------------------------------------------------------------------------
-// Debug
-// ---------------------------------------------------------------------------
+// debug
 
 fn svc_break(system: &mut System) {
     let reason = system.cpu.regs[0];
@@ -1161,7 +1120,7 @@ fn svc_break(system: &mut System) {
     system.broke = true;
 }
 
-/// svcOutputDebugString, r0 = pointer, r1 = length.
+/// svcOutputDebugString, r0 = ptr, r1 = length
 fn output_debug_string(system: &mut System) {
     let ptr = system.cpu.regs[0];
     let len = system.cpu.regs[1].min(0x1000) as usize;
@@ -1174,26 +1133,24 @@ fn output_debug_string(system: &mut System) {
     system.cpu.regs[0] = 0;
 }
 
-/// exposed so the syscall layer can consume a signal it already checked.
+/// exposed so the syscall layer can eat a signal it already checked
 impl super::Kernel {
     pub fn acquire_public(&mut self, object: ObjectId, waiter: super::thread::ThreadId) {
         self.acquire(object, waiter)
     }
 }
 
-/// the address a thread returns to when its entry point falls off the end.
+/// addr a thread returns to when its entry point falls off the end
 pub const THREAD_EXIT_ADDRESS: VAddr = THREAD_EXIT_MAGIC;
 
-/// unused placeholder keeping CURRENT_PROCESS referenced until process
-/// handles are wired up.
+/// unused placeholder keeping CURRENT_PROCESS referenced till process handles get wired up
 pub const _CURRENT_PROCESS: u32 = CURRENT_PROCESS;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// two reads of the clock in a row are as far apart as on the console,
-    /// so a title spinning on it until a frame is over spins no longer.
+    /// two clock reads in a row are as far apart as on the console, so a title spinning on it till a frame ends spins no longer
     #[test]
     fn reading_the_clock_takes_time() {
         let mut system = System::new(crate::Config::default());
@@ -1205,16 +1162,15 @@ mod tests {
         assert_eq!(read() - first, SYSTEM_TICK_COST);
     }
 
-    /// svcControlMemory with an operation, giving back r0 and r1.
+    /// svcControlMemory w/ an op, gives back r0 and r1
     fn control(system: &mut System, operation: u32, addr0: u32, size: u32) -> (u32, u32) {
         system.cpu.regs[..5].copy_from_slice(&[operation, addr0, 0, size, 3]);
         dispatch(system, 0x01);
         (system.cpu.regs[0], system.cpu.regs[1])
     }
 
-    /// the heap comes from the top of the region and the linear heap from
-    /// its bottom, so the first linear block is where the console has it,
-    /// and a heap shrunk from its end gives back the pages of its end.
+    /// the heap comes from the region's top and the linear heap from its bottom, so the first linear block is where the console puts it
+    /// and a heap shrunk from its end gives back its end pages
     #[test]
     fn the_linear_heap_starts_where_the_console_has_it() {
         let mut system = System::new(crate::Config::default());
