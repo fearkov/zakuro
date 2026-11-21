@@ -17,6 +17,7 @@ Games tested in Zakuro so far, as of v0.2.32. Recompiled means the game was test
 | Pokémon Omega Ruby | 000400000011C400 | USA | Playable | Yes | |
 | Pokémon Alpha Sapphire | 000400000011C500 | USA | Playable | Yes | |
 | Pokémon Sun | 0004000000164800 | USA | Playable | Yes | |
+| Pokémon Moon | 0004000000175E00 | USA | In-game | Yes | Tested: gets into the game, saves and loads; not yet played start to finish |
 | Pokémon Ultra Sun | 00040000001B5000 | USA | Playable | Yes | |
 | Pokémon Ultra Moon | 00040000001B5100 | USA | Playable | Yes | |
 | Super Mario 3D Land | 0004000000054000 | USA | Playable | Yes | Runs at 30 fps, as on the console |
