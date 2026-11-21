@@ -1,23 +1,22 @@
-//! APT:U, the applet manager.
+//! APT:U, the applet manager
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, ObjectId, SharedMemory};
 use crate::kernel::sync::ResetType;
 use crate::System;
 
-/// signals a parameter can carry. Wakeup is the one that starts a title.
+/// signals a parameter can carry, Wakeup is the one that starts a title
 pub const SIGNAL_NONE: u32 = 0;
 pub const SIGNAL_WAKEUP: u32 = 1;
-/// a title asking a library applet to get ready, and the applet's answer.
+/// a title asking a library applet to get ready, and the applet's answer
 pub const SIGNAL_REQUEST: u32 = 2;
 pub const SIGNAL_RESPONSE: u32 = 3;
-/// what a library applet leaves its caller when it closes.
+/// what a library applet leaves its caller when it closes
 pub const SIGNAL_WAKEUP_BY_EXIT: u32 = 10;
 
-/// the running title's own applet id.
+/// the running title's own applet id
 pub(crate) const APPLICATION: u32 = 0x300;
-/// the id a title asks IsRegistered about for whatever library applet it
-/// may have running.
+/// the id a title asks IsRegistered about for whatever library applet it may have running
 const ANY_LIBRARY_APPLET: u32 = 0x400;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -26,7 +25,7 @@ pub struct Parameter {
     pub destination: u32,
     pub signal: u32,
     pub buffer: Vec<u8>,
-    /// an object handed over along with it, the receiver gets a handle.
+    /// an object handed over w/ it, the receiver gets a handle
     pub object: Option<ObjectId>,
 }
 
@@ -38,32 +37,28 @@ pub struct AptState {
     pub parameter: Option<Parameter>,
     pub cpu_time_limit: u32,
     pub initialized: bool,
-    /// address and handle of the shared font block, once mapped.
+    /// addr and handle of the shared font block, once mapped
     pub shared_font: Option<(u32, u32)>,
-    /// the library applet a title is starting. there is no applet to run,
-    /// so APT answers for it the way it would answer.
+    /// the library applet a title is starting, there's no applet to run so APT answers for it like it would
     pub library_applet: Option<u32>,
-    /// the block a library applet hands its caller for the screen capture,
-    /// and its size, kept for the next applet.
+    /// the block a library applet hands its caller for the screen capture, plus its size, kept for the next applet
     pub capture_block: Option<(ObjectId, u32)>,
-    /// how the title laid out its last screen capture, as it sent it.
+    /// how the title laid out its last screen capture, as it sent it
     pub capture_info: Vec<u8>,
-    /// the software keyboard, while a title waits on it.
+    /// the software keyboard, while a title waits on it
     pub keyboard: Option<super::keyboard::Pending>,
 }
 
-/// the value the status word at the start of the shared font block takes once
-/// the system has finished loading it.
+/// the status word at the start of the shared font block once the system finished loading it
 const FONT_STATUS_LOADED: u32 = 2;
 
-/// where a dumped shared font is looked for, relative to the working
-/// directory and then to the user's data directory.
+/// where a dumped shared font gets looked for, relative to the cwd then the user data dir
 const SHARED_FONT_PATHS: &[&str] = &[
     "sysdata/shared_font.bin",
     "shared_font.bin",
 ];
 
-/// maps the system's shared font, if the user has dumped it.
+/// maps the system's shared font if the user dumped it
 fn shared_font(system: &mut System) -> Option<(u32, u32)> {
     if let Some(cached) = system.services.apt.shared_font {
         return Some(cached);
@@ -78,8 +73,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
 
     let data = match dump {
         Some(mut data) if data.len() > 0x84 && matches!(&data[0x80..0x84], b"CFNU" | b"CFNT") => {
-            // a dump taken from a console may have been captured before the
-            // system finished loading it, make sure it reads as loaded.
+            // a console dump may have been taken b4 the system finished loading it, make sure it reads as loaded
             data[0..4].copy_from_slice(&FONT_STATUS_LOADED.to_le_bytes());
             data
         }
@@ -88,9 +82,8 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
             return None;
         }
         None => {
-            // a title does not just use the font, it parses it, an empty block
-            // fails that parse and the title never gets going. it is built
-            // again for its address once there is one.
+            // a title doesn't just use the font, it parses it, an empty block fails that and the title never gets going
+            // it gets rebuilt for its addr once there is one
             log::info!("no shared font file found; using the generated stand-in");
             Vec::new()
         }
@@ -103,8 +96,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         .memory
         .phys
         .allocate(crate::memory::MemoryRegion::Base, size)?;
-    // the font sits where the linear mapping puts its memory, among the
-    // system's, a title's own linear heap can reach far and never there
+    // the font sits where the linear mapping puts its memory, among the system's, a title's linear heap reaches far but never there
     let address = system.kernel.linear_base + (block.addr - zakuro_common::memory_map::FCRAM_PADDR);
     let data = if generated { crate::services::shared_font::build(address) } else { data };
 
@@ -125,7 +117,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         .handles
         .create(&mut system.kernel.objects, object, "SharedFont");
 
-    // map it where the guest can see it, then copy the font in.
+    // map it where the guest can see it, then copy the font in
     system.memory.map(
         address,
         block.addr,
@@ -143,7 +135,7 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     let command = header.command_id();
     match command {
-        // GetLockHandle(flags) -> result, applet attributes, power state, lock
+        // GetLockHandle(flags) => result, applet attributes, power state, lock
         0x0001 => {
             let attributes = buffer.get(&mut system.memory, 1);
             let lock = match system.services.apt.lock {
@@ -173,8 +165,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
 
-        // initialize(app id, attributes) -> result + notification and
-        // parameter events.
+        // initialize(app id, attributes) => result plus notification and parameter events
         0x0002 => {
             let (_, notification) = system
                 .kernel
@@ -186,8 +177,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             system.services.apt.parameter_event = Some(parameter);
             system.services.apt.initialized = true;
 
-            // the application is started by being handed a Wakeup parameter,
-            // so queue it now and signal the event that says one is waiting.
+            // the app gets started by being handed a Wakeup parameter, so queue it now and signal the event saying one's waiting
             system.services.apt.parameter = Some(Parameter {
                 sender: 0,
                 destination: buffer.get(&mut system.memory, 1),
@@ -205,19 +195,17 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
 
-        // enable / Finalize / GetAppletManInfo / IsRegistered and friends.
+        // enable, Finalize, GetAppletManInfo, IsRegistered and friends
         0x0003 | 0x0004 => {
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // GetAppletManInfo -> active applet position, requested id, menu id,
-        // active id.
+        // GetAppletManInfo => active applet position, requested id, menu id, active id
         0x0005 => {
             buffer.reply(&mut system.memory, 0x0005, &[0, 0, 0x101, 0x300]);
             true
         }
-        // GetAppletInfo -> title id (u64), media type, registered, loaded,
-        // attributes.
+        // GetAppletInfo => title id (u64), media type, registered, loaded, attributes
         0x0006 => {
             let title = system.kernel.program_id;
             buffer.reply(
@@ -227,10 +215,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             );
             true
         }
-        // IsRegistered(app id) -> true, so a title believes the applet it
-        // asked about exists. any library applet is there only while the
-        // title prepares or runs one, a title told one is there cancels it
-        // and waits for it to close, Yo-kai Watch 2 as it starts
+        // IsRegistered(app id) => true, so a title believes the applet it asked about exists
+        // any library applet is only there while the title prepares or runs one
+        // a title told one's there cancels it and waits for it to close, Yo-kai Watch 2 does that at boot
         0x0009 => {
             let applet = buffer.get(&mut system.memory, 1);
             let apt = &system.services.apt;
@@ -238,7 +225,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x0009, &[registered as u32]);
             true
         }
-        // InquireNotification -> no pending notification.
+        // InquireNotification => no pending notification
         0x000B => {
             buffer.reply(&mut system.memory, 0x000B, &[0]);
             true
@@ -250,8 +237,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let size = buffer.get(&mut system.memory, 4);
             let data = read_static(system, buffer, 7, size);
             if system.services.apt.library_applet == Some(destination) && signal == SIGNAL_REQUEST {
-                // the applet answers with a block to capture the screens into,
-                // as big as the capture info that came with the request says.
+                // the applet answers w/ a block to capture the screens into, as big as the request's capture info says
                 let capture_size = data.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
                 let block = capture_block(system, capture_size);
                 send_parameter(
@@ -268,7 +254,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x000C, &[]);
             true
         }
-        // ReceiveParameter / GlanceParameter
+        // ReceiveParameter, GlanceParameter
         0x000D | 0x000E => {
             let glance = command == 0x000E;
             let parameter = if glance {
@@ -284,7 +270,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                         buffer.static_buffer(&mut system.memory, tls, 0)
                     };
                     let size = (parameter.buffer.len() as u32).min(capacity);
-                    // the receiver gets its own handle to whatever came along.
+                    // the receiver gets its own handle to whatever came along
                     let handle = parameter.object.map_or(0, |object| {
                         system.kernel.handles.create(&mut system.kernel.objects, object, "APT:parameter object")
                     });
@@ -302,30 +288,27 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                     }
                 }
                 None => {
-                    // 0xC8A0CFFC, "no parameter is waiting".
+                    // 0xC8A0CFFC, "no parameter is waiting"
                     buffer.reply_error(&mut system.memory, command, 0xC8A0_CFFC);
                 }
             }
             true
         }
-        // CancelParameter -> succeeded
+        // CancelParameter => succeeded
         0x000F => {
             system.services.apt.parameter = None;
             buffer.reply(&mut system.memory, 0x000F, &[1]);
             true
         }
-        // PreloadLibraryApplet / PrepareToStartLibraryApplet(applet id), the
-        // applet counts as there from now on.
+        // PreloadLibraryApplet, PrepareToStartLibraryApplet(applet id), the applet counts as there from now on
         0x0016 | 0x0018 => {
             system.services.apt.library_applet = Some(buffer.get(&mut system.memory, 1));
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // StartLibraryApplet(applet id, size, handle, buffer). the keyboard
-        // stays open until the frontend answers for it, the Mii selector
-        // picks the console's Mii and any other applet closes as soon as it
-        // starts and hands back a blank result the size of what it was
-        // given, which is what Citra's applets do.
+        // StartLibraryApplet(applet id, size, handle, buffer)
+        // the keyboard stays open till the frontend answers for it, the Mii selector picks the console's Mii
+        // any other applet closes right away and hands back a blank result the size of what it got, like Citra's applets
         0x001E => {
             let applet = buffer.get(&mut system.memory, 1);
             let size = buffer.get(&mut system.memory, 2);
@@ -362,15 +345,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // PrepareToStartApplication / StartApplication and the rest of the
-        // launching machinery, nothing to do while only one title runs.
+        // PrepareToStartApplication, StartApplication and the rest of the launch machinery, nothing to do w/ only one title running
         0x0015 | 0x0017 | 0x0019 | 0x001B | 0x001F => {
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // ReplySleepQuery(app id, reply) / ReplySleepNotificationComplete(app
-        // id). nothing here ever puts the console to sleep, so there is no
-        // query to settle and the answer is just acknowledged.
+        // ReplySleepQuery(app id, reply), ReplySleepNotificationComplete(app id)
+        // nothing here ever sleeps the console, so there's no query to settle, just ack it
         0x003E | 0x003F => {
             buffer.reply(&mut system.memory, command, &[]);
             true
@@ -382,7 +363,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x0040, &[]);
             true
         }
-        // ReceiveCaptureBufferInfo(size) -> the size given back and the info.
+        // ReceiveCaptureBufferInfo(size) => the size given back and the info
         0x0041 => {
             let (ptr, capacity) = {
                 let tls = system.kernel.current().map_or(0, |t| t.tls);
@@ -405,7 +386,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x0043, &[]);
             true
         }
-        // GetSharedFont -> the address the font was mapped at, plus its block.
+        // GetSharedFont => the addr the font got mapped at plus its block
         0x0044 => {
             match shared_font(system) {
                 Some((address, handle)) => {
@@ -416,15 +397,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                     buffer.set(&mut system.memory, 4, handle);
                 }
                 None => {
-                    // this is what hardware-less emulation has to say, there is
-                    // no system font to hand over.
+                    // what hardwareless emulation has to say, there's no system font to hand over
                     buffer.reply_error(&mut system.memory, 0x0044, 0xFFFF_FFFF);
                 }
             }
             true
         }
-        // GetWirelessRebootInfo(size), the host's address and passphrase a
-        // Download Play child connects with, into its static buffer
+        // GetWirelessRebootInfo(size), the host's addr and passphrase a Download Play child connects w/, into its static buffer
         0x0045 => {
             let info = system.config.wireless_reboot.unwrap_or([0; 16]);
             let size = (buffer.get(&mut system.memory, 1) as usize).min(info.len());
@@ -438,18 +417,17 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 3, destination);
             true
         }
-        // ReceiveDeliverArg / SetWirelessRebootInfo and the rest of the
-        // hand-off machinery.
+        // ReceiveDeliverArg, SetWirelessRebootInfo and the rest of the handoff machinery
         0x0035 | 0x0046 | 0x0047 => {
             buffer.reply(&mut system.memory, command, &[0, 0]);
             true
         }
-        // AppletUtility -> result plus one output word.
+        // AppletUtility => result plus one output word
         0x004B => {
             buffer.reply(&mut system.memory, 0x004B, &[0]);
             true
         }
-        // SetAppCpuTimeLimit / GetAppCpuTimeLimit
+        // SetAppCpuTimeLimit, GetAppCpuTimeLimit
         0x004F => {
             system.services.apt.cpu_time_limit = buffer.get(&mut system.memory, 2);
             buffer.reply(&mut system.memory, 0x004F, &[]);
@@ -460,7 +438,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x0050, &[limit]);
             true
         }
-        // SetScreenCapPostPermission / GetScreenCapPostPermission
+        // SetScreenCapPostPermission, GetScreenCapPostPermission
         0x0055 => {
             buffer.reply(&mut system.memory, 0x0055, &[]);
             true
@@ -481,7 +459,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[new3ds]);
             true
         }
-        // the platform the title runs on, 1 a 3DS, 2 a New 3DS
+        // the platform the title runs on, 1 is a 3DS, 2 a new 3DS
         0x0103 => {
             let platform = if system.config.new3ds { 2 } else { 1 };
             buffer.reply(&mut system.memory, command, &[platform]);
@@ -491,7 +469,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// queues a parameter for the title and signals the event it waits on.
+/// queues a parameter for the title and signals the event it waits on
 pub(crate) fn send_parameter(system: &mut System, parameter: Parameter) {
     system.services.apt.parameter = Some(parameter);
     let event = system.services.apt.parameter_event.and_then(|handle| system.kernel.resolve(handle));
@@ -500,8 +478,7 @@ pub(crate) fn send_parameter(system: &mut System, parameter: Parameter) {
     }
 }
 
-/// the bytes a request carries in the static buffer whose descriptor sits at
-/// word index, at most size of them.
+/// the bytes a request carries in the static buffer whose descriptor sits at word index, at most size of them
 fn read_static(system: &mut System, buffer: &CommandBuffer, index: u32, size: u32) -> Vec<u8> {
     let descriptor = buffer.get(&mut system.memory, index);
     let pointer = buffer.get(&mut system.memory, index + 1);
@@ -513,8 +490,7 @@ fn read_static(system: &mut System, buffer: &CommandBuffer, index: u32, size: u3
     data
 }
 
-/// a block of at least size bytes for a library applet to hand over for the
-/// screen capture, made once and reused while it is big enough.
+/// a block of at least size bytes for a library applet to hand over for the screen capture, made once and reused while big enough
 fn capture_block(system: &mut System, size: u32) -> Option<ObjectId> {
     if let Some((object, capacity)) = system.services.apt.capture_block {
         if capacity >= size {
@@ -530,8 +506,7 @@ fn capture_block(system: &mut System, size: u32) -> Option<ObjectId> {
         paddr: block.addr,
         mapped_at: None,
     }));
-    // APT holds on to it, a title closing every handle it was given must not
-    // take it away from the next applet.
+    // APT holds onto it, a title closing every handle it got must not take it from the next applet
     system.kernel.objects.add_ref(object);
     system.services.apt.capture_block = Some((object, size));
     Some(object)

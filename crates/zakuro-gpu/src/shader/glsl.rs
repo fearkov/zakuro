@@ -1,14 +1,13 @@
-//! a vertex shader program turned into GLSL ahead of time, doing operation
-//! for operation what shade.vert does interpreting it, so the GPU runs the
-//! title's instructions instead of an interpreter. everything the program
-//! fixes is worked out here, the instructions, their swizzles and masks,
-//! where each input sits and where each output goes, and only what changes
-//! from draw to draw, the uniforms and the viewport, is read as it runs.
+//! a vertex shader program turned into GLSL ahead of time, doing op for op what shade.vert does interpreting it,
+//! so the GPU runs the title's instructions instead of an interpreter
+//! everything the program fixes gets worked out here (the instructions, their swizzles and masks,
+//! where each input sits and where each output goes),
+//! only what changes from draw to draw (the uniforms and the viewport) gets read as it runs
 //!
-//! a program without flow instructions becomes straight code. one with
-//! them becomes runs of instructions between the addresses execution can
-//! come in at, with shade.vert's block stack between them, so calls, ifs,
-//! loops, jumps and breaks behave exactly as interpreted, odd ones too.
+//! a program w/o flow instructions becomes straight code
+//! one w/ them becomes runs of instructions between the addrs execution can come in at,
+//! w/ shade.vert's block stack between them, so calls, ifs, loops, jumps and breaks act exactly like interpreted,
+//! weird ones too
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
@@ -17,49 +16,46 @@ use std::sync::Arc;
 use super::isa::OpCode;
 use super::{Op, Operand, Program, ShaderUnit, PROGRAM_SIZE};
 
-/// the semantics shade.vert's main reads, one per output component.
+/// the semantics shade.vert's main reads, one per output component
 pub(crate) const SEMANTICS: usize = 24;
 
-/// executed instructions after which shade.vert gives up on a program. the
-/// translation counts a run's at its start, and stops a run that crosses
-/// the limit before it writes an output shade.vert would not have, what it
-/// ran past the limit until then only touching what no one reads after.
+/// executed instructions after which shade.vert gives up on a program
+/// the translation counts a run's at its start,
+/// and stops a run that crosses the limit b4 it writes an output shade.vert wouldn't have,
+/// what it ran past the limit till then only touching what nobody reads after
 const BUDGET: u32 = 0x10000;
 
-/// the address an end sends execution to, past any block's end.
+/// the addr an end sends execution to, past any block's end
 const FINISHED: u32 = u32::MAX;
 
-/// reachable instructions past which a program stays interpreted. real
-/// ones are far shorter, but execution falling into the words after a
-/// program runs to the end of the program memory, and a shader that long
-/// takes a long while to compile.
+/// reachable instructions past which a program stays interpreted
+/// real ones are way shorter, but execution falling into the words after a program runs to the end of the program
+/// memory, and a shader that long takes ages to compile
 const LONGEST: usize = 1024;
 
-/// the blocks shade.vert's stack holds, pushes past them are dropped.
+/// the blocks shade.vert's stack holds, pushes past them get dropped
 const BLOCK_LIMIT: usize = 16;
 
-/// the states, where execution is and the blocks open, the translation
-/// follows a program through before it leaves it to the interpreter.
+/// the states (where execution is and the blocks open) the translation follows a program thru b4 it leaves it to the interpreter
 const STATES: usize = 1 << 16;
 
 impl ShaderUnit {
-    /// the program from its entry point translated, as translate does.
+    /// the program from its entry point translated, like translate does
     #[cfg(test)]
     pub(crate) fn translate(&self, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
         let program = self.prepared().ok_or("the program was not prepared")?;
         translate(&program, self.entry_point, semantics)
     }
 
-    /// the program as prepare decoded it, to translate it elsewhere.
+    /// the program as prepare decoded it, to translate it elsewhere
     pub(crate) fn prepared(&self) -> Option<Arc<Program>> {
         self.decoded.clone()
     }
 }
 
-/// a program from an entry point as a GLSL vertex shader with shade.vert's
-/// interface, its outputs going where semantics says, the output register
-/// times four plus the component for each, or MISSING or ZERO as
-/// hardware.rs has them.
+/// a program from an entry point as a GLSL vertex shader w/ shade.vert's interface,
+/// its outputs going where semantics says, the output register times four plus the component for each,
+/// or MISSING or ZERO like hardware.rs has them
 pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
     let translator = Translator::new(program, entry_point)?;
     let length: usize = translator.runs.values().map(|run| run.length() as usize).sum();
@@ -69,9 +65,8 @@ pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; S
     Ok(translator.shader(semantics))
 }
 
-/// a vertex shader in GLSL to SPIR-V for vkCreateShaderModule, or why not.
-/// naga can panic on some inputs, so a panic is an error too, and the caller
-/// keeps the interpreter to fall back on.
+/// a vertex shader in GLSL to SPIR-V for vkCreateShaderModule, or why not
+/// naga can panic on some inputs, so a panic is an error too, and the caller keeps the interpreter to fall back on
 pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
     use naga::back::spv;
     use naga::front::glsl;
@@ -84,11 +79,9 @@ pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
             .validate(&module)
             .map_err(|error| error.emit_to_string_with_path(source, "translated vertex shader"))?;
         let options = spv::Options {
-            // no newer, naga's private arrays carry a stride later versions
-            // reject
+            // no newer, naga's private arrays carry a stride later versions reject
             lang_version: (1, 0),
-            // the default flags turn y around, as WebGPU wants, and label
-            // everything
+            // the default flags flip y like WebGPU wants and label everything
             flags: spv::WriterFlags::empty(),
             // the default counts every loop's iterations
             force_loop_bounding: false,
@@ -100,25 +93,24 @@ pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
     std::panic::catch_unwind(run).unwrap_or_else(|_| Err("naga panicked".to_owned()))
 }
 
-/// instructions from one address up to the next place execution can come
-/// in at or go elsewhere.
+/// instructions from one addr up to the next place execution can come in at or go elsewhere
 struct Run {
-    /// the arithmetic instructions, by address.
+    /// the arithmetic instructions, by addr
     body: Vec<u32>,
     exit: Exit,
 }
 
 #[derive(Clone, Copy)]
 enum Exit {
-    /// on to the next address, maybe past the program.
+    /// on to the next addr, maybe past the program
     Fall(u32),
     End,
-    /// the flow instruction at an address.
+    /// the flow instruction at an addr
     Flow(u32),
 }
 
 impl Run {
-    /// the instructions it executes, as shade.vert counts them.
+    /// the instructions it runs, as shade.vert counts them
     fn length(&self) -> u32 {
         self.body.len() as u32 + u32::from(!matches!(self.exit, Exit::Fall(_)))
     }
@@ -126,21 +118,21 @@ impl Run {
 
 struct Translator<'a> {
     ops: &'a [Op],
-    /// the input registers stage_shading packs, those any word reads.
+    /// the input registers stage_shading packs, those any word reads
     packed: u16,
     entry: u32,
-    /// the runs execution can reach, by their first address.
+    /// the runs execution can reach, by their first address
     runs: BTreeMap<u32, Run>,
-    /// the input registers the reachable code reads.
+    /// the input registers the reachable code reads
     read: u16,
 }
 
 impl<'a> Translator<'a> {
     fn new(program: &'a Program, entry: u32) -> Result<Translator<'a>, String> {
         let ops = &program.ops[..];
-        // split where any word could send execution, find what is reachable,
-        // then split again only where the reachable flow sends it, which
-        // words of earlier programs left in memory no longer cut up
+        // split where any word could send execution, find what's reachable,
+        // then split again only where the reachable flow sends it,
+        // words of earlier programs left in memory don't cut it up anymore
         let everywhere = starts(ops, entry, 0..ops.len() as u32);
         let first = reachable(ops, &everywhere, entry)?;
         let flows: Vec<u32> = first
@@ -154,8 +146,7 @@ impl<'a> Translator<'a> {
         Ok(Translator { ops, packed: program.inputs, entry, runs, read: 0 })
     }
 
-    /// whether anything reachable is a flow instruction, which needs the
-    /// block stack, otherwise the program runs straight to its end.
+    /// is anything reachable a flow instruction, that needs the block stack, otherwise the program runs straight to its end
     fn flows(&self) -> bool {
         self.runs.values().any(|run| matches!(run.exit, Exit::Flow(_)))
     }
@@ -175,8 +166,7 @@ impl<'a> Translator<'a> {
             out.push_str(BLOCKS);
         }
         out.push_str("void run() {\n");
-        // the inputs the code reads, each worked out once from the arrays
-        // the way the draw's attributes say
+        // the inputs the code reads, each worked out once from the arrays like the draw's attributes say
         for register in (0..16).filter(|register| self.read & (1 << register) != 0) {
             let _ = writeln!(out, "    vec4 v{register} = input_register({register}u);");
         }
@@ -210,7 +200,7 @@ impl<'a> Translator<'a> {
         out
     }
 
-    /// a program without flow, its runs one after another from the entry.
+    /// a program w/o flow, its runs one after another from the entry
     fn straight(&mut self, out: &mut String) {
         let mut at = self.entry;
         while let Some(run) = self.runs.get(&at) {
@@ -225,10 +215,8 @@ impl<'a> Translator<'a> {
         }
     }
 
-    /// a program with flow, its runs picked by address, the block stack
-    /// handled between them as shade.vert handles it between instructions.
-    /// every address a block can end at starts a run, so no end goes by
-    /// unseen.
+    /// a program w/ flow, its runs picked by addr, the block stack handled between them like shade.vert handles it between instructions
+    /// every addr a block can end at starts a run, so no end goes by unseen
     fn dispatch(&mut self, out: &mut String) {
         let _ = writeln!(out, "    uint pc = {}u;", self.entry);
         out.push_str("    uint budget = 0u;\n");
@@ -245,8 +233,7 @@ impl<'a> Translator<'a> {
             let _ = writeln!(out, "        case {start}u:");
             let _ = writeln!(out, "            budget += {length}u;");
             for (i, address) in (0u32..).zip(body) {
-                // shade.vert runs instruction i of the run only while the
-                // budget before the run plus i is under the limit
+                // shade.vert only runs instruction i of the run while the budget b4 the run plus i is under the limit
                 let op = &self.ops[address as usize];
                 if i > 0 && op.opcode.writes() && op.destination < 0x10 {
                     let _ = writeln!(out, "            if (budget >= {}u) {{", BUDGET + length - i);
@@ -273,7 +260,7 @@ impl<'a> Translator<'a> {
         out.push_str("    }\n");
     }
 
-    /// a flow instruction, as shade.vert's run does it.
+    /// a flow instruction, like shade.vert's run does it
     fn flow(&self, out: &mut String, at: u32) {
         let op = &self.ops[at as usize];
         let (destination, count) = op.instruction.flow_target();
@@ -339,8 +326,7 @@ impl<'a> Translator<'a> {
         }
     }
 
-    /// an arithmetic instruction, as shade.vert's arithmetic and
-    /// multiply_add do it, all its sources read before anything is written.
+    /// an arithmetic instruction, like shade.vert's arithmetic and multiply_add do it, all its sources read b4 anything gets written
     fn instruction(&mut self, out: &mut String, at: u32, indent: &str) {
         use OpCode::*;
         let op = self.ops[at as usize];
@@ -382,8 +368,7 @@ impl<'a> Translator<'a> {
             Sge | SgeI => "vec4(greaterThanEqual(a, b))".to_owned(),
             Slt | SltI => "vec4(lessThan(a, b))".to_owned(),
             Flr => "floor(a)".to_owned(),
-            // NaN behaving as on hardware, max(0, NaN) is NaN but
-            // max(NaN, 0) is 0
+            // NaN acting like on hardware, max(0, NaN) is NaN but max(NaN, 0) is 0
             Max => "vec4(a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y, a.z > b.z ? a.z : b.z, a.w > b.w ? a.w : b.w)"
                 .to_owned(),
             Min => "vec4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w)"
@@ -424,8 +409,7 @@ impl<'a> Translator<'a> {
         let _ = writeln!(out, "{indent}}}");
     }
 
-    /// a source's value with its swizzle and negation, as shade.vert's
-    /// source and operand read it.
+    /// a source's value w/ its swizzle and negation, like shade.vert's source and operand read it
     fn operand(&mut self, operand: &Operand) -> String {
         let register = operand.register;
         let value = if register < 0x10 {
@@ -459,9 +443,8 @@ impl<'a> Translator<'a> {
     }
 }
 
-/// every address execution can come in at, the entry and whatever the flow
-/// instructions at some addresses can send it to, a block's end included,
-/// so that runs split there.
+/// every addr execution can come in at, the entry and whatever the flow instructions at some addrs can send it to,
+/// a block's end included, so runs split there
 fn starts(ops: &[Op], entry: u32, flows: impl IntoIterator<Item = u32>) -> BTreeSet<u32> {
     let mut starts = BTreeSet::from([entry]);
     for at in flows {
@@ -470,8 +453,7 @@ fn starts(ops: &[Op], entry: u32, flows: impl IntoIterator<Item = u32>) -> BTree
         let next = at + 1;
         match op.opcode {
             OpCode::Call | OpCode::CallC | OpCode::CallU => starts.extend([destination, destination + count, next]),
-            // the body's end is the destination, or the body's start when
-            // the destination comes first
+            // the body's end is the destination, or the body's start when the destination comes first
             OpCode::IfU | OpCode::IfC => starts.extend([next, destination, destination + count]),
             OpCode::JmpC | OpCode::JmpU => starts.extend([destination, next]),
             OpCode::Loop => starts.extend([next, destination + 1]),
@@ -484,7 +466,7 @@ fn starts(ops: &[Op], entry: u32, flows: impl IntoIterator<Item = u32>) -> BTree
     starts
 }
 
-/// the run from start, up to the next start, an end or a flow instruction.
+/// the run from start, up to the next start, an end or a flow instruction
 fn scan(ops: &[Op], starts: &BTreeSet<u32>, start: u32) -> Run {
     let mut body = Vec::new();
     let mut at = start;
@@ -511,22 +493,21 @@ fn scan(ops: &[Op], starts: &BTreeSet<u32>, start: u32) -> Run {
     Run { body, exit }
 }
 
-/// a block open on the stack as the translation follows execution, all of
-/// it but how many more times a loop goes round, which the uniforms decide.
+/// a block open on the stack as the translation follows execution,
+/// all of it except how many more times a loop goes round, the uniforms decide that
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Open {
     end: u32,
-    /// where execution goes once the block is done.
+    /// where execution goes once the block is done
     back: u32,
-    /// where a loop goes round again from.
+    /// where a loop goes round again from
     start: u32,
     is_loop: bool,
 }
 
-/// the runs execution can reach from the entry, following it with the
-/// blocks it has open, the way shade.vert does, every way a condition or
-/// a loop's count could send it. a block's end is only an end with the
-/// block open, so the code a subroutine runs into at its end is not run.
+/// the runs execution can reach from the entry, following it w/ the blocks it has open like shade.vert does,
+/// every way a condition or a loop's count could send it
+/// a block's end is only an end w/ the block open, so the code a subroutine runs into at its end doesn't run
 fn reachable(ops: &[Op], starts: &BTreeSet<u32>, entry: u32) -> Result<BTreeMap<u32, Run>, String> {
     let mut runs = BTreeMap::new();
     let mut seen = HashSet::new();
@@ -550,9 +531,8 @@ fn reachable(ops: &[Op], starts: &BTreeSet<u32>, entry: u32) -> Result<BTreeMap<
     Ok(runs)
 }
 
-/// where execution goes once the blocks ending where it is are done,
-/// innermost first, as the top of the dispatch loop works it out, a loop
-/// going round again or not.
+/// where execution goes once the blocks ending where it is are done, innermost first,
+/// like the top of the dispatch loop works it out, a loop going round again or not
 fn settle(at: u32, open: Vec<Open>) -> Vec<(u32, Vec<Open>)> {
     let mut settled = Vec::new();
     let mut seen = HashSet::new();
@@ -575,8 +555,7 @@ fn settle(at: u32, open: Vec<Open>) -> Vec<(u32, Vec<Open>)> {
     settled
 }
 
-/// where a flow instruction can send execution and the blocks it leaves
-/// open, both ways where its condition decides.
+/// where a flow instruction can send execution and the blocks it leaves open, both ways where its condition decides
 fn follow(op: &Op, at: u32, open: Vec<Open>) -> Vec<(u32, Vec<Open>)> {
     let (destination, count) = op.instruction.flow_target();
     let next = at + 1;
@@ -607,8 +586,7 @@ fn follow(op: &Op, at: u32, open: Vec<Open>) -> Vec<(u32, Vec<Open>)> {
     }
 }
 
-/// a break, out of the innermost loop and whatever is open inside it, or
-/// on with nothing open when no loop is.
+/// a break, out of the innermost loop and whatever's open inside it, or on w/ nothing open when no loop is
 fn broken(mut open: Vec<Open>, next: u32) -> (u32, Vec<Open>) {
     while let Some(block) = open.pop() {
         if block.is_loop {
@@ -618,15 +596,14 @@ fn broken(mut open: Vec<Open>, next: u32) -> (u32, Vec<Open>) {
     (next, open)
 }
 
-/// whether a flow instruction is taken, as shade.vert's flow_condition
-/// works it out, its fields folded in.
+/// is a flow instruction taken, like shade.vert's flow_condition works it out, its fields folded in
 fn taken(op: &Op) -> String {
     let instruction = op.instruction;
     let set = format!("((bools & {}u) != 0u)", 1u32 << instruction.bool_index());
     match op.opcode {
         OpCode::Call | OpCode::Break => "true".to_owned(),
         OpCode::CallU | OpCode::IfU => set,
-        // the low bit of its count turns it around
+        // the low bit of its count flips it
         OpCode::JmpU if instruction.0 & 1 == 0 => set,
         OpCode::JmpU => format!("!{set}"),
         _ => {
@@ -643,8 +620,8 @@ fn taken(op: &Op) -> String {
     }
 }
 
-/// a comparison as shade.vert's compare makes it. not equal is true for
-/// NaN there, which only negating equal keeps whatever the compiler.
+/// a comparison like shade.vert's compare makes it
+/// not equal is true for NaN there, only negating equal keeps that whatever the compiler does
 fn compare(mode: u32, a: &str, b: &str) -> String {
     match mode {
         0 => format!("{a} == {b}"),
@@ -657,7 +634,7 @@ fn compare(mode: u32, a: &str, b: &str) -> String {
     }
 }
 
-/// the components a write mask selects, its most significant bit x.
+/// the components a write mask picks, its most significant bit x
 fn mask(mask: u32) -> String {
     [(8, 'x'), (4, 'y'), (2, 'z'), (1, 'w')]
         .iter()
@@ -666,7 +643,7 @@ fn mask(mask: u32) -> String {
         .collect()
 }
 
-/// an output or temporary register a destination names.
+/// an output or temporary register a destination names
 fn register(destination: u32) -> String {
     if destination < 0x10 {
         format!("outputs[{destination}]")
@@ -675,9 +652,8 @@ fn register(destination: u32) -> String {
     }
 }
 
-/// a semantic component's value, as shade.vert's semantic reads it, the
-/// default for one no register carries, zero for one past the enabled
-/// registers.
+/// a semantic component's value like shade.vert's semantic reads it, the default for one no register carries,
+/// zero for one past the enabled registers
 fn semantic(slot: u32, missing: &str) -> String {
     if slot == u32::MAX {
         missing.to_owned()
@@ -688,8 +664,7 @@ fn semantic(slot: u32, missing: &str) -> String {
     }
 }
 
-/// shade.vert's interface and the helpers its arithmetic uses, the same
-/// layouts so stage_shading fills it the same way, and no program buffer.
+/// shade.vert's interface and the helpers its math uses, the same layouts so stage_shading fills it the same way, and no program buffer
 const HEADER: &str = r#"#version 450
 
 layout(location = 0) out vec4 out_color;
@@ -799,7 +774,7 @@ vec4 input_register(uint r) {
 
 "#;
 
-/// shade.vert's block stack and enter, for programs with flow.
+/// shade.vert's block stack and enter, for programs w/ flow
 const BLOCKS: &str = r#"uint block_end[16];
 uint block_return[16];
 uint block_repeat[16];
@@ -823,10 +798,8 @@ uint enter(uint start, uint count, uint return_address) {
 
 "#;
 
-/// shade.vert's handling of the blocks that end where execution is, a
-/// loop going round again, anything else returning, innermost first. naga
-/// evaluates both sides of &&, so the stack is looked at only once it
-/// holds something.
+/// shade.vert's handling of the blocks that end where execution is, a loop going round again, anything else returning, innermost first
+/// naga evaluates both sides of &&, so the stack only gets looked at once it holds something
 const BLOCK_ENDS: &str = r#"        while (blocks > 0) {
             int top = blocks - 1;
             if (pc != block_end[top]) {
@@ -843,9 +816,8 @@ const BLOCK_ENDS: &str = r#"        while (blocks > 0) {
         }
 "#;
 
-/// shade.vert's main from the position on, the PICA placing vertices on a
-/// sixteenth of a pixel, halves to even as both round them, and clipping z
-/// to -w..0, which Vulkan has as 0..w.
+/// shade.vert's main from the position on, the PICA placing vertices on a 16th of a pixel,
+/// halves to even as both round them, and clipping z to -w..0, which Vulkan has as 0..w
 const EPILOGUE: &str = r#"    if (position.w > 1e-5) {
         vec2 window = viewport.xy + (position.xy / position.w * 0.5 + 0.5) * viewport.zw;
         window = roundEven(window * 16.0) / 16.0;
@@ -867,7 +839,7 @@ const EPILOGUE: &str = r#"    if (position.w > 1e-5) {
 mod tests {
     use super::*;
 
-    /// a little random number generator, the same numbers every run.
+    /// a lil random number generator, same numbers every run
     struct Random(u64);
 
     impl Random {
@@ -881,8 +853,7 @@ mod tests {
         }
     }
 
-    /// an arithmetic instruction of any kind, its registers, swizzles,
-    /// masks and address registers random.
+    /// an arithmetic instruction of any kind, its registers, swizzles, masks and addr registers random
     fn arithmetic(random: &mut Random) -> u32 {
         let ops = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x12, 0x13];
         let (destination, index, descriptor) = (random.below(32), random.below(4), random.below(128));
@@ -910,7 +881,7 @@ mod tests {
         }
     }
 
-    /// a flow instruction of any kind, whatever it points at.
+    /// a flow instruction of any kind, whatever it points at
     fn flow(random: &mut Random, at: u32, length: u32) -> u32 {
         let destination = random.below(length + 1);
         let count = random.below(6);
@@ -945,8 +916,7 @@ mod tests {
         unit
     }
 
-    /// semantics the way raster.rs makes them, some components on output
-    /// registers, some missing and some past the enabled ones.
+    /// semantics the way raster.rs makes them, some components on output registers, some missing and some past the enabled ones
     fn semantics(random: &mut Random) -> [u32; SEMANTICS] {
         std::array::from_fn(|_| match random.below(8) {
             0 => u32::MAX,
@@ -955,8 +925,7 @@ mod tests {
         })
     }
 
-    /// translates and compiles, failing with the source on any error, and
-    /// checks the SPIR-V with spirv-val when it is installed.
+    /// translates and compiles, failing w/ the source on any error, and checks the SPIR-V w/ `spirv-val` when it's installed
     fn compiles(unit: &ShaderUnit, semantics: &[u32; SEMANTICS]) -> String {
         let glsl = unit.translate(semantics).unwrap();
         let words = compile(&glsl).unwrap_or_else(|error| panic!("{error}\n{glsl}"));
@@ -971,8 +940,7 @@ mod tests {
         glsl
     }
 
-    /// programs of nothing but arithmetic come out straight, with no
-    /// dispatch, and compile.
+    /// programs of nothing but arithmetic come out straight, w/ no dispatch, and compile
     #[test]
     fn straight_programs_compile() {
         let mut random = Random(11);
@@ -986,9 +954,8 @@ mod tests {
         }
     }
 
-    /// programs with flow of every kind, wherever it points, compile, the
-    /// odd ones too, jumps out of ifs, calls that never return, breaks
-    /// with no loop and runs past the end of the program.
+    /// programs w/ flow of every kind, wherever it points, compile, the weird ones too, jumps out of ifs,
+    /// calls that never return, breaks w/ no loop and runs past the end of the program
     #[test]
     fn programs_with_flow_compile() {
         let mut random = Random(12);
@@ -1002,8 +969,7 @@ mod tests {
             program.push(0x22 << 26);
             let entry = random.below(4);
             let unit = unit(&program, entry, &mut random);
-            // falling into the words after the program leaves it to the
-            // interpreter
+            // falling into the words after the program leaves it to the interpreter
             let semantics = semantics(&mut random);
             if unit.translate(&semantics).is_ok() {
                 compiles(&unit, &semantics);
@@ -1013,8 +979,7 @@ mod tests {
         assert!(compiled > 150, "only {compiled} of 250 programs translated");
     }
 
-    /// execution falling into the words after a program, which run to the
-    /// end of the program memory, leaves the program to the interpreter.
+    /// execution falling into the words after a program (they run to the end of the program memory) leaves the program to the interpreter
     #[test]
     fn programs_running_into_the_rest_of_memory_stay_interpreted() {
         let mut random = Random(14);
@@ -1024,9 +989,8 @@ mod tests {
         assert!(unit.translate(&semantics(&mut random)).is_err());
     }
 
-    /// a program running into the last word and past it, inside a call
-    /// whose end is just past the program, returns from the call there,
-    /// as the interpreter does.
+    /// a program running into the last word and past it, inside a call whose end is just past the program,
+    /// returns from the call there like the interpreter does
     #[test]
     fn a_call_can_end_past_the_program() {
         let mut random = Random(13);

@@ -1,11 +1,11 @@
-//! stand-ins for the console's shared data archives.
+//! stand ins for the console's shared data archives
 
 use zakuro_fs::romfs_build::{self, BuildFile};
 
-/// regions the country archive is partitioned by, as their directory names.
+/// regions the country archive is split by, as their dir names
 const REGIONS: [&str; 6] = ["CN", "EU", "JP", "KR", "TW", "US"];
 
-/// country ids we describe, with the region each belongs to and its name.
+/// country ids we describe, w/ the region each belongs to and its name
 const COUNTRIES: [(&str, u8, &str); 6] = [
     ("CN", 160, "China"),
     ("EU", 110, "United Kingdom"),
@@ -15,13 +15,12 @@ const COUNTRIES: [(&str, u8, &str); 6] = [
     ("US", 49, "United States"),
 ];
 
-/// number of localised name slots in every entry, 12 languages, then four
-/// repeats of slot 1 that the format requires.
+/// localized name slots in every entry, 12 languages, then four repeats of slot 1 the format requires
 const NAME_SLOTS: usize = 16;
-/// bytes per localised name.
+/// bytes per localized name
 const NAME_SIZE: usize = 0x80;
 
-/// builds the region manifest archive (the country and region tables).
+/// builds the region manifest archive (the country and region tables)
 pub fn region_manifest() -> Vec<u8> {
     let mut files = Vec::new();
 
@@ -48,10 +47,9 @@ pub fn region_manifest() -> Vec<u8> {
     romfs_build::build(&files)
 }
 
-/// builds the profanity filter archive, a version file and one word list
-/// per language, which titles read as %d.txt. a missing list makes the
-/// filter refuse every name, so each holds a single word nobody types, an
-/// empty one could read as a pattern matching anything.
+/// builds the profanity filter archive, a version file and one word list per language, titles read them as %d.txt
+/// a missing list makes the filter refuse every name,
+/// so each holds a single word nobody types (an empty one could read as a pattern matching anything)
 pub fn bad_word_list() -> Vec<u8> {
     let mut files = vec![BuildFile {
         path: "badwordlist_ver.txt".into(),
@@ -70,15 +68,12 @@ pub fn bad_word_list() -> Vec<u8> {
     romfs_build::build(&files)
 }
 
-/// where the Mii resources dumped from a console are looked for, relative
-/// to the working directory and then to the user's data directory, as the
-/// shared font is.
+/// where the Mii resources dumped from a console get looked for, relative to the cwd then the user's data dir, like the shared font
 const MII_RESOURCE_PATHS: &[&str] = &["sysdata/CFL_Res.dat", "CFL_Res.dat"];
 
-/// builds the Mii data archive, which holds the models and textures Miis
-/// are drawn from, the user's own when dumped. titles load it whole while
-/// starting up and give up when it is missing, an empty resource file lets
-/// them start, with nothing to draw a Mii from.
+/// builds the Mii data archive, it holds the models and textures Miis get drawn from, the user's own when dumped
+/// titles load it whole while starting up and give up when it's missing,
+/// an empty resource file lets them start w/ nothing to draw a Mii from
 pub fn mii_data(data_dir: Option<&std::path::Path>) -> Vec<u8> {
     let dumped = MII_RESOURCE_PATHS
         .iter()
@@ -93,9 +88,8 @@ pub fn mii_data(data_dir: Option<&std::path::Path>) -> Vec<u8> {
     romfs_build::build(&[BuildFile { path: "CFL_Res.dat".into(), data }])
 }
 
-/// the per-region table of countries, two sections (the second patches the
-/// first), then a copy of each section-0 entry's sort order, then a bitmap
-/// of which countries are eShop-locked.
+/// the per region table of countries, two sections (the second patches the first),
+/// then a copy of each section 0 entry's sort order, then a bitmap of which countries are eShop locked
 fn country_list(countries: &[(u8, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -118,14 +112,13 @@ fn country_list(countries: &[(u8, &str)]) -> Vec<u8> {
     out
 }
 
-/// the per-country table of divisions (states, prefectures and the like).
+/// the per country table of divisions (states, prefectures and such)
 fn division_list(country: u8, name: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let divisions = 1usize;
 
     for section in 0..2 {
-        // the first section stores one less than it holds, the reader adds
-        // it back. The second stores its real length.
+        // the first section stores one less than it holds, the reader adds it back, the second stores its real length
         let stored = if section == 0 {
             divisions as u32 - 1
         } else {
@@ -148,7 +141,7 @@ fn division_list(country: u8, name: &str) -> Vec<u8> {
     out
 }
 
-/// writes the 16 name slots.
+/// writes the 16 name slots
 fn write_names(out: &mut Vec<u8>, name: &str) {
     let mut encoded = Vec::with_capacity(NAME_SIZE);
     for unit in name.encode_utf16() {
@@ -161,21 +154,19 @@ fn write_names(out: &mut Vec<u8>, name: &str) {
     }
 }
 
-/// writes the 16 sort-order slots, where the last four repeat slot 0.
+/// writes the 16 sort order slots, the last four repeat slot 0
 fn write_sort(out: &mut Vec<u8>, index: u8) {
     out.extend_from_slice(&[index; NAME_SLOTS]);
 }
 
-/// writes the trailing bitmap of eShop-locked entries, one bit each, all
-/// clear, nothing here is locked.
+/// writes the trailing bitmap of eShop locked entries, one bit each, all clear, nothing here is locked
 fn write_lock_bitmap(out: &mut Vec<u8>, entries: usize) {
     for _ in 0..(entries / 32 + 1) {
         out.extend_from_slice(&0u32.to_le_bytes());
     }
 }
 
-/// wraps data in an LZ11 container without actually compressing it, every byte
-/// is emitted as a literal.
+/// wraps data in an LZ11 container w/o actually compressing it, every byte goes out as a literal (peak compression)
 fn lz11_store(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + data.len() / 8 + 8);
     out.push(0x11);
@@ -183,7 +174,7 @@ fn lz11_store(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&size.to_le_bytes()[..3]);
 
     for chunk in data.chunks(8) {
-        out.push(0); // eight literals, no back-references
+        out.push(0); // eight literals, no back references
         out.extend_from_slice(chunk);
     }
     out
@@ -194,8 +185,7 @@ mod tests {
     use super::*;
     use zakuro_fs::romfs::RomFs;
 
-    /// decompresses an LZ11 stream, so a test can check what a title would
-    /// actually read rather than the container around it.
+    /// decompresses an LZ11 stream, so a test can check what a title would actually read instead of the container around it
     fn lz11_decompress(data: &[u8]) -> Vec<u8> {
         assert_eq!(data[0], 0x11, "not an LZ11 stream");
         let size = u32::from_le_bytes([data[1], data[2], data[3], 0]) as usize;
@@ -216,9 +206,8 @@ mod tests {
         out
     }
 
-    /// a CFL_Res.dat dumped from the user's own console, in their data
-    /// folder, is what the Mii data archive hands out, Miis need it to be
-    /// drawn, and an empty stand-in otherwise.
+    /// a CFL_Res.dat dumped from the user's own console, in their data folder,
+    /// is what the Mii data archive hands out (Miis need it to be drawn), an empty stand in otherwise
     #[test]
     fn the_mii_data_archive_takes_a_dumped_resource_file() {
         let dir = std::env::temp_dir().join(format!("zakuro-mii-{}", std::process::id()));
@@ -248,7 +237,7 @@ mod tests {
         let raw = &image[start..start + entry.data_size as usize];
         let decompressed = lz11_decompress(raw);
 
-        // one country in the US region, and it is the United States.
+        // one country in the US region, and it's the United States
         assert_eq!(u32::from_le_bytes(decompressed[0..4].try_into().unwrap()), 1);
         assert_eq!(decompressed[4..8], [0, 0, 0, 49]);
 
@@ -257,14 +246,12 @@ mod tests {
             .expect("the US division table should exist");
     }
 
-    /// every entry is a fixed size, and a reader walks them by that size, so
-    /// a single byte of drift makes the whole table unreadable.
+    /// every entry is a fixed size and a reader walks them by that size, so one byte of drift makes the whole table unreadable
     #[test]
     fn entries_are_the_documented_size() {
         let countries = [(49u8, "United States")];
         let list = country_list(&countries);
-        // two sections of (count + one 0x83C entry), then one sort copy of
-        // 16 bytes, then one word of lock bits.
+        // two sections of (count + one 0x83C entry), then one 16 byte sort copy, then one word of lock bits
         assert_eq!(list.len(), 2 * (4 + 0x83C) + 16 + 4);
 
         let divisions = division_list(49, "United States");

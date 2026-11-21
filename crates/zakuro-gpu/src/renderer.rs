@@ -1,16 +1,15 @@
-//! the rendering backend interface.
+//! the rendering backend interface
 
-/// everything a draw needs, handed over without copying the register file.
+/// everything a draw needs, handed over w/o copying the register file
 pub struct DrawCall<'a> {
     pub indexed: bool,
     pub registers: &'a [u32],
 }
 
-/// which backend a frontend asked for.
+/// which backend a frontend asked for
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RendererKind {
-    /// no 3D rasterization, the framebuffers are presented as the fill and
-    /// transfer engines leave them.
+    /// no 3D rasterization, the framebuffers get presented as the fill and transfer engines leave them
     #[default]
     Software,
     OpenGl,
@@ -29,28 +28,27 @@ impl RendererKind {
 }
 
 pub trait Renderer {
-    /// name shown in logs and in the window title.
+    /// name shown in logs and in the window title
     fn name(&self) -> &'static str;
 
-    /// executes a draw with the current register state.
+    /// runs a draw w/ the current register state
     fn draw(&mut self, call: DrawCall<'_>);
 
-    /// one word of vertex shader program upload.
+    /// one word of vertex shader program upload
     fn upload_shader_code(&mut self, word: u32) {
         let _ = word;
     }
 
-    /// one word of vertex shader operand descriptor upload.
+    /// one word of vertex shader operand descriptor upload
     fn upload_shader_operand_descriptor(&mut self, word: u32) {
         let _ = word;
     }
 
-    /// called once per emulated frame, after both screens have been
-    /// transferred, so a deferred backend can flush.
+    /// called once per emulated frame after both screens got transferred, so a deferred backend can flush
     fn end_frame(&mut self) {}
 }
 
-/// the do-nothing backend.
+/// the do nothing backend (it's very good at it)
 #[derive(Default)]
 pub struct SoftwareRenderer {
     pub draws: u64,

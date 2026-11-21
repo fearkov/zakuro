@@ -1,26 +1,23 @@
-//! the fog the PICA200 mixes into a fragment after the combiners, by its
-//! depth, through a table of 128 entries.
+//! the fog the PICA200 mixes into a fragment after the combiners, by its depth, thru a 128 entry table
 
-/// the fog's mode, in the bits under the combiner buffer's update, and
-/// whether the depth goes into the table from the far end, bit 16.
+/// the fog's mode, in the bits under the combiner buffer's update, and if the depth goes into the table from the far end (bit 16)
 pub const REG_MODE: usize = 0x0E0;
-/// the fog's color, a byte a channel from red up.
+/// the fog's color, a byte per channel from red up
 pub const REG_COLOR: usize = 0x0E1;
-/// the entry the next write to the table goes to.
+/// the entry the next write to the table goes to
 pub const REG_TABLE_INDEX: usize = 0x0E6;
 pub const REG_TABLE_DATA: usize = 0x0E8;
 pub const REG_TABLE_DATA_END: usize = 0x0EF;
 
-/// entries in the table.
+/// entries in the table
 pub const ENTRIES: usize = 128;
-/// the mode that mixes the fog in, the other one, 7, is gas.
+/// the mode that mixes the fog in, the other one (7) is gas
 const MODE_FOG: u32 = 5;
 
-/// the table, each entry the fog's factor at it and the step to the next.
+/// the table, each entry the fog's factor at it and the step to the next
 pub struct Table {
     entries: Box<[[f32; 2]; ENTRIES]>,
-    /// goes up with every write that changes an entry, so a copy elsewhere
-    /// knows it is stale.
+    /// goes up w/ every write that changes an entry, so a copy elsewhere knows it's stale
     generation: u64,
 }
 
@@ -31,12 +28,12 @@ impl Default for Table {
 }
 
 impl Table {
-    /// every entry, for a saved state.
+    /// every entry, for a save state
     pub(crate) fn saved(&self) -> Vec<[f32; 2]> {
         self.entries.to_vec()
     }
 
-    /// the entries a saved state had, false when they do not fit.
+    /// the entries a save state had, false when they don't fit
     pub(crate) fn restore(&mut self, entries: &[[f32; 2]]) -> bool {
         if entries.len() != ENTRIES {
             return false;
@@ -46,11 +43,10 @@ impl Table {
         true
     }
 
-    /// takes a write to the table data registers, into the entry the index
-    /// register names, which then moves on to the next.
+    /// takes a write to the table data registers, into the entry the index register names, which then moves on to the next
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
         let index = registers[REG_TABLE_INDEX];
-        // the factor in 0.11 above the step, 13 bits with the sign on top
+        // the factor in 0.11 above the step, 13 bits w/ the sign on top
         let step = ((value & 0x1FFF) as i32) << 19 >> 19;
         let entry = [((value >> 13) & 0x7FF) as f32 / 2048.0, step as f32 / 2048.0];
         let slot = &mut self.entries[index as usize % ENTRIES];
@@ -68,7 +64,7 @@ impl Table {
     }
 }
 
-/// a draw's fog, when its mode mixes it in.
+/// a draw's fog, when its mode mixes it in
 pub struct Fog<'a> {
     color: [f32; 3],
     flip: bool,
@@ -82,8 +78,7 @@ impl<'a> Fog<'a> {
         (mode & 7 == MODE_FOG).then_some(Fog { color: [r, g, b].map(f32::from), flip: mode & (1 << 16) != 0, table })
     }
 
-    /// mixes the fog into a fragment's color at a depth from 0 to 1, the
-    /// table's factor of the color and the rest of the fog's.
+    /// mixes the fog into a fragment's color at a depth from 0 to 1, the table's factor of the color and the rest of the fog's
     pub fn apply(&self, rgba: &mut [u8; 4], depth: f32) {
         let index = if self.flip { 1.0 - depth } else { depth } * ENTRIES as f32;
         let entry = index.floor().clamp(0.0, (ENTRIES - 1) as f32);
@@ -103,8 +98,7 @@ mod tests {
         vec![0; 0x300]
     }
 
-    /// entries arrive as a factor and a signed step to the next one, into
-    /// consecutive entries from the index.
+    /// entries arrive as a factor and a signed step to the next one, into consecutive entries from the index
     #[test]
     fn the_table_takes_factors_and_steps() {
         let mut registers = registers();
@@ -122,8 +116,8 @@ mod tests {
         assert_eq!(table.generation(), generation, "the same entry again changes nothing");
     }
 
-    /// the fog comes in as the factor falls, between entries too, and from
-    /// the far end of the table when flipped. other modes leave the color.
+    /// the fog comes in as the factor falls, between entries too, and from the far end of the table when flipped,
+    /// other modes leave the color
     #[test]
     fn fog_mixes_by_depth() {
         let mut registers = registers();

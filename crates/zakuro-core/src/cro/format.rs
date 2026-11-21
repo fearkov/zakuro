@@ -1,8 +1,8 @@
-//! on-disk layout of a CRO/CRS module.
+//! on disk layout of a CRO or CRS module
 
 use zakuro_common::VAddr;
 
-/// byte offsets of the header fields.
+/// byte offsets of the header fields
 pub mod header {
     pub const MAGIC: u32 = 0x080;
     pub const NAME_OFFSET: u32 = 0x084;
@@ -10,12 +10,12 @@ pub mod header {
     pub const PREVIOUS_CRO: u32 = 0x08C;
     pub const FILE_SIZE: u32 = 0x090;
     pub const BSS_SIZE: u32 = 0x094;
-    /// how much of the module is left once it is fixed.
+    /// how much of the module is left once it's fixed
     pub const FIXED_SIZE: u32 = 0x098;
-    /// the function every import points at while nothing provides it.
+    /// the func every import points at while nothing provides it
     pub const ON_UNRESOLVED_SEGMENT_TAG: u32 = 0x0AC;
 
-    /// the first field holding an offset that becomes an address on rebase.
+    /// first field holding an offset that becomes an addr on rebase
     pub const FIRST_REBASED: u32 = 0x0B0;
 
     pub const CODE_OFFSET: u32 = 0x0B0;
@@ -53,13 +53,13 @@ pub mod header {
     pub const STATIC_RELOCATION_TABLE_OFFSET: u32 = 0x130;
     pub const STATIC_RELOCATION_NUM: u32 = 0x134;
 
-    /// the last field holding an offset that becomes an address on rebase.
+    /// last field holding an offset that becomes an addr on rebase
     pub const LAST_REBASED: u32 = STATIC_RELOCATION_TABLE_OFFSET;
 
     pub const SIZE: u32 = 0x138;
 }
 
-/// which part of a module a segment holds.
+/// which part of a module a segment holds
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentType {
     Code,
@@ -96,8 +96,7 @@ pub const IMPORT_INDEXED_SYMBOL_ENTRY_SIZE: u32 = 8;
 pub const IMPORT_ANONYMOUS_SYMBOL_ENTRY_SIZE: u32 = 8;
 pub const RELOCATION_ENTRY_SIZE: u32 = 0xC;
 
-/// a position inside a module, a segment index in the low four bits and a byte
-/// offset into that segment in the rest.
+/// a spot inside a module, segment index in the low 4 bits and byte offset in the rest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentTag(pub u32);
 
@@ -111,14 +110,14 @@ impl SegmentTag {
     }
 }
 
-/// what a relocation does to its target word.
+/// what a reloc does to its target word
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocationType {
-    /// leaves the target alone, used to pad a batch.
+    /// leaves the target alone, pads a batch
     Nothing,
     /// *target = symbol + addend
     AbsoluteAddress,
-    /// *target = symbol + addend - target
+    /// *target = symbol + addend minus target
     RelativeAddress,
     ThumbBranch,
     ArmBranch,
@@ -128,10 +127,9 @@ pub enum RelocationType {
 }
 
 impl RelocationType {
-    /// the numbering is not contiguous and does not start at one, a module's
-    /// jump tables are AbsoluteAddress, which is 2, so reading 2 as
-    /// "relative" writes offsets where addresses belong and the module
-    /// branches into the first page of memory.
+    /// numbering isn't contiguous and doesn't start at 1
+    /// a module's jump tables are AbsoluteAddress (2), reading 2 as "relative" writes offsets where addrs belong
+    /// and the module happily branches into the first page of memory
     pub fn from_raw(value: u8) -> RelocationType {
         match value {
             0 => RelocationType::Nothing,
@@ -162,7 +160,7 @@ pub struct ExternalRelocation {
     pub addend: u32,
 }
 
-/// a module the loader has linked in.
+/// a module the loader linked in
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
     pub name: String,
@@ -175,9 +173,8 @@ mod tests {
     use super::header::*;
     use super::*;
 
-    /// Pokémon Alpha Sapphire's DllLangSelect.cro patches its jump table
-    /// with type-2 relocations, whose entries are loaded straight into the PC
-    /// by ldr pc, [pc, r1, lsl #2]. They must therefore be absolute.
+    /// Pokemon Alpha Sapphire's DllLangSelect.cro patches its jump table w/ type 2 relocs
+    /// its entries go straight into the PC via ldr pc, [pc, r1, lsl #2], so they must be absolute
     #[test]
     fn type_two_is_an_absolute_address() {
         assert_eq!(RelocationType::from_raw(2), RelocationType::AbsoluteAddress);
@@ -186,9 +183,7 @@ mod tests {
         assert_eq!(RelocationType::from_raw(0), RelocationType::Nothing);
     }
 
-    /// every table in a module is laid out end to end, so a correct set of
-    /// field offsets makes each table's end land exactly on the next table's
-    /// start.
+    /// every table in a module sits end to end, so correct field offsets make each table end exactly where the next starts
     #[test]
     fn header_offsets_match_a_real_module() {
         let values: &[(u32, u32)] = &[
@@ -225,7 +220,7 @@ mod tests {
                 .expect("field in the table above")
         };
 
-        // "DllLangSelect\0" is fourteen bytes.
+        // "DllLangSelect\0" is 14 bytes
         assert_eq!(get(MODULE_NAME_SIZE), 14);
 
         assert_eq!(
@@ -256,7 +251,7 @@ mod tests {
                 + get(IMPORT_ANONYMOUS_SYMBOL_NUM) * IMPORT_ANONYMOUS_SYMBOL_ENTRY_SIZE,
             get(IMPORT_STRINGS_OFFSET)
         );
-        // the internal relocations run right up to the data segment.
+        // internal relocs run right up to the data segment
         assert_eq!(
             get(INTERNAL_RELOCATION_TABLE_OFFSET)
                 + get(INTERNAL_RELOCATION_NUM) * RELOCATION_ENTRY_SIZE,

@@ -1,18 +1,17 @@
-//! synchronisation primitives.
+//! sync primitives
 
 use zakuro_common::VAddr;
 
 use super::thread::ThreadId;
 
-/// how an event or a timer behaves once a waiter picks it up.
+/// how an event or timer behaves once a waiter picks it up
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResetType {
-    /// releases exactly one waiter and clears itself.
+    /// releases exactly one waiter and clears itself
     OneShot,
-    /// stays signalled until it is cleared.
+    /// stays signalled till cleared
     Sticky,
-    /// releases what waits on it when signalled and clears, lost when
-    /// nothing waits.
+    /// releases its waiters when signalled and clears, lost when nobody waits
     Pulse,
 }
 
@@ -47,8 +46,7 @@ impl Event {
 pub struct Mutex {
     pub name: String,
     pub owner: Option<ThreadId>,
-    /// mutexes on the 3DS are recursive, the count is how many times the owner
-    /// has taken it.
+    /// 3DS mutexes are recursive, the count is how many times the owner took it
     pub lock_count: u32,
 }
 
@@ -74,22 +72,21 @@ pub struct Timer {
     pub name: String,
     pub reset_type: ResetType,
     pub signaled: bool,
-    /// absolute tick when the timer next fires, or None when stopped.
+    /// absolute tick the timer fires next, None when stopped
     pub fire_at: Option<u64>,
-    /// period in ticks for a repeating timer.
+    /// period in ticks for a repeating timer
     pub interval: u64,
 }
 
-/// an address arbiter is the 3DS's futex, threads sleep on a guest address and
-/// are woken by whoever writes to it.
+/// an address arbiter is the 3DS's futex, threads sleep on a guest addr and whoever writes it wakes them
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AddressArbiter {
     pub name: String,
-    /// threads currently parked, in the order they arrived.
+    /// threads parked rn, in arrival order
     pub waiters: Vec<(ThreadId, VAddr)>,
 }
 
-/// svcArbitrateAddress operations.
+/// svcArbitrateAddress ops
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbitrationType {
     Signal,

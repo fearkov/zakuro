@@ -1,5 +1,4 @@
-//! the audio DSP's final mixer, which brings the voices' intermediate mixes
-//! together into what the speakers play.
+//! the audio DSP's final mixer, brings the voices' intermediate mixes together into what the speakers play
 
 use zakuro_common::memory_map::PAGE_BITS;
 use zakuro_cpu::Bus;
@@ -7,17 +6,17 @@ use zakuro_cpu::Bus;
 use super::dsp_voices::{Frame, QuadFrame, FRAME_SAMPLES, REGION_STRIDE};
 use crate::memory::Memory;
 
-/// bits of the configuration's dirty word.
+/// bits of the config's dirty word
 mod dirty {
-    /// one bit per aux bus from here up.
+    /// one bit per aux bus from here up
     pub const AUX_BUS_ENABLE: u32 = 1 << 8;
     pub const MASTER_VOLUME: u32 = 1 << 16;
-    /// one bit per aux bus from here up.
+    /// one bit per aux bus from here up
     pub const AUX_RETURN_VOLUME: u32 = 1 << 24;
     pub const OUTPUT_FORMAT: u32 = 1 << 26;
 }
 
-/// offsets into the configuration.
+/// offsets into the config
 mod config {
     pub const DIRTY: u32 = 0x00;
     pub const MASTER_VOLUME: u32 = 0x04;
@@ -26,11 +25,10 @@ mod config {
     pub const AUX_BUS_ENABLE: u32 = 0x28;
 }
 
-/// bytes of one intermediate mix a title can process, 4 channels of 32-bit
-/// samples.
+/// bytes of one intermediate mix a title can process, 4 channels of 32 bit samples
 const AUX_MIX_SIZE: u32 = 4 * FRAME_SAMPLES as u32 * 4;
 
-/// addresses of the structures the mixer uses, in region 0.
+/// addrs of the structs the mixer uses, in region 0
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub configuration: u32,
@@ -46,13 +44,12 @@ enum Output {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Mixer {
-    /// how loud each intermediate mix comes out, the first being the master
-    /// volume and the others the aux returns.
+    /// how loud each intermediate mix comes out, the first is the master volume, the others the aux returns
     volume: [f32; 3],
-    /// whether mixes 1 and 2 go through the title first, for its effects.
+    /// do mixes 1 and 2 go thru the title first, for its effects
     aux: [bool; 2],
     output: Output,
-    /// the mixes as they reach the output.
+    /// the mixes as they reach the output
     #[serde(with = "crate::state::arrays::nested")]
     mixes: [QuadFrame; 3],
 }
@@ -64,14 +61,12 @@ impl Default for Mixer {
 }
 
 impl Mixer {
-    /// mixes one frame from what the voices made, with read the region the
-    /// title wrote last, and returns what the speakers play.
+    /// mixes one frame from what the voices made (read is the region the title wrote last), returns what the speakers play
     pub fn tick(&mut self, memory: &mut Memory, layout: Layout, read: u32, mixes: [QuadFrame; 3]) -> Frame {
         let write = 1 - read;
         self.parse_config(memory, layout.configuration + read * REGION_STRIDE);
 
-        // mixes 1 and 2 go out to the title, and what it made of the last
-        // ones comes back
+        // mixes 1 and 2 go out to the title, and what it made of the last ones comes back
         let (from, to) = (layout.intermediate_samples + read * REGION_STRIDE, layout.intermediate_samples + write * REGION_STRIDE);
         self.mixes[0] = mixes[0];
         for aux in 0..2 {
@@ -130,33 +125,31 @@ impl Mixer {
     }
 }
 
-/// where a sample of a channel sits in a mix the title processes, channel
-/// by channel.
+/// where a channel's sample sits in a mix the title processes, channel by channel
 fn sample_at(channel: usize, sample: usize) -> u32 {
     ((channel * FRAME_SAMPLES + sample) * 4) as u32
 }
 
-/// whether every page of a range is mapped. the DSP's memory always is, to
-/// read and write, and copying a range of it at once does what going
-/// through it a word at a time does, as there is no GPU drawing to bring
-/// down while the DSP runs. anywhere else goes a word at a time, missing
-/// each word as it did.
+/// is every page of a range mapped
+/// the DSP's memory always is (read and write),
+/// and copying a range of it at once does the same as a word at a time since there's no GPU drawing to bring down
+/// while the DSP runs
+/// anywhere else goes a word at a time, missing each word like it did
 fn mapped(memory: &Memory, address: u32, size: u32) -> bool {
     pages(address, size).all(|page| memory.is_readable(page, 1))
 }
 
-/// the same for writing, a page can be there to read and not to write.
+/// same for writing, a page can be readable and not writable
 fn writable(memory: &Memory, address: u32, size: u32) -> bool {
     pages(address, size).all(|page| memory.is_writable(page, 1))
 }
 
-/// where each page a range touches starts.
+/// where each page a range touches starts
 fn pages(address: u32, size: u32) -> impl Iterator<Item = u32> {
     (address >> PAGE_BITS..=(address + size - 1) >> PAGE_BITS).map(|page| page << PAGE_BITS)
 }
 
-/// reads what the title made of a mix, laid out channel by channel as
-/// ours is.
+/// reads what the title made of a mix, laid out channel by channel like ours
 fn read_mix(memory: &mut Memory, address: u32, mix: &mut QuadFrame) {
     if !mapped(memory, address, AUX_MIX_SIZE) {
         for sample in 0..FRAME_SAMPLES {
@@ -175,7 +168,7 @@ fn read_mix(memory: &mut Memory, address: u32, mix: &mut QuadFrame) {
     }
 }
 
-/// writes a mix out for the title to process.
+/// writes a mix out for the title to process
 fn write_mix(memory: &mut Memory, address: u32, mix: &QuadFrame) {
     if !writable(memory, address, AUX_MIX_SIZE) {
         for sample in 0..FRAME_SAMPLES {
@@ -194,7 +187,7 @@ fn write_mix(memory: &mut Memory, address: u32, mix: &QuadFrame) {
     memory.write_bytes(address, &bytes);
 }
 
-/// writes what the speakers play where the title finds it.
+/// writes what the speakers play where the title finds it
 fn write_frame(memory: &mut Memory, address: u32, frame: &Frame) {
     if !writable(memory, address, FRAME_SAMPLES as u32 * 4) {
         for (i, pair) in frame.iter().enumerate() {
@@ -211,7 +204,7 @@ fn write_frame(memory: &mut Memory, address: u32, frame: &Frame) {
     memory.write_bytes(address, &bytes);
 }
 
-/// adds a four channel mix to the stereo output at a volume.
+/// adds a four channel mix to the stereo output at a volume
 fn downmix(frame: &mut Frame, mix: &QuadFrame, volume: f32, output: Output) {
     let clamp = |value: f32| (value as i32).clamp(-32768, 32767);
     for (sample, out) in frame.iter_mut().enumerate() {
@@ -250,8 +243,7 @@ mod tests {
         assert_eq!(frame[0], [32767, -32768]);
     }
 
-    /// the mixer as it was, a word of memory and a sample at a time, with
-    /// the channels of each sample together.
+    /// the mixer as it was, one word of memory and one sample at a time, w/ each sample's channels together
     mod reference {
         use super::super::*;
 
@@ -316,7 +308,7 @@ mod tests {
         }
     }
 
-    /// a small xorshift generator, the same numbers every run.
+    /// a lil xorshift generator, same numbers every run
     struct Random(u64);
 
     impl Random {
@@ -336,10 +328,9 @@ mod tests {
         }
     }
 
-    /// the mixer comes out to the bit as it did a word and a sample at a
-    /// time: the speakers, what the title gets to process and what it finds
-    /// played, with the DSP's memory there or, failing that, every access
-    /// missing as it did.
+    /// the mixer matches to the bit what it did a word and a sample at a time
+    /// the speakers, what the title gets to process and what it finds played, w/ the DSP's memory there or,
+    /// failing that, every access missing like it did
     #[test]
     fn mixing_down_matches_the_word_at_a_time_reference() {
         use crate::memory::{MemoryState, Permission};
@@ -348,9 +339,8 @@ mod tests {
         let layout = Layout { configuration: at(0x9430), final_samples: at(0x8540), intermediate_samples: at(0x9492) };
         let volumes = [0.0f32, -0.0, 1.0, 0.5, 0.25, 2.0, 1e30, f32::INFINITY, f32::NAN, 3e-39, -1.0, -0.5, -3e38];
         let mut random = Random(0x5851_F42D_4C95_7F2D);
-        // the DSP's memory as mapped, by offset, size and permission: all of
-        // it, none, all but the page the first aux mix runs into, and all of
-        // it read only
+        // the DSP's memory as mapped, by offset, size and permission
+        // all of it, none, all but the page the first aux mix runs into, and all of it read only
         let whole = [(0, DSP_RAM_SIZE, Permission::RW)];
         let gap = [(0, 0x5_3000, Permission::RW), (0x5_4000, DSP_RAM_SIZE - 0x5_4000, Permission::RW)];
         let read_only = [(0, DSP_RAM_SIZE, Permission::READ)];

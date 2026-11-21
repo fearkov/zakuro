@@ -1,6 +1,5 @@
-//! Zig's C compiler, zig cc, downloaded into Zakuro's own folder when the
-//! computer has no C compiler and the player says yes, so that recompiling
-//! a game needs nothing installed by hand.
+//! Zig's C compiler, zig cc, downloaded into Zakuro's own folder when the computer has no C compiler and the
+//! player says yes, so recompiling a game needs nothing installed by hand
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,22 +8,20 @@ use std::time::Duration;
 
 use recomp3ds::compile::Compiler;
 
-/// the release Zakuro downloads.
+/// the release Zakuro downloads
 const VERSION: &str = "0.17.0";
 
-/// the list of mirrors the Zig project asks tools to download from, before
-/// ziglang.org itself.
+/// the list of mirrors the Zig project asks tools to download from, b4 ziglang.org itself
 const MIRRORS: &str = "https://ziglang.org/download/community-mirrors.txt";
 
-/// a release's archive for one system, as ziglang.org/download/index.json
-/// gives it.
+/// a release's archive for one system, like ziglang.org/download/index.json gives it
 struct Archive {
     name: &'static str,
     size: u64,
     sha256: &'static str,
 }
 
-/// the archive for the system Zakuro runs on, none where Zig has none.
+/// the archive for the system Zakuro runs on, none where Zig has none
 fn archive() -> Option<Archive> {
     let (name, size, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => ("zig-x86_64-linux-0.17.0.tar.xz", 57_332_648, "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"),
@@ -38,15 +35,12 @@ fn archive() -> Option<Archive> {
     Some(Archive { name, size, sha256 })
 }
 
-/// how many bytes the download is, none when there is nothing to download
-/// for this system.
+/// how many bytes the download is, none when there's nothing to download for this system
 pub fn download_size() -> Option<u64> {
     archive().map(|archive| archive.size)
 }
 
-/// where Zakuro keeps the tools it downloads: the local application data on
-/// Windows, which does not roam with the user, and the data folder
-/// elsewhere.
+/// where Zakuro keeps the tools it downloads, the local app data on Windows (doesn't roam w/ the user) and the data folder elsewhere
 pub fn tools_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
     if cfg!(windows) {
         let local = std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty())?;
@@ -60,15 +54,13 @@ fn folder(tools: &Path) -> PathBuf {
     tools.join(format!("zig-{VERSION}"))
 }
 
-/// the compiler, when it has been downloaded into tools.
+/// the compiler, when it's been downloaded into tools
 pub fn installed(tools: &Path) -> Option<Compiler> {
     let program = folder(tools).join(if cfg!(windows) { "zig.exe" } else { "zig" });
     program.is_file().then(|| Compiler::new(program, &["cc"]))
 }
 
-/// the program downloads go through, curl, which Linux, macOS and Windows
-/// 10 and later mostly have, or else wget, which some Linux systems have
-/// instead.
+/// the program downloads go thru, curl, which Linux, macOS and Windows 10+ mostly have, or else wget, some Linux systems have that instead
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Fetcher {
     Curl,
@@ -90,8 +82,7 @@ impl Fetcher {
         }
     }
 
-    /// a command downloading url to path, or to its output without one,
-    /// giving up after seconds.
+    /// a command downloading url to path, or to its output w/o one, giving up after seconds
     fn command(self, url: &str, path: Option<&Path>, seconds: u32) -> Command {
         let mut command = Command::new(self.program());
         match self {
@@ -115,15 +106,14 @@ impl Fetcher {
     }
 }
 
-/// whether Zakuro can download Zig here, having curl or wget to.
+/// can Zakuro download Zig here, having curl or wget to do it
 pub fn can_download() -> bool {
     Fetcher::find().is_some()
 }
 
-/// downloads Zig into tools and unpacks it, telling progress how much of the
-/// archive has arrived, 0 to 1. the mirrors the Zig project lists go first,
-/// in a random order, and ziglang.org last, as it asks of tools, and what
-/// arrives has to match the SHA-256 above whichever served it.
+/// downloads Zig into tools and unpacks it, telling progress how much of the archive arrived, 0 to 1
+/// the mirrors the Zig project lists go first in a random order, and ziglang.org last like it asks of tools,
+/// and what arrives has to match the SHA256 above whichever served it
 pub fn download(tools: &Path, progress: &dyn Fn(f32), cancel: &AtomicBool) -> Result<Compiler, String> {
     let archive = archive().ok_or("Zakuro has no compiler to download for this system")?;
     let fetcher = Fetcher::find().ok_or("Zakuro downloads with curl or wget, and this computer has neither")?;
@@ -158,8 +148,7 @@ pub fn download(tools: &Path, progress: &dyn Fn(f32), cancel: &AtomicBool) -> Re
     Err(format!("could not download Zig, from ziglang.org or any of its mirrors, the last said {last}"))
 }
 
-/// the mirrors the Zig project lists, in a random order, none when the list
-/// can't be had.
+/// the mirrors the Zig project lists, in a random order, none when the list can't be had
 fn mirrors(fetcher: Fetcher) -> Vec<String> {
     let listed = fetcher.command(MIRRORS, None, 30).stderr(Stdio::null()).output();
     let mut mirrors: Vec<String> = match listed {
@@ -171,7 +160,7 @@ fn mirrors(fetcher: Fetcher) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     };
-    // a shuffle seeded by the clock, so that the downloads spread over them
+    // a shuffle seeded by the clock, so the downloads spread over them
     let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |time| time.as_nanos() as u64) | 1;
     for i in (1..mirrors.len()).rev() {
         seed ^= seed << 13;
@@ -182,7 +171,7 @@ fn mirrors(fetcher: Fetcher) -> Vec<String> {
     mirrors
 }
 
-/// downloads url to path, following how much of size has arrived.
+/// downloads url to path, following how much of size arrived
 fn fetch(fetcher: Fetcher, url: &str, path: &Path, size: u64, progress: &dyn Fn(f32), cancel: &AtomicBool) -> Result<(), String> {
     let _ = std::fs::remove_file(path);
     let mut child = fetcher
@@ -214,8 +203,7 @@ fn fetch(fetcher: Fetcher, url: &str, path: &Path, size: u64, progress: &dyn Fn(
     }
 }
 
-/// whether the archive at path is the one Zakuro knows, by its size and its
-/// SHA-256.
+/// is the archive at path the one Zakuro knows, by its size and its SHA256
 fn verify(path: &Path, archive: &Archive) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
@@ -232,9 +220,8 @@ fn verify(path: &Path, archive: &Archive) -> Result<(), String> {
     Ok(())
 }
 
-/// unpacks the archive into its folder in tools with tar, which reads the
-/// zip on Windows too. the archive holds a single folder, renamed to
-/// zig-<version> once it is all there.
+/// unpacks the archive into its folder in tools w/ tar, which reads the zip on Windows too
+/// the archive holds a single folder, renamed to `zig-<version>` once it's all there
 fn unpack(archive: &Path, tools: &Path) -> Result<(), String> {
     let staging = tools.join(format!("zig-{VERSION}.unpacking"));
     let _ = std::fs::remove_dir_all(&staging);

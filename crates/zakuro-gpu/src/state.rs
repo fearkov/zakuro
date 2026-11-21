@@ -1,13 +1,13 @@
-//! what the emulated GPU holds, kept in a saved state: its registers, the
-//! shader units' programs and uniforms, the lookup tables and the work it
-//! is in the middle of. what the host's GPU keeps comes from memory again.
+//! what the emulated GPU holds, kept in a save state, its registers, the shader units' programs and uniforms,
+//! the lookup tables and the work it's in the middle of
+//! what the host's GPU keeps comes from memory again
 
 use serde::{Deserialize, Serialize};
 
 use crate::shader::Vec4;
 use crate::{FramebufferConfig, Gpu, GpuMemory};
 
-/// a shader unit, as saved.
+/// a shader unit, as saved
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitState {
     pub(crate) program: Vec<u32>,
@@ -24,7 +24,7 @@ pub struct UnitState {
     pub(crate) float_uniform_staging: [u32; 4],
 }
 
-/// the GPU, as saved.
+/// the GPU, as saved
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuState {
     external: Vec<u32>,
@@ -48,7 +48,7 @@ pub struct GpuState {
 }
 
 impl Gpu {
-    /// what a saved state keeps of the GPU.
+    /// what a save state keeps of the GPU
     pub fn save_state(&self) -> GpuState {
         let (proctex_maps, proctex_colors, proctex_steps) = self.resources.proctex_tables.saved();
         GpuState {
@@ -73,8 +73,7 @@ impl Gpu {
         }
     }
 
-    /// puts the GPU back as a saved state had it, after memory, and lets go
-    /// of everything the host's GPU drew, which comes from memory again.
+    /// puts the GPU back like a save state had it, after memory, and drops everything the host's GPU drew, that comes from memory again
     pub fn load_state(&mut self, state: &GpuState) -> Result<(), String> {
         let fits = state.external.len() == self.external.len()
             && state.internal.len() == self.internal.len()
@@ -113,15 +112,13 @@ impl Gpu {
         Ok(())
     }
 
-    /// writes back everything the host's GPU drew that memory does not have
-    /// yet, for a saved state to take memory as it stands.
+    /// writes back everything the host's GPU drew that memory doesn't have yet, so a save state takes memory as it stands
     pub fn write_back_all<M: GpuMemory>(&mut self, memory: &mut M) {
         self.sync_memory(memory, 0, u32::MAX);
     }
 
-    /// lets go of what the host's GPU drew and decoded, memory having been
-    /// put back as a saved state had it, and of what the last draws left to
-    /// the next.
+    /// drops what the host's GPU drew and decoded (memory having been put back like a save state had it) and what
+    /// the last draws left to the next
     pub fn forget_drawing(&mut self) {
         self.resources.forget();
         if self.interpolation.is_some() {

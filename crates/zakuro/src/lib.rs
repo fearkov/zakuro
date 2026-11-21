@@ -1,6 +1,5 @@
-//! Zakuro's frontend, a window showing the library of games or a game with
-//! a menu over it, and the loop that drives the emulated console one frame
-//! at a time.
+//! Zakuro's frontend, a window showing the game library or a game w/ a menu over it,
+//! plus the loop that drives the emulated console one frame at a time
 
 mod audio;
 mod camera;
@@ -44,31 +43,29 @@ pub use zakuro_core::recompiled::Linked;
 
 use crate::settings::Orientation;
 
-/// what a program built on Zakuro shows over its game, worked out from the
-/// game's memory: a line kept in a corner, and a notice shown for a moment.
-/// a recompiled game can show what the game keeps hidden this way, its
-/// alignment, a timer, without drawing into the game's own screens.
+/// what a program built on Zakuro shows over its game, worked out from the game's memory,
+/// a line kept in a corner and a notice shown for a moment
+/// a recompiled game can show what the game keeps hidden this way (its alignment, a timer) w/o drawing into the game's own screens
 pub trait GameOverlay {
-    /// called after each frame the game runs, with its memory.
+    /// called after each frame the game runs, w/ its memory
     fn frame(&mut self, memory: &mut Memory) -> OverlayText;
 }
 
-/// what a GameOverlay shows after a frame.
+/// what a GameOverlay shows after a frame
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct OverlayText {
-    /// a line in the bottom right corner while it is some.
+    /// a line in the bottom right corner while it's some
     pub corner: Option<String>,
-    /// a notice at the top for a moment, as a saved state's.
+    /// a notice at the top for a moment, like a save state's
     pub notice: Option<String>,
 }
 
-/// runs the emulator as the command line says, on recompiled code linked
-/// into the program when there is some.
+/// runs the emulator like the command line says, on recompiled code linked into the program when there's some
 pub fn run(linked: Option<Linked>) {
     run_with(linked, None)
 }
 
-/// runs the emulator as run does, with an overlay over the game.
+/// runs the emulator like run does, w/ an overlay over the game
 pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
     report::init();
 
@@ -80,8 +77,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         }
     };
     let mut settings = Settings::load();
-    // the console's own number, made the first time and kept, which tells
-    // it apart from others over local wireless
+    // the console's own number, made the first time and kept, it tells this one apart from others over local wireless
     if settings.console_id == 0 {
         use std::hash::{BuildHasher, Hasher};
         let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
@@ -189,7 +185,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
     }
 }
 
-/// opens a folder in the system's file manager.
+/// opens a folder in the system's file manager
 fn show_folder(folder: &Path) {
     let program = if cfg!(windows) {
         "explorer"
@@ -199,13 +195,13 @@ fn show_folder(folder: &Path) {
         "xdg-open"
     };
     match std::process::Command::new(program).arg(folder).spawn() {
-        // waited for so it leaves nothing behind when it closes
+        // waited for so it leaves nothing behind when it closes (no zombies here)
         Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
         Err(error) => log::warn!("showing {}: {error}", folder.display()),
     }
 }
 
-/// the system's place for a program's data.
+/// the system's place for a program's data
 fn default_data_dir() -> Option<PathBuf> {
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let dir = if cfg!(windows) {
@@ -218,7 +214,7 @@ fn default_data_dir() -> Option<PathBuf> {
     dir.map(|dir| dir.join("zakuro"))
 }
 
-/// how long ago a state was saved, as a person would say it.
+/// how long ago a state was saved, like a person would say it
 fn ago(time: std::time::SystemTime) -> String {
     let seconds = time.elapsed().map_or(0, |elapsed| elapsed.as_secs());
     match seconds {
@@ -232,8 +228,7 @@ fn ago(time: std::time::SystemTime) -> String {
     }
 }
 
-/// saves Zakuro kept in the working directory before it had a place for
-/// them, copied there the first time. the old ones stay as they were.
+/// saves Zakuro kept in the cwd b4 it had a place for them, copied there the first time, the old ones stay as they were
 fn bring_saves(data: &Path) {
     let (old, new) = (Path::new("user"), data.join("user"));
     if new.exists() || !old.is_dir() {
@@ -265,10 +260,9 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// builds a System with no title loaded and both screens filled with a
-/// solid color, to check the presentation path (framebuffer config -> guest
-/// memory -> window) in isolation from any title's boot logic, and that the
-/// GPU starts, which a packed release is tried with.
+/// builds a System w/ no title loaded and both screens filled w/ a solid color,
+/// to check the presentation path (framebuffer config => guest memory => window) apart from any title's boot
+/// logic, and that the GPU starts, a packed release gets tried w/ it
 fn paint_test_pattern(config: Config) -> System {
     use zakuro_core::memory::{MemoryRegion, MemoryState, Permission};
 
@@ -351,19 +345,18 @@ fn run_headless(system: &mut System, frames: u64) {
     }
 }
 
-/// a game being played.
+/// a game being played
 struct Running {
     system: System,
     path: PathBuf,
     name: String,
-    /// the inputs written down, ZAKURO_RECORD=file, for playing the run
-    /// back.
+    /// the inputs written down, ZAKURO_RECORD=file, for playing the run back
     recorder: Option<zakuro_core::replay::Recorder>,
-    /// the inputs a recording wrote down, ZAKURO_REPLAY=file, played back in
-    /// place of the keyboard's and the controllers', and the frames run.
+    /// the inputs a recording wrote down, ZAKURO_REPLAY=file,
+    /// played back in place of the keyboard's and the controllers', and the frames run
     replay: Option<zakuro_core::replay::Replay>,
     frame: u64,
-    /// frames run since counting_since, for the frame rate.
+    /// frames run since counting_since, for the frame rate
     frames: u32,
     counting_since: Instant,
     fps: f32,
@@ -397,14 +390,12 @@ impl Running {
 
 struct App {
     options: cli::Options,
-    /// the settings as the user left them, which get saved.
+    /// the settings as the user left them, those get saved
     settings: Settings,
-    /// the settings in force, what the running game has of its own over
-    /// the general ones, which is all there is without a game.
+    /// the settings in force, what the running game has of its own over the general ones, which is all there is w/o a game
     active: Settings,
     linked: Option<Linked>,
-    /// what the program built on Zakuro shows over the game, and the line it
-    /// keeps in the corner now.
+    /// what the program built on Zakuro shows over the game, and the line it keeps in the corner now
     overlay: Option<Box<dyn GameOverlay>>,
     overlay_corner: Option<String>,
     data_dir: Option<PathBuf>,
@@ -412,84 +403,76 @@ struct App {
     library: Library,
     menus: Menus,
     jobs: Vec<Job>,
-    /// the games waiting for their turn to recompile, the next one first.
+    /// the games waiting for their turn to recompile, the next one first
     waiting: Vec<Wanted>,
-    /// the player said yes to downloading a compiler for the next recompile.
+    /// the player said yes to downloading a compiler for the next recompile
     download_compiler: bool,
     gui: Option<Gui>,
-    // backend must be declared (and therefore dropped) before window, Rust
-    // drops struct fields in declaration order, and the GL surface's Drop
-    // calls eglDestroySurface, which on Wayland does a protocol round-trip
-    // against the window's wl_surface.
+    // backend must be declared (and so dropped) b4 window, Rust drops struct fields in declaration order,
+    // and the GL surface's Drop calls eglDestroySurface,
+    // which on Wayland does a protocol round trip against the window's wl_surface
     backend: Option<Backend>,
     window: Option<Window>,
     keyboard: Keyboard,
     gamepads: gamepad::Gamepads,
     audio: Option<audio::Audio>,
-    /// the window's size, times the console's.
+    /// the window's size, times the console's
     scale: u32,
-    /// how the screens are arranged.
+    /// how the screens are arranged
     layout: Screens,
     orientation: Orientation,
-    /// how wide the top screen shows.
+    /// how wide the top screen shows
     top_shape: settings::TopShape,
-    /// the left button is down, and where the pointer is, in window pixels.
+    /// the left button is down, and where the pointer is, in window pixels
     mouse_down: bool,
-    /// where the pointer was when the right button went down, which tilts
-    /// the console while held.
+    /// where the pointer was when the right button went down, it tilts the console while held
     tilting_from: Option<(f32, f32)>,
     cursor: (f32, f32),
     last_title_update: Instant,
-    /// when the next frame is due. frames run to a schedule rather than one
-    /// after another, so that a slow one is made up by those after it and
-    /// the sound, made as the console runs, keeps up.
+    /// when the next frame is due
+    /// frames run to a schedule instead of one after another,
+    /// so a slow one gets made up by the ones after it and the sound (made as the console runs) keeps up
     next_frame: Instant,
-    /// frames in a row not shown while catching up.
+    /// frames in a row not shown while catching up
     skipped: u32,
-    /// frames shown since the title was last updated.
+    /// frames shown since the title was last updated
     shown: u32,
-    /// how long emulating and showing frames took since the title was last
-    /// updated, for the frame rate's log.
+    /// how long emulating and showing frames took since the title was last updated, for the frame rate's log
     spent: Spent,
-    /// stopped with F1, without the menu.
+    /// stopped w/ F1, w/o the menu
     paused: bool,
-    /// Tab is held down, for fast forward.
+    /// Tab is held down, for fast forward
     fast_forward_key: bool,
-    /// whether the window is in front, for --focus-pad.
+    /// whether the window is in front, for --focus-pad
     focused: bool,
-    /// the game runs as fast as it can, its sound left out.
+    /// the game runs as fast as it can, its sound left out
     fast_forwarding: bool,
-    /// when fast forward shows its next frame, on a grid at the console's
-    /// frame rate.
+    /// when fast forward shows its next frame, on a grid at the console's frame rate
     next_shown: Instant,
     stop: bool,
-    /// what the running game's cameras were given to see, to give them
-    /// another only when the settings change it.
+    /// what the running game's cameras were given to see, to give them another only when the settings change it
     camera: Option<(CameraSource, Option<PathBuf>)>,
-    /// what the running game's microphone was given to hear, the same way.
+    /// what the running game's mic was given to hear, same way
     microphone: Option<MicrophoneSource>,
-    /// set while the blowing key is held, which the microphone hears.
+    /// set while the blowing key is held, the mic hears it
     blowing: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// the room this program holds open, and the one it is in.
+    /// the room this program holds open, and the one it's in
     room_server: Option<zakuro_core::room::Server>,
     room: Option<zakuro_core::room::Connection>,
-    /// Download Play as a guest, while in a room with no game running.
+    /// Download Play as a guest, while in a room w/ no game running
     dlp_guest: Option<zakuro_core::download_play::Guest>,
-    /// the player's own copy of the child joined for, played in place of
-    /// one sent.
+    /// the player's own copy of the child joined for, played instead of one sent
     dlp_own: Option<PathBuf>,
-    /// the network the next game joins as it starts, the host's of a
-    /// Download Play child.
+    /// the network the next game joins as it starts, the host's of a Download Play child
     wireless_reboot: Option<[u8; 16]>,
-    /// the window was maximized when it went full screen, which leaving
-    /// full screen brings back.
+    /// the window was maximized when it went full screen, leaving full screen brings that back
     maximized_before_full_screen: bool,
-    /// the layout or the scale changed while the window was full screen,
-    /// which kept its size, so leaving full screen fits the window to them.
+    /// the layout or the scale changed while the window was full screen, which kept its size,
+    /// so leaving full screen fits the window to them
     resize_after_full_screen: bool,
 }
 
-/// how long each step of the loop took, its mean and its longest.
+/// how long each step of the loop took, its mean and its longest
 #[derive(Default)]
 struct Spent {
     emulating: Times,
@@ -518,23 +501,21 @@ impl std::fmt::Display for Times {
     }
 }
 
-/// one 3DS frame, about 16.71 ms.
+/// one 3DS frame, about 16.71 ms
 const FRAME_TIME: Duration =
     Duration::from_nanos(zakuro_core::CYCLES_PER_FRAME * 1_000_000_000 / zakuro_core::kernel::thread::CPU_CLOCK_HZ);
-/// how far behind the schedule may fall before it starts over instead of
-/// running fast to catch up, after a pause say.
+/// how far behind the schedule may fall b4 it starts over instead of running fast to catch up, after a pause say
 const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);
-/// frames that may go unshown in a row while catching up.
+/// frames that may go unshown in a row while catching up
 const MAX_SKIPPED: u32 = 4;
 
-/// whether a frame goes unshown, the game running behind the schedule with
-/// a presenter that waits for the display, and fewer than MAX_SKIPPED
-/// unshown before it.
+/// does a frame go unshown, the game running behind the schedule w/ a presenter that waits for the display,
+/// and fewer than MAX_SKIPPED unshown b4 it
 fn skips_showing(playing: bool, behind: bool, waits: bool, skipped: u32) -> bool {
     playing && behind && waits && skipped < MAX_SKIPPED
 }
 
-/// what the player is told when the 3D can't be drawn on the GPU.
+/// what the player is told when the 3D can't be drawn on the GPU
 const GPU_FALLBACK: &str = "The 3D can't be drawn on the GPU, as Vulkan isn't working on this computer, so it's drawn in software. \
 Games run much slower that way, and texture packs are left out. Updating the graphics driver usually fixes it; the log says \
 what went wrong. To draw in software without this message, turn off \"Draw the 3D on the GPU\" in Settings, Graphics.";
@@ -559,7 +540,7 @@ impl ApplicationHandler for App {
             if renderer != RendererKind::Vulkan {
                 return Err(error);
             }
-            // a machine without a working Vulkan driver still gets a window
+            // a machine w/o a working Vulkan driver still gets a window
             log::warn!("could not start the Vulkan backend, {error}, presenting with OpenGL instead");
             Backend::create(event_loop, attributes, RendererKind::OpenGl)
         });
@@ -577,8 +558,7 @@ impl ApplicationHandler for App {
                 if self.options.fullscreen {
                     self.toggle_fullscreen();
                 }
-                // the game the command line names starts on the device the
-                // presenter may lend the renderer, once there is one
+                // the game the command line names starts on the device the presenter may lend the renderer, once there's one
                 self.start();
             }
             Err(error) => {
@@ -589,8 +569,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Tab is fast forward while a game runs, not a key for moving the
-        // interface's focus around
+        // Tab is fast forward while a game runs, not a key for moving the UI's focus around
         let (tab, repeat) = match &event {
             WindowEvent::KeyboardInput { event, .. } => (event.physical_key == PhysicalKey::Code(KeyCode::Tab), event.repeat),
             _ => (false, false),
@@ -648,14 +627,12 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// the id of the running game, none without one, or with the test
-    /// pattern.
+    /// the id of the running game, none w/o one or w/ the test pattern
     fn program_id(&self) -> Option<u64> {
         Some(self.game.as_ref()?.system.title.as_ref()?.program_id())
     }
 
-    /// the console's settings for a game, from the command line and the
-    /// settings it plays with.
+    /// the console's settings for a game, from the command line and the settings it plays w/
     fn config(&self, settings: &Settings) -> Config {
         let interpret = self.options.interpreter || !settings.recompiled;
         Config {
@@ -682,11 +659,10 @@ impl App {
         }
     }
 
-    /// starts what the command line asks for, the test pattern or a game.
+    /// starts what the command line asks for, the test pattern or a game
     fn start(&mut self) {
         if self.options.test_pattern {
-            // the test pattern has no CPU program to run, paused keeps just
-            // presenting what is there
+            // the test pattern has no CPU program to run, paused keeps just presenting what's there
             let system = paint_test_pattern(self.config(&self.settings));
             self.game = Some(Running::new(system, PathBuf::new(), "test pattern".to_owned()));
             self.paused = true;
@@ -710,11 +686,9 @@ impl App {
         }
     }
 
-    /// starts the game at path, in place of any other, with what it has of
-    /// its own in the settings.
+    /// starts the game at path in place of any other, w/ what it has of its own in the settings
     fn play(&mut self, path: &Path) -> Result<(), String> {
-        // the old game and what it holds on the GPU go first, its sound too,
-        // and the overlay's line about it
+        // the old game and what it holds on the GPU go first, its sound too, and the overlay's line about it
         self.game = None;
         self.overlay_corner = None;
         if let Some(audio) = &self.audio {
@@ -722,8 +696,8 @@ impl App {
         }
         // a Download Play guest goes with the game
         self.dlp_guest = None;
-        // one from the command line isn't in the library, or not yet, and
-        // a Download Play child listed apart from its game is there with no id
+        // one from the command line isn't in the library (or not yet),
+        // and a Download Play child listed apart from its game is there w/ no id
         let known = self.library.games.iter().find(|game| game.path == path && game.problem.is_none()).map(|game| game.program_id);
         let program_id = known.or_else(|| Some(zakuro_fs::Title::load(path).ok()?.program_id()));
         self.active = self.settings.for_game(program_id);
@@ -735,19 +709,17 @@ impl App {
         started
     }
 
-    /// loads the game at path, which the settings in force are for.
+    /// loads the game at path, the settings in force are for it
     fn start_game(&mut self, path: &Path) -> Result<(), String> {
         let mut config = self.config(&self.active);
         config.wireless_reboot = self.wireless_reboot.take();
-        // the update, DLC and Download Play child found with the game in
-        // the library
+        // the update, DLC and Download Play child found w/ the game in the library
         if let Some(game) = self.library.games.iter().find(|game| game.path == path) {
             config.update = game.update.as_ref().map(|update| update.path.clone());
             config.dlc = game.dlc.iter().map(|dlc| dlc.path.clone()).collect();
             config.dlp_child = game.dlp_child.as_ref().map(|child| child.path.clone());
         } else if let Some((update, dlc, dlp_child)) = library::addons_beside(path) {
-            // one from the command line starts before the library's scan is
-            // in, or isn't in its folder: what's next to it goes with it
+            // one from the command line starts b4 the library's scan is in, or isn't in its folder, what's next to it goes w/ it
             config.update = update.map(|update| update.path);
             config.dlc = dlc.into_iter().map(|dlc| dlc.path).collect();
             config.dlp_child = dlp_child.map(|child| child.path);
@@ -770,8 +742,7 @@ impl App {
         };
         let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
         let outdated = system.recompiled.as_ref().is_some_and(|code| code.outdated());
-        // the settings ask for the 3D on the GPU, but Vulkan didn't start:
-        // only the log said so, while the game ran slowly
+        // the settings ask for the 3D on the GPU but Vulkan didn't start, only the log said so while the game ran slow
         let in_software = system.config.hardware_renderer && !system.gpu.draws_on_gpu();
         let name = self
             .library
@@ -793,7 +764,7 @@ impl App {
                 Err(error) => log::warn!("could not record to {}, {error}", record.display()),
             }
         }
-        // both can be so, and the GPU's is what explains a slow game
+        // both can be true, and the GPU's is what explains a slow game
         let notes: Vec<String> = [
             in_software.then(|| GPU_FALLBACK.to_owned()),
             outdated.then(|| {
@@ -810,8 +781,7 @@ impl App {
             self.menus.message = Some(notes.join("\n\n"));
         }
         self.game = Some(game);
-        // the new game's cameras see what the settings say, and it plays
-        // in the room the player is in
+        // the new game's cameras see what the settings say, and it plays in the room the player's in
         self.camera = None;
         self.apply_camera();
         self.microphone = None;
@@ -838,13 +808,12 @@ impl App {
         }
         self.menus.menu_open = false;
         self.keyboard.release();
-        // what the game had of its own goes with it
+        // what the game had of its own goes w/ it
         self.active = self.settings.clone();
         self.apply_layout();
     }
 
-    /// arranges the screens another way, for the running game alone when it
-    /// has an arrangement of its own.
+    /// arranges the screens another way, for the running game alone when it has an arrangement of its own
     fn set_layout(&mut self, layout: Screens) {
         let own = self.program_id().and_then(|id| self.settings.per_game.get_mut(&settings::game_key(id)));
         match own.filter(|own| own.layout.is_some()) {
@@ -875,7 +844,7 @@ impl App {
             return;
         }
         if code == KeyCode::Tab && !event.repeat && !self.settings.keys.binds(KeyCode::Tab) {
-            // fast forward while it is held
+            // fast forward while it's held
             self.fast_forward_key = pressed && self.game.is_some();
         }
         if pressed && !event.repeat {
@@ -901,18 +870,17 @@ impl App {
             && !self.menus.over_game()
             && !consumed
             && !self.gui.as_ref().is_some_and(Gui::wants_keyboard);
-        // blowing into the microphone while M is held
+        // blowing into the mic while M is held
         if code == KeyCode::KeyM && !event.repeat && !self.settings.keys.binds(KeyCode::KeyM) && (to_game || !pressed) {
             self.blow(pressed);
         }
-        // letting go always gets through, so that no button stays held
+        // letting go always gets thru, so no button stays held
         if to_game || !pressed {
             self.keyboard.key(event.physical_key, pressed);
         }
     }
 
-    /// takes in the controllers' buttons, a binding waiting for one takes
-    /// it, and Home opens and closes the menu over the game.
+    /// takes in the controllers' buttons, a binding waiting for one takes it, and Home opens and closes the menu over the game
     fn poll_gamepads(&mut self) {
         for button in self.gamepads.poll() {
             if let Some(index) = self.menus.rebinding_pad.take() {
@@ -927,17 +895,17 @@ impl App {
         }
     }
 
-    /// whether the pointer is busy with something other than the game.
+    /// is the pointer busy w/ something other than the game
     fn pointer_taken(&self, consumed: bool) -> bool {
         consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
     }
 
-    /// touches the bottom screen while the button is down over it.
+    /// touches the bottom screen while the button is down over it
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
         let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.orientation.screen_orientation(), self.top_shape.width(), self.active.integer_scale);
-        // with the top screen alone there is nothing to touch
+        // w/ the top screen alone there's nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
             return;
@@ -957,9 +925,8 @@ impl App {
         }));
     }
 
-    /// tilts the console while the right button is held, toward where the
-    /// pointer went and by how far, as Citra's motion emulation does,
-    /// which titles were tried with. letting go stands it upright again.
+    /// tilts the console while the right button's held, toward where the pointer went and by how far,
+    /// like Citra's motion emulation, which titles were tried w/, letting go stands it upright again
     fn tilt(&mut self) {
         // radians a pixel, and the furthest it goes, a quarter turn
         const PER_PIXEL: f32 = 0.01;
@@ -984,9 +951,8 @@ impl App {
                 self.resize_after_full_screen = false;
             }
             window.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
-            // the layout may have changed meanwhile, which full screen kept
-            // the window's size through. a window maximized before comes
-            // back maximized, resizing it would take it out of that
+            // the layout may have changed meanwhile, full screen kept the window's size thru it
+            // a window maximized b4 comes back maximized, resizing it would take it out of that
             if full && self.resize_after_full_screen && !self.maximized_before_full_screen {
                 let _ = window.request_inner_size(self.window_size());
             }
@@ -999,7 +965,7 @@ impl App {
         }
     }
 
-    /// saves the settings and puts to use what can change right away.
+    /// saves the settings and puts to use what can change right away
     fn apply_settings(&mut self) {
         self.settings.save();
         self.active = self.settings.for_game(self.program_id());
@@ -1022,8 +988,7 @@ impl App {
         self.apply_layout();
     }
 
-    /// gives the running game's cameras what the settings say they see,
-    /// when it is not what they have.
+    /// gives the running game's cameras what the settings say they see, when it isn't what they have
     fn apply_camera(&mut self) {
         let wanted = (self.settings.camera, self.settings.camera_picture.clone());
         let Some(game) = &mut self.game else { return };
@@ -1047,8 +1012,7 @@ impl App {
         self.camera = Some(wanted);
     }
 
-    /// gives the running game's microphone what the settings say it hears,
-    /// when it is not what it has.
+    /// gives the running game's mic what the settings say it hears, when it isn't what it has
     fn apply_microphone(&mut self) {
         let wanted = self.settings.microphone;
         let Some(game) = &mut self.game else { return };
@@ -1057,7 +1021,7 @@ impl App {
         }
         let device = wanted == MicrophoneSource::Computer;
         let mut microphone = microphone::HostMicrophone::new(device, self.blowing.clone());
-        // a game listening already goes on listening to the new one
+        // a game already listening goes on listening to the new one
         if game.system.services.mic.is_sampling() {
             zakuro_core::microphone::Microphone::sampling(&mut microphone, true);
         }
@@ -1065,15 +1029,14 @@ impl App {
         self.microphone = Some(wanted);
     }
 
-    /// starts or stops blowing into the microphone.
+    /// starts or stops blowing into the mic
     fn blow(&mut self, on: bool) {
         if self.blowing.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
             log::debug!("{} into the microphone", if on { "blowing" } else { "no longer blowing" });
         }
     }
 
-    /// puts the screens' arrangement and the window scale to use, sizing
-    /// the window to them.
+    /// puts the screens' arrangement and the window scale to use, sizing the window to them
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
             backend.set_top_width(self.active.top_shape.width());
@@ -1090,8 +1053,7 @@ impl App {
                 backend.set_layout(self.layout.screens());
                 backend.set_orientation(self.orientation.screen_orientation());
             }
-            // a full screen or maximized window keeps its size, resizing
-            // it would take it out of that, full screen fits it on leaving
+            // a full screen or maximized window keeps its size, resizing it would take it out of that, full screen fits it on leaving
             match &self.window {
                 Some(window) if window.fullscreen().is_some() => self.resize_after_full_screen = true,
                 Some(window) if !window.is_maximized() => {
@@ -1102,15 +1064,15 @@ impl App {
         }
     }
 
-    /// the window size that fits the screens at the chosen scale.
+    /// the window size that fits the screens at the chosen scale
     fn window_size(&self) -> winit::dpi::Size {
         let (width, height) = self.layout.screens().size(self.top_shape.width());
         let (width, height) = match self.orientation.screen_orientation().is_portrait() {
             true => (height, width),
             false => (width, height)
         };
-        // scaled by whole numbers, a desktop scaled by 125% say would leave a
-        // border, so the window gets whole multiples of the screens' pixels
+        // scaled by whole numbers, a desktop scaled by 125% say would leave a border,
+        // so the window gets whole multiples of the screens' pixels
         if let (true, Some(window)) = (self.active.integer_scale, &self.window) {
             let times = (self.scale as f64 * window.scale_factor()).round().max(1.0) as u32;
             return winit::dpi::PhysicalSize::new(width * times, height * times).into();
@@ -1118,10 +1080,9 @@ impl App {
         winit::dpi::LogicalSize::new(width * self.scale, height * self.scale).into()
     }
 
-    /// what to recompile with: the computer's C compiler, or the Zig Zakuro
-    /// downloaded, or else, when the player said yes to it, Zig downloaded
-    /// first. with none of those there is none, it asks whether to download
-    /// Zig for games, or says what is missing.
+    /// what to recompile w/, the computer's C compiler, or the Zig Zakuro downloaded,
+    /// or else Zig downloaded first when the player said yes to it
+    /// w/ none of those there's none, it asks whether to download Zig for games, or says what's missing
     fn toolchain(&mut self, games: &[Wanted]) -> Option<Toolchain> {
         let tools = zig::tools_dir(self.data_dir.as_deref());
         let error = match recomp3ds::compile::check(None) {
@@ -1142,9 +1103,8 @@ impl App {
         None
     }
 
-    /// puts games in line to recompile, after those there are, each with
-    /// its turn once the one before it is done. download says the player
-    /// agreed to download a compiler should there be none.
+    /// puts games in line to recompile after the ones already there, each getting its turn once the one b4 it is done
+    /// download says the player agreed to download a compiler if there's none
     fn recompile(&mut self, games: Vec<Wanted>, download: bool) {
         self.download_compiler = download;
         if self.toolchain(&games).is_none() {
@@ -1159,13 +1119,12 @@ impl App {
         self.next_recompile();
     }
 
-    /// starts the game next in line, when none is recompiling.
+    /// starts the game next in line, when none is recompiling
     fn next_recompile(&mut self) {
         if self.waiting.is_empty() || self.jobs.iter().any(|job| !job.stage().finished()) {
             return;
         }
-        // a compiler can have stopped being there, its download failing or
-        // being cancelled, and it asks again for those left
+        // a compiler can have stopped being there (its download failed or got cancelled), and it asks again for the ones left
         let Some(toolchain) = self.toolchain(&self.waiting.clone()) else {
             self.waiting.clear();
             return;
@@ -1180,7 +1139,7 @@ impl App {
         }
     }
 
-    /// tells about recompiles as they finish, and starts the next.
+    /// tells about recompiles as they finish, and starts the next
     fn poll_jobs(&mut self) {
         let mut finished = Vec::new();
         for job in &mut self.jobs {
@@ -1209,7 +1168,7 @@ impl App {
                         }
                     }
                 }
-                // others can fail before anyone reads this, in a long line
+                // others can fail b4 anyone reads this, in a long line
                 Stage::Failed(error) if error != "cancelled" => {
                     let failed = format!("Recompiling {name} failed, {error}");
                     self.menus.message = Some(self.menus.message.take().map_or(failed.clone(), |earlier| format!("{earlier}\n\n{failed}")));
@@ -1384,7 +1343,7 @@ impl App {
         self.library.poll();
         self.poll_jobs();
         self.poll_gamepads();
-        // a room that went away takes the game's local wireless with it
+        // a room that went away takes the game's local wireless w/ it
         if self.room.as_ref().is_some_and(|room| !room.open()) {
             self.leave_room();
             self.menus.message = Some("The room closed, or the connection to it was lost.".into());
@@ -1394,14 +1353,13 @@ impl App {
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
         let playing = self.game.is_some() && !self.paused && !self.menus.over_game() && !typing;
-        // Tab or a controller's right trigger, or the right stick's click
-        // while ZR has the trigger, whichever no button of the console's is on
+        // Tab or a controller's right trigger, or the right stick's click while ZR has the trigger, whichever no console button is on
         let free = |button: gilrs::Button| self.settings.pad.map().iter().all(|&(_, bound)| bound != button);
         let trigger = [gilrs::Button::RightTrigger2, gilrs::Button::RightThumb].into_iter().find(|&button| free(button));
         let pad = self.focused || !self.options.focus_pad;
         let fast = playing && (self.fast_forward_key || (pad && trigger.is_some_and(|trigger| self.gamepads.holding(trigger))));
         if fast {
-            // the output waits out fast forward rather than run dry
+            // the output waits out fast forward instead of running dry
             if let Some(audio) = &self.audio {
                 audio.hold();
             }
@@ -1409,7 +1367,7 @@ impl App {
         if fast != self.fast_forwarding {
             self.fast_forwarding = fast;
             if !fast {
-                // back at the console's pace, with no sound piled up
+                // back at the console's pace, w/ no sound piled up
                 if let Some(audio) = &self.audio {
                     audio.clear();
                 }
@@ -1421,7 +1379,7 @@ impl App {
             self.emulate();
             self.spent.emulating.add(start.elapsed());
         } else if let Some(audio) = &self.audio {
-            // the sound stops with the game, which is not falling behind
+            // the sound stops w/ the game, which isn't falling behind
             audio.hold();
         }
 
@@ -1434,11 +1392,9 @@ impl App {
                 None => Instant::now(),
             };
         }
-        // behind the schedule, showing the frame would wait on the display,
-        // so it goes unshown, a few at most. a presenter that does not wait,
-        // in mailbox mode, shows them all, a game that could not keep up
-        // showed a fifth of its frames. fast forward shows them at the
-        // console's frame rate, waiting on the display for no more
+        // behind the schedule, showing the frame would wait on the display, so it goes unshown, a few at most
+        // a presenter that doesn't wait (mailbox mode) shows them all, a game that couldn't keep up showed a fifth of its frames
+        // fast forward shows them at the console's frame rate, waiting on the display for no more
         let behind = Instant::now() > self.next_frame;
         let waits = self.backend.as_ref().is_some_and(Backend::waits_for_display);
         let unshown = if fast { Instant::now() < self.next_shown } else { skips_showing(playing, behind, waits, self.skipped) };
@@ -1448,8 +1404,7 @@ impl App {
             self.skipped = 0;
             let start = Instant::now();
             self.present(event_loop);
-            // the next one a frame later, or right away after falling
-            // behind, at the console's rate on average
+            // the next one a frame later, or right away after falling behind, at the console's rate on average
             self.next_shown = (self.next_shown + FRAME_TIME).max(Instant::now() - FRAME_TIME);
             self.spent.showing.add(start.elapsed());
             self.shown += 1;
@@ -1486,7 +1441,7 @@ impl App {
         }
     }
 
-    /// runs one frame of the game.
+    /// runs one frame of the game
     fn emulate(&mut self) {
         let Some(game) = &mut self.game else { return };
         let input = match &mut game.replay {
@@ -1501,8 +1456,7 @@ impl App {
         }
         game.system.set_input(input);
         let outcome = game.system.run_frame();
-        // the overlay reads the game the program was built on, not another
-        // one its library opened
+        // the overlay reads the game the program was built on, not another one its library opened
         let ours = self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()));
         if let Some(overlay) = self.overlay.as_mut().filter(|_| ours) {
             let text = overlay.frame(&mut game.system.memory);
@@ -1513,7 +1467,7 @@ impl App {
         }
         game.count_frame();
         let sound = game.system.take_audio();
-        // fast forward plays no sound, there is too much of it too soon
+        // fast forward plays no sound, there's too much of it too soon
         if let (Some(audio), false) = (&self.audio, self.fast_forwarding) {
             audio.push(&sound);
         }
@@ -1537,7 +1491,7 @@ impl App {
         }
     }
 
-    /// the name the player goes by, the console's too.
+    /// the name the player goes by, the console's too
     fn nickname(&self) -> String {
         match self.settings.nickname.trim() {
             "" => "Player".into(),
@@ -1545,8 +1499,7 @@ impl App {
         }
     }
 
-    /// gives the running game the room the player is in, and tells the room
-    /// the game.
+    /// gives the running game the room the player's in, and tells the room the game
     fn link_room(&mut self) {
         let Some(game) = &mut self.game else { return };
         game.system.room = self.room.as_ref().map(|room| room.link());
@@ -1555,7 +1508,7 @@ impl App {
         }
     }
 
-    /// opens a room on the port chosen, and joins it.
+    /// opens a room on the port chosen, and joins it
     fn host_room(&mut self) {
         let name = match self.settings.room_name.trim() {
             "" => format!("{}'s room", self.nickname()),
@@ -1575,7 +1528,7 @@ impl App {
         }
     }
 
-    /// joins the room at address.
+    /// joins the room at address
     fn join_room(&mut self, address: &str) {
         let password = self.menus.room_password.clone();
         match zakuro_core::room::Connection::join(address.trim(), &self.nickname(), &password) {
@@ -1587,7 +1540,7 @@ impl App {
         }
     }
 
-    /// leaves the room, and closes it when it is this program's.
+    /// leaves the room, and closes it when it's this program's
     fn leave_room(&mut self) {
         self.dlp_guest = None;
         self.room = None;
@@ -1597,8 +1550,7 @@ impl App {
         }
     }
 
-    /// Download Play as a guest: hears the offers in the room while no game
-    /// runs, and starts the child once the host's game begins.
+    /// Download Play as a guest, hears the offers in the room while no game runs and starts the child once the host's game begins
     fn download_play(&mut self) {
         let Some(room) = self.room.as_ref().filter(|_| self.game.is_none()) else {
             self.dlp_guest = None;
@@ -1630,8 +1582,7 @@ impl App {
         }
     }
 
-    /// takes part in the Download Play offer at index, with the player's own
-    /// copy of the child when the folder has one.
+    /// takes part in the Download Play offer at index, w/ the player's own copy of the child when the folder has one
     fn join_download_play(&mut self, index: usize) {
         let node = zakuro_core::download_play::node(self.settings.console_id, &self.nickname());
         let Some(guest) = &mut self.dlp_guest else { return };
@@ -1641,7 +1592,7 @@ impl App {
         guest.join(host, node, self.dlp_own.is_some());
     }
 
-    /// keeps a child the host sent, for it to run from.
+    /// keeps a child the host sent, for it to run from
     fn keep_child(&self, child: &[u8]) -> Result<PathBuf, String> {
         let cia = zakuro_fs::Cia::read(child).map_err(|_| "the host sent something that isn't a game".to_owned())?;
         let folder = self.data_dir.clone().unwrap_or_else(std::env::temp_dir).join("dlp");
@@ -1650,13 +1601,13 @@ impl App {
         Ok(path)
     }
 
-    /// the file of a slot of the running game's saved states.
+    /// the file of a slot of the running game's save states
     fn state_path(&self, slot: u8) -> Option<PathBuf> {
         let program_id = self.game.as_ref()?.system.title.as_ref()?.program_id();
         Some(self.data_dir.as_ref()?.join("states").join(format!("{program_id:016X}")).join(format!("{slot}.state")))
     }
 
-    /// saves the running game's state to the slot chosen.
+    /// saves the running game's state to the slot chosen
     fn save_state(&mut self) {
         let slot = self.menus.slot;
         let Some(path) = self.state_path(slot) else { return };
@@ -1665,8 +1616,7 @@ impl App {
         let saved = game.system.save_state().and_then(|bytes| {
             let parent = path.parent().expect("a state's file is in a folder");
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            // written beside it first, a state cut short never takes the
-            // place of a whole one
+            // written beside it first, so a state cut short never replaces a whole one
             let partial = path.with_extension("state.new");
             std::fs::write(&partial, &bytes).and_then(|()| std::fs::rename(&partial, &path)).map_err(|error| error.to_string())
         });
@@ -1677,11 +1627,11 @@ impl App {
             }
             Err(error) => self.menus.message = Some(format!("The state could not be saved, {error}")),
         }
-        // the time it took is not the game's to make up
+        // the time it took isn't the game's to make up
         self.next_frame = Instant::now();
     }
 
-    /// loads the running game's state from the slot chosen.
+    /// loads the running game's state from the slot chosen
     fn load_state(&mut self) {
         let slot = self.menus.slot;
         let Some(path) = self.state_path(slot) else { return };
@@ -1697,8 +1647,7 @@ impl App {
                 log::info!("loaded the state from {}", path.display());
                 self.menus.toast = Some((format!("Loaded slot {slot}"), Instant::now()));
                 self.menus.menu_open = false;
-                // the overlay's line was about the memory before, the next
-                // frame gives the one about the state
+                // the overlay's line was about the memory b4, the next frame gives the one about the state
                 self.overlay_corner = None;
                 if let Some(audio) = &self.audio {
                     audio.clear();
@@ -1709,13 +1658,13 @@ impl App {
         self.next_frame = Instant::now();
     }
 
-    /// the file of the running game's cheats.
+    /// the file of the running game's cheats
     fn cheats_path(&self) -> Option<PathBuf> {
         let program_id = self.game.as_ref()?.system.title.as_ref()?.program_id();
         Some(zakuro_core::cheats::path(self.data_dir.as_ref()?, program_id))
     }
 
-    /// writes the running game's cheats to their file.
+    /// writes the running game's cheats to their file
     fn save_cheats(&mut self) {
         let (Some(path), Some(game)) = (self.cheats_path(), &self.game) else { return };
         if let Err(error) = zakuro_core::cheats::save(&path, &game.system.cheats) {
@@ -1723,9 +1672,9 @@ impl App {
         }
     }
 
-    /// the menus, and the actions they asked for, done.
+    /// the menus, and the actions they asked for, done
     fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
-        // when the slot chosen was saved to, while the menu shows it
+        // when the chosen slot was saved to, while the menu shows it
         let saved = self
             .menus
             .menu_open
@@ -1819,8 +1768,7 @@ impl App {
     }
 }
 
-/// what the multiplayer window shows of Download Play: the offers in the
-/// room, and where the guest is.
+/// what the multiplayer window shows of Download Play, the offers in the room and where the guest is
 fn download_play_view(guest: &zakuro_core::download_play::Guest, members: &[zakuro_core::room::Member], library: &Library) -> menus::DlpView {
     use zakuro_core::download_play::Phase;
     let offers = guest
@@ -1863,9 +1811,8 @@ fn download_play_view(guest: &zakuro_core::download_play::Guest, members: &[zaku
     menus::DlpView { offers, doing }
 }
 
-/// a screen as the presenter takes it, straight from the GPU when it shares
-/// the renderer's device and the GPU drew what the screen shows, else its
-/// pixels.
+/// a screen as the presenter takes it, straight from the GPU when it shares the renderer's device and the GPU drew
+/// what the screen shows, otherwise its pixels
 fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<GpuScreen>) {
     if let Some(gpu) = system.gpu_screen(screen) {
         let scale = system.gpu.scale();
@@ -1874,8 +1821,7 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<Gp
     (system.read_screen_scaled(screen), None)
 }
 
-/// the top screen's picture for the right eye, as shown gives the screens,
-/// when the game draws in 3D.
+/// the top screen's picture for the right eye, like shown gives the screens, when the game draws in 3D
 fn shown_right(system: &mut System) -> Option<(zakuro_core::Screen, Option<GpuScreen>)> {
     if let Some(gpu) = system.gpu_right_eye() {
         let scale = system.gpu.scale();
@@ -1884,15 +1830,14 @@ fn shown_right(system: &mut System) -> Option<(zakuro_core::Screen, Option<GpuSc
     system.read_right_eye_scaled().map(|screen| (screen, None))
 }
 
-/// keeps the renderer kind referenced even when a backend feature is off.
+/// keeps the renderer kind referenced even when a backend feature is off
 const _: RendererKind = RendererKind::Software;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// a frame goes unshown only while the game runs behind with a
-    /// presenter that waits for the display, a few in a row at most.
+    /// a frame only goes unshown while the game runs behind w/ a presenter that waits for the display, a few in a row at most
     #[test]
     fn frames_go_unshown_only_when_showing_would_wait() {
         assert!(skips_showing(true, true, true, 0));

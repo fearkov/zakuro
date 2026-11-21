@@ -1,8 +1,6 @@
 //! rooms, where consoles on different computers meet for local wireless
-//! play. a room is a server each member keeps a TCP connection to. it gives
-//! every member a MAC address and passes what one sends on to the member it
-//! is for, or to all the others. what goes through is the members' own, the
-//! room never looks inside.
+//! a room is a server every member keeps a TCP connection to, it hands out MACs and passes what one sends to its target or everyone else
+//! what goes thru is the members' business, the room never peeks
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -16,18 +14,18 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub type Mac = [u8; 6];
-/// every member of the room.
+/// every member of the room
 pub const BROADCAST: Mac = [0xFF; 6];
-/// the port a room listens on unless it is told another.
+/// the port a room listens on unless told otherwise
 pub const DEFAULT_PORT: u16 = 24873;
-/// rooms and members speaking another version do not meet.
+/// rooms and members on another version don't meet
 const VERSION: u32 = 1;
-/// the largest message, a beacon or a packet with room to spare.
+/// biggest message, a beacon or packet w/ room to spare
 const LARGEST: usize = 64 * 1024;
-/// how long joining waits for the room to answer.
+/// how long joining waits for the room to answer
 const PATIENCE: Duration = Duration::from_secs(5);
 
-/// someone in a room, and the game they play.
+/// someone in a room and the game they play
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub nickname: String,
@@ -38,7 +36,7 @@ pub struct Member {
 #[derive(Serialize, Deserialize)]
 enum ToRoom {
     Hello { version: u32, nickname: String, password: String },
-    /// the game the member plays now, none when it plays nothing.
+    /// the game the member plays now, none when nothing
     Playing(String),
     Packet { to: Mac, body: Vec<u8> },
 }
@@ -71,7 +69,7 @@ fn read<T: DeserializeOwned>(stream: &mut impl Read) -> std::io::Result<T> {
     postcard::from_bytes(&body).map_err(std::io::Error::other)
 }
 
-/// a room this program holds open for others to join.
+/// a room this program holds open for others
 pub struct Server {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -82,9 +80,9 @@ struct Seats {
     name: String,
     password: String,
     most: usize,
-    /// the members, and the stream each is written to through.
+    /// the members and the stream each is written thru
     taken: Vec<(Member, Arc<Mutex<TcpStream>>)>,
-    /// the last part of the next MAC address handed out.
+    /// last part of the next MAC handed out
     next: u32,
 }
 
@@ -93,7 +91,7 @@ impl Seats {
         self.taken.iter().map(|(member, _)| member.clone()).collect()
     }
 
-    /// tells everyone who is in the room.
+    /// tells everyone who's in the room
     fn announce(&self) {
         let members = FromRoom::Members(self.members());
         for (_, stream) in &self.taken {
@@ -105,7 +103,7 @@ impl Seats {
 }
 
 impl Server {
-    /// opens a room on port, 0 for any free one, for up to most members.
+    /// opens a room on port (0 for any free one) for up to most members
     pub fn start(port: u16, name: &str, password: &str, most: usize) -> std::io::Result<Server> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let port = listener.local_addr()?.port();
@@ -162,10 +160,9 @@ impl Drop for Server {
     }
 }
 
-/// a member's time in the room, from its hello to its leaving.
+/// a member's stay in the room, hello to leaving
 fn seat(mut stream: TcpStream, address: String, seats: &Mutex<Seats>, stop: &AtomicBool) {
-    // on Windows a stream takes the listener's not blocking, and the member
-    // would be gone at the first read with nothing to read yet
+    // on windows a stream inherits the listener's nonblocking, the member would vanish at the first read w/ nothing to read yet
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(PATIENCE));
@@ -190,7 +187,7 @@ fn seat(mut stream: TcpStream, address: String, seats: &Mutex<Seats>, stop: &Ato
             let _ = write(&mut stream, &FromRoom::Refused(reason));
             return;
         }
-        // locally administered addresses, Z and K, then the member's number
+        // locally administered addrs, Z and K, then the member's number
         let number = room.next;
         room.next += 1;
         let mac = [0x02, 0x5A, 0x4B, (number >> 16) as u8, (number >> 8) as u8, number as u8];
@@ -233,17 +230,17 @@ fn seat(mut stream: TcpStream, address: String, seats: &Mutex<Seats>, stop: &Ato
     log::info!("{nickname} left the room");
 }
 
-/// what the connection to a room and the console's side of it share.
+/// what the room connection and the console's side share
 struct Shared {
     mac: Mac,
     room: String,
     open: AtomicBool,
     members: Mutex<Vec<Member>>,
-    /// what came for the console, from whom, oldest first.
+    /// what came for the console and from whom, oldest first
     inbox: Mutex<VecDeque<(Mac, Vec<u8>)>>,
 }
 
-/// this program in a room.
+/// this program in a room
 pub struct Connection {
     stream: TcpStream,
     outbox: Sender<ToRoom>,
@@ -251,7 +248,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// joins the room at address, host:port, under nickname.
+    /// joins the room at address (`host:port`) as nickname
     pub fn join(address: &str, nickname: &str, password: &str) -> Result<Connection, String> {
         let target = address
             .to_socket_addrs()
@@ -278,8 +275,7 @@ impl Connection {
             inbox: Mutex::new(VecDeque::new()),
         });
 
-        // what this side sends goes through a thread of its own, the
-        // console never waits on the network
+        // this side's sends go thru their own thread, the console never waits on the network
         let (outbox, outgoing) = channel::<ToRoom>();
         let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
         let sending = shared.clone();
@@ -308,8 +304,7 @@ impl Connection {
                         }
                         FromRoom::Packet { from, body } => {
                             if let Ok(mut inbox) = receiving.inbox.lock() {
-                                // a console that stopped taking them does not
-                                // pile them up for good
+                                // a console that stopped taking them doesn't pile them up forever
                                 if inbox.len() >= 4096 {
                                     inbox.pop_front();
                                 }
@@ -327,7 +322,7 @@ impl Connection {
         Ok(Connection { stream, outbox, shared })
     }
 
-    /// the room's name.
+    /// the room's name
     pub fn room(&self) -> &str {
         &self.shared.room
     }
@@ -344,12 +339,12 @@ impl Connection {
         self.shared.members.lock().map(|members| members.clone()).unwrap_or_default()
     }
 
-    /// tells the room the game this member plays, none for none.
+    /// tells the room what game this member plays, none for none
     pub fn playing(&self, game: &str) {
         let _ = self.outbox.send(ToRoom::Playing(game.to_owned()));
     }
 
-    /// the console's way into the room, which leaves what came before it.
+    /// the console's way into the room, leaves what came b4 it
     pub fn link(&self) -> Link {
         if let Ok(mut inbox) = self.shared.inbox.lock() {
             inbox.clear();
@@ -365,7 +360,7 @@ impl Drop for Connection {
     }
 }
 
-/// what the console sends into a room and takes out of it.
+/// what the console sends into a room and takes out of it
 #[derive(Clone)]
 pub struct Link {
     outbox: Sender<ToRoom>,
@@ -377,23 +372,22 @@ impl Link {
         self.shared.mac
     }
 
-    /// whether the room is still there.
+    /// is the room still there
     pub fn open(&self) -> bool {
         self.shared.open.load(Ordering::Relaxed)
     }
 
-    /// sends body to the member with the address, or to everyone.
+    /// sends body to the member at the addr, or everyone
     pub fn send(&self, to: Mac, body: Vec<u8>) {
         let _ = self.outbox.send(ToRoom::Packet { to, body });
     }
 
-    /// what came since the last call, and from whom.
+    /// what came since the last call and from whom
     pub fn receive(&self) -> Vec<(Mac, Vec<u8>)> {
         self.shared.inbox.lock().map(|mut inbox| inbox.drain(..).collect()).unwrap_or_default()
     }
 
-    /// a link no room is behind, which hands what is sent to the other end
-    /// of the pair, for two consoles in one program.
+    /// a link w/ no room behind it, hands sends to the other end of the pair, for two consoles in one program
     pub fn pair() -> (Link, Link) {
         let make = |mac: Mac| {
             Arc::new(Shared {
@@ -430,8 +424,7 @@ impl Link {
 mod tests {
     use super::*;
 
-    /// two members of a room get their own addresses, see each other, and
-    /// what one sends to the other or to everyone reaches the other only.
+    /// two room members get their own addrs, see each other, and what one sends (direct or to everyone) reaches only the other
     #[test]
     fn a_room_passes_packets_between_members() {
         let server = Server::start(0, "test", "", 4).unwrap();

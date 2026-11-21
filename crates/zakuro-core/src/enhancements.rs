@@ -1,26 +1,21 @@
-//! enhancements, the community's codes that make games run at 60 FPS and
-//! the like, for the builds of games they were tested on, which a player
-//! turns on by name instead of finding and pasting the code.
+//! enhancements, community codes like 60 FPS for the game builds they were tested on, players turn them on by name instead of pasting code
 
 use crate::cheats::Cheat;
 
-/// the codes, one game after another, its title id and name, then each
-/// enhancement, its name, the build it is for, who made it and what to know
-/// about it, and its code.
+/// the codes, game after game, title id and name, then each enhancement's name, build, author, notes and code
 const LIST: &str = include_str!("enhancements.txt");
 
-/// one enhancement for a game.
+/// one enhancement for a game
 #[derive(Debug, Clone, PartialEq)]
 pub struct Enhancement {
     pub name: String,
     pub author: String,
-    /// what a player should know before turning it on, empty if nothing.
+    /// what a player should know b4 turning it on, empty if nothing
     pub note: String,
     pub lines: Vec<String>,
 }
 
-/// the build a title runs, which an enhancement's code has to be made for:
-/// its update's version, or else its cartridge's revision.
+/// the build a title runs (its update's version, else its cart revision), an enhancement's code must match it
 pub fn build(title: &zakuro_fs::Title) -> String {
     match title.update() {
         Some(update) => format!("update {}.{}", update.version >> 10, update.version >> 4 & 0x3F),
@@ -28,7 +23,7 @@ pub fn build(title: &zakuro_fs::Title) -> String {
     }
 }
 
-/// the enhancements for a game of program_id running build.
+/// enhancements for a program_id game running build
 pub fn for_title(program_id: u64, build: &str) -> Vec<Enhancement> {
     let mut found: Vec<Enhancement> = Vec::new();
     let (mut game, mut taking) = (false, false);
@@ -58,8 +53,7 @@ pub fn for_title(program_id: u64, build: &str) -> Vec<Enhancement> {
     found
 }
 
-/// the game's enhancements as cheats of its own, the ones named in on
-/// turned on, which go nowhere near the player's cheat file.
+/// the game's enhancements as its own cheats, the ones named in on enabled, nowhere near the player's cheat file
 pub fn cheats(program_id: u64, build: &str, on: &[String]) -> Vec<Cheat> {
     for_title(program_id, build)
         .into_iter()
@@ -78,8 +72,7 @@ pub fn cheats(program_id: u64, build: &str, on: &[String]) -> Vec<Cheat> {
 mod tests {
     use super::*;
 
-    /// each enhancement is for its own game and build, with its note and
-    /// who made it, and only its own code.
+    /// each enhancement is for its own game and build, w/ its note and author, and only its own code
     #[test]
     fn a_game_gets_the_enhancements_for_its_build() {
         let enhancements = for_title(0x0004_0000_0008_C300, "rev2");

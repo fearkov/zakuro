@@ -1,10 +1,9 @@
-//! dlp:SRVR, the host's side of Download Play. a game offers its child, the
-//! small program its card carries for others, takes in guests, sends them
-//! the child and then the passphrase of the network it puts up for them.
-//! guests are Zakuro's own Download Play, see download_play, in the room
-//! local wireless goes through. the child on a card is encrypted, so it goes
-//! to guests only when the host has it decrypted, see Config::dlp_child,
-//! and a guest without it needs its own.
+//! dlp:SRVR, the host side of Download Play
+//! a game offers its child (the lil program its card carries for others), takes guests in, sends them the child,
+//! then the passphrase of the network it puts up for them
+//! guests are Zakuro's own Download Play (see download_play) in the room local wireless goes thru
+//! the card's child is encrypted, so guests only get it when the host has it decrypted (see `Config::dlp_child`),
+//! otherwise a guest needs its own
 
 use std::sync::Arc;
 
@@ -17,7 +16,7 @@ use crate::room::{Mac, BROADCAST};
 use crate::services::uds::Wireless;
 use crate::System;
 
-// the server's states, as GetServerState reports them
+// server states as GetServerState reports them
 const NOT_INITIALIZED: u8 = 0;
 const INITIALIZED: u8 = 1;
 const ACCEPTING: u8 = 2;
@@ -26,23 +25,23 @@ const DISTRIBUTING: u8 = 7;
 const NEED_TO_SEND_PASSPHRASE: u8 = 8;
 const COMPLETE: u8 = 9;
 
-/// where each guest is.
+/// where each guest's at
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Stage {
-    /// waiting for the game to take it in.
+    /// waiting for the game to let it in
     NeedsAuth,
     Accepted,
-    /// told distribution starts, waiting to hear whether it needs the child.
+    /// told distribution starts, waiting to hear if it needs the child
     NeedsDistributeAck,
-    /// being sent the child.
+    /// getting the child
     NeedsContent,
-    /// has the child, waiting for the game to begin.
+    /// has the child, waiting for the game to start
     DistributeDone,
     SentPassphrase,
 }
 
 impl Stage {
-    /// GetClientState's view of it, the client's own state.
+    /// what GetClientState reports for it
     fn reported(self) -> u32 {
         match self {
             Stage::NeedsAuth => 64,
@@ -58,28 +57,27 @@ impl Stage {
     }
 }
 
-/// a guest of the session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Guest {
     node_id: u16,
     mac: Mac,
     node: Vec<u8>,
     stage: Stage,
-    /// how much of the child has gone to it.
+    /// how much of the child it got so far
     sent: u64,
 }
 
-/// what a host offers, which guests see in their list.
+/// what a host offers, guests see it in their list
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Offer {
-    /// the child's title id.
+    /// the child's title id
     pub child: u64,
-    /// its SMDH, titles and icon, empty when the card has none.
+    /// its SMDH (titles and icon), empty when the card has none
     pub smdh: Vec<u8>,
     pub size: u64,
     pub guests: u8,
     pub most: u8,
-    /// whether the host can send the child, having it decrypted.
+    /// can the host send the child (it has it decrypted)
     pub sends_child: bool,
 }
 
@@ -89,19 +87,19 @@ pub struct DlpState {
     most: u8,
     manual: bool,
     guests: Vec<Guest>,
-    /// the child the card carries.
+    /// the child the card carries
     child: Option<(u64, Vec<u8>, u64)>,
     next_offer: Option<u64>,
-    /// the child decrypted, read when it is first sent.
+    /// the decrypted child, read the first time it's sent
     #[serde(skip)]
     decrypted: Option<Arc<Vec<u8>>>,
 }
 
-/// the child goes in pieces this large.
+/// the child goes in pieces this big
 pub const PIECE: usize = 32 * 1024;
-/// and this many at a time to each guest, so a room keeps up.
+/// and this many at a time to each guest, so a room keeps up
 const PIECES_A_TICK: usize = 8;
-/// an offer goes out this often.
+/// an offer goes out once a second
 const OFFER_NANOS: u64 = 1_000_000_000;
 
 fn result(description: u32, summary: Summary, level: Level) -> u32 {
@@ -109,16 +107,14 @@ fn result(description: u32, summary: Summary, level: Level) -> u32 {
 }
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
-    // with no room wireless is off, as local wireless has it, unless the
-    // game already started on it in one
+    // w/o a room wireless is off, like local wireless does, unless the game already started on it in one
     if system.services.dlp.state == NOT_INITIALIZED && system.room.as_ref().is_none_or(|room| !room.open()) {
         return false;
     }
     let command = header.command_id();
     let word = |system: &mut System, index: u32| buffer.get(&mut system.memory, index);
     match command {
-        // Initialize(shared memory size, most guests, process, ...) and
-        // InitializeWithName(..., name), the child read from the card
+        // Initialize(shared mem size, max guests, process, ...) and InitializeWithName(..., name), the child gets read from the card
         0x0001 | 0x000F => {
             let most = word(system, 2) as u8;
             initialize(system, most);
@@ -273,7 +269,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 None => buffer.reply_error(&mut system.memory, command, result(1007, Summary::NotFound, Level::Status)),
             }
         }
-        // IsChild(process), whether the title running is a Download Play child
+        // IsChild(process), is the running title a Download Play child
         0x000E => {
             let child = system.title.as_ref().is_some_and(|title| title.program_id() >> 32 == 0x0004_0001);
             buffer.reply(&mut system.memory, command, &[child as u32]);
@@ -285,7 +281,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     true
 }
 
-/// starts the service, the child read off the card.
+/// starts the service and reads the child off the card
 fn initialize(system: &mut System, most: u8) {
     let child = system.title.as_ref().and_then(|title| {
         let image = title.image().data();
@@ -316,7 +312,7 @@ fn tell_guests(system: &System, message: &Wireless) {
     }
 }
 
-/// the server's state follows its guests once distribution started.
+/// once distribution started the server's state follows its guests
 fn settle(system: &mut System) {
     let dlp = &mut system.services.dlp;
     if !matches!(dlp.state, WAITING_FOR_DISTRIBUTION | DISTRIBUTING) {
@@ -332,7 +328,7 @@ fn settle(system: &mut System) {
     };
 }
 
-/// the child decrypted, read once, none when there is none to send.
+/// the decrypted child, read once, none when there's nothing to send
 fn decrypted(system: &mut System) -> Option<Arc<Vec<u8>>> {
     if let Some(bytes) = &system.services.dlp.decrypted {
         return Some(bytes.clone());
@@ -351,7 +347,7 @@ fn decrypted(system: &mut System) -> Option<Arc<Vec<u8>>> {
     }
 }
 
-/// what a guest sent the host.
+/// what a guest sent the host
 pub(crate) fn take(system: &mut System, from: Mac, message: Wireless) {
     let dlp = &system.services.dlp;
     if dlp.state == NOT_INITIALIZED {
@@ -381,7 +377,7 @@ pub(crate) fn take(system: &mut System, from: Mac, message: Wireless) {
             let dlp = &mut system.services.dlp;
             let Some(guest) = dlp.guests.iter_mut().find(|guest| guest.mac == from && guest.stage == Stage::NeedsDistributeAck) else { return };
             if needs && !has {
-                // nothing to send it, the guest has to go
+                // nothing to send it, bye guest
                 let mac = guest.mac;
                 dlp.guests.retain(|guest| guest.mac != mac);
                 send(system, mac, &Wireless::DlpRefused);
@@ -405,7 +401,7 @@ pub(crate) fn take(system: &mut System, from: Mac, message: Wireless) {
     }
 }
 
-/// the offer due, and the pieces of the child due to guests getting it.
+/// sends the offer when due and the next pieces of the child to guests getting it
 pub fn tick(system: &mut System) {
     if system.room.is_none() || system.services.dlp.state == NOT_INITIALIZED {
         return;
@@ -461,8 +457,7 @@ mod tests {
         (buffer.get(&mut system.memory, 1), (2..7).map(|i| buffer.get(&mut system.memory, i)).collect())
     }
 
-    /// a host offers its child, a guest joins, gets the child in pieces and
-    /// then the passphrase, ending up with what the child runs with.
+    /// a host offers its child, a guest joins, gets the child in pieces then the passphrase, and ends up w/ what the child runs w/
     #[test]
     fn a_guest_gets_the_child_and_the_passphrase() {
         let (host_link, guest_link) = Link::pair();
@@ -474,7 +469,7 @@ mod tests {
         std::fs::write(&path, &child).unwrap();
         host.config.dlp_child = Some(path.clone());
 
-        // Initialize(size, four guests, process, ...), the child as a card has it
+        // Initialize(size, four guests, process, ...), the child like a card has it
         assert_eq!(request(&mut host, &buffer, &[0x0001_0183, 0x1000, 4, 0, 0, 0, 0, 0, 0, 0]).0, 0);
         host.services.dlp.child = Some((0x0004_0001_0010_BF00, vec![0x53; 0x36C0], child.len() as u64));
         assert_eq!(request(&mut host, &buffer, &[0x0003_0000]).1[0], INITIALIZED as u32);
@@ -529,7 +524,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// with no room, wireless is off, as local wireless has it.
+    /// w/o a room wireless is off, like local wireless does
     #[test]
     fn no_room_is_wireless_off() {
         let (mut system, buffer) = system_with_thread();

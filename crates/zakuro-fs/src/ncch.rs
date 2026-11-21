@@ -1,5 +1,5 @@
 //! NCCH containers (.cxi executables and .cfa archives) and their extended
-//! header.
+//! header
 
 use crate::ncsd::MEDIA_UNIT;
 use crate::reader::Reader;
@@ -32,7 +32,7 @@ pub struct NcchHeader {
 
 impl NcchHeader {
     pub const SIZE: usize = 0x200;
-    /// the header proper starts after the 0x100-byte RSA signature.
+    /// the header proper starts after the 0x100 byte RSA signature
     pub const HEADER_OFFSET: usize = 0x100;
 
     pub fn detect(data: &[u8]) -> bool {
@@ -69,12 +69,12 @@ impl NcchHeader {
         })
     }
 
-    /// crypto method, 0x00 original, 0x01 7.x, 0x0A Secure3, 0x0B Secure4.
+    /// crypto method, 0x00 original, 0x01 7.x, 0x0A Secure3, 0x0B Secure4
     pub fn crypto_method(&self) -> u8 {
         self.flags[3]
     }
 
-    /// 1 = CTR (Old3DS), 2 = "snake" (New3DS only).
+    /// 1 = CTR (Old3DS), 2 = "snake" (New3DS only)
     pub fn platform(&self) -> u8 {
         self.flags[4]
     }
@@ -83,8 +83,7 @@ impl NcchHeader {
         self.flags[5] & 0x02 != 0
     }
 
-    /// true when the partition is stored in the clear, which is the case for
-    /// decrypted dumps. Anything else needs the console's AES key scrambler.
+    /// true when the partition is stored in the clear, like decrypted dumps, anything else needs the console's AES key scrambler
     pub fn is_decrypted(&self) -> bool {
         self.flags[7] & 0x04 != 0
     }
@@ -98,17 +97,15 @@ impl NcchHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Extended header
-// ---------------------------------------------------------------------------
+// extended header
 
-/// where one segment of .code is mapped, straight out of the exheader.
+/// where one segment of .code is mapped, straight out of the exheader
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodeSetInfo {
     pub address: u32,
-    /// size of the mapped region, in pages.
+    /// size of the mapped region, in pages
     pub num_pages: u32,
-    /// size of the actual data, in bytes (<= num_pages * 0x1000).
+    /// size of the actual data, in bytes (<= num_pages * 0x1000)
     pub size: u32,
 }
 
@@ -123,7 +120,7 @@ impl CodeSetInfo {
 }
 
 /// how much FCRAM the kernel reserves for the process, from the ARM11 kernel
-/// capability descriptors.
+/// capability descriptors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryType {
     #[default]
@@ -142,20 +139,19 @@ impl MemoryType {
     }
 }
 
-/// Old3DS system mode, which decides the FCRAM split between the application
-/// and the system. ORAS ships as Prod (64 MiB for the game).
+/// Old3DS system mode, it decides the FCRAM split between the app and the system, ORAS ships as Prod (64 MiB for the game)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SystemMode {
-    /// 64 MiB application / 32 MiB system / 32 MiB base
+    /// 64 MiB app / 32 MiB system / 32 MiB base
     #[default]
     Prod,
-    /// 96 MiB application
+    /// 96 MiB app
     Dev1,
-    /// 80 MiB application
+    /// 80 MiB app
     Dev2,
-    /// 72 MiB application
+    /// 72 MiB app
     Dev3,
-    /// 32 MiB application
+    /// 32 MiB app
     Dev4,
 }
 
@@ -170,7 +166,7 @@ impl SystemMode {
         }
     }
 
-    /// bytes of FCRAM the APPLICATION memory region gets.
+    /// bytes of FCRAM the APPLICATION memory region gets
     pub fn application_memory(self) -> u32 {
         match self {
             SystemMode::Prod => 64 * 1024 * 1024,
@@ -185,7 +181,7 @@ impl SystemMode {
 #[derive(Debug, Clone)]
 pub struct ExHeader {
     pub title: String,
-    /// when set, ExeFS .code is BLZ-compressed.
+    /// when set, ExeFS .code is BLZ compressed
     pub compress_code: bool,
     pub sd_application: bool,
     pub remaster_version: u16,
@@ -206,31 +202,28 @@ pub struct ExHeader {
     pub ideal_processor: u8,
     pub affinity_mask: u8,
     pub system_mode: SystemMode,
-    /// New3DS system mode, 0 legacy, 1 = 124 MiB, 2 = 178 MiB.
+    /// New3DS system mode, 0 legacy, 1 = 124 MiB, 2 = 178 MiB
     pub n3ds_system_mode: u8,
-    /// New3DS CPU clock, 0 = 268 MHz, 1 = 804 MHz.
+    /// New3DS CPU clock, 0 = 268 MHz, 1 = 804 MHz
     pub n3ds_cpu_speed: u8,
     pub enable_l2_cache: bool,
     pub resource_limit_category: u8,
     pub service_access: Vec<String>,
 
     pub memory_type: MemoryType,
-    /// the kernel the title was made for, major in the high byte, from 0x22C,
-    /// firmware 8.0's, its linear heap is at 0x30000000
+    /// the kernel the title was made for, major in the high byte, from 0x22C (firmware 8.0's) its linear heap is at 0x30000000
     pub kernel_version: u16,
-    /// memory blocks the title creates without an address come from its own
-    /// region rather than the BASE one
+    /// memory blocks the title makes w/o an addr come from its own region instead of the BASE one
     pub shared_device_memory: bool,
     pub handle_table_size: u32,
-    /// SVC numbers the title is allowed to call, the eight tables a mask
-    /// descriptor can name reach up to 191.
+    /// SVC numbers the title may call, the eight tables a mask descriptor can name reach up to 191
     pub allowed_svcs: [u32; 6],
 }
 
 impl ExHeader {
-    /// size of the region covered by the NCCH header's exheader hash.
+    /// size of the region covered by the NCCH header's exheader hash
     pub const HASHED_SIZE: usize = 0x400;
-    /// size of the whole exheader region in the file.
+    /// size of the whole exheader region in the file
     pub const FULL_SIZE: usize = 0x800;
 
     pub fn parse(data: &[u8]) -> Result<ExHeader, FsError> {
@@ -248,7 +241,7 @@ impl ExHeader {
             }
         }
 
-        // ARM11 local system capabilities live at the start of the ACI.
+        // ARM11 local system capabilities live at the start of the ACI
         let flag1 = aci.u8(0x0C)?;
         let flag2 = aci.u8(0x0D)?;
         let flag0 = aci.u8(0x0E)?;
@@ -261,7 +254,7 @@ impl ExHeader {
             }
         }
 
-        // ARM11 kernel capabilities, 28 tagged u32 descriptors at ACI+0x170.
+        // ARM11 kernel capabilities, 28 tagged u32 descriptors at ACI + 0x170
         let mut memory_type = MemoryType::Application;
         let mut kernel_version = 0;
         let mut shared_device_memory = false;
@@ -274,7 +267,7 @@ impl ExHeader {
             }
             let tag = desc >> 20;
             if tag & 0xF80 == 0xF00 {
-                // allowed syscall mask, 24 SVC numbers per descriptor.
+                // allowed syscall mask, 24 SVC numbers per descriptor
                 let index = ((desc >> 24) & 7) as usize * 24;
                 let bits = desc & 0x00FF_FFFF;
                 for bit in 0..24 {
@@ -288,12 +281,11 @@ impl ExHeader {
             } else if tag & 0xFF0 == 0xFE0 {
                 handle_table_size = desc & 0x3FF;
             } else if tag & 0xFF8 == 0xFF0 {
-                // misc parameters, bits 8..11 hold the memory type.
+                // misc params, bits 8 to 11 hold the memory type
                 memory_type = MemoryType::from_raw((desc >> 8) & 0xF);
                 shared_device_memory = desc & 0x40 != 0;
             }
-            // the remaining tags describe mapped IO ranges and interrupts,
-            // which an HLE kernel does not need to honour.
+            // the remaining tags describe mapped IO ranges and interrupts, an HLE kernel doesn't need to honor those
         }
 
         Ok(ExHeader {
@@ -328,7 +320,7 @@ impl ExHeader {
         })
     }
 
-    /// total bytes the three code segments occupy once mapped, including BSS.
+    /// total bytes the three code segments take once mapped, BSS included
     pub fn code_span(&self) -> u32 {
         let end = self.data.address + self.data.num_pages * 0x1000 + self.bss_size;
         end.saturating_sub(self.text.address)
@@ -340,8 +332,7 @@ mod tests {
     use super::*;
 
     /// a syscall mask descriptor names one of eight tables of 24 calls,
-    /// the last ones past the calls the console has, which a dump can
-    /// carry all the same.
+    /// the last ones past the calls the console has, a dump can carry them anyway
     #[test]
     fn every_syscall_table_a_descriptor_names_is_read() {
         let mut data = vec![0u8; 0x800];

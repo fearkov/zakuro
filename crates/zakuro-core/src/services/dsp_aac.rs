@@ -1,7 +1,6 @@
-//! the audio firmware's AAC decoder, which titles drive through the binary
-//! pipe, the third. a request says where ADTS frames are and where each
-//! channel's PCM goes, and the answer says how much came out. Pokémon X and
-//! Y play their music through it. the layout of the messages is Citra's.
+//! the audio firmware's AAC decoder, titles drive it thru the binary pipe (the third)
+//! a request says where the ADTS frames are and where each channel's PCM goes, the answer says how much came out
+//! Pokémon X and Y play their music thru it, message layout is Citra's
 
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
@@ -11,7 +10,7 @@ use symphonia_core::units::{Duration, Timestamp};
 
 use crate::System;
 
-/// how long a message is either way.
+/// how long a message is either way
 pub const MESSAGE: usize = 32;
 
 const CODEC_DECODE_AAC: u16 = 1;
@@ -19,16 +18,15 @@ const COMMAND_INIT: u16 = 0;
 const COMMAND_DECODE: u16 = 1;
 const RESULT_ERROR: u32 = 1;
 
-/// where FCRAM starts for the DSP, which addresses it physically.
+/// where FCRAM starts for the DSP, which addresses it physically
 const FCRAM: u32 = 0x2000_0000;
 
-/// the sample rates ADTS numbers, and how the answer numbers them.
+/// the sample rates ADTS numbers, and how the answer numbers them
 const RATES: [(u32, u32); 9] =
     [(48000, 0), (44100, 1), (32000, 2), (24000, 3), (22050, 4), (16000, 5), (12000, 6), (11025, 7), (8000, 8)];
 const ADTS_RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
-/// the decoder, kept between requests since each frame overlaps the one
-/// before, with the stream it was made for.
+/// the decoder, kept between requests since each frame overlaps the one b4, w/ the stream it was made for
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Aac {
     /// made again after a saved state, a frame of overlap short
@@ -36,7 +34,7 @@ pub struct Aac {
     decoder: Option<(AacDecoder, (u32, u32))>,
 }
 
-/// a request's answer.
+/// a request's answer
 pub fn answer(system: &mut System, request: &[u8]) -> [u8; MESSAGE] {
     let mut message = [0u8; MESSAGE];
     message[..request.len().min(MESSAGE)].copy_from_slice(&request[..request.len().min(MESSAGE)]);
@@ -47,8 +45,7 @@ pub fn answer(system: &mut System, request: &[u8]) -> [u8; MESSAGE] {
         message[4..8].copy_from_slice(&RESULT_ERROR.to_le_bytes());
         return message;
     }
-    // initializing, shutting down and the rest succeed, whatever was left
-    // in the result the title sent
+    // init, shutdown and the rest succeed, whatever was left in the result the title sent
     let succeeded = |mut message: [u8; MESSAGE]| {
         message[4..8].copy_from_slice(&0u32.to_le_bytes());
         message
@@ -69,7 +66,7 @@ fn decode(system: &mut System, request: &[u8; MESSAGE]) -> [u8; MESSAGE] {
     let mut answer = [0u8; MESSAGE];
     answer[..4].copy_from_slice(&request[..4]);
     let mut put = |at: usize, value: u32| answer[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    // what Citra answers when decoding fails, which keeps titles going
+    // what Citra answers when decoding fails, keeps titles going
     put(8, 0);
     put(12, 2);
     put(16, size);
@@ -88,8 +85,7 @@ fn decode(system: &mut System, request: &[u8; MESSAGE]) -> [u8; MESSAGE] {
     let mut at = 0;
     while at + 7 <= data.len() {
         let frame = &data[at..];
-        // an ADTS header, sync word, then the rate, the channels and the
-        // frame's length
+        // an ADTS header, sync word, then the rate, channels and the frame's length
         if frame[0] != 0xFF || frame[1] & 0xF0 != 0xF0 {
             log::warn!("dsp: no ADTS frame at {at} of {size} bytes");
             break;
@@ -139,7 +135,7 @@ fn decode(system: &mut System, request: &[u8; MESSAGE]) -> [u8; MESSAGE] {
     answer
 }
 
-/// the decoder for a stream, made again when the stream changes.
+/// the decoder for a stream, made again when the stream changes
 fn decoder_for(aac: &mut Aac, rate_index: u32, layout: u32) -> Option<&mut AacDecoder> {
     let key = (rate_index, layout);
     if aac.decoder.as_ref().is_none_or(|(_, made)| *made != key) {

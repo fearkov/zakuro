@@ -1,11 +1,10 @@
 #version 450
 
-// a display transfer between two surfaces, the way the CPU does it. both
-// images hold rows bottom first, so a buffer's row y is image row
-// height - 1 - y, and the input can start some rows into its surface. each
-// pixel is quantized to the input format, averaged over its block, then
-// quantized to the output format, since memory would hold the pixels in
-// those formats.
+// a display transfer between two surfaces, like the CPU does it
+// both images hold rows bottom first, so a buffer's row y is image row height minus 1 minus y,
+// and the input can start some rows into its surface
+// each pixel gets quantized to the input format, averaged over its block, then quantized to the output format,
+// since memory would hold the pixels in those formats
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, rgba8) uniform readonly image2D source;

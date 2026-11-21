@@ -1,7 +1,6 @@
 #!/bin/sh
-# packs the Linux binary as an AppImage, which holds nothing but the program:
-# the libraries it needs are the ones every desktop system has, and the
-# sound one has to be the system's own for its plugins to work.
+# packs the Linux binary as an AppImage that holds nothing but the program
+# the libs it needs are the ones every desktop system has, and the sound one has to be the system's own for its plugins to work
 #
 #   appimage.sh <binary> <output>
 set -eu
@@ -29,8 +28,7 @@ cp "$binary" "$app/usr/bin/zakuro"
 ln -s usr/bin/zakuro "$app/AppRun"
 cp "$here/zakuro.desktop" "$here/zakuro.png" "$app/"
 
-# the update information has AppImage updaters, Gear Lever's say, follow the
-# releases
+# the update info makes AppImage updaters (Gear Lever's say) follow the releases
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$work/appimagetool" \
     --runtime-file "$work/runtime" \
     --updateinformation "gh-releases-zsync|fearkov|zakuro|latest|Zakuro-x86_64.AppImage.zsync" \

@@ -1,7 +1,6 @@
-//! cam:u, the cameras. what they see comes from the frontend, the host's
-//! camera or a picture, scaled to the size the title set, turned and
-//! colored as it set, in its format, and written into its buffer at the
-//! camera's frame rate. the two outer cameras and the inner one see the same.
+//! cam:u, the cameras
+//! what they see comes from the frontend (webcam or a picture), scaled to the title's size, flipped and colored as it set
+//! in its format, written into its buffer at the camera's frame rate, both outer cameras and the inner one see the same thing
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, ObjectId};
@@ -10,28 +9,27 @@ use crate::kernel::thread::CPU_CLOCK_HZ;
 use crate::System;
 use zakuro_common::result::errors;
 
-/// the cameras, as the bits that select them, the outer right one, the
-/// inner one and the outer left one.
+/// the cameras as their select bits, outer right, inner, outer left
 const CAMERAS: usize = 3;
-/// the ports pictures come in through, a camera on each.
+/// the ports pictures come in thru, a camera on each
 const PORTS: usize = 2;
-/// the formats a camera puts out.
+/// the formats a camera puts out
 const YUV422: u8 = 0;
 const RGB565: u8 = 1;
-/// the flips.
+/// the flips
 const FLIP_HORIZONTAL: u8 = 1;
 const FLIP_VERTICAL: u8 = 2;
 const FLIP_BOTH: u8 = 3;
-/// the effects.
+/// the effects
 const MONO: u8 = 1;
 const SEPIA: u8 = 2;
 const NEGATIVE: u8 = 3;
 const NEGATIVE_FILM: u8 = 4;
 const SEPIA_01: u8 = 5;
-/// how many vertical syncs a title can ask the times of.
+/// how many vsync times a title can ask for
 const VSYNC_TIMINGS: usize = 5;
 
-/// what a camera puts out in each of its two contexts.
+/// what a camera puts out in each of its two contexts
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Context {
     width: u16,
@@ -54,24 +52,22 @@ struct Camera {
     frame_rate: u8,
 }
 
-/// a port, the camera on it, what it captures and where the next picture
-/// goes.
+/// a port, its camera, what it captures and where the next picture goes
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct Port {
     camera: Option<usize>,
     capturing: bool,
-    /// where the title wants the next picture and how many bytes it takes,
-    /// and when it lands, while capturing.
+    /// where the title wants the next picture, how many bytes, and when it lands, while capturing
     receive: Option<(u32, u32)>,
     lands_at: Option<u64>,
     trimming: bool,
-    /// the corners of the part kept, left, top, right and bottom.
+    /// corners of the kept part, left, top, right, bottom
     trim: [i16; 4],
     transfer_bytes: u32,
     next_vsync: Option<u64>,
-    /// the ticks of the latest vertical syncs, newest first.
+    /// ticks of the latest vsyncs, newest first
     vsyncs: Vec<u64>,
-    /// the received, vertical sync and buffer error events.
+    /// the received, vsync and buffer error events
     events: Option<[ObjectId; 3]>,
 }
 
@@ -85,7 +81,7 @@ pub struct CamState {
     ports: [Port; PORTS],
 }
 
-/// the sizes a title picks from.
+/// the sizes a title picks from
 fn size(index: u32) -> (u16, u16) {
     match index {
         0 => (640, 480),
@@ -100,7 +96,7 @@ fn size(index: u32) -> (u16, u16) {
     }
 }
 
-/// ticks between frames at a frame rate, the highest a varying one goes to.
+/// ticks between frames at a frame rate, the highest a varying one hits
 fn frame_ticks(rate: u8) -> u64 {
     let per_second: f64 = match rate {
         0..=2 | 10 => 15.0,
@@ -113,17 +109,17 @@ fn frame_ticks(rate: u8) -> u64 {
     (CPU_CLOCK_HZ as f64 / per_second) as u64
 }
 
-/// the cameras a selection names.
+/// cameras a selection names
 fn cameras(select: u32) -> impl Iterator<Item = usize> {
     (0..CAMERAS).filter(move |i| select & 1 << i != 0)
 }
 
-/// the ports a selection names.
+/// ports a selection names
 fn ports(select: u32) -> impl Iterator<Item = usize> {
     (0..PORTS).filter(move |i| select & 1 << i != 0)
 }
 
-/// the contexts a selection names.
+/// contexts a selection names
 fn contexts(select: u32) -> impl Iterator<Item = usize> {
     (0..2).filter(move |i| select & 1 << i != 0)
 }
@@ -165,7 +161,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // IsBusy(ports) / IsFinishedReceiving(ports)
+        // IsBusy(ports), IsFinishedReceiving(ports)
         0x0003 | 0x0008 => {
             let select = word(system, 1);
             let state = &system.services.cam;
@@ -179,7 +175,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // GetVsyncInterruptEvent / GetBufferErrorInterruptEvent(port)
+        // GetVsyncInterruptEvent, GetBufferErrorInterruptEvent(port)
         0x0005 | 0x0006 => {
             let port = ports(word(system, 1)).next().unwrap_or(0);
             let which = if command == 0x0005 { VSYNC } else { BUFFER_ERROR };
@@ -213,8 +209,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // GetMaxLines(width, height) / GetMaxBytes(width, height), what one
-        // transfer can take, as the console works it out
+        // GetMaxLines(width, height), GetMaxBytes(width, height), what one transfer takes, like the console works it out
         0x000A | 0x000D => {
             let width = word(system, 1) & 0xFFFF;
             let height = word(system, 2) & 0xFFFF;
@@ -273,8 +268,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &trim);
             true
         }
-        // SetTrimmingParamsCenter(ports, trimmed width and height, camera
-        // width and height)
+        // SetTrimmingParamsCenter(ports, trimmed width and height, camera width and height)
         0x0012 => {
             let [width, height, camera_width, camera_height] = [2, 3, 4, 5].map(|i| word(system, i) as i16);
             let (left, top) = ((camera_width - width) / 2, (camera_height - height) / 2);
@@ -284,11 +278,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // Activate(cameras), none to turn them all off. the inner camera or
-        // the outer right one goes on the first port, the outer left one on
-        // the second, and on the first too when it is alone. a camera on
-        // starts its vertical syncs, which a title waits for before it
-        // captures
+        // Activate(cameras), none turns them all off
+        // the inner or outer right camera goes on port 1, outer left on port 2 (and on port 1 too when alone)
+        // a camera on starts its vsyncs, which a title waits for b4 capturing
         0x0013 => {
             let select = word(system, 1) & 7;
             let first = [0, 1, 2].into_iter().find(|&camera| select & 1 << camera != 0);
@@ -386,13 +378,12 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 3, destination);
             true
         }
-        // GetStereoCameraCalibrationData, a console's, a title that uses it
-        // spins forever on one that is not valid
+        // GetStereoCameraCalibrationData, a real console's, a title using it spins forever on invalid data
         0x002B => {
             buffer.reply(&mut system.memory, command, &stereo_calibration());
             true
         }
-        // ReadRegisterI2cExclusive / ReadMcuVariableI2cExclusive
+        // ReadRegisterI2cExclusive, ReadMcuVariableI2cExclusive
         0x002F | 0x0030 => {
             buffer.reply(&mut system.memory, command, &[0]);
             true
@@ -402,8 +393,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[0; 6]);
             true
         }
-        // SetPackageParameterWithoutContext(cameras, ..., frame rate, ...),
-        // the bytes one after another
+        // SetPackageParameterWithoutContext(cameras, ..., frame rate, ...), bytes back to back
         0x0033 => {
             let first = word(system, 1);
             let second = word(system, 2);
@@ -414,9 +404,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // SetPackageParameterWithContext(cameras, contexts, flip, effect,
-        // size) / WithContextDetail(cameras, contexts, flip, effect, width,
-        // height, crop), the bytes one after another
+        // SetPackageParameterWithContext(cameras, contexts, flip, effect, size)
+        // and WithContextDetail(cameras, contexts, flip, effect, width, height, crop), bytes back to back
         0x0034 | 0x0035 => {
             let first = word(system, 1);
             let [select, context_select, flip, effect] = first.to_le_bytes();
@@ -434,8 +423,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // GetSuitableY2rStandardCoefficient, ITU-R BT.601 at full range,
-        // which is how the pictures come
+        // GetSuitableY2rStandardCoefficient, ITU R BT.601 full range, how the pictures come
         0x0036 => {
             buffer.reply(&mut system.memory, command, &[0]);
             true
@@ -470,7 +458,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[select]);
             true
         }
-        // IsAutoExposure / IsAutoWhiteBalance, always
+        // IsAutoExposure, IsAutoWhiteBalance, always
         0x001A | 0x001C => {
             buffer.reply(&mut system.memory, command, &[1]);
             true
@@ -480,10 +468,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[0]);
             true
         }
-        // the settings a picture taken this way has no use for, exposure,
-        // white balance, sharpness, photo mode, contrast, lens correction,
-        // the windows they measure in, noise, synchronizing the two outer
-        // cameras, calibration, the shutter sound and sleep
+        // settings a picture taken this way has no use for
+        // exposure, white balance, sharpness, photo mode, contrast, lens correction, their measuring windows
+        // noise, syncing the two outer cameras, calibration, the shutter sound and sleep
         0x0015..=0x0019 | 0x001B | 0x0021 | 0x0023 | 0x0024 | 0x0026..=0x0029 | 0x002C..=0x002E | 0x0031 | 0x0037
         | 0x0038 | 0x003D | 0x003E => {
             buffer.reply(&mut system.memory, command, &[]);
@@ -493,7 +480,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// changes the named contexts of the named cameras.
+/// changes the named contexts of the named cameras
 fn set_contexts(system: &mut System, cameras_select: u32, contexts_select: u32, change: impl Fn(&mut Context)) {
     for camera in cameras(cameras_select) {
         for context in contexts(contexts_select) {
@@ -502,7 +489,7 @@ fn set_contexts(system: &mut System, cameras_select: u32, contexts_select: u32, 
     }
 }
 
-/// tells the frontend's camera whether any port captures.
+/// tells the frontend's camera if any port captures
 pub(crate) fn capturing(system: &mut System) {
     let on = system.services.cam.ports.iter().any(|port| port.capturing);
     if let Some(camera) = &mut system.camera {
@@ -510,7 +497,7 @@ pub(crate) fn capturing(system: &mut System) {
     }
 }
 
-/// the most lines of width a transfer takes, none when nothing fits.
+/// max lines of width a transfer takes, none when nothing fits
 fn max_lines(width: u32, height: u32) -> Option<u32> {
     const UNIT: u32 = 256;
     const MOST: u32 = 2560;
@@ -524,7 +511,7 @@ fn max_lines(width: u32, height: u32) -> Option<u32> {
     (lines > 0).then_some(lines)
 }
 
-/// the most bytes a transfer takes, none when nothing fits.
+/// max bytes a transfer takes, none when nothing fits
 fn max_bytes(width: u32, height: u32) -> Option<u32> {
     const UNIT: u32 = 256;
     const MOST: u32 = 2560;
@@ -538,8 +525,7 @@ fn max_bytes(width: u32, height: u32) -> Option<u32> {
     Some(bytes)
 }
 
-/// the stereo calibration of a console, the angle and distance of the two
-/// outer cameras.
+/// a console's stereo calibration, angle and distance of the two outer cameras
 fn stereo_calibration() -> [u32; 16] {
     let float = |value: f32| value.to_bits();
     [
@@ -562,7 +548,7 @@ fn stereo_calibration() -> [u32; 16] {
     ]
 }
 
-/// a port's events, made the first time they are asked for.
+/// a port's events, made the first time they're asked for
 fn events(system: &mut System, port: usize) -> [ObjectId; 3] {
     if let Some(events) = system.services.cam.ports[port].events {
         return events;
@@ -570,8 +556,7 @@ fn events(system: &mut System, port: usize) -> [ObjectId; 3] {
     let names = ["CAM:Received", "CAM:Vsync", "CAM:BufferError"];
     let events = names.map(|name| {
         let object = system.kernel.objects.insert(KObject::Event(crate::kernel::sync::Event::new(ResetType::OneShot, name)));
-        // the service keeps them, a title closing its handles must not take
-        // them away
+        // the service keeps them, a title closing its handles must not take them away
         system.kernel.objects.add_ref(object);
         object
     });
@@ -587,7 +572,7 @@ fn reply_with_event(system: &mut System, buffer: &CommandBuffer, command: u16, o
     buffer.set(&mut system.memory, 3, handle);
 }
 
-/// signals the vertical syncs due and lands the pictures due.
+/// signals due vsyncs and lands due pictures
 pub fn tick(system: &mut System) {
     let now = system.cpu.cycles;
     for index in 0..PORTS {
@@ -618,8 +603,7 @@ pub fn tick(system: &mut System) {
     }
 }
 
-/// a picture as a camera on a port puts it out, at its size, flipped and
-/// colored, in its format, trimmed as the port says.
+/// a picture as a camera on a port puts it out, at its size, flipped, colored, in its format, trimmed as the port says
 fn take(system: &mut System, port: usize, camera: usize) -> Vec<u8> {
     let state = &system.services.cam;
     let unit = state.cameras[camera];
@@ -662,14 +646,14 @@ fn flip(pixels: &mut [[u8; 3]], width: usize, flip: u8) {
     }
 }
 
-/// Y, U and V of a pixel, ITU-R BT.601 at full range.
+/// Y, U and V of a pixel, ITU R BT.601 full range
 fn yuv([r, g, b]: [u8; 3]) -> [f32; 3] {
     let (r, g, b) = (r as f32, g as f32, b as f32);
     let y = 0.299 * r + 0.587 * g + 0.114 * b;
     [y, (b - y) * 0.564 + 128.0, (r - y) * 0.713 + 128.0]
 }
 
-/// the pixels in a camera's format, two bytes each, with its effect.
+/// pixels in a camera's format, 2 bytes each, w/ its effect
 fn encode(pixels: &[[u8; 3]], width: usize, format: u8, effect: u8) -> Vec<u8> {
     let byte = |value: f32| value.round().clamp(0.0, 255.0) as u8;
     // the effects work on Y, U and V
@@ -683,7 +667,7 @@ fn encode(pixels: &[[u8; 3]], width: usize, format: u8, effect: u8) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(pixels.len() * 2);
     if format == RGB565 {
         for &pixel in pixels {
-            // the effect back from Y, U and V, when there is one
+            // the effect back from Y, U and V, when there's one
             let [r, g, b] = if effect == 0 {
                 pixel
             } else {
@@ -696,7 +680,7 @@ fn encode(pixels: &[[u8; 3]], width: usize, format: u8, effect: u8) -> Vec<u8> {
         }
         return bytes;
     }
-    // Y of each, U and V of the two together, Y U Y V
+    // Y each, U and V shared by the pair, Y U Y V
     for row in pixels.chunks(width.max(1)) {
         for pair in row.chunks(2) {
             let first = colored(yuv(pair[0]));
@@ -720,21 +704,18 @@ mod tests {
     use crate::services::{handle_request, Target};
     use std::sync::Arc;
 
-    /// what the console answers for the transfer sizes, which titles take
-    /// as they are.
+    /// what the console answers for transfer sizes, titles take them as is
     #[test]
     fn transfers_are_sized_as_the_console_sizes_them() {
         assert_eq!(max_lines(640, 480), Some(4));
         assert_eq!(max_bytes(640, 480), Some(2560));
-        // a line of 400 is never a whole number of transfer units in the
-        // lines that fit, only bytes do
+        // a 400 wide line is never a whole number of transfer units in the lines that fit, only bytes are
         assert_eq!(max_lines(400, 240), None);
         assert_eq!(max_bytes(400, 240), Some(2560));
         assert_eq!(max_lines(3, 3), None);
     }
 
-    /// white is the brightest Y with U and V at their middle, red as
-    /// RGB565 is all red.
+    /// white is max Y w/ U and V centered, red in RGB565 is all red
     #[test]
     fn colors_come_out_in_the_formats() {
         let yuv = encode(&[[255; 3], [255; 3]], 2, YUV422, 0);
@@ -743,9 +724,8 @@ mod tests {
         assert_eq!(u16::from_le_bytes([rgb[0], rgb[1]]), 0xF800);
     }
 
-    /// a title that activates the outer camera, starts capturing and asks
-    /// for a picture gets the frontend's at the size and in the format it
-    /// set, after a frame, and the event.
+    /// a title that activates the outer camera, starts capturing and asks for a picture
+    /// gets the frontend's at its size and format after a frame, plus the event
     #[test]
     fn a_picture_lands_in_the_title_buffer() {
         let (mut system, buffer) = system_with_thread();

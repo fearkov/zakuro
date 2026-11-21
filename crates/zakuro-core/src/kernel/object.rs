@@ -1,4 +1,4 @@
-//! kernel objects and the per-process handle table.
+//! kernel objects and the per process handle table
 
 use zakuro_common::hash::IntMap;
 use zakuro_common::VAddr;
@@ -6,14 +6,14 @@ use zakuro_common::VAddr;
 use super::sync::{AddressArbiter, Event, Mutex, Semaphore, Timer};
 use super::thread::ThreadId;
 
-/// a guest-visible handle.
+/// a guest visible handle
 pub type Handle = u32;
 
-/// svcGetProcessId and friends accept these instead of a real handle.
+/// svcGetProcessId and friends take these instead of a real handle
 pub const CURRENT_PROCESS: Handle = 0xFFFF_8001;
 pub const CURRENT_THREAD: Handle = 0xFFFF_8000;
 
-/// index into the kernel's object slab.
+/// index into the kernel's object slab
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ObjectId(pub u32);
 
@@ -26,9 +26,9 @@ pub enum KObject {
     Timer(Timer),
     AddressArbiter(AddressArbiter),
     SharedMemory(SharedMemory),
-    /// the client end of an IPC session.
+    /// client end of an IPC session
     ClientSession(ClientSession),
-    /// a named port a game can connect to, e.g. srv:.
+    /// a named port a game can connect to, like srv:
     ClientPort(String),
     Process,
     ResourceLimit,
@@ -52,33 +52,32 @@ impl KObject {
     }
 }
 
-/// a block of memory shared between processes, or between a process and a
-/// service. GSP and HID both hand one of these to the game.
+/// memory shared between processes, or a process and a service, GSP and HID both hand one to the game
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SharedMemory {
     pub name: String,
-    /// address in the owning process, or 0 when the kernel picks.
+    /// addr in the owning process, or 0 when the kernel picks
     pub address: VAddr,
     pub size: u32,
-    /// physical address backing it, so it can be mapped elsewhere.
+    /// physical addr behind it, so it can be mapped elsewhere
     pub paddr: u32,
     pub mapped_at: Option<VAddr>,
 }
 
-/// the game's end of a connection to a service.
+/// the game's end of a connection to a service
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClientSession {
-    /// which HLE service handles requests on this session.
+    /// which HLE service handles this session's requests
     pub service: String,
-    /// per-session state, used by services like FS that hand out sub-sessions.
+    /// per session state, for services like FS handing out sub sessions
     pub subhandle: u32,
 }
 
-/// one slab entry.
+/// one slab entry
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Slot {
     object: KObject,
-    /// number of handles naming this object.
+    /// how many handles name this object
     refcount: u32,
 }
 
@@ -117,15 +116,14 @@ impl ObjectStore {
             .map(|s| &mut s.object)
     }
 
-    /// counts one more holder, which the kernel's own services use to keep an
-    /// object alive that no guest handle may be holding.
+    /// counts one more holder, the kernel's own services use it to keep an object alive w/o any guest handle
     pub(crate) fn add_ref(&mut self, id: ObjectId) {
         if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
             slot.refcount += 1;
         }
     }
 
-    /// counts one holder less, freeing the object with the last.
+    /// counts one holder less, frees the object w/ the last
     pub(crate) fn release(&mut self, id: ObjectId) {
         let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) else {
             return;
@@ -137,7 +135,7 @@ impl ObjectStore {
         }
     }
 
-    /// how many hold the object, handles and the kernel's own holds alike.
+    /// how many hold the object, handles and the kernel's own holds alike
     pub(crate) fn refcount(&self, id: ObjectId) -> u32 {
         self.slots.get(id.0 as usize).and_then(|s| s.as_ref()).map_or(0, |s| s.refcount)
     }
@@ -154,8 +152,7 @@ impl ObjectStore {
 pub struct HandleTable {
     entries: IntMap<Handle, ObjectId>,
     next: Handle,
-    /// names, kept only for logs, a handle leak is far easier to find when the
-    /// log can say what leaked.
+    /// names, only for logs, a handle leak is way easier to find when the log says what leaked
     labels: IntMap<Handle, String>,
 }
 
@@ -163,8 +160,7 @@ impl Default for HandleTable {
     fn default() -> Self {
         HandleTable {
             entries: IntMap::default(),
-            // real handles start well above zero so that a zeroed variable
-            // used as a handle fails loudly.
+            // real handles start way above zero so a zeroed variable used as a handle fails loudly
             next: 0x0001_0000,
             labels: IntMap::default(),
         }
@@ -185,7 +181,7 @@ impl HandleTable {
         self.entries.get(&handle).copied()
     }
 
-    /// creates a second handle naming an object that is already known.
+    /// a second handle naming an already known object
     pub fn duplicate_object(
         &mut self,
         store: &mut ObjectStore,

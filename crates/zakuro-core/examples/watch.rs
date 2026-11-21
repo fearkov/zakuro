@@ -1,4 +1,4 @@
-//! cargo run -p zakuro-core --example watch -- <rom> <addr> [more addrs...]
+//! `cargo run -p zakuro-core --example watch -- <rom> <addr> [more addrs...]`
 
 use zakuro_core::{loader, Config, StepOutcome};
 use zakuro_cpu::Bus;
@@ -12,7 +12,7 @@ fn main() {
         std::process::exit(2);
     };
 
-    // each argument is either an address or addr:words for a range.
+    // each arg is an addr or `addr:words` for a range
     let mut watches: Vec<u32> = Vec::new();
     for arg in args {
         let (addr, count) = match arg.split_once(':') {
@@ -40,8 +40,7 @@ fn main() {
         println!("  0x{addr:08X} starts at 0x{value:08X}");
     }
 
-    // enough to get well past initialization, a stalled title will not use it
-    // all doing anything new.
+    // enough to get well past init, a stalled title won't burn it all doing anything new
     let budget: u64 = 1_500_000_000;
     let mut changes = 0;
     let start = system.cpu.cycles;

@@ -1,22 +1,22 @@
-//! VFPv2 floating point.
+//! VFPv2 floating point
 
 use zakuro_common::bits::{bit, bits};
 
 use crate::{Bus, Cpu, Exit};
 
-/// bits 31:28 of FPSCR, the comparison result flags.
+/// bits 31 to 28 of FPSCR, the compare result flags
 const FPSCR_FLAG_MASK: u32 = 0xF000_0000;
-/// flush-to-zero.
+/// flush to zero
 const FPSCR_FZ: u32 = 1 << 24;
-/// default NaN mode.
+/// default NaN mode
 const FPSCR_DN: u32 = 1 << 25;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Vfp {
-    /// s0..s31 as raw bits. dN occupies s(2N) (low word) and s(2N+1).
+    /// s0 to s31 as raw bits, dN sits in s(2N) (low word) and s(2N+1)
     pub regs: [u32; 32],
     pub fpscr: u32,
-    /// FPEXC. Bit 30 is EN, the kernel sets it before a thread uses VFP.
+    /// FPEXC, bit 30 is EN, the kernel sets it b4 a thread uses VFP
     pub fpexc: u32,
 }
 
@@ -60,7 +60,7 @@ impl Vfp {
         self.regs[(index * 2 + 1) & 31] = (bits >> 32) as u32;
     }
 
-    /// applies flush-to-zero if the guest enabled it.
+    /// applies flush to zero if the guest turned it on
     #[inline(always)]
     fn flush(&self, value: f32) -> f32 {
         if self.fpscr & FPSCR_FZ != 0 && value != 0.0 && value.is_subnormal() {
@@ -92,9 +92,7 @@ impl Vfp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Register number decoding
-// ---------------------------------------------------------------------------
+// register number decoding
 
 #[inline(always)]
 fn sreg(vd: u32, extra: bool) -> usize {
@@ -106,9 +104,7 @@ fn dreg(vd: u32, extra: bool) -> usize {
     (((extra as u32) << 4) | vd) as usize
 }
 
-// ---------------------------------------------------------------------------
-// Data processing (CDP space, coprocessors 10 and 11)
-// ---------------------------------------------------------------------------
+// data processing (CDP space, coprocessors 10 and 11)
 
 pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let coproc = bits(op, 8, 11);
@@ -133,10 +129,9 @@ pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
         (sreg(vd, d_bit), sreg(vn, n_bit), sreg(vm, m_bit))
     };
 
-    // bit 22 inside this field is the D register-number bit, not part of the
-    // opcode, so it has to be masked out before comparing.
+    // bit 22 in this field is the D register number bit, not part of the opcode, so it has to be masked out b4 comparing
     let opc1 = bits(op, 20, 23) & 0b1011;
-    // opc3's low bit selects between the pairs (VADD/VSUB, VMUL/VNMUL, ...).
+    // opc3's low bit selects between the pairs (VADD/VSUB, VMUL/VNMUL, ...)
     let negate = bit(op, 6);
 
     let operation = match (opc1, negate) {
@@ -149,7 +144,7 @@ pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
         (0b0011, false) => Arithmetic::Add,
         (0b0011, true) => Arithmetic::Subtract,
         (0b1000, false) => Arithmetic::Divide,
-        // the extension group, unary operations, comparisons and conversions.
+        // the extension group, unary ops, comparisons and conversions
         (0b1011, true) => return extension(cpu, op, double, rd, rm),
         _ => {
             return Some(Exit::Undefined {
@@ -160,8 +155,7 @@ pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     };
 
     for (d, n, m) in Vector::new(cpu.vfp.fpscr, double, rd).registers(rd, rn, rm) {
-        // single-precision operations are computed in f32 rather than promoted
-        // to f64, so the result is rounded exactly once as hardware does.
+        // single precision ops are computed in f32 instead of promoted to f64, so the result gets rounded exactly once like hardware does
         if double {
             let (a, b, acc) = (cpu.vfp.get_f64(n), cpu.vfp.get_f64(m), cpu.vfp.get_f64(d));
             let result = operation.apply(a, b, acc);
@@ -181,8 +175,7 @@ pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-/// debugging aid, RUST_LOG=zakuro_cpu::vfp::nan=trace reports operations
-/// that turn ordinary numbers into NaN.
+/// debugging aid, `RUST_LOG=zakuro_cpu::vfp::nan=trace` reports ops that turn ordinary numbers into NaN
 #[cold]
 fn trace_nan(cpu: &Cpu, op: u32, operation: Arithmetic, operands: [f64; 3]) {
     log::trace!(
@@ -194,7 +187,7 @@ fn trace_nan(cpu: &Cpu, op: u32, operation: Arithmetic, operands: [f64; 3]) {
     );
 }
 
-/// the two-operand data-processing instructions.
+/// the two operand data processing instructions
 #[derive(Debug, Clone, Copy)]
 enum Arithmetic {
     MultiplyAccumulate,
@@ -209,7 +202,7 @@ enum Arithmetic {
 }
 
 impl Arithmetic {
-    /// a and b are the operands, acc the destination's old value.
+    /// a and b are the operands, acc the destination's old value
     fn apply<T>(self, a: T, b: T, acc: T) -> T
     where
         T: std::ops::Add<Output = T>
@@ -233,8 +226,8 @@ impl Arithmetic {
     }
 }
 
-/// VFPv2's short vectors.
-// of course the SDK does its matrix math in vector mode. of course it does
+/// VFPv2's short vectors
+// of course the SDK does its matrix math in vector mode, of course it does
 struct Vector {
     iterations: usize,
     stride: usize,
@@ -257,7 +250,7 @@ impl Vector {
         base | ((register + iteration * self.stride) & (self.bank - 1))
     }
 
-    /// the (d, n, m) registers of each iteration.
+    /// the (d, n, m) registers of each iteration
     fn registers(&self, d: usize, n: usize, m: usize) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
         let scalar_m = m < self.bank;
         (0..self.iterations).map(move |i| {
@@ -273,7 +266,7 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
 
     match (opc2, top) {
         // VMOV (register), VABS, VNEG and VSQRT take part in short vectors
-        // like the arithmetic does.
+        // like the arithmetic does
         (0b0000, _) | (0b0001, _) => {
             let registers: Vec<(usize, usize)> = Vector::new(cpu.vfp.fpscr, double, rd)
                 .registers(rd, rd, rm)
@@ -290,7 +283,7 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
         // VCVT between single and double
         (0b0111, true) => {
             if double {
-                // source is double, destination single.
+                // source is double, destination single
                 let v = cpu.vfp.get_f64(rm) as f32;
                 let sd = sreg(bits(op, 12, 15), bit(op, 22));
                 cpu.vfp.set_f32(sd, v);
@@ -305,7 +298,7 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
         (0b1000, _) => {
             let sm = sreg(op & 0xF, bit(op, 5));
             let raw = cpu.vfp.regs[sm];
-            // bit 7 selects signed (1) or unsigned (0).
+            // bit 7 picks signed (1) or unsigned (0)
             let value = if top { raw as i32 as f64 } else { raw as f64 };
             if double {
                 cpu.vfp.set_f64(rd, value);
@@ -313,7 +306,7 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
                 cpu.vfp.set_f32(rd, value as f32);
             }
         }
-        // VCVT to integer.
+        // VCVT to integer
         (0b1100, _) | (0b1101, _) => {
             let source = if double {
                 cpu.vfp.get_f64(rm)
@@ -345,12 +338,11 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
 }
 
 /// VMOV (!second, !top), VABS (!second, top), VNEG (second,
-/// !top) and VSQRT (second, top) on one register.
+/// !top) and VSQRT (second, top) on one register
 fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: usize) {
     if double {
-        // the moves and sign operations copy bits and flush nothing. titles
-        // pass two singles in a double register, whose bits as a double can
-        // be subnormal, and flushing them would zero the singles
+        // the moves and sign ops copy bits and flush nothing
+        // titles pass two singles in a double register, its bits as a double can be subnormal, and flushing them would zero the singles
         let raw = |cpu: &Cpu, index: usize| {
             (cpu.vfp.regs[(index * 2) & 31] as u64) | (cpu.vfp.regs[(index * 2 + 1) & 31] as u64) << 32
         };
@@ -367,7 +359,7 @@ fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: 
         cpu.vfp.regs[(rd * 2) & 31] = bits as u32;
         cpu.vfp.regs[(rd * 2 + 1) & 31] = (bits >> 32) as u32;
     } else {
-        // the sign operations work on the raw bits so NaN payloads survive.
+        // the sign ops work on the raw bits so NaN payloads survive
         let raw = cpu.vfp.regs[rm];
         match (second, top) {
             (false, false) => cpu.vfp.regs[rd] = raw,
@@ -403,8 +395,7 @@ fn compare(cpu: &mut Cpu, double: bool, rd: usize, rm: Option<usize>) {
         )
     };
 
-    // VFP comparison results map onto the same NZCV encoding the ARM
-    // condition codes use, which is why VMRS APSR_nzcv works.
+    // VFP compare results map onto the same NZCV encoding the ARM condition codes use, that's why VMRS APSR_nzcv works
     let flags = if a.is_nan() || b.is_nan() {
         0b0011 // unordered, C and V set
     } else if a == b {
@@ -421,7 +412,7 @@ fn compare(cpu: &mut Cpu, double: bool, rd: usize, rm: Option<usize>) {
 fn round_to_mode(value: f64, mode: u32) -> f64 {
     match mode {
         0b00 => {
-            // round to nearest, ties to even.
+            // round to nearest, ties to even
             let rounded = value.round();
             if (value - value.trunc()).abs() == 0.5 && rounded % 2.0 != 0.0 {
                 rounded - value.signum()
@@ -459,16 +450,14 @@ fn saturate_to_u32(value: f64) -> u32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Register transfers (MCR / MRC on coprocessors 10 and 11)
-// ---------------------------------------------------------------------------
+// register transfers (MCR / MRC on coprocessors 10 and 11)
 
 pub fn coprocessor_register(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     let load = bit(op, 20);
     let rt = bits(op, 12, 15) as usize;
     let opc1 = bits(op, 21, 23);
 
-    // VMSR / VMRS, opc1 == 7, with CRn selecting the system register.
+    // VMSR / VMRS, opc1 == 7, w/ CRn picking the system register
     if opc1 == 7 {
         let reg = bits(op, 16, 19);
         if load {
@@ -481,7 +470,7 @@ pub fn coprocessor_register(cpu: &mut Cpu, op: u32) -> Option<Exit> {
                 _ => 0,
             };
             if rt == 15 {
-                // VMRS APSR_nzcv, FPSCR moves the comparison flags across.
+                // VMRS APSR_nzcv, FPSCR moves the comparison flags across
                 cpu.cpsr.n = bit(value, 31);
                 cpu.cpsr.z = bit(value, 30);
                 cpu.cpsr.c = bit(value, 29);
@@ -500,7 +489,7 @@ pub fn coprocessor_register(cpu: &mut Cpu, op: u32) -> Option<Exit> {
         return None;
     }
 
-    // VMOV between a core register and a single-precision register.
+    // VMOV between a core register and a single precision register
     if opc1 == 0 {
         let sn = sreg(bits(op, 16, 19), bit(op, 7));
         if load {
@@ -519,9 +508,7 @@ pub fn coprocessor_register(cpu: &mut Cpu, op: u32) -> Option<Exit> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Load/store (LDC / STC space)
-// ---------------------------------------------------------------------------
+// load/store (LDC / STC space)
 
 pub fn coprocessor_load_store<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
     let coproc = bits(op, 8, 11);
@@ -530,7 +517,7 @@ pub fn coprocessor_load_store<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Op
         return None;
     }
 
-    // bits 27:21 == 0b1100010 is the 64-bit core<->VFP transfer space.
+    // bits 27 to 21 == 0b1100010 is the 64 bit core<->VFP transfer space
     if bits(op, 21, 27) == 0b110_0010 {
         return move_pair(cpu, op, coproc == 11);
     }
@@ -551,7 +538,7 @@ pub fn coprocessor_load_store<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Op
         sreg(vd, d_bit)
     };
 
-    // a single VLDR/VSTR has P=1, W=0, the multiple forms have P xor W.
+    // a single VLDR/VSTR has P=1, W=0, the multiple forms have P xor W
     let count = if pre_index && !writeback {
         1
     } else if double {
@@ -606,7 +593,7 @@ pub fn coprocessor_load_store<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Op
     None
 }
 
-/// VMOV between two core registers and either a double or two singles.
+/// VMOV between two core registers and either a double or two singles
 fn move_pair(cpu: &mut Cpu, op: u32, double: bool) -> Option<Exit> {
     let load = bit(op, 20);
     let rt = bits(op, 12, 15) as usize;
@@ -636,6 +623,5 @@ fn move_pair(cpu: &mut Cpu, op: u32, double: bool) -> Option<Exit> {
     None
 }
 
-/// kept so the default-NaN bit is not silently dropped when we add strict
-/// NaN propagation.
+/// kept so the default NaN bit doesn't get silently dropped when we add strict NaN propagation
 pub const _FPSCR_DN: u32 = FPSCR_DN;

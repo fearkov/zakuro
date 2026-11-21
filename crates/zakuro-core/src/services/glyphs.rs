@@ -1,6 +1,6 @@
-//! an 8x8 bitmap glyph for each printable ASCII character.
+//! an 8x8 bitmap glyph for each printable ASCII char
 
-/// rows of each glyph, from ' ' (0x20) through '~' (0x7E).
+/// rows of each glyph, from ' ' (0x20) thru '~' (0x7E)
 pub const GLYPHS: [[u8; 8]; 95] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ' '
     [0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00], // '!'

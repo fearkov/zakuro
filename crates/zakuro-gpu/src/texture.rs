@@ -1,9 +1,8 @@
-//! PICA200 texture decoding.
+//! PICA200 texture decoding
 
 use crate::format::morton_offset;
 
-/// A PICA texture format, straight from GPUREG_TEXUNIT0_TYPE and the
-/// equivalent registers for units 1/2. The numbering is fixed by hardware.
+/// a PICA texture format, straight from GPUREG_TEXUNIT0_TYPE and the matching registers for units 1/2, the hardware fixes the numbering
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureFormat {
     Rgba8,
@@ -11,19 +10,19 @@ pub enum TextureFormat {
     Rgba5551,
     Rgb565,
     Rgba4,
-    /// luminance-alpha, 8 bits each.
+    /// luminance alpha, 8 bits each
     La8,
-    /// two-component 8-bit, used for normal maps. Decoded as (0, g, r, 1).
+    /// two component 8 bit, used for normal maps, decoded as (0, g, r, 1)
     Hilo8,
-    /// luminance only, 8 bit.
+    /// luminance only, 8 bit
     L8,
-    /// Alpha only, 8 bit.
+    /// alpha only, 8 bit
     A8,
-    /// luminance-alpha, 4 bits each.
+    /// luminance alpha, 4 bits each
     La4,
-    /// luminance only, 4 bit.
+    /// luminance only, 4 bit
     L4,
-    /// Alpha only, 4 bit.
+    /// alpha only, 4 bit
     A4,
     Etc1,
     Etc1A4,
@@ -51,7 +50,7 @@ impl TextureFormat {
         }
     }
 
-    /// bits per pixel.
+    /// bits per pixel
     pub fn bits_per_pixel(self) -> u32 {
         match self {
             TextureFormat::Rgba8 => 32,
@@ -63,8 +62,8 @@ impl TextureFormat {
             | TextureFormat::Hilo8 => 16,
             TextureFormat::L8 | TextureFormat::A8 | TextureFormat::La4 => 8,
             TextureFormat::L4 | TextureFormat::A4 => 4,
-            // ETC1 packs a 4x4 block (16 pixels) into 8 bytes = 4 bits/pixel,
-            // ETC1A4 adds a 4-bit alpha per pixel on top, for 8 bits/pixel.
+            // ETC1 packs a 4x4 block (16 pixels) into 8 bytes = 4 bits per pixel,
+            // ETC1A4 adds a 4 bit alpha per pixel on top, for 8 bits per pixel
             TextureFormat::Etc1 => 4,
             TextureFormat::Etc1A4 => 8,
             TextureFormat::Unknown(_) => 32,
@@ -72,7 +71,7 @@ impl TextureFormat {
     }
 }
 
-/// reads one texel as straight RGBA8.
+/// reads one texel as straight RGBA8
 pub fn sample_texel(data: &[u8], format: TextureFormat, width: u32, x: u32, y: u32) -> [u8; 4] {
     match format {
         TextureFormat::Etc1 | TextureFormat::Etc1A4 => sample_etc1(data, format, width, x, y),
@@ -96,8 +95,7 @@ fn sample_uncompressed(
         };
         decode_bytes(format, bytes_slice)
     } else {
-        // sub-byte formats (L4, A4), the Morton tile index addresses a
-        // nibble, two texels per byte, low nibble first.
+        // sub byte formats (L4, A4), the Morton tile index addresses a nibble, two texels per byte, low nibble first
         let bit_offset = morton_offset(x, y, width, bits) ;
         let byte_index = (bit_offset / 8) as usize;
         let Some(&byte) = data.get(byte_index) else {
@@ -114,8 +112,7 @@ fn sample_uncompressed(
 
 fn decode_bytes(format: TextureFormat, b: &[u8]) -> [u8; 4] {
     match format {
-        // textures store components in the same reversed byte order the
-        // framebuffer formats do.
+        // textures store components in the same reversed byte order the framebuffer formats do
         TextureFormat::Rgba8 => [b[3], b[2], b[1], b[0]],
         TextureFormat::Rgb8 => [b[2], b[1], b[0], 0xFF],
         TextureFormat::Rgba5551 => {
@@ -164,17 +161,15 @@ fn decode_nibble(format: TextureFormat, nibble: u8) -> [u8; 4] {
             let l = expand4(nibble);
             [l, l, l, 0xFF]
         }
-        // alpha alone reads with black color, as in OpenGL ES
+        // alpha alone reads w/ black color, like in OpenGL ES
         TextureFormat::A4 => [0, 0, 0, expand4(nibble)],
         _ => [0, 0, 0, 0],
     }
 }
 
-// ---------------------------------------------------------------------------
 // ETC1 / ETC1A4
-// ---------------------------------------------------------------------------
 
-/// the four per-table delta values for each of ETC1's 8 modifier tables.
+/// the four per table delta values for each of ETC1's 8 modifier tables
 const ETC1_MODIFIERS: [[i32; 4]; 8] = [
     [2, 8, -2, -8],
     [5, 17, -5, -17],
@@ -187,8 +182,7 @@ const ETC1_MODIFIERS: [[i32; 4]; 8] = [
 ];
 
 fn sample_etc1(data: &[u8], format: TextureFormat, width: u32, x: u32, y: u32) -> [u8; 4] {
-    // like every other format, the texture is split into 8x8 tiles stored row
-    // by row.
+    // like every other format the texture is split into 8x8 tiles stored row by row
     let block_size = if format == TextureFormat::Etc1A4 { 16 } else { 8 };
     let tile = (y / 8) * (width / 8).max(1) + x / 8;
     let sub_block = (x % 8) / 4 + 2 * ((y % 8) / 4);
@@ -215,9 +209,9 @@ fn sample_etc1(data: &[u8], format: TextureFormat, width: u32, x: u32, y: u32) -
     [rgb[0], rgb[1], rgb[2], alpha]
 }
 
-/// decodes one pixel of a plain 8-byte ETC1 block.
+/// decodes one pixel of a plain 8 byte ETC1 block
 fn decode_etc1_block(block: &[u8], x: u32, y: u32) -> [u8; 3] {
-    // little-endian, because why the hell would it match the spec
+    // little endian, bc why the hell would it match the spec
     let word = u64::from_le_bytes(block.try_into().unwrap());
     let low = (word & 0xFFFF_FFFF) as u32;
     let high = (word >> 32) as u32;
@@ -258,9 +252,8 @@ fn decode_etc1_block(block: &[u8], x: u32, y: u32) -> [u8; 3] {
     let table0 = ((high >> 5) & 0x7) as usize;
     let table1 = ((high >> 2) & 0x7) as usize;
 
-    // which sub-block this pixel belongs to depends on the flip bit, an
-    // unflipped block splits into left/right halves, a flipped one into
-    // top/bottom.
+    // which sub block this pixel belongs to depends on the flip bit,
+    // an unflipped block splits into left/right halves, a flipped one into top/bottom
     let first_half = if flip { y < 2 } else { x < 2 };
     let (base, table) = if first_half {
         (base0, table0)
@@ -268,14 +261,13 @@ fn decode_etc1_block(block: &[u8], x: u32, y: u32) -> [u8; 3] {
         (base1, table1)
     };
 
-    // the two 16-bit pixel-index planes are stored transposed (column-major)
-    // relative to (x, y).
+    // the two 16 bit pixel index planes are stored transposed (column major) relative to (x, y)
     let pixel_index = x * 4 + y;
     let msb = (low >> (pixel_index + 16)) & 1;
     let lsb = (low >> pixel_index) & 1;
-    // the table's four entries already alternate sign (e.g. [2, 8, -2, -8]),
-    // so the (msb, lsb) pair selecting one of them via modifier_index
-    // already encodes the sign, nothing further needs to branch on msb.
+    // the table's four entries already alternate sign (like [2, 8, -2, -8]), so the (msb,
+    // lsb) pair picking one of them via modifier_index already encodes the sign,
+    // nothing else needs to branch on msb
     let modifier_index = ((msb << 1) | lsb) as usize;
     let delta = ETC1_MODIFIERS[table][modifier_index];
 
@@ -286,7 +278,7 @@ fn decode_etc1_block(block: &[u8], x: u32, y: u32) -> [u8; 3] {
     ]
 }
 
-/// decodes one pixel's alpha from ETC1A4's 8-byte, 4-bit-per-texel alpha plane.
+/// decodes one pixel's alpha from ETC1A4's 8 byte, 4 bit per texel alpha plane
 fn decode_etc1a4_alpha(block: &[u8], x: u32, y: u32) -> u8 {
     let word = u64::from_le_bytes(block.try_into().unwrap());
     let pixel_index = x * 4 + y;
@@ -325,13 +317,13 @@ mod tests {
 
     #[test]
     fn rgba8_round_trips() {
-        // ABGR in memory (reversed), so bytes [A,B,G,R] decode to [R,G,B,A].
+        // ABGR in memory (reversed), so bytes [A,B,G,R] decode to [R,G,B,A]
         let bytes = [0x11u8, 0x22, 0x33, 0x44];
         let decoded = decode_bytes(TextureFormat::Rgba8, &bytes);
         assert_eq!(decoded, [0x44, 0x33, 0x22, 0x11]);
     }
 
-    /// alpha alone comes with black color, luminance alone with full alpha.
+    /// alpha alone comes with black color, luminance alone with full alpha
     #[test]
     fn a4_and_l4_expand_to_full_range() {
         assert_eq!(decode_nibble(TextureFormat::A4, 0xF), [0, 0, 0, 0xFF]);
@@ -340,8 +332,7 @@ mod tests {
         assert_eq!(decode_bytes(TextureFormat::A8, &[0x80]), [0, 0, 0, 0x80]);
     }
 
-    /// builds a diff-mode (diff=1) ETC1 block from named fields, using the
-    /// exact same bit positions [decode_etc1_block] reads.
+    /// builds a diff mode (diff=1) ETC1 block from named fields, using the exact same bit positions [decode_etc1_block] reads
     #[allow(clippy::too_many_arguments)]
     fn build_diff_block(
         r0: u8,
@@ -367,20 +358,17 @@ mod tests {
             | (1 << 1) // diff
             | (flip as u32);
         let mut block = [0u8; 8];
-        // little-endian 64-bit word, the index planes in the low half, the
-        // colors and flags in the high half.
+        // little endian 64 bit word, the index planes in the low half, the colors and flags in the high half
         block[0..4].copy_from_slice(&pixel_bits.to_le_bytes());
         block[4..8].copy_from_slice(&high.to_le_bytes());
         block
     }
 
-    /// a solid-color block (zero deltas, every pixel selecting the same
-    /// modifier) must decode to one uniform color across all 16 texels,
-    /// the standard "does the bit-unpacking hang together" smoke test.
+    /// a solid color block (zero deltas, every pixel picking the same modifier) must decode to one uniform color
+    /// across all 16 texels, the standard "does the bit unpacking hang together" smoke test
     #[test]
     fn etc1_flat_block_is_uniform() {
-        // all pixel-index bits zero selects modifier 0 for every texel in
-        // both sub-blocks, so a flat base color stays flat.
+        // all pixel index bits zero picks modifier 0 for every texel in both sub blocks, so a flat base color stays flat
         let block = build_diff_block(16, 16, 16, 0, 0, 0, 0, 0, false, 0);
 
         let mut colors = std::collections::HashSet::new();
@@ -392,15 +380,13 @@ mod tests {
         assert_eq!(colors.len(), 1, "a flat block must decode to one color");
     }
 
-    /// an unflipped block's two sub-blocks are its left and right halves
-    /// (x<2 vs x>=2), each with its own base color, so making the two base
-    /// colors different must produce different left/right averages while
-    /// every row stays internally consistent between x=0/x=1 and x=2/x=3.
+    /// an unflipped block's two sub blocks are its left and right halves (x<2 vs x>=2), each w/ its own base color
+    /// so making the two base colors different must give different left/right averages while every row stays
+    /// consistent between x=0/x=1 and x=2/x=3
     #[test]
     fn etc1_unflipped_splits_left_and_right() {
-        // a non-zero delta makes sub-block 1's base color (base0 + delta)
-        // different from sub-block 0's, which is what should actually make
-        // the two halves differ.
+        // a non zero delta makes sub block 1's base color (base0 + delta) different from sub block 0's,
+        // that's what should actually make the two halves differ
         let block = build_diff_block(4, 4, 4, 3, 3, 3, 0, 0, false, 0);
         let left = decode_etc1_block(&block, 0, 0);
         let right = decode_etc1_block(&block, 3, 0);
@@ -409,7 +395,7 @@ mod tests {
         assert_eq!(decode_etc1_block(&block, 2, 0), decode_etc1_block(&block, 3, 0));
     }
 
-    /// a flipped block's sub-blocks are its top and bottom halves instead.
+    /// a flipped block's sub blocks are its top and bottom halves instead
     #[test]
     fn etc1_flipped_splits_top_and_bottom() {
         let block = build_diff_block(4, 4, 4, 3, 3, 3, 0, 0, true, 0);
@@ -420,13 +406,12 @@ mod tests {
         assert_eq!(decode_etc1_block(&block, 0, 2), decode_etc1_block(&block, 0, 3));
     }
 
-    /// blocks sit in 8x8 tiles stored row by row, four blocks per tile in
-    /// Z order, not a Morton curve over the blocks themselves.
+    /// blocks sit in 8x8 tiles stored row by row, four blocks per tile in Z order, not a Morton curve over the blocks themselves
     #[test]
     fn etc1_blocks_are_laid_out_in_row_major_tiles() {
         let width = 32;
         let height = 8;
-        // one flat block per 4x4 region, each a different gray.
+        // one flat block per 4x4 region, each a different gray
         let mut data = vec![0u8; (width * height / 2) as usize];
         for block in 0..(data.len() / 8) {
             let gray = (block as u8) * 2;
@@ -435,7 +420,7 @@ mod tests {
         }
         let gray_at = |x: u32, y: u32| sample_etc1(&data, TextureFormat::Etc1, width, x, y)[0];
         let block_gray = |n: usize| sample_etc1(&data[n * 8..], TextureFormat::Etc1, 8, 0, 0)[0];
-        // tile 1 (pixels 8..16 across) holds blocks 4-7.
+        // tile 1 (pixels 8..16 across) holds blocks 4 to 7
         assert_eq!(gray_at(8, 0), block_gray(4));
         assert_eq!(gray_at(12, 0), block_gray(5));
         assert_eq!(gray_at(8, 4), block_gray(6));

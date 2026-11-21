@@ -1,4 +1,4 @@
-//! types and constants shared by every Zakuro crate.
+//! types and consts every zakuro crate shares
 
 pub mod bits;
 pub mod hash;
@@ -7,12 +7,12 @@ pub mod result;
 
 pub use result::{ResultCode, ResultValue};
 
-/// a virtual address inside an emulated process.
+/// a virtual addr inside an emulated process
 pub type VAddr = u32;
-/// a physical address on the 3DS bus.
+/// a physical addr on the 3DS bus
 pub type PAddr = u32;
 
-/// both 3DS screens, as the GPU and the presentation layer see them.
+/// both 3DS screens, as the GPU and the presenter see them
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Screen {
     Top,
@@ -22,8 +22,7 @@ pub enum Screen {
 impl Screen {
     pub const fn width(self) -> u32 {
         match self {
-            // the framebuffers are stored rotated 90 degrees, the "width" the
-            // GPU writes is the physical height of the panel.
+            // framebuffers are stored rotated 90 degrees, the "width" the GPU writes is the panel's physical height
             Screen::Top => 400,
             Screen::Bottom => 320,
         }
@@ -34,7 +33,7 @@ impl Screen {
     }
 }
 
-/// which console we pretend to be.
+/// which console we pretend to be
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsoleModel {
     #[default]

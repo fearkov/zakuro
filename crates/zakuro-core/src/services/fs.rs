@@ -1,5 +1,4 @@
-//! fs:USER, the filesystem service, plus the file and directory sessions it
-//! hands out.
+//! fs:USER, the filesystem service, plus the file and dir sessions it hands out
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,34 +12,33 @@ use crate::kernel::object::{ClientSession, KObject};
 use crate::services::Target;
 use crate::System;
 
-/// archive ids, as FS_ArchiveID defines them.
+/// archive ids, as FS_ArchiveID defines them
 pub const ARCHIVE_SELF_NCCH: u32 = 0x0000_0003;
 pub const ARCHIVE_SAVEDATA: u32 = 0x0000_0004;
 pub const ARCHIVE_EXTDATA: u32 = 0x0000_0006;
 pub const ARCHIVE_SHARED_EXTDATA: u32 = 0x0000_0007;
 pub const ARCHIVE_SYSTEM_SAVEDATA: u32 = 0x0000_0008;
 pub const ARCHIVE_SDMC: u32 = 0x0000_0009;
-/// "Title access", reaches an NCCH by program ID rather than the implicit self
-/// that ARCHIVE_SELF_NCCH gives.
+/// title access, reaches an NCCH by program id instead of the implicit self that ARCHIVE_SELF_NCCH gives
 pub const ARCHIVE_NCCH: u32 = 0x2345_678A;
 
-/// media the NCCH archive's path can select.
+/// media the NCCH archive's path can select
 const MEDIA_NAND: u8 = 0;
 const MEDIA_SDMC: u8 = 1;
 const MEDIA_GAMECARD: u8 = 2;
 
-/// high title IDs of the two NAND archives a game reads shared data from.
+/// high title ids of the two NAND archives a game reads shared data from
 const SHARED_DATA_ARCHIVE: u32 = 0x0004_009B;
 const SYSTEM_DATA_ARCHIVE: u32 = 0x0004_00DB;
 
-/// low title IDs of the individual shared data files.
+/// low title ids of the individual shared data files
 const SYSTEM_FILE_MII_DATA: u32 = 0x0001_0202;
 const SYSTEM_FILE_BAD_WORD_LIST: u32 = 0x0001_0302;
 const SYSTEM_FILE_REGION_MANIFEST: u32 = 0x0001_0402;
 const SYSTEM_FILE_TLS_ROOT_CERTIFICATES: u32 = 0x0001_0602;
 const SYSTEM_FILE_SHARED_FONT: u32 = 0x0001_4002;
 
-/// which title an NCCH-archive path points at.
+/// which title an NCCH archive path points at
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct NcchArchivePath {
     pub low_program_id: u32,
@@ -49,8 +47,7 @@ pub struct NcchArchivePath {
 }
 
 impl NcchArchivePath {
-    /// decodes the 16-byte binary path, the program ID as two words, then
-    /// the media type as a single byte at offset 8.
+    /// decodes the 16 byte binary path, the program id as two words, then the media type as one byte at offset 8
     fn decode(system: &mut System, path_size: u32, path_ptr: u32) -> Option<NcchArchivePath> {
         use zakuro_cpu::Bus;
         if path_size < 12 {
@@ -63,7 +60,7 @@ impl NcchArchivePath {
         })
     }
 
-    /// a human-readable name for the shared data file this points at, for logs.
+    /// a readable name for the shared data file this points at, for logs
     fn system_file_name(&self) -> Option<&'static str> {
         match (self.high_program_id, self.low_program_id) {
             (SHARED_DATA_ARCHIVE, SYSTEM_FILE_MII_DATA) => Some("Mii data"),
@@ -78,37 +75,36 @@ impl NcchArchivePath {
     }
 }
 
-/// path encodings.
+/// path encodings
 pub const PATH_INVALID: u32 = 0;
 pub const PATH_EMPTY: u32 = 1;
 pub const PATH_BINARY: u32 = 2;
 pub const PATH_ASCII: u32 = 3;
 pub const PATH_UTF16: u32 = 4;
 
-/// which part of its own NCCH a title is asking for.
+/// which part of its own NCCH a title is asking for
 const SELF_NCCH_ROMFS: u32 = 0;
 const SELF_NCCH_CODE: u32 = 1;
 const SELF_NCCH_EXEFS: u32 = 2;
-/// the RomFS of the title's update, which is its own RomFS while no update
-/// is installed.
+/// the RomFS of the title's update, its own RomFS while no update is installed
 const SELF_NCCH_UPDATE_ROMFS: u32 = 5;
 
-/// OpenFile flags.
+/// OpenFile flags
 const OPEN_CREATE: u32 = 1 << 2;
 
-/// size of one entry a directory read returns.
+/// size of one entry a dir read returns
 const DIRECTORY_ENTRY_SIZE: u32 = 0x228;
 
-/// an open file, and where its bytes come from.
+/// an open file and where its bytes come from
 #[derive(Debug, Clone)]
 pub enum FileBacking {
-    /// a window into a ROM image, the title's, its update's or its DLC's.
+    /// a window into a ROM image, the title's, its update's or its DLC's
     RomImage { image: std::sync::Arc<zakuro_fs::RomImage>, offset: u64, size: u64 },
-    /// a file in one of the writable archives, kept on the host.
+    /// a file in one of the writable archives, kept on the host
     Host(PathBuf),
-    /// read-only bytes generated in memory.
+    /// read only bytes made in memory
     Memory(Vec<u8>),
-    /// a RomFS with mods over it, and the image it is in.
+    /// a RomFS w/ mods over it, and the image it's in
     Layered(std::sync::Arc<zakuro_fs::layered::Layered>, std::sync::Arc<zakuro_fs::RomImage>),
 }
 
@@ -129,8 +125,7 @@ pub struct OpenFile {
     pub backing: FileBacking,
 }
 
-/// an open file as a saved state keeps it, the ROM image it reads by its
-/// place among the title's, see state::images.
+/// an open file as a save state keeps it, the ROM image it reads goes by its place among the title's (see state::images)
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SavedFile {
     path: String,
@@ -148,8 +143,7 @@ enum SavedBacking {
 type Images<'a> = (&'a [std::sync::Arc<zakuro_fs::RomImage>], &'a [std::sync::Arc<zakuro_fs::layered::Layered>]);
 
 impl OpenFile {
-    /// the file as a saved state keeps it, none when it reads an image the
-    /// title does not have.
+    /// the file as a save state keeps it, none when it reads an image the title doesn't have
     pub fn save(&self, (images, layers): Images) -> Option<SavedFile> {
         let place = |image: &std::sync::Arc<zakuro_fs::RomImage>| images.iter().position(|known| std::sync::Arc::ptr_eq(known, image)).map(|i| i as u32);
         let backing = match &self.backing {
@@ -166,7 +160,7 @@ impl OpenFile {
 }
 
 impl SavedFile {
-    /// the file open again, on the title's images.
+    /// opens the file again on the title's images
     pub fn open(self, (images, layers): Images) -> Option<OpenFile> {
         let backing = match self.backing {
             SavedBacking::RomImage { image, offset, size } => FileBacking::RomImage { image: images.get(image as usize)?.clone(), offset, size },
@@ -183,15 +177,13 @@ impl SavedFile {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenArchive {
     pub id: u32,
-    /// for [ARCHIVE_NCCH], which title the archive was opened on, a file
-    /// opened through it means nothing without knowing that.
+    /// for [ARCHIVE_NCCH], which title the archive was opened on, a file opened thru it means nothing w/o knowing that
     pub ncch_path: Option<NcchArchivePath>,
-    /// for the writable archives, the host directory behind it.
+    /// for the writable archives, the host dir behind it
     pub host: Option<HostArchive>,
 }
 
-/// an open directory, its listing, taken when it was opened, and how much
-/// of it has been read.
+/// an open dir, its listing (taken when it was opened) and how much of it got read
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenDirectory {
     entries: Vec<DirectoryEntry>,
@@ -200,20 +192,19 @@ pub struct OpenDirectory {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FsState {
-    /// where the writable archives live on the host, this run's.
+    /// where the writable archives live on the host, this run's
     #[serde(skip)]
     pub user_dir: PathBuf,
     pub archives: HashMap<u64, OpenArchive>,
     pub next_archive: u64,
-    /// the files, which a saved state keeps apart, see SavedFile.
+    /// the files, a save state keeps them apart (see SavedFile)
     #[serde(skip)]
     pub files: HashMap<u32, OpenFile>,
     pub next_file: u32,
     pub directories: HashMap<u32, OpenDirectory>,
     pub next_directory: u32,
     pub priority: u32,
-    /// the tick each medium, the game's and the SD card, is busy until. a
-    /// medium reads one request after another.
+    /// the tick each medium (the game's and the SD card) is busy till, a medium reads one request after another
     pub busy_until: [u64; 2],
 }
 
@@ -262,8 +253,7 @@ pub fn handle(
     header: Header,
     target: &Target,
 ) -> bool {
-    // file and directory sessions carry the object id in the session's
-    // subhandle.
+    // file and dir sessions carry the object id in the session's subhandle
     if let Target::Service { name, subhandle } = target {
         match name.as_str() {
             "FSFile" => return file_command(system, buffer, header, *subhandle),
@@ -274,7 +264,7 @@ pub fn handle(
     user_command(system, buffer, header)
 }
 
-/// replies with nothing but result's code, success or not.
+/// replies w/ nothing but result's code, success or not
 fn reply_result(system: &mut System, buffer: &CommandBuffer, command: u16, result: Result<(), ResultCode>) {
     match result {
         Ok(()) => buffer.reply(&mut system.memory, command, &[]),
@@ -282,15 +272,14 @@ fn reply_result(system: &mut System, buffer: &CommandBuffer, command: u16, resul
     }
 }
 
-/// reads an IPC path argument as raw bytes.
+/// reads an IPC path arg as raw bytes
 fn path_bytes(system: &mut System, size: u32, pointer: u32) -> Vec<u8> {
     let mut bytes = vec![0u8; size.min(0x400) as usize];
     system.memory.read_bytes(pointer, &mut bytes);
     bytes
 }
 
-/// the host directory behind a writable archive, whether or not it has
-/// been created yet. None for archives that are not writable.
+/// the host dir behind a writable archive, created yet or not, None for archives that aren't writable
 fn host_archive_for(system: &System, archive_id: u32, path: &[u8]) -> Option<HostArchive> {
     let base = &system.services.fs.user_dir;
     let word = |i: usize| {
@@ -299,7 +288,7 @@ fn host_archive_for(system: &System, archive_id: u32, path: &[u8]) -> Option<Hos
     };
     match archive_id {
         ARCHIVE_SAVEDATA => Some(HostArchive::save_data(base, system.kernel.program_id)),
-        // path, media type, then the 64-bit extra data id.
+        // path, media type, then the 64 bit extra data id
         ARCHIVE_EXTDATA | ARCHIVE_SHARED_EXTDATA => {
             let id = word(4) as u64 | ((word(8) as u64) << 32);
             Some(HostArchive::ext_data(base, id, archive_id == ARCHIVE_SHARED_EXTDATA))
@@ -313,13 +302,12 @@ fn host_archive_for(system: &System, archive_id: u32, path: &[u8]) -> Option<Hos
     }
 }
 
-/// opens a writable archive, failing the way a console does when it was
-/// never created, each kind has its own code, and titles tell "create it"
-/// apart from "it is broken" by exactly which one comes back.
+/// opens a writable archive, failing like a console does when it was never created
+/// each kind has its own code, and titles tell "create it" apart from "it's broken" by exactly which one comes back
 fn open_host_archive(system: &System, archive_id: u32, path: &[u8]) -> Result<HostArchive, ResultCode> {
     let archive = host_archive_for(system, archive_id, path).ok_or(errors::FS_NOT_FOUND)?;
     if archive_id == ARCHIVE_SDMC {
-        // the SD card is simply there.
+        // the SD card is just there
         let _ = std::fs::create_dir_all(archive.resolve("").unwrap_or_default());
         return Ok(archive);
     }
@@ -336,13 +324,11 @@ fn open_host_archive(system: &System, archive_id: u32, path: &[u8]) -> Result<Ho
     })
 }
 
-/// the shared extra data holding the play coins, which every console has
-/// and titles open without ever creating it.
+/// the shared extra data w/ the play coins, every console has it and titles open it w/o ever creating it
 const PLAY_COINS: u32 = 0xF000_000B;
 
-/// makes the play coins' extra data the way a console that never walked
-/// anywhere has it, a magic, 42 coins, no steps and the date they were
-/// last counted.
+/// makes the play coins' extra data like a console that never walked anywhere has it (couch potato), a magic,
+/// 42 coins, no steps and the date they were last counted
 fn make_play_coins(archive: &HostArchive) -> Result<(), ResultCode> {
     archive.format(FormatInfo::default())?;
     let mut coins = Vec::with_capacity(20);
@@ -355,11 +341,11 @@ fn make_play_coins(archive: &HostArchive) -> Result<(), ResultCode> {
     std::fs::write(file, coins).map_err(|_| errors::FS_NOT_FORMATTED)
 }
 
-/// the writable archive an archive handle refers to.
+/// the writable archive an archive handle refers to
 fn archive_of(system: &System, handle: u64) -> Result<HostArchive, ResultCode> {
     match system.services.fs.archives.get(&handle) {
         Some(OpenArchive { host: Some(host), .. }) => Ok(host.clone()),
-        // read-only archives have nowhere to put anything.
+        // read only archives have nowhere to put anything
         Some(_) => Err(errors::FS_UNEXPECTED_FILE_OR_DIRECTORY),
         None => Err(errors::FS_ARCHIVE_NOT_MOUNTED),
     }
@@ -374,8 +360,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // OpenFile(transaction, archive handle, path type, path size, flags,
-        //          attributes, <path>)
+        // OpenFile(transaction, archive handle, path type, path size, flags, attributes, <path>)
         0x0802 => {
             let archive = read_u64(system, buffer, 2);
             let path_type = buffer.get(&mut system.memory, 4);
@@ -398,9 +383,8 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // OpenFileDirectly(transaction, archive id, archive path type,
-        //   archive path size, file path type, file path size, flags,
-        //   attributes, <archive path>, <file path>)
+        // OpenFileDirectly(transaction, archive id, archive path type, archive path size,
+        // file path type, file path size, flags, attributes, <archive path>, <file path>)
         0x0803 => {
             let archive_id = buffer.get(&mut system.memory, 2);
             let archive_path_size = buffer.get(&mut system.memory, 4);
@@ -428,8 +412,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // DeleteFile / DeleteDirectory / DeleteDirectoryRecursively
-        //   (transaction, archive handle, path type, path size, <path>)
+        // DeleteFile / DeleteDirectory / DeleteDirectoryRecursively(transaction, archive handle, path type, path size, <path>)
         0x0804 | 0x0806 | 0x0807 => {
             let archive = read_u64(system, buffer, 2);
             let path_type = buffer.get(&mut system.memory, 4);
@@ -445,9 +428,8 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // RenameFile / RenameDirectory(transaction, source archive, source
-        //   path type, source path size, destination archive, destination
-        //   path type, destination path size, <source>, <destination>)
+        // RenameFile / RenameDirectory(transaction, source archive, source path type, source path size,
+        // destination archive, destination path type, destination path size, <source>, <destination>)
         0x0805 | 0x080A => {
             let source_archive = read_u64(system, buffer, 2);
             let source_type = buffer.get(&mut system.memory, 4);
@@ -458,7 +440,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             let dest_ptr = buffer.get(&mut system.memory, 13);
             let source = decode_path(system, source_type, source_size, source_ptr);
             let dest = decode_path(system, dest_type, dest_size, dest_ptr);
-            // renames only ever happen within one archive.
+            // renames only ever happen inside one archive
             let result = archive_of(system, source_archive).and_then(|host| {
                 if command == 0x0805 {
                     host.rename_file(&source, &dest)
@@ -471,8 +453,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // CreateFile(transaction, archive handle, path type, path size,
-        //   attributes, size u64, <path>)
+        // CreateFile(transaction, archive handle, path type, path size, attributes, size u64, <path>)
         0x0808 => {
             let archive = read_u64(system, buffer, 2);
             let path_type = buffer.get(&mut system.memory, 4);
@@ -486,8 +467,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // CreateDirectory(transaction, archive handle, path type, path
-        //   size, attributes, <path>)
+        // CreateDirectory(transaction, archive handle, path type, path size, attributes, <path>)
         0x0809 => {
             let archive = read_u64(system, buffer, 2);
             let path_type = buffer.get(&mut system.memory, 4);
@@ -562,9 +542,8 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // ControlArchive(archive handle, action, input size, output size,
-        //   <input>, <output>). The one action titles use commits save
-        //   data, which host files do on every write anyway.
+        // ControlArchive(archive handle, action, input size, output size, <input>, <output>)
+        // the one action titles use commits save data, host files do that on every write anyway
         0x080D => {
             let descriptors: Vec<u32> = (6..10).map(|i| buffer.get(&mut system.memory, i)).collect();
             buffer.set(&mut system.memory, 0, Header::new(command, 1, 4).0);
@@ -583,8 +562,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // FormatThisUserSaveData(block size, directories, files, directory
-        //   buckets, file buckets, duplicate data)
+        // FormatThisUserSaveData(block size, dirs, files, dir buckets, file buckets, duplicate data)
         0x080F => {
             let info = FormatInfo {
                 total_size: buffer.get(&mut system.memory, 1).wrapping_mul(512),
@@ -598,9 +576,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // FormatSaveData(archive id, path type, path size, block size,
-        //   directories, files, directory buckets, file buckets, duplicate
-        //   data, <path>)
+        // FormatSaveData(archive id, path type, path size, block size, dirs, files, dir buckets, file buckets, duplicate data, <path>)
         0x084C => {
             let archive_id = buffer.get(&mut system.memory, 1);
             let path_size = buffer.get(&mut system.memory, 3);
@@ -621,22 +597,21 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // GetFreeBytes(archive handle) -> u64. Plenty.
+        // GetFreeBytes(archive handle) => u64, plenty
         0x0812 => {
             let free: u64 = 512 * 1024 * 1024;
             buffer.reply(&mut system.memory, command, &[free as u32, (free >> 32) as u32]);
             true
         }
 
-        // GetCardType, a CTR card.
+        // GetCardType, a CTR card
         0x0813 => {
             buffer.reply(&mut system.memory, command, &[0]);
             true
         }
 
-        // GetSdmcArchiveResource / GetNandArchiveResource /
-        // GetArchiveResource(media type), sector size, cluster size, total
-        // and free clusters.
+        // GetSdmcArchiveResource / GetNandArchiveResource / GetArchiveResource(media type), sector size,
+        // cluster size, total and free clusters
         0x0814 | 0x0815 | 0x0849 => {
             buffer.reply(&mut system.memory, command, &[0x200, 0x4000, 0x8_0000, 0x8_0000]);
             true
@@ -648,7 +623,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // CheckAuthorityToAccessExtSaveData, yes.
+        // CheckAuthorityToAccessExtSaveData, sure go ahead
         0x083D => {
             buffer.reply(&mut system.memory, command, &[1]);
             true
@@ -660,8 +635,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // GetFormatInfo(archive id, path type, path size, <path>) -> total
-        // size, directories, files, duplicate data
+        // GetFormatInfo(archive id, path type, path size, <path>) => total size, dirs, files, duplicate data
         0x0845 => {
             let archive_id = buffer.get(&mut system.memory, 1);
             let path_size = buffer.get(&mut system.memory, 3);
@@ -681,8 +655,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // CreateExtSaveData(media type, id low, id high, unknown,
-        //   directories, files, size limit u64, icon size, <icon>)
+        // CreateExtSaveData(media type, id low, id high, unknown, dirs, files, size limit u64, icon size, <icon>)
         0x0851 => {
             let path: Vec<u8> = (1..4)
                 .flat_map(|i| buffer.get(&mut system.memory, i).to_le_bytes())
@@ -696,8 +669,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             let icon_descriptor = buffer.get(&mut system.memory, 10);
             let icon_ptr = buffer.get(&mut system.memory, 11);
             let result = match host_archive_for(system, ARCHIVE_EXTDATA, &path) {
-                // creating extra data that is already there leaves its
-                // contents alone.
+                // creating extra data that's already there leaves its contents alone
                 Some(archive) if archive.exists() => Ok(()),
                 Some(archive) => archive.format(info),
                 None => Err(errors::FS_INVALID_PATH),
@@ -734,11 +706,9 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // SetThisSaveDataSecureValue(slot, value) / GetThisSaveDataSecureValue
-        // (slot) -> exists, on a game card, value. the value only keeps a
-        // save from being swapped for an older one, which nothing here
-        // checks, and a title finding none takes the save as it is, the
-        // Pokémon games that set one when saving among them
+        // SetThisSaveDataSecureValue(slot, value) / GetThisSaveDataSecureValue(slot) => exists, on a game card, value
+        // the value only keeps a save from being swapped for an older one, nothing here checks that
+        // a title finding none takes the save as is, the Pokémon games that set one when saving included
         0x086E => {
             buffer.reply(&mut system.memory, command, &[]);
             true
@@ -752,7 +722,7 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
     }
 }
 
-/// opens a file inside a writable archive.
+/// opens a file inside a writable archive
 fn open_host_file(
     system: &mut System,
     host: &HostArchive,
@@ -786,7 +756,7 @@ fn reply_with_file(
     }
 }
 
-/// commands sent to a file session.
+/// commands sent to a file session
 fn file_command(
     system: &mut System,
     buffer: &CommandBuffer,
@@ -819,8 +789,7 @@ fn file_command(
             buffer.set(&mut system.memory, 2, read);
             buffer.set(&mut system.memory, 3, (size << 4) | 0xC);
             buffer.set(&mut system.memory, 4, dest);
-            // the thread waits as long as the console would take, after the
-            // reads the medium is still busy with
+            // the thread waits as long as the console would take, after the reads the medium is still busy w/
             let medium = match &backing {
                 Some(FileBacking::Host(_)) => 1,
                 _ => 0,
@@ -844,8 +813,7 @@ fn file_command(
                     system.memory.read_bytes(source, &mut data);
                     host_archive::write_at(&path, offset, &data) as u32
                 }
-                // anything else is read-only, the ROM image and the
-                // generated system archives have nowhere to put writes.
+                // anything else is read only, the ROM image and the generated system archives have nowhere to put writes
                 _ => 0,
             };
 
@@ -856,7 +824,7 @@ fn file_command(
             buffer.set(&mut system.memory, 4, source);
             true
         }
-        // GetSize -> u64
+        // GetSize => u64
         0x0804 => {
             let size = backing.map_or(0, |b| b.size());
             buffer.reply(
@@ -876,7 +844,7 @@ fn file_command(
             reply_result(system, buffer, command, result);
             true
         }
-        // GetAttributes, an ordinary file.
+        // GetAttributes, an ordinary file
         0x0806 => {
             buffer.reply(&mut system.memory, command, &[0]);
             true
@@ -887,7 +855,7 @@ fn file_command(
             buffer.reply(&mut system.memory, command, &[]);
             true
         }
-        // SetAttributes / Flush / SetPriority, host writes are already durable.
+        // SetAttributes / Flush / SetPriority, host writes are already durable
         0x0807 | 0x0809 | 0x080A => {
             buffer.reply(&mut system.memory, command, &[]);
             true
@@ -897,7 +865,7 @@ fn file_command(
             buffer.reply(&mut system.memory, command, &[0]);
             true
         }
-        // OpenLinkFile, hand back another session onto the same file.
+        // OpenLinkFile, hand back another session onto the same file
         0x080C => {
             let handle = make_session(system, "FSFile", file_id);
             buffer.reply_with_handle(&mut system.memory, command, handle);
@@ -907,7 +875,7 @@ fn file_command(
     }
 }
 
-/// commands sent to a directory session.
+/// commands sent to a directory session
 fn directory_command(
     system: &mut System,
     buffer: &CommandBuffer,
@@ -916,7 +884,7 @@ fn directory_command(
 ) -> bool {
     let command = header.command_id();
     match command {
-        // read(count, <mapped buffer>) -> entries read
+        // read(count, <mapped buffer>) => entries read
         0x0801 => {
             let count = buffer.get(&mut system.memory, 1);
             let descriptor = buffer.get(&mut system.memory, 2);
@@ -951,8 +919,7 @@ fn directory_command(
     }
 }
 
-/// lays out one directory entry the way FSDir:Read returns them, the
-/// UTF-16 name, an 8.3 short name and extension, flags, and the size.
+/// lays out one dir entry like FSDir:Read returns them, the UTF 16 name, an 8.3 short name and extension, flags and the size
 fn encode_directory_entry(entry: &DirectoryEntry) -> [u8; DIRECTORY_ENTRY_SIZE as usize] {
     let mut raw = [0u8; DIRECTORY_ENTRY_SIZE as usize];
     for (i, unit) in entry.name.encode_utf16().take(0x105).enumerate() {
@@ -981,7 +948,7 @@ fn read_u64(system: &mut System, buffer: &CommandBuffer, index: u32) -> u64 {
     low | (high << 32)
 }
 
-/// creates the session object a file or directory is reached through.
+/// makes the session object a file or dir is reached thru
 fn make_session(system: &mut System, service: &str, id: u32) -> u32 {
     let object = system
         .kernel
@@ -996,8 +963,7 @@ fn make_session(system: &mut System, service: &str, id: u32) -> u32 {
         .create(&mut system.kernel.objects, object, service)
 }
 
-/// opens a file in one of the read-only archives, the title's own NCCH
-/// and the system's shared data.
+/// opens a file in one of the read only archives, the title's own NCCH and the system's shared data
 fn open_file(
     system: &mut System,
     archive_id: u32,
@@ -1016,10 +982,10 @@ fn open_file(
                 return None;
             }
 
-            // the media type in the *archive* path decides what this is, a game
-            // reaching into its own cartridge, or, far more often, a read of
-            // one of the system's shared data archives on NAND, which has
-            // nothing to do with this title's content.
+            // the media type in the *archive* path decides what this is,
+            // a game reaching into its own cartridge or, way more often,
+            // a read of one of the system's shared data archives on NAND,
+            // which has nothing to do w/ this title's content
             let archive_path = archive_path.unwrap_or_default();
             match archive_path.media_type {
                 MEDIA_NAND => open_system_archive(system, archive_path),
@@ -1056,7 +1022,7 @@ fn open_self_ncch(
     path_size: u32,
     path_ptr: u32,
 ) -> Option<u32> {
-    // a binary path selects which part of the NCCH, an empty path means RomFS.
+    // a binary path picks which part of the NCCH, an empty path means RomFS
     let kind = if path_type == PATH_BINARY && path_size >= 4 {
         use zakuro_cpu::Bus;
         system.memory.read32(path_ptr)
@@ -1067,7 +1033,7 @@ fn open_self_ncch(
     open_ncch_kind(system, kind)
 }
 
-/// opens one of the system's shared data archives on NAND.
+/// opens one of the system's shared data archives on NAND
 fn open_system_archive(system: &mut System, path: NcchArchivePath) -> Option<u32> {
     let Some(name) = path.system_file_name() else {
         log::warn!(
@@ -1086,7 +1052,7 @@ fn open_system_archive(system: &mut System, path: NcchArchivePath) -> Option<u32
     }))
 }
 
-/// stand-in contents for a shared data archive.
+/// stand in contents for a shared data archive
 fn system_archive_data(path: NcchArchivePath, data_dir: Option<&std::path::Path>) -> Vec<u8> {
     use crate::services::system_archives;
     match (path.high_program_id, path.low_program_id) {
@@ -1100,8 +1066,7 @@ fn system_archive_data(path: NcchArchivePath, data_dir: Option<&std::path::Path>
 fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     match kind {
-        // the update's RomFS, which a game opens besides its own, its own
-        // when there is no update
+        // the update's RomFS, a game opens it besides its own, its own when there's no update
         SELF_NCCH_ROMFS | SELF_NCCH_UPDATE_ROMFS => {
             let update = title.update().filter(|_| kind == SELF_NCCH_UPDATE_ROMFS);
             let (backing, path) = match update {
@@ -1125,8 +1090,7 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
     }
 }
 
-/// what a title's RomFS reads through, with its mods over it when it has
-/// any.
+/// what a title's RomFS reads thru, w/ its mods over it when it has any
 fn romfs_backing(title: &zakuro_fs::Title) -> Option<FileBacking> {
     if let Some(layered) = title.layered.clone() {
         return Some(FileBacking::Layered(layered, title.shared_image()));
@@ -1137,8 +1101,8 @@ fn romfs_backing(title: &zakuro_fs::Title) -> Option<FileBacking> {
     Some(FileBacking::RomImage { image: title.shared_image(), offset: romfs.base, size: end.saturating_sub(romfs.base) })
 }
 
-/// opens a title on the SD card through the NCCH archive, the game itself
-/// installed from a CIA, its update, or the content of an index of its DLC.
+/// opens a title on the SD card thru the NCCH archive, the game itself installed from a CIA, its update,
+/// or the content of an index of its DLC
 fn open_sd_title(system: &mut System, title_id: u64, content_index: u16, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     if title_id == title.program_id() {
@@ -1167,11 +1131,9 @@ fn open_sd_title(system: &mut System, title_id: u64, content_index: u16, kind: u
     }))
 }
 
-/// how long a read of length bytes takes on the console, in nanoseconds,
-/// the numbers Citra measured reading a game card on an Old 3DS. titles
-/// that load on a worker thread count on their other threads getting
-/// ahead meanwhile, Animal Crossing runs out of memory when a load is
-/// done before it asks.
+/// how long reading length bytes takes on the console, in nanos, the numbers Citra measured reading a game card on an Old 3DS
+/// titles loading on a worker thread count on their other threads getting ahead meanwhile,
+/// Animal Crossing runs out of memory when a load is done b4 it asks
 fn read_delay(length: u32) -> u64 {
     (u64::from(length) * 94 + 582_778).max(663_124)
 }
@@ -1196,8 +1158,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
                 log::warn!("fs: read past the end of the ROM image");
                 return 0;
             };
-            // copying through a temporary keeps the borrow of title from
-            // overlapping the mutable borrow of memory.
+            // copy thru a temp so the borrow of title doesn't overlap the mutable borrow of memory (borrowck things)
             let data = slice.to_vec();
             system.write_from_service(dest, &data);
             count as u32
@@ -1249,6 +1210,5 @@ fn decode_path(system: &mut System, path_type: u32, path_size: u32, path_ptr: u3
     }
 }
 
-/// kept so the descriptor helper stays in scope for the mapped-buffer replies
-/// above, which build their descriptors by hand.
+/// kept so the descriptor helper stays in scope for the mapped buffer replies above, they build their descriptors by hand
 pub const _MAPPED_BUFFER_RW: u32 = Descriptor::static_buffer(0, 0);

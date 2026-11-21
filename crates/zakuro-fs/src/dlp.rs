@@ -1,10 +1,9 @@
-//! the Download Play child a game card carries, a CIA in the RomFS of the
-//! card's partition 2, which the console sends to others to play along.
+//! the Download Play child a game card carries, a CIA in the RomFS of the card's partition 2, the console sends it to others to play along
 
 use crate::reader::Reader;
 use crate::{NcchHeader, Ncsd, RomFs};
 
-/// where the child's CIA is in a card's image, its offset and size.
+/// where the child's CIA is in a card's image, its offset and size
 pub fn child_cia(image: &[u8]) -> Option<(u64, u64)> {
     if !Ncsd::detect(image) {
         return None;
@@ -30,8 +29,7 @@ pub fn child_cia(image: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
-/// a CIA's SMDH, its titles and icons, which its meta section holds past
-/// the dependency list, none for a CIA without one.
+/// a CIA's SMDH (its titles and icons), its meta section holds it past the dependency list, none for a CIA w/o one
 pub fn cia_icon(cia: &[u8]) -> Option<&[u8]> {
     const ALIGN: u64 = 0x40;
     const SMDH_SIZE: usize = 0x36C0;

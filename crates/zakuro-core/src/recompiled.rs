@@ -1,8 +1,6 @@
-//! running code that 3dsrecomp turned into a library ahead of time. the
-//! library's functions work on a context holding the registers and reach
-//! memory through the same page tables the interpreter uses, calling back
-//! here for anything else. whatever the library has no code for stays with
-//! the interpreter.
+//! runs code 3dsrecomp turned into a lib ahead of time
+//! the lib's funcs work on a context holding the regs and reach memory thru the same page tables as the interpreter
+//! calling back here for anything else, whatever the lib has no code for stays w/ the interpreter
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -17,114 +15,96 @@ use crate::System;
 
 pub use recomp_abi::Linked;
 
-/// the library 3dsrecomp build installed for a title, if there is one.
+/// the lib `3dsrecomp build` installed for a title, if any
 pub fn installed(program_id: u64) -> Option<std::path::PathBuf> {
     recomp_abi::installed(program_id)
 }
 
-/// whether the library at path is worth building again, having come from
-/// an older 3dsrecomp than this build has, or not running at all.
+/// is the lib at path worth rebuilding, from an older 3dsrecomp than this build has or not running at all
 pub fn outdated(path: &Path) -> bool {
     !recomp_abi::Library::open(path).is_ok_and(|code| code.generation() >= recomp_abi::GENERATION)
 }
 
-/// recompiled code, and how much of its work it handed back.
+/// recompiled code and how much work it handed back
 pub struct Library {
     code: recomp_abi::Library,
-    /// instructions the code handed to the interpreter one at a time.
+    /// instrs the code handed to the interpreter one at a time
     fallbacks: Cell<u64>,
-    /// svcs the code ran in place and went on after.
+    /// svcs the code ran in place and went on after
     in_place: Cell<u64>,
-    /// where the code reads the clock itself, see recomp_abi::Context, the
-    /// last place tick_in_place answered GetSystemTick at.
+    /// where the code reads the clock itself (see recomp_abi::Context), the last spot tick_in_place answered GetSystemTick at
     tick_at: Cell<u32>,
-    /// where the code takes and lets go of the mutex it is lent, see
-    /// recomp_abi::Context, the last places wait_in_place and
-    /// release_in_place ran at.
+    /// where the code takes and drops its lent mutex (see recomp_abi::Context), the last spots wait_in_place and release_in_place ran at
     wait_at: Cell<u32>,
     release_at: Cell<u32>,
-    /// the code found for addresses lately, each in a slot its address
-    /// picks. a jump through a register looks its target up, which is a
-    /// search through every function otherwise.
+    /// code found for addrs lately, each in a slot its addr picks
+    /// a jump thru a reg looks its target up, otherwise that's a search thru every func
     found: Box<[Found]>,
 }
 
-/// a slot of Library::found, an address and the code found for it.
+/// a Library::found slot, an addr and the code found for it
 type Found = Cell<(u32, Option<Code>)>;
 
-/// slots of Library::found, a power of two.
+/// Library::found slots, a power of two
 const FOUND: usize = 65536;
 
-/// the slot of Library::found an address goes in, the top bits of the
-/// address times the golden ratio. ARM addresses step by four and Thumb ones
-/// by two with bit 0 set, and taking low bits would leave half the slots to
-/// one of them.
+/// the Library::found slot an addr goes in, top bits of addr times the golden ratio
+/// ARM addrs step by 4 and Thumb ones by 2 w/ bit 0 set, low bits would leave half the slots to one of them
 fn slot(address: u32) -> usize {
     (address.wrapping_mul(0x9E37_79B1) >> (32 - FOUND.trailing_zeros())) as usize
 }
 
-/// why a run of recompiled code ended.
+/// why a run of recompiled code ended
 pub enum Stop {
-    /// an svc, the cpu is already past it.
+    /// an svc, the cpu's already past it
     Svc(u32),
-    /// the interpreter stopped on an instruction the code handed it.
+    /// the interpreter stopped on an instr the code handed it
     Exit(Exit),
-    /// the budget ran out, or execution left for code the library does not
-    /// have.
+    /// budget ran out, or execution left for code the lib doesn't have
     Left,
-    /// after an svc it ran in place, the code had no budget for the next
-    /// block, which the interpreter goes through instead, as it would have
-    /// in the step after the svc.
+    /// after an in place svc the code had no budget for the next block, the interpreter takes it like it would in the step after the svc
     Declined,
 }
 
-/// what the callbacks reach through the context.
+/// what the callbacks reach thru the context
 struct Machine<'a> {
-    /// the system the code runs in, which the library is out of meanwhile.
+    /// the system the code runs in, the lib's out of it meanwhile
     system: *mut System,
     library: &'a Library,
-    /// what the interpreter stopped with inside a callback.
+    /// what the interpreter stopped w/ inside a callback
     pending: Option<Exit>,
-    /// the cycle count and the budget when the code started, or went on
-    /// after an svc, and how many instructions it ran before.
+    /// cycle count and budget when the code started (or went on after an svc), and instrs it ran b4
     cycles: u64,
     budget: i32,
     ran: u64,
-    /// the deadline the step had, and the next event's tick, which the
-    /// budget stops at.
+    /// the step's deadline and the next event's tick, the budget stops there
     deadline: Option<u64>,
     event: Option<u64>,
-    /// the cycle count the budget runs out at, as last worked out.
+    /// the cycle count the budget runs out at, as last worked out
     limit: u64,
-    /// an svc the code ran had the step do more, which the code left for.
+    /// an svc the code ran needed the step to do more, the code left for it
     left: bool,
-    /// the code went on after an svc it ran.
+    /// the code went on after an svc it ran
     went_on: bool,
-    /// the cycle count a GetSystemTick the code reads itself has to come
-    /// before, its cost included, or none when the code reads none.
+    /// cycle count a self read GetSystemTick must come b4 (cost included), none when the code reads none
     due: Option<u64>,
-    /// the mutex lent to the code, see recomp_abi::Context, and the cycle
-    /// count a wait or a release the code answers itself has to come
-    /// before.
+    /// the mutex lent to the code (see recomp_abi::Context) and the cycle count a self answered wait or release must come b4
     held: Option<(ObjectId, u64)>,
-    /// whether the code can be lent one, having been made for version 8 of
-    /// the interface or a later one.
+    /// can the code be lent one, made for interface v8 or later
     lends: bool,
-    /// a tick the code would answer itself has to come to the host, which
-    /// a try at skipping turns of a loop polling the clock takes, see
-    /// crate::spin.
+    /// a tick the code would answer itself has to come to the host,
+    /// a try at skipping turns of a clock polling loop takes it, see crate::spin
     tick_wanted: bool,
 }
 
 impl Machine<'_> {
-    /// what tick_in_place, wait_in_place and release_in_place would have
-    /// done for the svcs the code answered itself since the host last
-    /// looked, see recomp_abi::Context: the ones in the trail, the last at
-    /// tick_last, or for code made before version 8, ticks from tick_at.
+    /// what tick_in_place, wait_in_place and release_in_place would have done for the svcs the code answered
+    /// itself since the host last looked
+    /// see recomp_abi::Context, the ones in the trail (last at tick_last) or ticks from tick_at for pre v8 code
     ///
     /// # Safety
     ///
-    /// as for machine, and nothing else may hold the system.
+    /// same as machine, and nothing else may hold the system
     #[inline(always)]
     unsafe fn caught_up(&mut self, ctx: &mut Context) {
         // mostly the code answered nothing since
@@ -133,20 +113,20 @@ impl Machine<'_> {
         }
     }
 
-    /// caught_up, when the code answered something.
+    /// caught_up, when the code answered smth
     ///
     /// # Safety
     ///
-    /// as for machine, and nothing else may hold the system.
+    /// same as machine, and nothing else may hold the system
     unsafe fn catch_up(&mut self, ctx: &mut Context) {
         let done = std::mem::take(&mut ctx.done);
         let ticks = std::mem::take(&mut ctx.ticks);
         let cost = ctx.tick_cost as u64;
-        // a tick, the last one, costs, a wait or a release nothing
+        // a tick (the last one) costs, a wait or release costs nothing
         let last_tick = done == 0 || ctx.trail[(done - 1) as usize % TRAIL] == ctx.tick_at;
         let after = ctx.tick_last + if last_tick { cost } else { 0 };
         let budget = ctx.tick_end.saturating_sub(after).min(i32::MAX as u64) as i32;
-        // what ran before the last svc, the ticks aside
+        // what ran b4 the last svc, ticks aside
         self.ran += (self.budget.saturating_sub(budget).max(0) as u64).saturating_sub(cost * ticks as u64);
         self.cycles = after;
         self.budget = budget;
@@ -162,22 +142,19 @@ impl Machine<'_> {
         }
     }
 
-    /// takes back the mutex lent to the code, which the host can do
-    /// anything to now.
+    /// takes back the mutex lent to the code, the host can do anything to it now
     #[inline(always)]
     fn take_back(&mut self, ctx: &mut Context) {
         self.held = None;
         ctx.held_floor = NOTHING_HELD;
     }
 
-    /// lends the code the mutex a wait or a release ran in place at at took
-    /// or let go of alone, see recomp_abi::Context, when nothing but the
-    /// code's thread can touch it for a while. the mutex is a release's
-    /// handle, or where a wait's handle is.
+    /// lends the code the mutex a wait or release ran in place at at took or dropped alone (see recomp_abi::Context)
+    /// when nothing but the code's thread can touch it for a while, the mutex is a release's handle or where a wait's handle is
     ///
     /// # Safety
     ///
-    /// as for machine, and nothing else may hold the system.
+    /// same as machine, and nothing else may hold the system
     unsafe fn lend(&mut self, ctx: &mut Context, (mutex, wait): (u32, bool), at: u32) {
         let system = unsafe { &*self.system };
         let Some(due) = self.due else { return };
@@ -198,9 +175,8 @@ impl Machine<'_> {
         self.held_from(ctx);
     }
 
-    /// where the code may answer a wait or a release itself from here, with
-    /// the cycle count and budget the host just gave it: one at t is clear of
-    /// the mutex's due when t < due, where t is tick_end less the budget.
+    /// where the code may answer a wait or release itself from here, w/ the cycle count and budget the host just gave it
+    /// one at t is clear of the mutex's due when t < due, t being tick_end minus the budget
     fn held_from(&self, ctx: &mut Context) {
         ctx.held_floor = self.held.map_or(NOTHING_HELD, |(_, due)| {
             let floor = ctx.tick_end as i64 - due as i64;
@@ -208,9 +184,8 @@ impl Machine<'_> {
         });
     }
 
-    /// where the code may answer GetSystemTick itself from here, with the
-    /// cycle count and budget the host just gave it: a tick at t is clear
-    /// of due when t + cost < due, where t is tick_end less the budget.
+    /// where the code may answer GetSystemTick itself from here, w/ the cycle count and budget the host just gave it
+    /// a tick at t is clear of due when t + cost < due, t being tick_end minus the budget
     fn ticks_from(&self, ctx: &mut Context) {
         ctx.tick_end = self.cycles + self.budget.max(0) as u64;
         ctx.tick_floor = self.due.map_or(i32::MAX, |due| {
@@ -223,17 +198,16 @@ impl Machine<'_> {
 
 /// # Safety
 ///
-/// ctx has to be a context run set up, whose user field points at a live
-/// Machine.
+/// ctx must be a context run set up, its user field pointing at a live Machine
 unsafe fn machine<'a>(ctx: *mut Context) -> &'a mut Machine<'a> {
     unsafe { &mut *((*ctx).user as *mut Machine) }
 }
 
-/// the memory the code runs on.
+/// the memory the code runs on
 ///
 /// # Safety
 ///
-/// as for machine, and nothing else may hold the system.
+/// same as machine, and nothing else may hold the system
 unsafe fn memory<'a>(ctx: *mut Context) -> &'a mut Memory {
     unsafe { &mut (*machine(ctx).system).memory }
 }
@@ -262,7 +236,7 @@ unsafe extern "C" fn write32(ctx: *mut Context, address: u32, value: u32) {
     unsafe { memory(ctx).write32(address, value) }
 }
 
-/// runs one instruction the code left to the interpreter.
+/// runs one instr the code left to the interpreter
 unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
     unsafe {
         let machine = machine(ctx);
@@ -287,16 +261,14 @@ unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
     unsafe { machine(ctx).library.lookup(address) }
 }
 
-/// whether svcs run in place, unless ZAKURO_SVC_IN_PLACE is 0, which has
-/// the code stop at every one as before.
+/// do svcs run in place, unless ZAKURO_SVC_IN_PLACE is 0, then the code stops at every one like b4
 pub(crate) fn svcs_in_place() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ZAKURO_SVC_IN_PLACE").map_or(true, |value| value != "0"))
 }
 
-/// runs an svc the code made, which the code goes on after when the next
-/// step would only run it on, see System::svc_in_place. one that can't run
-/// in place stops the code for the step to run it.
+/// runs an svc the code made, the code goes on after it when the next step would just run it on (see System::svc_in_place)
+/// one that can't run in place stops the code for the step to run it
 unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
     unsafe {
         let machine = machine(ctx);
@@ -310,24 +282,21 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             return;
         }
         let system = &mut *machine.system;
-        // as far as the step goes, the code stopped at the svc
+        // as far as the step goes the code stopped at the svc
         let ran = machine.budget.saturating_sub(ctx.budget).max(0) as u64;
         machine.ran += ran;
-        // the clock, a wait that is over at once and a mutex let go of,
-        // which titles call more than anything, without the rest of a step
-        // around them when that would change nothing
+        // the clock, an instant wait and a dropped mutex, what titles call more than anything
+        // w/o the rest of a step around them when that'd change nothing
         let cycles = machine.cycles + ran;
         let at = ctx.r[15] | ctx.thumb as u32;
         let (event, deadline, limit, library) = (machine.event, machine.deadline, machine.limit, machine.library);
         let preempt = system.next_preempt;
         let mut tick_at = None;
-        // a mutex taken or let go of alone, which the code may then go on
-        // to do itself, see Machine::lend
+        // a mutex taken or dropped alone, the code may then do it itself, see Machine::lend
         let mut mutex = None;
         let done = match number {
             0x28 => {
-                // whole turns of a loop polling the clock skipped first, see
-                // crate::spin
+                // whole turns of a clock polling loop get skipped first, see crate::spin
                 let mut cycles = cycles;
                 if let Some(period) = system.spin.due(cycles).then(|| system.spin_period(at)).flatten() {
                     let core = Core::of(ctx, &system.cpu);
@@ -340,7 +309,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                 system.tick_in_place(cycles, at, event, deadline, limit, library).inspect(|_| {
                     ctx.r[0] = cycles as u32;
                     ctx.r[1] = (cycles >> 32) as u32;
-                    // the code reads the clock here itself from now on
+                    // the code reads the clock itself here from now on
                     tick_at = Some(at);
                 })
             }
@@ -368,9 +337,8 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             machine.went_on = true;
             library.in_place.set(library.in_place.get() + 1);
             machine.budget = ctx.budget;
-            // nothing it looks at changed, unless the budget was cut short,
-            // a preempt passed, which moves the next, or this is the tick a
-            // try at skipping turns wanted
+            // nothing it looks at changed, unless the budget got cut short,
+            // a preempt passed (moving the next one) or a skip try wanted this tick
             let passed = system.next_preempt != preempt;
             if passed {
                 machine.due = system.tick_due(event, deadline);
@@ -386,18 +354,14 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
             if let Some(mutex) = mutex.filter(|_| machine.lends) {
                 machine.lend(ctx, mutex, at);
             } else if lent && tick_at.is_some() {
-                // a tick changes nothing the mutex was lent on, nor does
-                // the pass of a preempt it came to, so the code keeps it,
-                // rather than coming back with its next wait to have it
-                // lent again
+                // a tick changes nothing the mutex was lent on, nor does a preempt's pass it hit
+                // so the code keeps it instead of coming back w/ its next wait to get it lent again
                 let (handle, release_at) = (ctx.held, ctx.release_at);
                 machine.lend(ctx, (handle, false), release_at);
             }
-            // a try at skipping turns of a loop polling the clock is due,
-            // the history showing one, which takes the next tick, see
-            // crate::spin. a turn's other svcs may be the ones coming to the
-            // preempts every time, or a try was at another of the turn's
-            // ticks than the one it starts at
+            // a try at skipping turns of a clock polling loop is due (the history shows one), it takes the next tick, see crate::spin
+            // a turn's other svcs may be the ones hitting the preempts every time,
+            // or a try was at another of the turn's ticks than its first
             let wants = match number {
                 0x28 => system.spin.wants_tick(),
                 _ => system.spin.due(machine.cycles) && system.history_repeats(),
@@ -425,8 +389,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
                 machine.ticks_from(ctx);
             }
             None => {
-                // nothing is left of the run but the unwinding, its event
-                // looked at already
+                // nothing's left of the run but unwinding, its event already looked at
                 machine.event = None;
                 machine.left = true;
                 ctx.exit = EXIT_UNWIND;
@@ -465,19 +428,18 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
 }
 
 impl Library {
-    /// a library 3dsrecomp built.
+    /// a lib 3dsrecomp built
     pub fn open(path: &Path) -> Result<Library, String> {
         recomp_abi::Library::open(path).map(Library::new)
     }
 
-    /// the code linked into the program.
+    /// the code linked into the program
     pub fn linked(linked: &Linked) -> Result<Library, String> {
         recomp_abi::Library::linked(linked).map(Library::new)
     }
 
     fn new(mut code: recomp_abi::Library) -> Library {
-        // ZAKURO_NATIVES=0 has the title's own code run for the C library
-        // functions the library does on the host
+        // ZAKURO_NATIVES=0 runs the title's own code for the C lib funcs the lib does on the host
         if std::env::var("ZAKURO_NATIVES").is_ok_and(|value| value == "0") && code.set_natives(false) {
             log::info!("the library's natives are off, the title's own code runs for them");
         }
@@ -492,40 +454,37 @@ impl Library {
         }
     }
 
-    /// every slot of found empty, an address no code starts at in each.
+    /// every found slot empty, w/ an addr no code starts at in each
     fn nothing_found() -> Box<[Found]> {
         (0..FOUND).map(|_| Cell::new((u32::MAX, None))).collect()
     }
 
-    /// whether the code came from an older 3dsrecomp than the one this
-    /// build has, so that recompiling the game again makes it better.
+    /// did the code come from an older 3dsrecomp than this build has, so recompiling makes it better
     pub fn outdated(&self) -> bool {
         self.code.generation() < recomp_abi::GENERATION
     }
 
-    /// whether the code can tell the functions whose code changed in
-    /// memory, which it can from generation 2 on.
+    /// can the code tell which funcs changed in memory, gen 2 and up can
     pub fn checks_itself(&self) -> bool {
         self.code.origins(0).is_some()
     }
 
-    /// how many instructions the code has handed to the interpreter.
+    /// instrs the code handed to the interpreter
     pub fn fallbacks(&self) -> u64 {
         self.fallbacks.get()
     }
 
-    /// how many svcs the code ran in place, going on after them.
+    /// svcs the code ran in place and went on after
     pub fn in_place(&self) -> u64 {
         self.in_place.get()
     }
 
-    /// how many functions and modules there is code for.
+    /// how many funcs and modules have code
     pub fn describe(&self) -> String {
         self.code.describe()
     }
 
-    /// the code that can run from address, bit 0 set for Thumb, in the
-    /// executable or in a module that is loaded.
+    /// code that can run from address (bit 0 for Thumb) in the exe or a loaded module
     fn lookup(&self, address: u32) -> Option<Code> {
         let slot = &self.found[slot(address)];
         match slot.get() {
@@ -542,22 +501,19 @@ impl Library {
         self.lookup(address).is_some()
     }
 
-    /// marks the executable's functions whose code in memory is not what
-    /// they were recompiled from, which a mod or another version of the
-    /// game does, so that the interpreter runs them. how many there are.
+    /// marks the exe's funcs whose code in memory isn't what they were recompiled from (a mod or another game version does that)
+    /// so the interpreter runs them, returns how many
     pub fn check(&mut self, memory: &mut Memory) -> usize {
         let stale = self.code.check(0, 0, |address, bytes| memory.read_bytes(address, bytes));
         self.found = Library::nothing_found();
         stale
     }
 
-    /// tells the code of the module called name where the title loaded it,
-    /// zero when it unloads it, and checks the module's code once it is in
-    /// memory.
+    /// tells module name's code where the title loaded it (0 on unload) and checks its code once it's in memory
     pub fn place(&mut self, name: &str, base: u32, memory: &mut Memory) {
         let Some(index) = self.code.module_index(name) else { return };
         self.code.place(index, base);
-        // what was found before may have moved or gone
+        // what was found b4 may have moved or gone
         self.found = Library::nothing_found();
         if base == 0 {
             return;
@@ -569,21 +525,17 @@ impl Library {
         }
     }
 
-    /// runs recompiled code from the cpu's pc for about budget instructions,
-    /// returning how many ran, why it stopped and the tick of the event its
-    /// budget last stopped at. the code runs the svcs it can in place, going
-    /// on after them, and deadline, event and limit are what the step had,
-    /// for those. the library has to be out of the system, which the code
-    /// has to itself.
+    /// runs recompiled code from the cpu's pc for about budget instrs, returns how many ran,
+    /// why it stopped and the tick its budget last stopped at
+    /// the code runs what svcs it can in place, deadline, event and limit are what the step had for those
+    /// the lib must be out of the system, the code gets it to itself
     pub fn run(&self, system: &mut System, budget: u64, deadline: Option<u64>, event: Option<u64>, limit: u64) -> (u64, Stop, Option<u64>) {
         let system: *mut System = system;
         let budget = budget.min(i32::MAX as u64) as i32;
-        // SAFETY: everything the code reaches of the system comes from this
-        // one pointer, which nothing else uses until the run is over
+        // safe bc everything the code reaches of the system comes from this one ptr, nothing else uses it till the run's over
         let (cycles, read_pages, write_pages, vfp, fpscr) = unsafe {
             let (read_pages, write_pages) = (*system).memory.page_tables();
-            // the code works on the VFP registers where they are, so the
-            // interpreter sees its changes without copying them around
+            // the code works on the VFP regs in place so the interpreter sees its changes w/o copying them around
             let vfp = &raw mut (*system).cpu.vfp.regs as *mut u32;
             let fpscr = &raw mut (*system).cpu.vfp.fpscr;
             ((*system).cpu.cycles, read_pages, write_pages, vfp, fpscr)
@@ -625,19 +577,18 @@ impl Library {
             done: 0,
             trail: [0; TRAIL],
         };
-        // SAFETY: as above
+        // safe, same as above
         store(unsafe { &(*system).cpu }, &mut ctx);
-        // the code reads the clock, takes the mutex it is lent and lets it
-        // go itself where it last did, while that is still code to run, which
-        // nothing but the step changes
-        // SAFETY: as above
+        // the code reads the clock, takes and drops its lent mutex itself where it last did,
+        // while that's still code to run (only the step changes it)
+        // safe, same as above
         let runs = |at: u32| at != recomp_abi::NO_TICKS && unsafe { (*system).memory.is_executable(at & !1) } && self.has_code(at);
         for (site, kept) in [(&mut ctx.tick_at, &self.tick_at), (&mut ctx.wait_at, &self.wait_at), (&mut ctx.release_at, &self.release_at)] {
             if runs(kept.get()) {
                 *site = kept.get();
             }
         }
-        // SAFETY: as above
+        // safe, same as above
         let due = unsafe { (*system).tick_due(event, deadline) };
         let lends = self.code.abi() >= 8;
         let mut machine = Machine {
@@ -670,11 +621,10 @@ impl Library {
             ctx.exit = 0;
             ctx.depth = 0;
             ctx.stack_limit = recomp_abi::stack_limit();
-            // SAFETY: the code came from the library and ctx is set up the
-            // way it expects, with user pointing at machine. where it went
-            // is in the context, what it gives back is only for other code
+            // safe bc the code came from the lib and ctx is set up how it expects, user pointing at machine
+            // where it went is in the context, its return value is just for other code
             unsafe { code(&mut ctx) };
-            // SAFETY: as above, the code returned
+            // safe, same as above, the code returned
             unsafe { machine.caught_up(&mut ctx) };
             if let Some(exit) = machine.pending.take() {
                 break Stop::Exit(exit);
@@ -691,26 +641,24 @@ impl Library {
             }
         };
 
-        // SAFETY: the code is done with the system
+        // safe bc the code's done w/ the system
         let cpu = unsafe { &mut (*system).cpu };
         load(&ctx, cpu);
         let ran = machine.budget.saturating_sub(ctx.budget.max(0)).max(0) as u64;
-        // the interpreter counted the instructions it ran for the code, which
-        // the budget already has
+        // the interpreter counted the instrs it ran for the code, the budget has them already
         cpu.cycles = machine.cycles + ran;
         (machine.ran + ran, stop, machine.event)
     }
 }
 
-// -- turns run on the side, see crate::spin ------------------------------
+// turns run on the side, see crate::spin
 
-/// the core of recompiled code at an svc, all a turn run on the side starts
-/// from: the registers, the flags, the monitor and the VFP registers, which
-/// the code works on where the system's CPU has them.
+/// recompiled code's core at an svc, all a side turn starts from
+/// regs, flags, monitor and VFP regs, which the code works on where the system's cpu has them
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Core {
     pub r: [u32; 16],
-    /// n, z, c, v, q, thumb, ge and exclusive, as the context has them.
+    /// n, z, c, v, q, thumb, ge and exclusive, as the context has them
     flags: [u8; 8],
     exclusive_address: u32,
     tls: u32,
@@ -719,8 +667,7 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    /// the core the code has at an svc, the context's and the CPU's VFP
-    /// registers.
+    /// the core the code has at an svc, the context's plus the cpu's VFP regs
     pub(crate) fn of(ctx: &Context, cpu: &Cpu) -> Core {
         Core {
             r: ctx.r,
@@ -737,36 +684,30 @@ impl Core {
     }
 }
 
-/// where turns run on the side write: a write table with no page in it,
-/// which has their code write every byte through the host, the pages they
-/// wrote for real, each with the bytes written, and what each byte held
-/// before, to be put back after.
+/// where side turns write, a write table w/ no pages so their code writes every byte thru the host
+/// plus the pages they really wrote w/ the bytes written, and what each byte held b4, to put back after
 pub(crate) struct Sandbox {
     table: Vec<*mut u8>,
-    /// the pages written since put_back, the first used of them, the rest
-    /// kept for the next with no byte written.
+    /// pages written since put_back, the first used ones, the rest kept for the next w/ no byte written
     touched: Vec<Touched>,
     used: usize,
-    /// the one of them written last.
+    /// the one written last
     last: usize,
-    /// each byte written since put_back, once, with what it held before the
-    /// first write, what the interpreter wrote over for their code before
-    /// that aside.
+    /// each byte written since put_back, once, w/ what it held b4 the first write, minus what the interpreter wrote for their code b4 that
     old: Vec<Old>,
 }
 
-/// bytes written in a page, a bit each.
+/// bytes written in a page, a bit each
 pub(crate) type Bytes = [u64; PAGE_SIZE / 64];
 
-/// a page turns run on the side wrote.
+/// a page side turns wrote
 struct Touched {
     page: usize,
     at: *mut u8,
     written: Bytes,
 }
 
-/// a byte turns run on the side wrote, where the host has it, its address
-/// and what it held.
+/// a byte side turns wrote, where the host has it, its addr and what it held
 struct Old {
     at: *mut u8,
     address: u32,
@@ -787,8 +728,7 @@ impl Sandbox {
         }
     }
 
-    /// the page written at, which the CPU writes plainly at real, noted
-    /// from now on, or none when it can't.
+    /// the page written at (the cpu writes it plainly at real), noted from now on, or none when it can't
     #[inline]
     fn page(&mut self, page: usize, real: *const *mut u8) -> Option<&mut Touched> {
         if self.last < self.used && self.touched[self.last].page == page {
@@ -802,7 +742,7 @@ impl Sandbox {
             self.last = index;
             return Some(&mut self.touched[index]);
         }
-        // SAFETY: the CPU's write table has an entry for every page
+        // safe bc the cpu's write table has an entry for every page
         let at = unsafe { *real.add(page) };
         if at.is_null() {
             return None;
@@ -817,11 +757,9 @@ impl Sandbox {
         Some(touched)
     }
 
-    /// each byte the turns run since put_back changed, of those written,
-    /// with what it holds now, by address.
+    /// each byte side turns since put_back changed (of those written) w/ what it holds now, by addr
     pub(crate) fn changed(&self, memory: &mut Memory) -> Vec<(u32, u8)> {
-        // SAFETY: a byte written is in one of the CPU's pages, there while the
-        // turns ran
+        // safe bc a written byte is in one of the cpu's pages, there while the turns ran
         let mut changed: Vec<(u32, u8)> =
             self.old.iter().filter_map(|old| Some((old.address, unsafe { *old.at })).filter(|&(_, now)| now != old.old)).collect();
         if memory.logged_any() {
@@ -838,8 +776,7 @@ impl Sandbox {
         changed
     }
 
-    /// the bytes the turns run since put_back wrote, the interpreter's for
-    /// their code too, by page.
+    /// bytes side turns since put_back wrote (the interpreter's for their code too) by page
     pub(crate) fn written(&mut self, memory: &Memory) -> Vec<(u32, Bytes)> {
         self.touched[..self.used].sort_unstable_by_key(|touched| touched.page);
         self.last = 0;
@@ -861,12 +798,11 @@ impl Sandbox {
         written
     }
 
-    /// puts back what the turns run since wrote, what the interpreter wrote
-    /// for their code first, and forgets them.
+    /// puts back what the side turns since wrote (what the interpreter wrote for their code first) and forgets them
     pub(crate) fn put_back(&mut self, memory: &mut Memory) {
         memory.undo_writes();
         for old in self.old.drain(..) {
-            // SAFETY: as in changed
+            // safe, same as in changed
             unsafe { *old.at = old.old };
         }
         for touched in &mut self.touched[..self.used] {
@@ -876,53 +812,49 @@ impl Sandbox {
     }
 }
 
-/// a turn run on the side: its svcs, the address after each with bit 0
-/// set for Thumb, the cycles from the start each came at and its number,
-/// the cycles it took and the core the next turn starts from.
+/// a side turn, its svcs (addr after each w/ bit 0 for Thumb, cycles from the start each came at, its number)
+/// the cycles it took and the core the next turn starts from
 pub(crate) struct Side {
     pub svcs: Vec<(u32, u64, u32)>,
     pub cost: u64,
     pub end: Core,
 }
 
-/// a turn running on the side.
+/// a turn running on the side
 struct Run<'a> {
     system: *mut System,
     library: &'a Library,
     sandbox: *mut Sandbox,
-    /// where the turn starts, the pc after its svc, Thumb, sp and lr.
+    /// where the turn starts, pc after its svc, Thumb, sp and lr
     start: (u32, u8, u32, u32),
     period: usize,
     tick: u64,
-    /// the budget the code started with, before the first svc's cost.
+    /// budget the code started w/, b4 the first svc's cost
     from: i32,
     svcs: Vec<(u32, u64, u32)>,
     mutex: Option<u32>,
     holding: u32,
-    /// the cycles it took and the core the next turn starts from, once it
-    /// got there.
+    /// cycles it took and the core the next turn starts from, once it got there
     end: Option<(u64, Core)>,
     failed: bool,
     vfp: [u32; 32],
     fpscr: u32,
 }
 
-/// the turn running on the side, which the context's user points at.
+/// the turn running on the side, the context's user points at it
 unsafe fn run<'a>(ctx: *mut Context) -> &'a mut Run<'a> {
     unsafe { &mut *((*ctx).user as *mut Run) }
 }
 
 impl Run<'_> {
-    /// writes the len bytes of value at address for real, noting each with
-    /// what it held before the first write. a page the CPU can't write
-    /// plainly, guarded, watched or not there, is no polling loop's.
+    /// writes the len bytes of value at address for real, noting each w/ what it held b4 the first write
+    /// a page the cpu can't write plainly (guarded, watched, missing) isn't a polling loop's
     #[inline]
     fn write(&mut self, address: u32, value: u32, len: usize) {
-        // SAFETY: the system and the sandbox outlive the run, and nothing
-        // else holds them meanwhile
+        // safe bc the system and sandbox outlive the run and nothing else holds them meanwhile
         let (system, sandbox) = unsafe { (&mut *self.system, &mut *self.sandbox) };
         let offset = address as usize % PAGE_SIZE;
-        // within a page and a word of its bytes written, as nearly all are
+        // within a page and one word of its bytes, like nearly all are
         if offset % 64 + len > 64 {
             return self.write_bytes(address, value, len);
         }
@@ -941,19 +873,18 @@ impl Run<'_> {
                 let byte = word * 64 + fresh.trailing_zeros() as usize;
                 fresh &= fresh - 1;
                 let address = (address & !(PAGE_SIZE as u32 - 1)) | byte as u32;
-                // what the interpreter wrote there for the code already is
-                // not what the byte held
-                // SAFETY: a page touched is a whole one of the CPU's
+                // what the interpreter wrote there for the code already isn't what the byte held
+                // safe bc a touched page is a whole one of the cpu's
                 let old = unsafe { *at.add(byte) };
                 let old = if logged { system.memory.logged_old_at(address).unwrap_or(old) } else { old };
                 sandbox.old.push(Old { at: unsafe { at.add(byte) }, address, old });
             }
         }
-        // SAFETY: as above, the bytes within the page
+        // safe, same as above, the bytes are inside the page
         unsafe { std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), at.add(offset), len) };
     }
 
-    /// write, a byte at a time, for bytes across pages or words.
+    /// write, byte by byte, for bytes across pages or words
     #[cold]
     fn write_bytes(&mut self, address: u32, value: u32, len: usize) {
         for (offset, &byte) in value.to_le_bytes()[..len].iter().enumerate() {
@@ -997,9 +928,8 @@ unsafe extern "C" fn side_write32(ctx: *mut Context, address: u32, value: u32) {
     unsafe { run(ctx).write(address, value, 4) }
 }
 
-/// memory as the interpreter reaches it for a turn on the side, a type of
-/// its own so that the interpreter the steps run stays as the compiler
-/// built it, the interpreter being inlined where it is called.
+/// memory as the interpreter reaches it for a side turn
+/// its own type so the interpreter the steps run stays as compiled, it gets inlined where it's called
 struct SideBus<'a>(&'a mut Memory);
 
 impl Bus for SideBus<'_> {
@@ -1028,8 +958,7 @@ impl Bus for SideBus<'_> {
     }
 }
 
-/// an instruction the code leaves to the interpreter, its writes noted to
-/// be undone with the rest.
+/// an instr the code leaves to the interpreter, its writes noted to undo w/ the rest
 unsafe extern "C" fn side_interpret(ctx: *mut Context, address: u32, _opcode: u32) {
     unsafe {
         let run = run(ctx);
@@ -1054,10 +983,9 @@ unsafe extern "C" fn side_lookup(ctx: *mut Context, address: u32) -> Option<Code
     unsafe { run(ctx).library.lookup(address) }
 }
 
-/// an svc of a turn on the side: the clock read as the code would find it
-/// then, a wait on the mutex alone taking it and its release letting it go
-/// in a count of their own. the one the next turn starts at ends it, and
-/// any other svc, or one where the turn would wait, fails it.
+/// an svc of a side turn, the clock read as the code would see it then
+/// a wait on the mutex alone takes it and its release drops it, counted separately
+/// the one the next turn starts at ends it, any other svc (or one where the turn would wait) fails it
 unsafe extern "C" fn side_svc(ctx: *mut Context, number: u32) {
     unsafe {
         let run = run(ctx);
@@ -1081,8 +1009,7 @@ unsafe extern "C" fn side_svc(ctx: *mut Context, number: u32) {
                 ctx.r[1] = (now >> 32) as u32;
                 ctx.budget -= crate::kernel::svc::SYSTEM_TICK_COST as i32;
             }
-            // WaitSynchronizationN on the mutex alone, which wait_in_place
-            // answers with the handle where the CPU reads it plainly
+            // WaitSynchronizationN on the mutex alone, wait_in_place answers it w/ the handle where the cpu reads it plainly
             0x25 => match system.memory.plain_read32(ctx.r[1]) {
                 Some(handle) if ctx.r[2] == 1 && *run.mutex.get_or_insert(handle) == handle && system.kernel.quiet_mutex(handle) => {
                     run.holding += 1;
@@ -1119,16 +1046,13 @@ static SIDE: Host = Host {
 };
 
 impl Library {
-    /// runs a turn of a loop on the side, from core at the svc reading the
-    /// clock it starts at, answered with tick, up to the svc period svcs on,
-    /// the next turn's first, which it leaves unanswered, see side_svc.
-    /// none when it does anything else or comes back elsewhere. what it
-    /// wrote stays, for sandbox.put_back.
+    /// runs one loop turn on the side from core at the svc reading the clock it starts at (answered w/ tick)
+    /// up to the svc period svcs later, the next turn's first, which it leaves unanswered, see side_svc
+    /// none when it does anything else or comes back elsewhere, its writes stay for sandbox.put_back
     ///
     /// # Safety
     ///
-    /// the system outlives the call and nothing else uses it meanwhile, as
-    /// inside an svc of the code, which is the library's own.
+    /// the system outlives the call and nothing else uses it meanwhile, like inside an svc of the lib's own code
     pub(crate) unsafe fn run_on_the_side(
         &self,
         system: *mut System,
@@ -1208,8 +1132,7 @@ impl Library {
             ctx.exit = 0;
             ctx.depth = 0;
             ctx.stack_limit = recomp_abi::stack_limit();
-            // SAFETY: the code came from the library and ctx is set up the
-            // way it expects, with user pointing at run
+            // safe bc the code came from the lib and ctx is set up how it expects, user pointing at run
             unsafe { code(&mut ctx) };
             if ctx.exit == EXIT_BUDGET {
                 break;
@@ -1223,9 +1146,9 @@ impl Library {
 }
 
 impl Run<'_> {
-    /// the write table the turn's code goes through.
+    /// the write table the turn's code goes thru
     fn sandbox_table(&self) -> *const *mut u8 {
-        // SAFETY: the sandbox outlives the run
+        // safe bc the sandbox outlives the run
         unsafe { (*self.sandbox).table.as_ptr() }
     }
 }
@@ -1234,8 +1157,7 @@ impl Run<'_> {
 mod tests {
     use super::*;
 
-    /// a library that doesn't open has nothing to run, recompiling is what
-    /// mends it.
+    /// a lib that won't open has nothing to run, recompiling fixes it
     #[test]
     fn a_library_that_cant_be_opened_is_outdated() {
         assert!(outdated(Path::new("/nowhere/at/all.so")));

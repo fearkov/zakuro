@@ -1,7 +1,6 @@
-//! saved states, the whole console as it was at a moment, to go back to. a
-//! file holds a header, then the state of everything but memory as
-//! postcard writes it, then each memory, all of them in LZ4. a state is for
-//! the game it was saved from and the version of Zakuro that saved it.
+//! save states, the whole console as it was at a moment, to go back to
+//! a file holds a header, then the state of everything but memory as postcard writes it, then each memory, all in LZ4
+//! a state is for the game it was saved from and the Zakuro version that saved it
 
 pub(crate) mod arrays;
 
@@ -20,10 +19,10 @@ use crate::services::ServiceState;
 use crate::{GuestMemory, Pacing, System, HISTORY_LENGTH};
 
 const MAGIC: &[u8; 8] = b"ZAKUROST";
-/// what a state holds changes from one version to the next.
+/// what a state holds changes from one version to the next
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// everything but memory, as it is written.
+/// everything but memory, as it's written
 #[derive(Serialize)]
 struct SavedRef<'a> {
     cpu: &'a zakuro_cpu::Cpu,
@@ -36,7 +35,7 @@ struct SavedRef<'a> {
     console: Console,
 }
 
-/// the same, as it is read back.
+/// same, as it's read back
 #[derive(Deserialize)]
 struct Saved {
     cpu: zakuro_cpu::Cpu,
@@ -49,7 +48,7 @@ struct Saved {
     console: Console,
 }
 
-/// the system's own, how far it ran and what it is due to do next.
+/// the system's own, how far it ran and what it's due to do next
 #[derive(Serialize, Deserialize)]
 struct Console {
     exited: bool,
@@ -67,13 +66,11 @@ struct Console {
     history_index: u64,
     interpreted_instructions: u64,
     recompiled_instructions: u64,
-    /// what each enhancement overwrote, by its name, so that turning it
-    /// off after loading puts that back too.
+    /// what each enhancement overwrote, by name, so turning it off after loading puts that back too
     enhancements: Vec<(String, BTreeMap<u32, Overwrote>)>,
 }
 
-/// the ROM images and the RomFS layers the title's files read, in the
-/// order a state names them by.
+/// the ROM images and RomFS layers the title's files read, in the order a state names them by
 type Images = (Vec<Arc<zakuro_fs::RomImage>>, Vec<Arc<zakuro_fs::layered::Layered>>);
 
 fn images(system: &System) -> Images {
@@ -91,10 +88,9 @@ fn images(system: &System) -> Images {
 }
 
 impl System {
-    /// the console as it is, between frames, as a saved state.
+    /// the console as it is between frames, as a save state
     pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
-        // what the host's GPU drew comes down first, so that memory holds
-        // all of it
+        // what the host GPU drew comes down first, so memory holds all of it
         let linear_base = self.kernel.linear_base;
         self.gpu.write_back_all(&mut GuestMemory { memory: &mut self.memory, linear_base, writes: 0 });
         let (images, layers) = images(self);
@@ -150,8 +146,7 @@ impl System {
         Ok(out)
     }
 
-    /// puts the console back as a saved state had it. nothing changes when
-    /// the state is not one this game and this Zakuro can take.
+    /// puts the console back like a save state had it, nothing changes when the state isn't one this game and this Zakuro can take
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.idle_interrupted(true);
         self.spin.forget();
@@ -226,14 +221,12 @@ impl System {
         self.history_index = console.history_index as usize % HISTORY_LENGTH;
         self.interpreted_instructions = console.interpreted_instructions;
         self.recompiled_instructions = console.recompiled_instructions;
-        // an enhancement off now, that was on when the state was saved, puts
-        // back what it overwrote at the next frame
+        // an enhancement that's off now but was on when the state was saved puts back what it overwrote at the next frame
         let mut overwrote: std::collections::HashMap<String, BTreeMap<u32, Overwrote>> = console.enhancements.into_iter().collect();
         for cheat in self.cheats.iter_mut().filter(|cheat| cheat.builtin) {
             cheat.overwrote = overwrote.remove(&cheat.name).unwrap_or_default();
         }
-        // what was about to be shown, and the pace of the pictures in
-        // between, start again
+        // what was about to be shown, and the pace of the in between pictures, start again
         self.showing = [None, None, None];
         self.pacing = Pacing::default();
         self.prefetch_aborts.clear();
@@ -242,14 +235,14 @@ impl System {
     }
 }
 
-/// a part of the file, how long it is in LZ4 and its bytes in LZ4.
+/// a part of the file, its length in LZ4 and its bytes in LZ4
 fn section(out: &mut Vec<u8>, bytes: &[u8]) {
     let compressed = lz4_flex::compress_prepend_size(bytes);
     out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
     out.extend_from_slice(&compressed);
 }
 
-/// reads a state's file from the start on.
+/// reads a state's file from the start on
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -283,8 +276,8 @@ mod tests {
     use crate::memory::{MemoryRegion, MemoryState, Permission};
     use crate::services::tests::system_with_thread;
 
-    /// what changes after a state is saved goes back to how it was when it
-    /// is loaded, registers, memory, the memory map and the kernel's objects.
+    /// whatever changes after a state is saved goes back to how it was when it's loaded, registers, memory,
+    /// the memory map and the kernel's objects
     #[test]
     fn a_state_puts_everything_back() {
         let (mut system, _) = system_with_thread();
@@ -312,8 +305,7 @@ mod tests {
         assert_eq!(system.frames, 600);
     }
 
-    /// an enhancement on when a state was saved and off when it is loaded,
-    /// in another session, puts back what it overwrote.
+    /// an enhancement on when a state got saved and off when it's loaded in another session puts back what it overwrote
     #[test]
     fn a_state_keeps_what_an_enhancement_overwrote() {
         let (mut system, _) = system_with_thread();
@@ -327,7 +319,7 @@ mod tests {
         crate::cheats::run(&mut system);
         let state = system.save_state().unwrap();
 
-        // Zakuro started again, with the enhancement off
+        // Zakuro started again, w/ the enhancement off
         system.cheats[0].enabled = false;
         system.cheats[0].overwrote.clear();
         system.load_state(&state).unwrap();
@@ -339,8 +331,7 @@ mod tests {
         assert_eq!(byte, [1]);
     }
 
-    /// a state of another game, or not a state at all, is turned down and
-    /// nothing changes.
+    /// a state of another game, or not a state at all, gets turned down and nothing changes
     #[test]
     fn a_state_of_another_game_is_turned_down() {
         let (mut system, _) = system_with_thread();

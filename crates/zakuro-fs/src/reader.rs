@@ -1,4 +1,4 @@
-//! bounds-checked little-endian reads over a byte slice.
+//! bounds checked little endian reads over a byte slice
 
 use crate::FsError;
 
@@ -13,8 +13,7 @@ impl<'a> Reader<'a> {
         Reader { data, base: 0 }
     }
 
-    /// a view of data[offset..], used so structure fields can be written with
-    /// the offsets straight out of the 3dbrew tables.
+    /// a view of data[offset..], so struct fields can be written w/ the offsets straight from the 3dbrew tables
     pub fn at(&self, offset: usize) -> Result<Reader<'a>, FsError> {
         if offset > self.data.len() {
             return Err(FsError::Truncated {
@@ -64,7 +63,7 @@ impl<'a> Reader<'a> {
         ]))
     }
 
-    /// the big-endian reads, for the TMD's fields.
+    /// the big endian reads, for the TMD's fields
     pub fn u16_be(&self, offset: usize) -> Result<u16, FsError> {
         let b = self.bytes(offset, 2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
@@ -92,8 +91,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// reads a fixed-size field and trims trailing NULs, for the ASCII fields
-    /// in NCCH headers (product code, title, ...).
+    /// reads a fixed size field and trims trailing NULs, for the ASCII fields in NCCH headers (product code, title, ...)
     pub fn ascii(&self, offset: usize, len: usize) -> Result<String, FsError> {
         let raw = self.bytes(offset, len)?;
         let end = raw.iter().position(|&b| b == 0).unwrap_or(len);

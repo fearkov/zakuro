@@ -1,5 +1,4 @@
-//! the main thread runs the game's code, whose stack is 8 MiB on Linux
-//! and only 1 MiB on Windows unless the program asks for more.
+//! the main thread runs the game's code, its stack is 8 MiB on Linux and only 1 MiB on Windows unless the program asks for more
 
 fn main() {
     let windows = std::env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|family| family == "windows");

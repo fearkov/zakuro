@@ -1,4 +1,4 @@
-//! srv:, the service directory.
+//! srv:, the service directory
 
 use crate::kernel::ipc::{CommandBuffer, Header};
 use crate::kernel::object::{ClientSession, KObject};
@@ -7,9 +7,9 @@ use crate::System;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct SrvState {
-    /// handle of the notification semaphore, created on demand.
+    /// handle of the notification semaphore, made on demand
     pub notification_semaphore: Option<u32>,
-    /// pending notification ids, newest last.
+    /// pending notification ids, newest last
     pub notifications: Vec<u32>,
 }
 
@@ -20,7 +20,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x0001, &[]);
             true
         }
-        // EnableNotification, hands back a semaphore the caller waits on.
+        // EnableNotification, hands back a semaphore the caller waits on
         0x0002 => {
             let handle = match system.services.srv.notification_semaphore {
                 Some(handle) => handle,
@@ -69,7 +69,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply_with_handle(&mut system.memory, 0x0005, handle);
             true
         }
-        // subscribe / Unsubscribe
+        // Subscribe / Unsubscribe
         0x0009 | 0x000A => {
             buffer.reply(&mut system.memory, header.command_id(), &[]);
             true
@@ -80,8 +80,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, 0x000B, &[notification]);
             true
         }
-        // IsServiceRegistered, everything a title asks for is "present", since
-        // an unimplemented service still answers.
+        // IsServiceRegistered, everything a title asks for is "present" since an unimplemented service still answers
         0x000E => {
             buffer.reply(&mut system.memory, 0x000E, &[1]);
             true
@@ -90,8 +89,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// queues a notification and bumps the semaphore, which is how the system
-/// tells a title about things like the home button being pressed.
+/// queues a notification and bumps the semaphore, that's how the system tells a title about stuff like the home button being pressed
 pub fn notify(system: &mut System, id: u32) {
     system.services.srv.notifications.insert(0, id);
     if let Some(handle) = system.services.srv.notification_semaphore {
@@ -104,6 +102,5 @@ pub fn notify(system: &mut System, id: u32) {
     }
 }
 
-/// unused for now, kept so the reset-type import stays meaningful when
-/// notification events are added.
+/// unused for now, kept so the reset type import still means something once notification events get added
 pub const _NOTIFICATION_RESET: ResetType = ResetType::OneShot;

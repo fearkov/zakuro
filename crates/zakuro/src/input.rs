@@ -1,21 +1,21 @@
-//! keyboard to 3DS button mapping.
+//! keyboard to 3DS button mapping
 
 use winit::keyboard::{KeyCode, PhysicalKey};
 use zakuro_core::services::hid::{InputState, PadState};
 
 use crate::settings::Keys;
 
-/// accumulates key state between frames.
+/// piles up key state between frames
 #[derive(Default)]
 pub struct Keyboard {
     keys: Keys,
     buttons: PadState,
-    /// the circle pad keys held, up, down, left, right.
+    /// the circle pad keys held, up, down, left, right
     circle: [bool; 4],
-    /// the C-stick's, the same way.
+    /// the C stick's, same deal
     c_stick: [bool; 4],
     touch: Option<(u16, u16)>,
-    /// how the mouse tilts the console, see InputState::tilt.
+    /// how the mouse tilts the console, see InputState::tilt
     tilt: [f32; 2],
 }
 
@@ -29,7 +29,7 @@ impl Keyboard {
         self.release();
     }
 
-    /// lets go of everything, when the game stops seeing the keyboard.
+    /// lets go of everything, when the game stops seeing the keyboard
     pub fn release(&mut self) {
         self.buttons = PadState::default();
         self.circle = [false; 4];
@@ -77,19 +77,18 @@ impl Keyboard {
         }
     }
 
-    /// records a click on the bottom screen, in screen pixels, or its release.
+    /// records a click on the bottom screen, in screen pixels, or its release
     pub fn touch(&mut self, position: Option<(u16, u16)>) {
         self.touch = position;
     }
 
-    /// records the tilt the mouse gives the console.
+    /// records the tilt the mouse gives the console
     pub fn tilt(&mut self, tilt: [f32; 2]) {
         self.tilt = tilt;
     }
 
     pub fn state(&self) -> InputState {
-        // holding two opposite keys cancels out, which is what a real stick
-        // would do
+        // holding two opposite keys cancels out, like a real stick would
         let axis = |plus: bool, minus: bool| plus as i8 as f32 - minus as i8 as f32;
         let [up, down, left, right] = self.circle;
         let [c_up, c_down, c_left, c_right] = self.c_stick;

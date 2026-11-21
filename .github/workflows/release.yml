@@ -1,5 +1,4 @@
-# on a version tag, builds Zakuro for Windows, Linux and macOS and publishes
-# them as a GitHub release
+# on a version tag, builds zakuro for windows, linux and macos and ships a github release
 name: Release
 
 on:
@@ -26,15 +25,13 @@ jobs:
         include:
           - os: windows-latest
             archive: zakuro-windows-x86_64.zip
-          # built on an old system, as a program runs on systems as new as
-          # the one it was built on or newer
+          # built on an old distro bc programs run on systems as new as their build box or newer
           - os: ubuntu-latest
             container: ubuntu:22.04
             archive: zakuro-linux-x86_64.tar.gz
           - os: macos-latest
             archive: zakuro-macos-arm64.zip
-          # MoltenVK aborts inside Metal on this runner's virtual GPU, which
-          # has no driver of its own for what it asks
+          # MoltenVK aborts inside Metal on this runner's virtual GPU, it has no real driver for what it asks
           - os: macos-15-intel
             archive: zakuro-macos-x86_64.zip
             try: --rasterizer software
@@ -52,8 +49,7 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
       - run: cargo build --release --locked -p zakuro
-      # each one is started as packed, which tells in the log whether the GPU
-      # starts, and stops the release when the program doesn't
+      # each one gets launched once packed, the log shows if the GPU starts and the release stops if the program doesn't
       - name: Pack for Windows
         if: runner.os == 'Windows'
         run: |

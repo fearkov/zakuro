@@ -1,9 +1,8 @@
-//! the PICA200's output merger, how a fragment combines with what is already in
-//! the color buffer.
+//! the PICA200's output merger, how a fragment combines w/ what's already in the color buffer
 
 use crate::registers::*;
 
-/// register holding the constant color the Constant* factors read.
+/// register holding the constant color the Constant* factors read
 const REG_BLEND_COLOR: usize = 0x0103;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +21,7 @@ impl Equation {
             2 => Equation::ReverseSubtract,
             3 => Equation::Min,
             4 => Equation::Max,
-            // 0, and the undocumented 5-7, which hardware treats as add.
+            // 0, plus the undocumented 5 to 7, hardware treats those as add
             _ => Equation::Add,
         }
     }
@@ -34,7 +33,7 @@ impl Equation {
             Equation::Add => s + d,
             Equation::Subtract => s - d,
             Equation::ReverseSubtract => d - s,
-            // min and max ignore the factors, as they do in OpenGL.
+            // min and max ignore the factors, like in OpenGL
             Equation::Min => source.min(dest),
             Equation::Max => source.max(dest),
         }
@@ -79,12 +78,12 @@ impl Factor {
             12 => Factor::ConstantAlpha,
             13 => Factor::OneMinusConstantAlpha,
             14 => Factor::SourceAlphaSaturate,
-            // 15 is undocumented, Citra treats it as one.
+            // 15 is undocumented, Citra treats it as one
             _ => Factor::One,
         }
     }
 
-    /// the factor's value for one channel.
+    /// the factor's value for one channel
     fn value(
         self,
         channel: usize,
@@ -118,7 +117,7 @@ impl Factor {
     }
 }
 
-/// a decoded blend configuration.
+/// a decoded blend configuration
 #[derive(Debug, Clone, Copy)]
 pub struct Blend {
     color_equation: Equation,
@@ -131,11 +130,9 @@ pub struct Blend {
 }
 
 impl Blend {
-    /// reads the blend configuration, or None when the output merger is
-    /// in logic-op mode rather than blending.
+    /// reads the blend config, or None when the output merger's in logic op mode instead of blending
     pub fn read(registers: &[u32]) -> Option<Blend> {
-        // bit 8 of the color operation register selects blending over the
-        // logic op.
+        // bit 8 of the color operation register picks blending over the logic op
         if registers[REG_COLOR_OPERATION] & 0x100 == 0 {
             return None;
         }
@@ -157,7 +154,7 @@ impl Blend {
         })
     }
 
-    /// combines a fragment with the pixel already in the buffer.
+    /// combines a fragment w/ the pixel already in the buffer
     pub fn apply(&self, source: [f32; 4], dest: [f32; 4]) -> [f32; 4] {
         let mut out = [0.0; 4];
         for (channel, value) in out.iter_mut().enumerate().take(3) {
@@ -178,8 +175,7 @@ impl Blend {
     }
 }
 
-/// what the output merger does with a fragment and the pixel under it when
-/// it is not blending, bit by bit, in the PICA's order.
+/// what the output merger does w/ a fragment and the pixel under it when it's not blending, bit by bit, in the PICA's order
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogicOp {
     Clear,
@@ -220,8 +216,7 @@ impl LogicOp {
         LogicOp::OrInverted,
     ];
 
-    /// the logic op in use, none when the output merger blends or simply
-    /// copies, which leaves the fragment as it is.
+    /// the logic op in use, none when the output merger blends or just copies, which leaves the fragment as is
     pub fn read(registers: &[u32]) -> Option<LogicOp> {
         if registers[REG_COLOR_OPERATION] & 0x100 != 0 {
             return None;
@@ -229,7 +224,7 @@ impl LogicOp {
         Some(LogicOp::ALL[(registers[REG_LOGIC_OP] & 0xF) as usize]).filter(|&op| op != LogicOp::Copy)
     }
 
-    /// combines a channel of the fragment with the one in the buffer.
+    /// combines a channel of the fragment w/ the one in the buffer
     pub fn apply(self, source: u8, dest: u8) -> u8 {
         match self {
             LogicOp::Clear => 0,
@@ -263,18 +258,17 @@ mod tests {
         registers
     }
 
-    /// ordinary transparency, add, source alpha, one minus source alpha,
-    /// what almost every UI draw configures.
+    /// ordinary transparency, add, source alpha, one minus source alpha, what almost every UI draw sets up
     #[test]
     fn standard_transparency_mixes_by_source_alpha() {
-        // equation add (0) for both, src = SrcAlpha (6), dst = 1-SrcAlpha (7)
+        // equation add (0) for both, src = SrcAlpha (6), dst = 1 minus SrcAlpha (7)
         let blend = Blend::read(&registers(0x7676_0000)).unwrap();
         let out = blend.apply([1.0, 0.0, 0.0, 0.25], [0.0, 0.0, 1.0, 1.0]);
         assert!((out[0] - 0.25).abs() < 1e-5, "red {}", out[0]);
         assert!((out[2] - 0.75).abs() < 1e-5, "blue {}", out[2]);
     }
 
-    /// additive, source and destination both at factor one.
+    /// additive, source and destination both at factor one
     #[test]
     fn additive_blending_brightens() {
         let blend = Blend::read(&registers(0x1111_0000)).unwrap();
@@ -282,8 +276,7 @@ mod tests {
         assert!((out[0] - 0.75).abs() < 1e-5, "red {}", out[0]);
     }
 
-    /// shadow volumes mark the stencil buffer with a logic op that leaves
-    /// the colors alone.
+    /// shadow volumes mark the stencil buffer w/ a logic op that leaves the colors alone
     #[test]
     fn noop_keeps_the_buffer() {
         let mut registers = registers(0);

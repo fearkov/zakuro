@@ -1,7 +1,6 @@
-//! the procedural texture, texture 3. rather than reading memory, the PICA
-//! makes it up per fragment from its coordinates, a noise and lookup
-//! tables. how each step comes out follows what Citra worked out against
-//! the hardware.
+//! the procedural texture, texture 3
+//! instead of reading memory the PICA makes it up per fragment from its coords, a noise and lookup tables
+//! how each step comes out follows what Citra worked out against the hardware
 
 pub const REG_CONFIG: usize = 0x0A8;
 const REG_NOISE_U: usize = 0x0A9;
@@ -13,27 +12,26 @@ pub const REG_TABLE_INDEX: usize = 0x0AF;
 pub const REG_TABLE_DATA: usize = 0x0B0;
 pub const REG_TABLE_DATA_END: usize = 0x0B7;
 
-/// the tables, by the number the index register gives them.
+/// the tables, by the number the index register gives them
 const NOISE: usize = 0;
 const COLOR_MAP: usize = 2;
 const ALPHA_MAP: usize = 3;
 const COLOR: usize = 4;
 const COLOR_DIFF: usize = 5;
 
-/// entries in the noise and map tables, and in the color tables.
+/// entries in the noise and map tables, and in the color tables
 pub const MAP_ENTRIES: usize = 128;
 pub const COLOR_ENTRIES: usize = 256;
 
-/// the lookup tables, each entry decoded as it arrives.
+/// the lookup tables, each entry decoded as it arrives
 pub struct Tables {
     /// the noise, color map and alpha map, a value and the step to the
-    /// next entry each.
+    /// next entry each
     maps: Box<[[[f32; 2]; MAP_ENTRIES]; 3]>,
-    /// the colors, 0 to 255 a channel, and the steps to the next ones.
+    /// the colors, 0 to 255 a channel, and the steps to the next ones
     colors: Box<[[f32; 4]; COLOR_ENTRIES]>,
     steps: Box<[[f32; 4]; COLOR_ENTRIES]>,
-    /// goes up with every write that changes an entry, so a copy elsewhere
-    /// knows it is stale. titles send the same tables over and over.
+    /// goes up w/ every write that changes an entry, so a copy elsewhere knows it's stale, titles send the same tables over and over
     generation: u64,
 }
 
@@ -48,24 +46,23 @@ impl Default for Tables {
     }
 }
 
-/// an entry set to a new value, and whether that changed it, to the bit.
+/// an entry set to a new value, and if that changed it, to the bit
 fn replace<const N: usize>(entry: &mut [f32; N], value: [f32; N]) -> bool {
     let changed = entry.map(f32::to_bits) != value.map(f32::to_bits);
     *entry = value;
     changed
 }
 
-/// the tables as a saved state keeps them, the maps, the colors and their
-/// steps.
+/// the tables as a save state keeps them, the maps, the colors and their steps
 pub(crate) type Saved = (Vec<[f32; 2]>, Vec<[f32; 4]>, Vec<[f32; 4]>);
 
 impl Tables {
-    /// the maps, the colors and their steps, for a saved state.
+    /// the maps, the colors and their steps, for a save state
     pub(crate) fn saved(&self) -> Saved {
         (self.maps.iter().flatten().copied().collect(), self.colors.to_vec(), self.steps.to_vec())
     }
 
-    /// what a saved state had, false when it does not fit.
+    /// what a save state had, false when it doesn't fit
     pub(crate) fn restore(&mut self, maps: &[[f32; 2]], colors: &[[f32; 4]], steps: &[[f32; 4]]) -> bool {
         if maps.len() != 3 * MAP_ENTRIES || colors.len() != COLOR_ENTRIES || steps.len() != COLOR_ENTRIES {
             return false;
@@ -80,14 +77,13 @@ impl Tables {
     }
 
     /// takes a write to the table data registers, into the table and entry
-    /// the index register names, which then moves on to the next entry.
+    /// the index register names, which then moves on to the next entry
     pub fn write(&mut self, registers: &mut [u32], value: u32) {
         let index = registers[REG_TABLE_INDEX];
         let entry = (index & 0xFF) as usize;
         let changed = match ((index >> 8) & 0xF) as usize {
             table @ (NOISE | COLOR_MAP | ALPHA_MAP) if entry < MAP_ENTRIES => {
-                // a 0.12 value and the step to the next one, 12 bits with
-                // the sign on top
+                // a 0.12 value and the step to the next one, 12 bits w/ the sign on top
                 let step = (((value >> 12) & 0xFFF) as i32) << 20 >> 20;
                 let map = match table {
                     NOISE => 0,
@@ -105,12 +101,12 @@ impl Tables {
         registers[REG_TABLE_INDEX] = (index & !0xFF) | ((entry as u32 + 1) & 0xFF);
     }
 
-    /// the noise, color map and alpha map tables.
+    /// the noise, color map and alpha map tables
     pub(crate) fn maps(&self) -> &[[[f32; 2]; MAP_ENTRIES]; 3] {
         &self.maps
     }
 
-    /// the colors and the steps between them.
+    /// the colors and the steps between them
     pub(crate) fn colors(&self) -> (&[[f32; 4]; COLOR_ENTRIES], &[[f32; 4]; COLOR_ENTRIES]) {
         (&self.colors, &self.steps)
     }
@@ -119,7 +115,7 @@ impl Tables {
         self.generation
     }
 
-    /// a map table read at a coordinate from 0 to 1, between its entries.
+    /// a map table read at a coordinate from 0 to 1, between its entries
     fn lookup(&self, map: usize, coordinate: f32) -> f32 {
         let at = coordinate * MAP_ENTRIES as f32;
         let entry = (at.max(0.0) as usize).min(MAP_ENTRIES - 1);
@@ -128,7 +124,7 @@ impl Tables {
     }
 }
 
-/// the procedural texture as a draw sets it up.
+/// the procedural texture as a draw sets it up
 #[derive(Clone, Copy)]
 pub struct ProcTex<'a> {
     config: u32,
@@ -136,13 +132,13 @@ pub struct ProcTex<'a> {
     frequency: u32,
     lut: u32,
     offset: u32,
-    /// which texture coordinates it reads.
+    /// which texture coords it reads
     pub coordinates: usize,
     tables: &'a Tables,
 }
 
 impl<'a> ProcTex<'a> {
-    /// the procedural texture, when the texture configuration turns it on.
+    /// the procedural texture, when the texture configuration turns it on
     pub fn read(registers: &[u32], tables: &'a Tables) -> Option<ProcTex<'a>> {
         let units = registers[crate::registers::REG_TEXTURE_CONFIG];
         if units & (1 << 10) == 0 {
@@ -159,12 +155,12 @@ impl<'a> ProcTex<'a> {
         })
     }
 
-    /// the color at a pair of coordinates, 0 to 1 a channel.
+    /// the color at a pair of coords, 0 to 1 a channel
     pub fn sample(&self, u: f32, v: f32) -> [f32; 4] {
         let config = self.config;
         let clamps = [config & 7, (config >> 3) & 7];
         let (mut u, mut v) = (u.abs(), v.abs());
-        // the shifts come from the coordinates before the noise moves them
+        // the shifts come from the coords b4 the noise moves them
         let shifts = [shift(v, (config >> 16) & 3, clamps[0]), shift(u, (config >> 18) & 3, clamps[1])];
         if config & (1 << 15) != 0 {
             let noise = self.noise(u, v);
@@ -196,7 +192,7 @@ impl<'a> ProcTex<'a> {
         color
     }
 
-    /// how much the noise moves a pair of coordinates, -1 to 1.
+    /// how much the noise moves a pair of coords, -1 to 1
     fn noise(&self, u: f32, v: f32) -> f32 {
         let phase = |word: u32| (word >> 16) as f32 / 4096.0;
         let frequency = |half: u32| half_to_f32(half as u16);
@@ -216,7 +212,7 @@ impl<'a> ProcTex<'a> {
     }
 }
 
-/// a pseudo-random value from -1 to 1 for a point of the noise's grid.
+/// a pseudo random value from -1 to 1 for a point of the noise's grid
 fn random(x: u32, y: u32) -> f32 {
     const ROWS: [u32; 16] = [0, 4, 10, 8, 4, 9, 7, 12, 5, 15, 13, 14, 11, 15, 2, 11];
     const MIX: [u32; 16] = [10, 2, 15, 8, 0, 7, 4, 5, 5, 13, 2, 6, 13, 9, 3, 14];
@@ -233,7 +229,7 @@ fn random(x: u32, y: u32) -> f32 {
     -1.0 + v as f32 * 2.0 / 15.0
 }
 
-/// how far the shift moves one coordinate, by the other.
+/// how far the shift moves one coordinate, by the other
 fn shift(other: f32, mode: u32, clamp: u32) -> f32 {
     let amount = if clamp == 3 { 1.0 } else { 0.5 };
     let other = other as i32;
@@ -245,7 +241,7 @@ fn shift(other: f32, mode: u32, clamp: u32) -> f32 {
     }
 }
 
-/// brings a coordinate back to 0 to 1.
+/// brings a coordinate back to 0 to 1
 fn clamp(c: f32, mode: u32) -> f32 {
     match mode {
         // to zero
@@ -282,7 +278,7 @@ fn clamp(c: f32, mode: u32) -> f32 {
     }
 }
 
-/// the two coordinates made into one.
+/// the two coords made into one
 fn combine(u: f32, v: f32, function: u32) -> f32 {
     let length = (u * u + v * v).sqrt();
     match function {
@@ -300,7 +296,7 @@ fn combine(u: f32, v: f32, function: u32) -> f32 {
     }
 }
 
-/// a 16-bit float, a sign, 5 bits of exponent and 10 of mantissa.
+/// a 16 bit float, a sign, 5 bits of exponent and 10 of mantissa
 fn half_to_f32(half: u16) -> f32 {
     let sign = if half & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = ((half >> 10) & 0x1F) as i32;
@@ -315,8 +311,7 @@ fn half_to_f32(half: u16) -> f32 {
 mod tests {
     use super::*;
 
-    /// the same tables sent again leave what the GPU has of them as it is,
-    /// a changed entry of any of them makes it stale.
+    /// the same tables sent again leave what the GPU has of them as is, a changed entry of any of them makes it stale
     #[test]
     fn only_a_changed_entry_makes_the_tables_stale() {
         let mut registers = vec![0u32; 0x300];
@@ -335,8 +330,7 @@ mod tests {
         assert_ne!(tables.generation(), sent);
     }
 
-    /// a flat grey table and a map straight through, the texture comes out
-    /// the grey wherever it is read.
+    /// a flat grey table and a map straight thru, the texture comes out grey wherever it's read
     #[test]
     fn a_flat_table_gives_its_color_everywhere() {
         let mut registers = vec![0u32; 0x300];
@@ -351,7 +345,7 @@ mod tests {
             tables.write(&mut registers, 0xFF80_8080);
         }
         registers[crate::registers::REG_TEXTURE_CONFIG] = 1 << 10;
-        // repeat both ways, u as the coordinate, a 256 entry linear table
+        // repeat both ways, u as the coord, a 256 entry linear table
         registers[REG_CONFIG] = 2 | 2 << 3;
         registers[REG_LUT] = 1 | 255 << 11;
         let proctex = ProcTex::read(&registers, &tables).expect("turned on");

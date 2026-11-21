@@ -1,74 +1,66 @@
-//! loops in recompiled code that poll the clock. a thread alone on the
-//! core with nothing to do until a time comes spins in a loop that reads
-//! the clock, and takes and lets go of a mutex, each turn the same but for
-//! the ticks it reads, until one of them is late enough, which on a console
-//! costs nothing and here every turn runs. once a turn is seen to go the
-//! same way whatever the turns before it left, the run skips whole turns at
-//! once, up to the last before the loop would go another way or the next
-//! thing happens, leaving the machine as running every one of them would:
-//! the clock, the history, the preempt and the instructions counted. the
-//! code then runs the turn after them for real, which goes the same way and
-//! so writes over all that the skipped ones would have left.
+//! loops in recompiled code that poll the clock
+//! a thread alone on the core w/ nothing to do till some time spins in a loop that reads the clock and takes and
+//! drops a mutex, each turn the same except the ticks it reads, till one's late enough
+//! on a console that costs nothing, here every turn runs
 //!
-//! which way a turn goes from a tick is found by running the code for it on
-//! the side, see recompiled::Library::run_on_the_side, on a copy of the
-//! core, the clock answered as it would be then, the mutex taken and let go
-//! of in a count of its own and what it writes put back after: its svcs,
-//! when each comes, the cycles it takes and the bytes it changes. a turn
-//! goes another way past a tick, the way a time reached does, and before it
-//! the same, so the turns to skip are found by halving.
+//! once a turn is seen to go the same way whatever the turns b4 it left, the run skips whole turns at once,
+//! up to the last b4 the loop would go another way or the next thing happens
+//! it leaves the machine like running every one of them would (the clock, the history, the preempt and the instructions counted)
+//! the code then runs the turn after them for real, which goes the same way and so writes over everything the skipped ones would have left
 //!
-//! a try starts at a tick the host answers when the history of svcs shows a
-//! loop, and the ticks a loop's other svcs come to the host before then
-//! have the next one come too. a loop going another way soon is tried again
-//! once it did, for the next it comes back to, and one whose turn can't be
-//! learned waits, longer each time.
+//! which way a turn goes from a tick is found by running its code on the side (see
+//! recompiled::Library::run_on_the_side) on a copy of the core
+//! the clock answered as it'd be then, the mutex taken and dropped in a count of its own, and what it writes put back after
+//! we get its svcs, when each comes, the cycles it takes and the bytes it changes
+//! a turn goes another way past a tick (like a time reached does) and the same b4 it,
+//! so the turns to skip are found by halving (binary search ftw)
+//!
+//! a try starts at a tick the host answers when the svc history shows a loop,
+//! and the ticks a loop's other svcs bring to the host b4 then have the next one come too
+//! a loop going another way soon gets tried again once it did, for the next one it comes back to,
+//! and one whose turn can't be learned waits, longer each time
 
 use crate::kernel::svc::SYSTEM_TICK_COST;
 use crate::kernel::thread::ThreadId;
 use crate::recompiled::{self, Core, Sandbox};
 use crate::{System, HISTORY_LENGTH, PREEMPT_INTERVAL};
 
-/// the most svcs a turn of a polling loop makes.
+/// the most svcs a turn of a polling loop makes
 const MOST_SVCS: usize = 16;
-/// skipping fewer turns than this is not worth finding them.
+/// skipping fewer turns than this isn't worth finding them
 const FEWEST_TURNS: u64 = 4;
-/// how close the turn a loop goes another way at is found, the turns
-/// between running.
+/// how close the turn where a loop goes another way gets found, the turns between just run
 const ROUGHLY: u64 = 16;
-/// after a loop's turn couldn't be learned, no try starts for this long at
-/// first, twice as long each time that loop's can't again, up to the most.
+/// after a loop's turn couldn't be learned, no try starts for this long at first,
+/// twice as long each time that loop fails again, up to the most
 const RETRY: u64 = 8192;
 const MOST_RETRY: u64 = 2 * 1024 * 1024;
 
-/// loops skipped, and the one learned.
+/// loops skipped, and the one learned
 pub struct SpinLoops {
-    /// before this cycle no try starts, an svc pays one comparison.
+    /// b4 this cycle no try starts, an svc pays one comparison
     next_try: u64,
-    /// the loop whose turn couldn't be learned last, its thread, the svc at
-    /// and the svcs in a turn, and how long its next try waited.
+    /// the loop whose turn couldn't be learned last (its thread, the svc at and the svcs in a turn) and how long its next try waited
     failed: Option<(ThreadId, u32, usize)>,
     retry: u64,
     learned: Option<Box<Learned>>,
-    /// where turns run on the side write, made at the first try.
+    /// where turns run on the side write, made at the first try
     sandbox: Option<Box<Sandbox>>,
-    /// the loop learned is where the code is, at another of its ticks, the
-    /// next of which a try wants.
+    /// the loop learned is where the code is, at another of its ticks, a try wants the next one
     wants_tick: bool,
-    /// cycles and turns skipped, for reports.
+    /// cycles and turns skipped, for reports
     pub skipped: u64,
     pub turns: u64,
 }
 
 impl SpinLoops {
-    /// loops skipped or, when off, never looked for. ZAKURO_SPIN=0 turns
-    /// them off too.
+    /// loops skipped or, when off, never looked for, ZAKURO_SPIN=0 turns them off too
     pub fn new(on: bool) -> SpinLoops {
         let on = on && std::env::var("ZAKURO_SPIN").map_or(true, |value| value != "0");
         SpinLoops { next_try: if on { 0 } else { u64::MAX }, failed: None, retry: 0, learned: None, sandbox: None, wants_tick: false, skipped: 0, turns: 0 }
     }
 
-    /// forgets the loop learned and when to try next, for a state loaded.
+    /// forgets the loop learned and when to try next, for a loaded state
     pub(crate) fn forget(&mut self) {
         self.learned = None;
         self.failed = None;
@@ -78,23 +70,22 @@ impl SpinLoops {
         }
     }
 
-    /// whether an svc at tick is worth a try, the history showing a loop.
+    /// is an svc at tick worth a try, the history showing a loop
     #[inline(always)]
     pub(crate) fn due(&self, tick: u64) -> bool {
         tick >= self.next_try
     }
 
-    /// whether the try just made wants the next tick, the code being in the
-    /// loop learned at another of its ticks.
+    /// does the try just made want the next tick, the code being in the loop learned at another of its ticks
     pub(crate) fn wants_tick(&mut self) -> bool {
         std::mem::take(&mut self.wants_tick)
     }
 }
 
-/// what a turn run on the side did: its svcs, the address after each with
-/// bit 0 set for Thumb, the cycles from the turn's start it came at and its
-/// number, the first the one reading the clock it starts at, the cycles to
-/// the next turn's, and the bytes it wrote.
+/// what a turn run on the side did
+/// its svcs, the addr after each (bit 0 set for Thumb),
+/// the cycles from the turn's start it came at and its number (the first is the one reading the clock it starts
+/// at), the cycles to the next turn's, and the bytes it wrote
 #[derive(PartialEq, Eq)]
 struct Turn {
     svcs: Vec<(u32, u64, u32)>,
@@ -102,58 +93,52 @@ struct Turn {
     written: Vec<(u32, recompiled::Bytes)>,
 }
 
-/// a loop learned.
 struct Learned {
     thread: ThreadId,
     thumb: bool,
-    /// the core where a turn starts, the svc reading the clock made and not
-    /// yet answered: the registers the same at every turn's start, by mask.
+    /// the core where a turn starts, the clock reading svc made and not answered yet, the registers the same at every turn's start, by mask
     regs: [u32; 16],
     constant: u16,
     turn: Turn,
-    /// the instructions a turn runs, its cycles less what reading the clock
-    /// costs.
+    /// the instructions a turn runs, its cycles minus what reading the clock costs
     instructions: u64,
-    /// the mutex its waits take.
+    /// the mutex its waits take
     mutex: Option<u32>,
     /// the latest tick a turn was found to go the same way from, and the
-    /// first it was found to go another way from.
+    /// first it was found to go another way from
     same_until: u64,
     other_from: Option<u64>,
 }
 
 /// turns skipped, the cycles and instructions they took and their svcs,
-/// for the svc to be answered after them.
+/// for the svc to be answered after them
 pub(crate) struct Skipped {
     pub cycles: u64,
     pub instructions: u64,
     pub svcs: u64,
 }
 
-/// what a try came to.
+/// what a try came to
 enum Tried {
     Skipped(Skipped),
-    /// a loop it would skip but for what comes first, tried again past
-    /// that.
+    /// a loop it'd skip if not for what comes first, tried again past that
     Past(u64),
-    /// the loop learned, at another of its ticks, tried again at the next.
+    /// the loop learned, at another of its ticks, tried again at the next
     Next,
-    /// a turn of the loop that couldn't be learned, tried again later.
+    /// a turn of the loop that couldn't be learned, tried again later
     Failed,
     /// nothing to skip now, tried again at the next tick the history shows
-    /// a loop at.
+    /// a loop at
     Nothing,
 }
 
 impl System {
-    /// before the clock is read in place at at, the core the code has at
-    /// the svc, tick what it reads: whole turns of a loop polling it
-    /// skipped, when the code is in one, the history showing its turns of
-    /// period svcs, see spin_period, up to the event or the deadline at the
-    /// most, with the history and the preempt as answering each of their
-    /// svcs would leave them. the svc then has to be answered after them,
-    /// which this makes sure tick_in_place does. none, having done nothing,
-    /// when there is nothing to skip.
+    /// b4 the clock is read in place at at (the core the code has at the svc, tick what it reads),
+    /// skips whole turns of a loop polling it when the code is in one
+    /// the history shows its turns of period svcs (see spin_period), up to the event or the deadline at most,
+    /// w/ the history and the preempt left like answering each of their svcs would
+    /// the svc then has to be answered after them, this makes sure tick_in_place does
+    /// none, having done nothing, when there's nothing to skip
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spin_skip(
         &mut self,
@@ -204,16 +189,14 @@ impl System {
         library: &recompiled::Library,
     ) -> Tried {
         let Some(thread) = self.kernel.current_thread else { return Tried::Nothing };
-        // nothing but the thread and the clock until the horizon, and the
-        // pass any preempt before it has due a quiet one
+        // nothing but the thread and the clock till the horizon, and the pass any preempt b4 it has due is a quiet one
         let after = tick + SYSTEM_TICK_COST;
         if !self.plain_in_place(after, at, event, deadline, library) || !self.kernel.quiet_pass(after) {
             return Tried::Nothing;
         }
         let Some(quiet) = self.kernel.quiet_until() else { return Tried::Nothing };
         let horizon = [event, deadline].into_iter().flatten().fold(quiet.min(self.next_frame_boundary).min(self.next_audio_frame), u64::min);
-        // too close to skip the turns of the loop learned, which is likely
-        // the one
+        // too close to skip the turns of the loop learned, which is likely the one
         if self.spin.learned.as_ref().is_some_and(|learned| horizon.saturating_sub(after) / learned.turn.cost < FEWEST_TURNS + 2) {
             return Tried::Past(horizon);
         }
@@ -234,9 +217,8 @@ impl System {
         let after = tick + turns * cost + SYSTEM_TICK_COST;
         let skipped = (turns >= FEWEST_TURNS && self.plain_in_place(after, at, event, deadline, library))
             .then(|| self.skip_turns(&learned, tick, turns));
-        // too few turns before the loop goes another way: the next try once
-        // it did, rather than at the horizon, which a loop the code comes
-        // back to meanwhile would spin to
+        // too few turns b4 the loop goes another way, so the next try comes once it did instead of at the horizon
+        // a loop the code comes back to meanwhile would spin all the way to that
         let past = learned.other_from.map_or(horizon, |other| other.max(tick + cost).min(horizon));
         self.spin.learned = Some(learned);
         match skipped {
@@ -245,29 +227,26 @@ impl System {
         }
     }
 
-    /// how many svcs a turn of a loop around the svc at at makes, the last
-    /// in the history repeating that often and the one at at the first of
-    /// them, the history holding each svc answered in place. none when they
-    /// don't repeat.
+    /// how many svcs a turn of a loop around the svc at at makes, the last in the history repeating that often w/ the one at at first
+    /// the history holds each svc answered in place, none when they don't repeat
     #[inline]
     pub(crate) fn spin_period(&self, at: u32) -> Option<usize> {
-        // back 0 the newest
+        // back 0 is the newest
         let entry = |back: usize| self.history[(self.history_index + 2 * HISTORY_LENGTH - 1 - back) % HISTORY_LENGTH];
         (1..=MOST_SVCS).find(|&period| entry(period - 1) == at && (period..HISTORY_LENGTH).all(|back| entry(back) == entry(back - period)))
     }
 
-    /// whether the history repeats, the svcs answered in place a loop's
-    /// turns, which a try at skipping them wants the next tick for.
+    /// does the history repeat (the svcs answered in place being a loop's turns), a try at skipping them wants the next tick for that
     #[inline]
     pub(crate) fn history_repeats(&self) -> bool {
         let entry = |back: usize| self.history[(self.history_index + 2 * HISTORY_LENGTH - 1 - back) % HISTORY_LENGTH];
         (1..=MOST_SVCS).any(|period| (period..HISTORY_LENGTH).all(|back| entry(back) == entry(back - period)))
     }
 
-    /// where in a turn of the loop learned the svc at hand is, by the
-    /// history's last turn, the svcs the thread made: how many svcs after
-    /// the one the learned turns start at. none when the history is not
-    /// that loop's.
+    /// where in a turn of the loop learned the svc at hand is,
+    /// by the history's last turn (the svcs the thread made),
+    /// how many svcs after the one the learned turns start at
+    /// none when the history isn't that loop's
     fn learned_turn_at(&self, learned: &Learned, thread: ThreadId, period: usize) -> Option<usize> {
         let entry = |back: usize| self.history[(self.history_index + 2 * HISTORY_LENGTH - 1 - back) % HISTORY_LENGTH];
         let svcs = &learned.turn.svcs;
@@ -276,20 +255,17 @@ impl System {
             .flatten()
     }
 
-    /// whether the loop learned is the one the core is in, the one thread at
-    /// the svc its turns start at and the core's registers those the same at
-    /// each turn's start.
+    /// is the loop learned the one the core's in,
+    /// the one thread at the svc its turns start at and the core's registers the same as at each turn's start
     fn still_learned(&self, learned: &Learned, thread: ThreadId, core: &Core, period: usize) -> bool {
         learned.thumb == core.thumb()
             && self.learned_turn_at(learned, thread, period) == Some(0)
             && (0..16).all(|index| learned.constant & (1 << index) == 0 || core.r[index] == learned.regs[index])
     }
 
-    /// what a turn of the loop from the core at tick does, and whether it
-    /// goes the same way whatever the turns before it left: a turn, the
-    /// turn after it, and that one again from the core instead, which has to
-    /// go the same way and leave the same core and memory. none when the
-    /// three don't.
+    /// what a turn of the loop from the core at tick does, and if it goes the same way whatever the turns b4 it left
+    /// a turn, the turn after it, and that one again from the core instead, which has to go the same way and leave the same core and memory
+    /// none when the three don't
     fn learn_turn(&mut self, library: &recompiled::Library, thread: ThreadId, core: &Core, tick: u64, period: usize) -> Option<Box<Learned>> {
         self.memory.log_all_writes();
         let learned = self.learn_on_the_side(library, thread, core, tick, period);
@@ -326,8 +302,7 @@ impl System {
         }))
     }
 
-    /// whether a turn of the loop learned from the core at tick goes the way
-    /// it learned.
+    /// does a turn of the loop learned from the core at tick go the way it learned
     fn goes_the_same(&mut self, library: &recompiled::Library, learned: &Learned, core: &Core, tick: u64) -> bool {
         let mut mutex = learned.mutex;
         self.memory.log_all_writes();
@@ -337,9 +312,8 @@ impl System {
         turn.is_some_and(|(turn, _)| turn == learned.turn) && mutex == learned.mutex
     }
 
-    /// runs a turn of the loop on the side from the core at tick: what it
-    /// did, the bytes it wrote counting those of the turns since the last
-    /// put_back, and the core it left.
+    /// runs a turn of the loop on the side from the core at tick, returns what it did,
+    /// the bytes it wrote (counting those of the turns since the last put_back) and the core it left
     fn turn_on_the_side(
         &mut self,
         library: &recompiled::Library,
@@ -350,8 +324,7 @@ impl System {
     ) -> Option<(Turn, Core)> {
         let mut sandbox = self.spin.sandbox.take().unwrap_or_else(|| Box::new(Sandbox::new()));
         let system: *mut System = self;
-        // SAFETY: an svc of the library's code is where this runs from,
-        // nothing else holds the system meanwhile
+        // safe bc this runs from an svc of the library's code, nothing else holds the system meanwhile
         let ran = unsafe { library.run_on_the_side(system, &mut sandbox, core, tick, period, mutex) };
         let written = sandbox.written(&self.memory);
         self.spin.sandbox = Some(sandbox);
@@ -359,25 +332,22 @@ impl System {
         Some((Turn { svcs: side.svcs, cost: side.cost, written }, side.end))
     }
 
-    /// the bytes turns run on the side since the last put_back changed,
-    /// with what they hold.
+    /// the bytes turns run on the side changed since the last put_back, w/ what they hold
     fn changed_on_the_side(&mut self) -> Vec<(u32, u8)> {
         self.spin.sandbox.as_ref().map_or_else(Vec::new, |sandbox| sandbox.changed(&mut self.memory))
     }
 
-    /// puts back what turns run on the side wrote.
+    /// puts back what turns run on the side wrote
     fn put_back(&mut self) {
         if let Some(sandbox) = &mut self.spin.sandbox {
             sandbox.put_back(&mut self.memory);
         }
     }
 
-    /// how many turns of the loop learned to skip from the core at tick:
-    /// all going the same way, and the turn after them too, which runs for
-    /// real and so writes over all that they would have left, and the start
-    /// of the next before horizon, so that one runs whole before anything
-    /// looks. found by running that last turn, and halving when it goes
-    /// another way.
+    /// how many turns of the loop learned to skip from the core at tick
+    /// all going the same way, the turn after them too (it runs for real and so writes over everything they'd have
+    /// left), and the start of the next b4 horizon so that one runs whole b4 anything looks
+    /// found by running that last turn and halving when it goes another way
     fn turns_to_skip(&mut self, library: &recompiled::Library, learned: &mut Learned, core: &Core, tick: u64, horizon: u64) -> u64 {
         let cost = learned.turn.cost;
         let start = |turn: u64| tick + turn * cost;
@@ -385,18 +355,16 @@ impl System {
         if most < FEWEST_TURNS {
             return most;
         }
-        // where it went another way is past, the turns from here are to be
-        // found again
+        // where it went another way is past, the turns from here have to be found again
         if learned.other_from.is_some_and(|other| tick >= other) {
             (learned.same_until, learned.other_from) = (0, None);
         }
-        // those starting by same_until go the same way
+        // the ones starting by same_until go the same way
         let same = if learned.same_until >= tick { (learned.same_until - tick) / cost + 1 } else { 0 };
         if most < same {
             return most;
         }
-        // the first going another way is known, the turns before it only as
-        // far as same_until
+        // the first going another way is known, the turns b4 it only as far as same_until
         if learned.other_from.is_some() {
             return same.saturating_sub(1);
         }
@@ -404,8 +372,7 @@ impl System {
             learned.same_until = start(most);
             return most;
         }
-        // the first going another way, roughly, the last known to go the
-        // same way before it the one that runs
+        // the first going another way, roughly, the last known to go the same way b4 it is the one that runs
         let (mut same_turns, mut other) = (same, most);
         while other > same_turns + ROUGHLY {
             let middle = same_turns + (other - same_turns) / 2;
@@ -422,9 +389,9 @@ impl System {
         same_turns.saturating_sub(1)
     }
 
-    /// skips turns of the loop learned from tick, noting each of their svcs
-    /// in the history and having the preempts they come to pass as their
-    /// svcs would, each one the first svc at or after it.
+    /// skips turns of the loop learned from tick,
+    /// noting each of their svcs in the history and having the preempts they hit pass like their svcs would,
+    /// each one at the first svc at or after it
     fn skip_turns(&mut self, learned: &Learned, tick: u64, turns: u64) -> Skipped {
         let turn = &learned.turn;
         let period = turn.svcs.len() as u64;

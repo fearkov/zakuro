@@ -1,25 +1,22 @@
 #version 450
 
-// the PICA200's fragment stages for one draw, the texture units, fragment
-// lighting and the six combiners, then the alpha test. they follow the
-// software rasterizer, which follows the hardware.
+// the PICA200's fragment stages for one draw, the texture units, fragment lighting and the six combiners, then the alpha test
+// they follow the software rasterizer, which follows the hardware
 
 layout(location = 0) in vec4 in_color;
 layout(location = 1) in vec4 in_texcoords01;
 layout(location = 2) in vec2 in_texcoord2;
 layout(location = 3) noperspective in float in_depth;
 layout(location = 4) in vec4 in_quaternion;
-// the view vector, and in w texture coordinate set 0's w
+// the view vector, and in w texture coord set 0's w
 layout(location = 5) in vec4 in_view;
 
 layout(location = 0) out vec4 out_color;
 
-// what decides the shape of the fragment stages comes in as specialization
-// constants, a pipeline for each combination, so the driver compiles away
-// the combiners' switches and the stages a draw does not use. per combiner
-// stage the source, operand, combiner and scale registers, then the buffer
-// update, the texture units' configuration, whether lighting is on, the
-// alpha test's switch and function, and the depth mode
+// what decides the shape of the fragment stages comes in as specialization constants, a pipeline per combination,
+// so the driver compiles away the combiners' switches and the stages a draw doesn't use
+// per combiner stage the source, operand, combiner and scale registers, then the buffer update,
+// the texture units' config, if lighting's on, the alpha test's switch and function, and the depth mode
 layout(constant_id = 0) const uint SOURCE0 = 0u;
 layout(constant_id = 1) const uint SOURCE1 = 0u;
 layout(constant_id = 2) const uint SOURCE2 = 0u;
@@ -49,11 +46,9 @@ layout(constant_id = 25) const uint TEXTURE_CONFIG = 0u;
 layout(constant_id = 26) const uint LIGHTING = 0u;
 layout(constant_id = 27) const uint ALPHA_TEST = 0u;
 layout(constant_id = 28) const uint DEPTH_MODE = 0u;
-// set, a generic pipeline that reads the above from the draw's registers
-// instead, to draw with while the one for its combination compiles. it
-// keeps lighting and the procedural texture's switch, a lot of code it goes
-// without when they are off. it masks the rest as hardware.rs masks the
-// constants, so the two draw the same
+// set, a generic pipeline that reads the above from the draw's registers instead, to draw w/ while the one for its combination compiles
+// it keeps lighting and the procedural texture's switch, lots of code it skips when they're off
+// it masks the rest like hardware.rs masks the constants, so both draw the same
 layout(constant_id = 29) const uint DYNAMIC = 0u;
 
 layout(set = 0, binding = 0) uniform sampler2D texture0;
@@ -78,34 +73,28 @@ struct Light {
 layout(std140, set = 0, binding = 3) uniform Draw {
     // per stage the source, operand, combiner, constant and scale registers
     uvec4 tev[12];
-    // the buffer update and buffer color registers, the alpha test and the
-    // texture unit configuration
+    // the buffer update and buffer color registers, the alpha test and the texture unit config
     uvec4 misc;
-    // per unit the configuration word and the border color
+    // per unit the config word and the border color
     uvec4 units[3];
-    // x, 1 a w-buffer, 2 depth from the fragment's z, y, lighting is on,
-    // z and w, the depth map's scale and offset
+    // x, 1 a w buffer, 2 depth from the fragment's z, y, lighting is on, z and w, the depth map's scale and offset
     uvec4 flags;
-    // x, the configuration, y, how many lights, z, bump mapping, w, shadow
+    // x, the config, y, how many lights, z, bump mapping, w, shadow
     uvec4 light_config;
     // x, fresnel into the primary alpha, y, into the secondary, z, clamp
     // highlights, w, 1 when the half vector is read, 2 the view vector
     uvec4 light_flags;
-    // distribution 0 and 1, fresnel, reflection red, green and blue and the
-    // spotlight, each whether it is read, its input, abs and scale
+    // distribution 0 and 1, fresnel, reflection red, green and blue and the spotlight, each w/ if it's read, its input, abs and scale
     uvec4 lookups[7];
     vec4 global_ambient;
     Light lights[8];
-    // the procedural texture's registers, the configuration, the noise's
-    // u and v and its frequencies, then its table's configuration and
-    // offset
+    // the procedural texture's registers, the config, the noise's u and v and its frequencies, then its table's config and offset
     uvec4 proctex[2];
     // x, the fog's color
     uvec4 fog;
 };
 
-// a combiner stage's source, operand, combiner and scale registers, the
-// pipeline's constants or, generic, the draw's
+// a combiner stage's source, operand, combiner and scale registers, the pipeline's constants or, if generic, the draw's
 uvec4 stage_registers(uint stage, uvec4 constants) {
     if (DYNAMIC == 0u) {
         return constants;
@@ -140,18 +129,16 @@ vec4 unpack_color(uint value) {
     return unpackUnorm4x8(value);
 }
 
-// a texture unit's sample, with v = 0 at the bottom row as the PICA has it
-// and the border color outside the texture where the unit clamps to it
+// a texture unit's sample, w/ v = 0 at the bottom row like the PICA has it and the border color outside the
+// texture where the unit clamps to it
 vec4 sample_unit(uint unit, vec2 uv) {
     uint config = units[unit].x;
     uint wrap_t = (config >> 8) & 7u;
     uint wrap_s = (config >> 12) & 7u;
-    // precise as the combiners are. the coordinate itself the driver may
-    // still interpolate a hair apart from one shader to another
+    // precise like the combiners, the driver may still interpolate the coord itself a hair apart from one shader to another
     precise vec2 st = vec2(uv.x, 1.0 - uv.y);
-    // sampled before the border is decided on for each fragment, so that a
-    // texture pack's picture picks which of its sizes to draw with from all
-    // of a fragment's neighbours
+    // sampled b4 the border gets decided for each fragment,
+    // so a texture pack's picture picks which of its sizes to draw w/ from all of a fragment's neighbors
     vec4 sampled;
     if (unit == 0u) {
         sampled = texture(texture0, st);
@@ -182,7 +169,7 @@ vec4 proctex_color(uint entry, uint base) {
     return vec4(tables[base + entry * 2u], tables[base + entry * 2u + 1u]);
 }
 
-// a pseudo-random value from -1 to 1 for a point of the noise's grid
+// a pseudo random value from -1 to 1 for a point of the noise's grid
 float proctex_random(uint x, uint y) {
     const uint rows[16] = uint[16](0u, 4u, 10u, 8u, 4u, 9u, 7u, 12u, 5u, 15u, 13u, 14u, 11u, 15u, 2u, 11u);
     const uint mixes[16] = uint[16](10u, 2u, 15u, 8u, 0u, 7u, 4u, 5u, 5u, 13u, 2u, 6u, 13u, 9u, 3u, 14u);
@@ -241,8 +228,7 @@ precise float proctex_combine(float u, float v, uint function) {
     }
 }
 
-// texture 3, made up from its coordinates, as the software rasterizer has
-// it. precise as the combiners are, as is lighting
+// texture 3, made up from its coords like the software rasterizer has it, precise like the combiners are, same for lighting
 precise vec4 procedural(vec2 uv) {
     uint config = proctex[0].x;
     uvec2 clamps = uvec2(config & 7u, (config >> 3) & 7u);
@@ -484,9 +470,8 @@ precise float alpha_operand(vec4 s, uint operand) {
     }
 }
 
-// the operations' results are precise, so the driver fuses no multiply
-// into an add, which it would do one way where it knows the operation and
-// another where the generic shader does not, rounding differently
+// the ops' results are precise so the driver fuses no multiply into an add
+// it'd do that one way where it knows the op and another where the generic shader doesn't, rounding differently
 vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
     precise vec3 result;
     switch (op) {
@@ -498,7 +483,7 @@ vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
         case 5u: result = max(a - b, vec3(0.0)); break;
         case 6u:
         case 7u: {
-            // both inputs are signed values packed into 0..1
+            // both inputs are signed values packed into 0 to 1
             float d = clamp(dot(a * 2.0 - 1.0, b * 2.0 - 1.0), 0.0, 1.0);
             result = vec3(d);
             break;
@@ -565,8 +550,7 @@ vec4 source_value(uint s, vec4 primary, vec4 fragment_primary, vec4 fragment_sec
     }
 }
 
-// one combiner stage, its registers and the buffer update register
-// constant in each pipeline but the generic one
+// one combiner stage, its registers and the buffer update register are constant in each pipeline except the generic one
 void combine_stage(
     uint stage, uvec4 registers, uint update,
     vec4 primary, vec4 fragment_primary, vec4 fragment_secondary, vec4 textures[4],
@@ -576,10 +560,8 @@ void combine_stage(
     uint operand = registers.y;
     uint combiner = registers.z;
     uint scale = registers.w;
-    // a stage handing the previous color on as it is changes nothing, as
-    // the color is between 0 and 1 already. titles leave most stages so,
-    // and the generic shader, which cannot drop them as it compiles, skips
-    // them as it runs
+    // a stage handing the previous color on as is changes nothing, the color's between 0 and 1 already
+    // titles leave most stages like that, and the generic shader, which can't drop them at compile time, skips them at run time
     bool passes = (source & 0x000F000Fu) == 0x000F000Fu && (operand & 0x700Fu) == 0u
         && (combiner & 0x000F000Fu) == 0u && scale == 0u;
     if (!passes) {
@@ -622,10 +604,9 @@ void combine_stage(
 }
 
 #ifdef WRITES_DEPTH
-// what the GPU shaded maps z/w itself, which the clipper got exactly.
-// precise as the combiners are. built so only for a w-buffer and for a
-// depth map the viewport can't hold, the rest leave depth to the
-// rasterizer, which lets the GPU skip what is hidden before shading it
+// what the GPU shaded maps z/w itself, which the clipper got exactly, precise like the combiners
+// built like that only for a w buffer and for a depth map the viewport can't hold,
+// the rest leave depth to the rasterizer, which lets the GPU skip what's hidden b4 shading it
 float fragment_depth() {
     precise float depth = in_depth;
     uint depth_mode = DYNAMIC != 0u ? flags.x : DEPTH_MODE;
@@ -638,7 +619,7 @@ float fragment_depth() {
     return clamp(depth, 0.0, 1.0);
 }
 #else
-// the viewport mapped the depth as the PICA does
+// the viewport mapped the depth like the PICA does
 float fragment_depth() {
     return gl_FragCoord.z;
 }
@@ -647,13 +628,11 @@ float fragment_depth() {
 void main() {
     vec4 primary = clamp(in_color, 0.0, 1.0);
 
-    // the units the configuration turns on, unit 2 can read coordinate
-    // set 1 instead of its own
+    // the units the config turns on, unit 2 can read coord set 1 instead of its own
     uint texture_config = DYNAMIC != 0u ? (misc.w & 0x2307u) | (TEXTURE_CONFIG & 0x400u) : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
-        // a projected texture, type 3 in bits 28-30 of the unit's
-        // configuration, divides its coordinates by set 0's w
+        // a projected texture (type 3 in bits 28 to 30 of the unit's config) divides its coords by set 0's w
         bool projected = ((units[0].x >> 28) & 7u) == 3u;
         textures[0] = sample_unit(0u, projected ? in_texcoords01.xy / in_view.w : in_texcoords01.xy);
     }
@@ -668,8 +647,7 @@ void main() {
         textures[3] = procedural(set == 0u ? in_texcoords01.xy : (set == 1u ? in_texcoords01.zw : in_texcoord2));
     }
 
-    // without fragment lighting the primary fragment color is the vertex
-    // color and there is no specular term
+    // w/o fragment lighting the primary fragment color is the vertex color and there's no specular term
     vec4 fragment_primary = primary;
     vec4 fragment_secondary = vec4(0.0, 0.0, 0.0, 1.0);
     if (LIGHTING != 0u) {
@@ -677,8 +655,7 @@ void main() {
     }
 
     vec4 previous = primary;
-    // the buffer lags a stage behind, the first stage reads zero, the second
-    // the configured buffer color
+    // the buffer lags a stage behind, the first stage reads zero, the second the configured buffer color
     vec4 held = vec4(0.0);
     vec4 next_buffer = unpack_color(misc.y);
     uint update = DYNAMIC != 0u ? misc.x & 0xFF00u : UPDATE;
@@ -689,18 +666,17 @@ void main() {
     combine_stage(4u, stage_registers(4u, uvec4(SOURCE4, OPERAND4, COMBINER4, SCALE4)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
     combine_stage(5u, stage_registers(5u, uvec4(SOURCE5, OPERAND5, COMBINER5, SCALE5)), update, primary, fragment_primary, fragment_secondary, textures, previous, held, next_buffer);
 
-    // the color leaves as whole bytes, the way the software path truncates.
-    // precise, as everything from the operands on is, or where the driver
-    // knows the operands it works 1 - a times 255 out as 255 - 255a, which
-    // rounds to the other side of a byte
+    // the color leaves as whole bytes, like the software path truncates
+    // precise, like everything from the operands on,
+    // or where the driver knows the operands it works 1 minus a times 255 out as 255 minus 255a,
+    // which rounds to the other side of a byte
     precise vec4 color = floor(previous * 255.0);
     uint alpha_test = DYNAMIC != 0u ? misc.z & 0x71u : ALPHA_TEST;
     if ((alpha_test & 1u) != 0u && !compare((alpha_test >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
         discard;
     }
-    // the fog, by the fragment's depth through its table, the table's factor
-    // of the color and the rest of the fog's, which the alpha test came
-    // before. 5 turns it on, 7 is gas
+    // the fog, by the fragment's depth thru its table, the table's factor of the color and the rest of the fog's, the alpha test came b4
+    // 5 turns it on, 7 is gas
     if ((misc.x & 7u) == 5u) {
         float depth = fragment_depth();
         precise float index = ((misc.x & 0x10000u) != 0u ? 1.0 - depth : depth) * 128.0;

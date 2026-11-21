@@ -1,8 +1,8 @@
-//! program status register.
+//! program status register
 
 use zakuro_common::bits::bit;
 
-/// ARM processor modes.
+/// ARM processor modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Mode {
@@ -39,9 +39,9 @@ pub struct Psr {
     pub z: bool,
     pub c: bool,
     pub v: bool,
-    /// sticky saturation flag, set by the DSP and saturating-arithmetic ops.
+    /// sticky saturation flag, set by the DSP and saturating ops
     pub q: bool,
-    /// ARMv6 SIMD "greater than or equal" flags, one per byte lane.
+    /// ARMv6 SIMD "greater than or equal" flags, one per byte lane
     pub ge: u8,
     pub e: bool,
     pub a: bool,
@@ -103,11 +103,9 @@ impl Psr {
         }
     }
 
-    /// applies a write from MSR, honouring the field mask and dropping
-    /// privileged fields when in User mode.
+    /// applies a write from MSR, honoring the field mask and dropping privileged fields in User mode
     pub fn write_masked(&mut self, value: u32, field_mask: u32, privileged: bool) {
-        // bit 3 of the mask, flags (31:24), bit 2, status (23:16),
-        // bit 1, extension (15:8), bit 0, control (7:0).
+        // mask bit 3, flags (31 to 24), bit 2, status (23 to 16), bit 1, extension (15 to 8), bit 0, control (7 to 0)
         if field_mask & 0b1000 != 0 {
             self.n = bit(value, 31);
             self.z = bit(value, 30);
@@ -125,14 +123,13 @@ impl Psr {
         if field_mask & 0b0001 != 0 && privileged {
             self.i = bit(value, 7);
             self.f = bit(value, 6);
-            // the T bit is never written directly by MSR.
+            // the T bit is never written directly by MSR
             self.mode = Mode::from_bits(value);
         }
     }
 }
 
-/// the four condition-code bits an instruction's condition field is tested
-/// against.
+/// the four condition code bits an instruction's condition field gets tested against
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Condition {
     Eq,
@@ -150,8 +147,7 @@ pub enum Condition {
     Gt,
     Le,
     Al,
-    /// 0b1111, on ARMv5 and later this encodes unconditional instructions
-    /// rather than "never".
+    /// 0b1111, on ARMv5 and later this encodes unconditional instructions instead of "never"
     Nv,
 }
 

@@ -1,8 +1,6 @@
-//! a quick hash for the maps keyed by what the emulator makes itself,
-//! pipelines, programs, their translations and samplers. the standard one,
-//! SipHash, guards against keys picked to collide, which these never are,
-//! and every draw looks a few of them up, a pipeline's key being some 150
-//! bytes.
+//! a quick hash for the maps keyed by what the emulator makes itself, pipelines, programs, their translations and samplers
+//! the standard one (SipHash) guards against keys picked to collide, which these never are,
+//! and every draw looks a few of them up, a pipeline's key being some 150 bytes
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -10,10 +8,10 @@ use std::hash::{BuildHasherDefault, Hasher};
 pub(super) type QuickMap<K, V> = HashMap<K, V, BuildHasherDefault<Quick>>;
 pub(super) type QuickSet<K> = HashSet<K, BuildHasherDefault<Quick>>;
 
-/// odd, with its bits spread over the word, rustc's own hasher uses it.
+/// odd, w/ its bits spread over the word, rustc's own hasher uses it
 const K: u64 = 0xF135_7AEA_2E62_A9C5;
 
-/// adds in a word at a time and multiplies, the way rustc's FxHasher does.
+/// adds in a word at a time and multiplies, like rustc's FxHasher does
 #[derive(Default, Clone, Copy)]
 pub(super) struct Quick {
     hash: u64,
@@ -59,9 +57,8 @@ impl Hasher for Quick {
     }
 
     fn finish(&self) -> u64 {
-        // the multiplies leave the best mixed bits at the top, and the map
-        // picks a bucket by the bottom ones, folding the halves of a wide
-        // multiply together spreads every bit over both
+        // the multiplies leave the best mixed bits at the top and the map picks a bucket by the bottom ones,
+        // folding the halves of a wide multiply together spreads every bit over both
         let wide = self.hash as u128 * K as u128;
         wide as u64 ^ (wide >> 64) as u64
     }
@@ -76,8 +73,7 @@ mod tests {
         BuildHasherDefault::<Quick>::default().hash_one(value)
     }
 
-    /// keys that differ anywhere, in a word or in the bytes after the last
-    /// whole one, hash apart, and the same key the same.
+    /// keys that differ anywhere (in a word or in the bytes after the last whole one) hash apart, and the same key the same
     #[test]
     fn keys_that_differ_hash_apart() {
         let key = (Some(0x1234u32), 7u8, [0x0FFF_0FFFu32; 30]);
@@ -94,9 +90,8 @@ mod tests {
         assert_ne!(hash(&[0u8; 9][..]), hash(&[0u8, 0, 0, 0, 0, 0, 0, 0, 1][..]));
     }
 
-    /// addresses a page apart, as large allocations are, spread over the
-    /// low bits a map picks its buckets by about as keys picked at random
-    /// would, some 160 of 256.
+    /// addrs a page apart (like big allocations are) spread over the low bits a map picks its buckets by about as
+    /// well as random keys would, some 160 of 256
     #[test]
     fn aligned_keys_spread_over_the_buckets() {
         let buckets: QuickSet<u64> = (0..256usize).map(|i| hash(0x7F00_0000_0000usize + i * 4096) & 255).collect();

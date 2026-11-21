@@ -1,6 +1,5 @@
-//! ROM container parsing, NCSD cartridge images, CIA archives, NCCH
-//! partitions, ExeFS, RomFS and the BLZ compression the CTR SDK applies to
-//! .code.
+//! ROM container parsing, NCSD cartridge images, CIA archives, NCCH partitions, ExeFS,
+//! RomFS and the BLZ compression the CTR SDK applies to .code
 
 pub mod cia;
 pub mod dlp;
@@ -82,7 +81,7 @@ pub enum FsError {
     PatchMismatch,
 }
 
-/// a memory-mapped ROM file. Games are up to 4 GiB, so nothing is read eagerly.
+/// a memory mapped ROM file, games are up to 4 GiB so nothing gets read eagerly
 pub struct RomImage {
     path: PathBuf,
     map: Mmap,
@@ -98,7 +97,7 @@ impl RomImage {
     pub fn open(path: impl AsRef<Path>) -> Result<RomImage, FsError> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
-        // SAFETY: the ROM is a regular file we only ever read.
+        // safe bc the ROM is a regular file we only ever read
         let map = unsafe { Mmap::map(&file)? };
         Ok(RomImage { path, map })
     }
@@ -120,25 +119,23 @@ impl RomImage {
     }
 }
 
-/// a loaded title, the executable NCCH of a cartridge, with its headers parsed
-/// and its filesystems located.
+/// a loaded title, the executable NCCH of a cartridge, w/ its headers parsed and its filesystems located
 pub struct Title {
     image: Arc<RomImage>,
-    /// offset of the CXI inside the image.
+    /// offset of the CXI in the image
     ncch_offset: u64,
     pub ncch: NcchHeader,
     pub exheader: ExHeader,
     pub exefs: ExeFs,
     exefs_offset: u64,
     pub romfs: Option<RomFs>,
-    /// the RomFS with mods over it, when there are any.
+    /// the RomFS w/ mods over it, when there are any
     pub layered: Option<std::sync::Arc<layered::Layered>>,
-    /// the update installed for it, whose code and exheader it runs.
+    /// the update installed for it, whose code and exheader it runs
     update: Option<Box<Update>>,
 }
 
-/// a game's update, the code, exheader and data that take the place of the
-/// game's own, from the update's CIA.
+/// a game's update, the code, exheader and data that replace the game's own, from the update's CIA
 pub struct Update {
     pub title: Title,
     pub title_id: u64,
@@ -165,13 +162,12 @@ impl Update {
     }
 }
 
-/// downloadable content, from its CIA, contents of data a game opens by
-/// their index, each an NCCH with a RomFS.
+/// downloadable content from its CIA, contents of data a game opens by index, each an NCCH w/ a RomFS
 pub struct Dlc {
     image: Arc<RomImage>,
     pub title_id: u64,
     pub version: u16,
-    /// every content its TMD lists, those the file holds with a place.
+    /// every content its TMD lists, the ones the file holds w/ a place
     pub contents: Vec<Content>,
 }
 
@@ -195,9 +191,8 @@ impl Dlc {
         self.image.clone()
     }
 
-    /// where the RomFS of the content of an index lies in the file, the
-    /// window a game reads it through, none when the file leaves the content
-    /// out or it has no RomFS it can read.
+    /// where the RomFS of the content of an index lies in the file (the window a game reads it thru),
+    /// none when the file leaves the content out or it has no readable RomFS
     pub fn romfs(&self, index: u16) -> Option<(u64, u64)> {
         let offset = self.contents.iter().find(|content| content.index == index)?.offset?;
         let data = self.image.data();
@@ -235,7 +230,7 @@ impl Title {
         Title::from_image(image, ncch_offset)
     }
 
-    /// the title whose NCCH is at ncch_offset in image.
+    /// the title whose NCCH is at ncch_offset in image
     fn from_image(image: Arc<RomImage>, ncch_offset: u64) -> Result<Title, FsError> {
         let data = image.data();
         let ncch_data = data.get(ncch_offset as usize..).ok_or(FsError::NoExecutablePartition)?;
@@ -251,8 +246,7 @@ impl Title {
         let exefs_offset = ncch_offset + ncch.exefs_offset;
         let exefs = ExeFs::parse(&data[exefs_offset as usize..])?;
 
-        // a game reads its data from the RomFS, without one that reads it
-        // stops on its first file
+        // a game reads its data from the RomFS, w/o one it stops on its first file
         let romfs = if ncch.has_romfs() {
             let fs = RomFs::parse(data, ncch_offset + ncch.romfs_offset)
                 .map_err(|error| FsError::UnreadableRomFs(error.to_string()))?;
@@ -274,8 +268,7 @@ impl Title {
         })
     }
 
-    /// runs the update's code and exheader from now on, and has its RomFS
-    /// for the game to open besides its own.
+    /// runs the update's code and exheader from now on, and has its RomFS for the game to open besides its own
     pub fn attach_update(&mut self, update: Update) {
         self.exheader = update.title.exheader.clone();
         self.update = Some(Box::new(update));
@@ -289,13 +282,12 @@ impl Title {
         self.update.as_deref_mut()
     }
 
-    /// the image the title is read from, to read it elsewhere.
+    /// the image the title is read from, to read it elsewhere
     pub fn shared_image(&self) -> Arc<RomImage> {
         self.image.clone()
     }
 
-    /// the exheader's bytes that describe the program, the update's when
-    /// there is one.
+    /// the exheader's bytes that describe the program, the update's when there's one
     pub fn exheader_bytes(&self) -> &[u8] {
         if let Some(update) = &self.update {
             return update.title.exheader_bytes();
@@ -304,8 +296,7 @@ impl Title {
         &self.image.data()[start..start + ExHeader::HASHED_SIZE]
     }
 
-    /// lays the mod in dir over the RomFS. what it changed, when it changed
-    /// anything.
+    /// lays the mod in dir over the RomFS, returns what it changed if it changed anything
     pub fn lay_mods(&mut self, dir: &Path) -> Result<Option<layered::Changes>, FsError> {
         let Some(romfs) = &self.romfs else {
             return Ok(None);
@@ -324,7 +315,7 @@ impl Title {
         self.ncch_offset
     }
 
-    /// raw bytes of an ExeFS entry, from the update when it has it.
+    /// raw bytes of an ExeFS entry, from the update when it has it
     pub fn exefs_file(&self, name: &str) -> Option<&[u8]> {
         if let Some(file) = self.update.as_ref().and_then(|update| update.title.exefs_file(name)) {
             return Some(file);
@@ -335,8 +326,7 @@ impl Title {
         self.image.data().get(start..end)
     }
 
-    /// the executable image, decompressed if the exheader says it is BLZ'd,
-    /// the update's when there is one.
+    /// the executable image, decompressed if the exheader says it's BLZ'd, the update's when there's one
     pub fn code(&self) -> Result<Vec<u8>, FsError> {
         if let Some(update) = &self.update {
             return update.title.code();
@@ -349,7 +339,7 @@ impl Title {
         }
     }
 
-    /// reads len bytes at offset from a RomFS file.
+    /// reads len bytes at offset from a RomFS file
     pub fn read_romfs(&self, file: &romfs::FileEntry, offset: u64, len: usize) -> Option<&[u8]> {
         let fs = self.romfs.as_ref()?;
         if offset >= file.data_size {
@@ -365,7 +355,7 @@ impl Title {
         self.ncch.program_id
     }
 
-    /// human-readable one-liner for the log banner.
+    /// readable one liner for the log banner
     pub fn describe(&self) -> String {
         format!(
             "{} [{}] title={:016X} v{}",
@@ -384,7 +374,7 @@ mod addon_tests {
     const DLC: u64 = 0x0004_008C_00AB_CD00;
 
     /// a game runs its update's code and exheader, and has the update's
-    /// RomFS besides its own.
+    /// RomFS besides its own
     #[test]
     fn a_game_runs_its_updates_code() {
         let game = write("update", "game.cxi", &ncch(GAME, Some(&[1; 8]), &[("a.bin", b"game")]));
@@ -405,7 +395,7 @@ mod addon_tests {
     }
 
     /// DLC lists every content its TMD has, and the RomFS of each it holds
-    /// reads by its index.
+    /// reads by its index
     #[test]
     fn dlc_contents_open_by_their_index() {
         let first = ncch(DLC, None, &[("quests/1.bin", b"one")]);

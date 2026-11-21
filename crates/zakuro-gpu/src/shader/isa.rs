@@ -1,6 +1,6 @@
-//! decoding of the PICA200 shader instruction set.
+//! decoding the PICA200 shader instruction set
 
-/// the subset of the instruction set a vertex shader actually uses.
+/// the subset of the instruction set a vertex shader actually uses
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
     Add,
@@ -40,18 +40,16 @@ pub enum OpCode {
     JmpC,
     JmpU,
     Cmp,
-    /// multiply-add whose *third* source is the wide one.
+    /// multiply add whose *third* source is the wide one
     MadI,
     Mad,
-    /// anything we do not model.
+    /// anything we don't model
     Unknown(u8),
 }
 
 impl OpCode {
-    /// whether this is one of the inverted encodings, whose wide operand
-    /// (the one that can be a uniform) is the second source.
-    /// whether it writes a destination register, which arithmetic does
-    /// but for mova and cmp.
+    /// is this one of the inverted encodings, whose wide operand (the one that can be a uniform) is the second source
+    /// does it write a destination register, arithmetic does except mova and cmp
     pub fn writes(self) -> bool {
         matches!(
             self,
@@ -123,10 +121,9 @@ impl OpCode {
             0x2B => OpCode::SetEmit,
             0x2C => OpCode::JmpC,
             0x2D => OpCode::JmpU,
-            // the low opcode bit belongs to the first comparison mode.
+            // the low opcode bit belongs to the first comparison mode
             0x2E..=0x2F => OpCode::Cmp,
-            // multiply-add only uses the top three opcode bits, the rest
-            // of the field holds the destination register.
+            // multiply add only uses the top three opcode bits, the rest of the field holds the destination register
             0x30..=0x37 => OpCode::MadI,
             0x38..=0x3F => OpCode::Mad,
             other => OpCode::Unknown(other),
@@ -134,7 +131,7 @@ impl OpCode {
     }
 }
 
-/// a raw instruction word.
+/// a raw instruction word
 #[derive(Debug, Clone, Copy)]
 pub struct Instruction(pub u32);
 
@@ -143,12 +140,12 @@ impl Instruction {
         OpCode::from_raw((self.0 >> 26) as u8)
     }
 
-    /// index into the operand descriptor table for an arithmetic instruction.
+    /// index into the operand descriptor table for an arithmetic instruction
     pub fn descriptor_index(self) -> u32 {
         self.0 & 0x7F
     }
 
-    /// (src1, src2) register numbers.
+    /// (src1, src2) register numbers
     pub fn sources(self) -> (u32, u32) {
         if self.opcode().is_inverted() {
             ((self.0 >> 14) & 0x1F, (self.0 >> 7) & 0x7F)
@@ -157,8 +154,7 @@ impl Instruction {
         }
     }
 
-    /// which address register indexes the wide source operand, src1
-    /// normally, src2 for the inverted forms, or zero for none.
+    /// which addr register indexes the wide source operand, src1 normally, src2 for the inverted forms, or zero for none
     pub fn address_register_index(self) -> u32 {
         (self.0 >> 19) & 0x3
     }
@@ -167,13 +163,13 @@ impl Instruction {
         (self.0 >> 21) & 0x1F
     }
 
-    // -- multiply-add, which packs its fields differently ------------------
+    // multiply add, which packs its fields differently
 
     pub fn mad_descriptor_index(self) -> u32 {
         self.0 & 0x1F
     }
 
-    /// (src1, src2, src3) register numbers.
+    /// (src1, src2, src3) register numbers
     pub fn mad_sources(self) -> (u32, u32, u32) {
         let src1 = (self.0 >> 17) & 0x1F;
         if self.opcode() == OpCode::MadI {
@@ -183,7 +179,7 @@ impl Instruction {
         }
     }
 
-    /// which address register indexes the wide source of a multiply-add.
+    /// which addr register indexes the wide source of a multiply add
     pub fn mad_address_register_index(self) -> u32 {
         (self.0 >> 22) & 0x3
     }
@@ -192,21 +188,21 @@ impl Instruction {
         (self.0 >> 24) & 0x1F
     }
 
-    // -- geometry shader output ---------------------------------------------
+    // geometry shader output
 
-    /// setemit, which of the three vertex slots the next emit fills.
+    /// setemit, which of the three vertex slots the next emit fills
     pub fn emit_vertex(self) -> usize {
         ((self.0 >> 24) & 0x3) as usize
     }
 
-    /// setemit, whether the next emit completes a triangle.
+    /// setemit, whether the next emit completes a triangle
     pub fn emit_primitive(self) -> bool {
         (self.0 >> 23) & 1 != 0
     }
 
-    // -- flow control ------------------------------------------------------
+    // flow control
 
-    /// (destination, instruction count).
+    /// (destination, instruction count)
     pub fn flow_target(self) -> (u32, u32) {
         (((self.0 >> 10) & 0xFFF), self.0 & 0xFF)
     }
@@ -223,34 +219,33 @@ impl Instruction {
         (self.0 >> 22) & 0x3
     }
 
-    /// which of x and y the condition compares, and how they combine.
+    /// which of x and y the condition compares, and how they combine
     pub fn condition_op(self) -> u32 {
         (self.0 >> 22) & 0x3
     }
 
-    /// the values the condition registers are compared against.
+    /// the values the condition registers get compared against
     pub fn condition_reference(self) -> [bool; 2] {
         [(self.0 >> 25) & 1 != 0, (self.0 >> 24) & 1 != 0]
     }
 
-    /// the two comparison modes a cmp applies to x and y.
+    /// the two comparison modes a cmp applies to x and y
     pub fn compare_modes(self) -> [u32; 2] {
         [(self.0 >> 24) & 0x7, (self.0 >> 21) & 0x7]
     }
 }
 
-/// supplies swizzles, negation and the write mask for an instruction.
+/// gives swizzles, negation and the write mask for an instruction
 #[derive(Debug, Clone, Copy)]
 pub struct OperandDescriptor(pub u32);
 
 impl OperandDescriptor {
-    /// which destination components the instruction writes.
+    /// which destination components the instruction writes
     pub fn destination_mask(self) -> u32 {
         self.0 & 0xF
     }
 
-    /// a source's swizzle, the component each one takes, and whether it is
-    /// negated, source being 1, 2 or 3.
+    /// a source's swizzle (the component each one takes) and if it's negated, source being 1, 2 or 3
     pub fn source(self, source: u32) -> ([u8; 4], bool) {
         let shift = [5, 14, 23][(source as usize - 1).min(2)];
         let pattern = (self.0 >> shift) & 0xFF;
@@ -271,7 +266,7 @@ impl OperandDescriptor {
     }
 }
 
-/// applies a swizzle pattern and optional negation.
+/// applies a swizzle pattern and optional negation
 fn swizzle(value: [f32; 4], pattern: u32, negate: bool) -> [f32; 4] {
     let pick = |component: u32| value[((pattern >> (6 - component * 2)) & 3) as usize];
     let mut out = [pick(0), pick(1), pick(2), pick(3)];
@@ -283,7 +278,7 @@ fn swizzle(value: [f32; 4], pattern: u32, negate: bool) -> [f32; 4] {
     out
 }
 
-/// decodes the 24-bit float format the shader uses for its uniforms.
+/// decodes the 24 bit float format the shader uses for its uniforms
 pub fn decode_float24(raw: u32) -> f32 {
     let raw = raw & 0x00FF_FFFF;
     if raw == 0 {
@@ -294,7 +289,7 @@ pub fn decode_float24(raw: u32) -> f32 {
     let mantissa = raw & 0xFFFF;
 
     if exponent == 0 {
-        // subnormal, the shader treats these as zero.
+        // subnormal, the shader treats these as zero
         return if sign != 0 { -0.0 } else { 0.0 };
     }
     if exponent == 0x7F {
@@ -315,13 +310,13 @@ mod tests {
 
     #[test]
     fn float24_decodes_simple_values() {
-        // 1.0 is exponent 63 (the bias) with a zero mantissa.
+        // 1.0 is exponent 63 (the bias) with a zero mantissa
         assert_eq!(decode_float24(63 << 16), 1.0);
-        // 2.0 raises the exponent by one.
+        // 2.0 raises the exponent by one
         assert_eq!(decode_float24(64 << 16), 2.0);
-        // 0.5 lowers it by one.
+        // 0.5 lowers it by one
         assert_eq!(decode_float24(62 << 16), 0.5);
-        // the sign bit is the top bit of the 24.
+        // the sign bit is the top bit of the 24
         assert_eq!(decode_float24((1 << 23) | (63 << 16)), -1.0);
         assert_eq!(decode_float24(0), 0.0);
     }
@@ -329,20 +324,19 @@ mod tests {
     #[test]
     fn swizzle_takes_x_from_the_top_pair() {
         let value = [1.0, 2.0, 3.0, 4.0];
-        // 0b00_01_10_11 selects x, y, z, w in order.
+        // 0b00_01_10_11 picks x, y, z, w in order
         assert_eq!(swizzle(value, 0b00_01_10_11, false), [1.0, 2.0, 3.0, 4.0]);
-        // broadcasting x to every component.
+        // broadcasting x to every component
         assert_eq!(swizzle(value, 0b00_00_00_00, false), [1.0; 4]);
-        // reversing.
+        // reversing
         assert_eq!(swizzle(value, 0b11_10_01_00, false), [4.0, 3.0, 2.0, 1.0]);
-        // negation applies after the swizzle.
+        // negation applies after the swizzle
         assert_eq!(swizzle(value, 0b00_00_00_00, true), [-1.0; 4]);
     }
 
     #[test]
     fn decodes_an_instruction_the_way_hardware_does() {
-        // mov o0, v0 as the assembler emits it, opcode 0x13, destination 0,
-        // source 0, descriptor 0.
+        // mov o0, v0 as the assembler emits it, opcode 0x13, destination 0, source 0, descriptor 0
         let instruction = Instruction(0x13 << 26);
         assert_eq!(instruction.opcode(), OpCode::Mov);
         assert_eq!(instruction.destination(), 0);

@@ -1,4 +1,4 @@
-//! the PICA200's shader units, which run both vertex and geometry shaders.
+//! the PICA200's shader units, they run both vertex and geometry shaders
 
 pub mod isa;
 mod batch;
@@ -14,10 +14,9 @@ use isa::{Instruction, OpCode, OperandDescriptor};
 pub const PROGRAM_SIZE: usize = 4096;
 pub const DESCRIPTOR_SIZE: usize = 128;
 
-/// the words fingerprint hashes on their own, the runs' hashes then going
-/// together, so that preparing a program hashes again only the runs an
-/// upload changed, rather than the 4224 words a title switching shaders
-/// uploads a few of.
+/// the words fingerprint hashes on their own, the runs' hashes then going together,
+/// so preparing a program only hashes again the runs an upload changed,
+/// instead of the 4224 words a title switching shaders uploads a few of
 const RUN: usize = 64;
 const RUNS: usize = (PROGRAM_SIZE + DESCRIPTOR_SIZE) / RUN;
 const _: () = assert!(PROGRAM_SIZE.is_multiple_of(RUN) && DESCRIPTOR_SIZE.is_multiple_of(RUN));
@@ -26,20 +25,19 @@ pub const INPUT_REGISTERS: usize = 16;
 pub const OUTPUT_REGISTERS: usize = 16;
 pub const TEMP_REGISTERS: usize = 16;
 
-/// a four-component vector, which is the only data type the shader has.
+/// a four component vector, the only data type the shader has
 pub type Vec4 = [f32; 4];
 
-/// how many decoded programs a unit keeps before starting over.
+/// how many decoded programs a unit keeps b4 starting over
 const DECODED_KEPT: usize = 64;
 
 pub const ZERO: Vec4 = [0.0; 4];
 
-/// what a temporary register holds before the program writes it, which
-/// titles count on. Project Mirai DX takes r15.w for a position's w before
-/// ever writing it, and a w of 0 leaves out the line its notes run along.
+/// what a temp register holds b4 the program writes it, titles count on it
+/// Project Mirai DX takes r15.w for a position's w b4 ever writing it, and a w of 0 leaves out the line its notes run along
 pub const TEMP_START: Vec4 = [0.0, 0.0, 0.0, 1.0];
 
-/// shader state that persists between vertices.
+/// shader state that sticks around between vertices
 #[derive(Clone)]
 pub struct ShaderUnit {
     pub program: Box<[u32; PROGRAM_SIZE]>,
@@ -49,20 +47,18 @@ pub struct ShaderUnit {
     pub bool_uniforms: u16,
     pub entry_point: u32,
 
-    /// upload cursors, driven by the command list.
+    /// upload cursors, driven by the command list
     pub program_write_offset: usize,
     pub descriptor_write_offset: usize,
     float_uniform_index: usize,
     float_uniform_component: usize,
     float_uniform_wide: bool,
     float_uniform_staging: [u32; 4],
-    /// the program decoded, none since it or its descriptors changed.
+    /// the program decoded, none since it or its descriptors changed
     decoded: Option<Arc<Program>>,
-    /// programs decoded before, by fingerprint. titles upload the program
-    /// again each time they switch shaders, often the same few.
+    /// programs decoded b4, by fingerprint, titles upload the program again each time they switch shaders, often the same few
     decoded_before: zakuro_common::hash::IntMap<u64, Arc<Program>>,
-    /// the runs of words the unit's fingerprint last went over, and their
-    /// hashes.
+    /// the runs of words the unit's fingerprint last went over, and their hashes
     hashed: Option<Box<Hashed>>,
 }
 
@@ -72,12 +68,12 @@ struct Hashed {
     hashes: [u64; RUNS],
 }
 
-/// takes a word into a hash, as fingerprint's lanes do.
+/// takes a word into a hash, as fingerprint's lanes do
 fn mix(hash: u64, word: u64) -> u64 {
     (hash.rotate_left(5) ^ word).wrapping_mul(0x517C_C1B7_2722_0A95)
 }
 
-/// a run's hash, in four lanes the CPU works on side by side.
+/// a run's hash, in four lanes the CPU works on side by side
 fn run_hash(run: &[u32; RUN]) -> u64 {
     let mut lanes = [0u64; 4];
     for chunk in run.as_chunks::<4>().0 {
@@ -115,8 +111,7 @@ impl ShaderUnit {
         }
     }
 
-    /// what a saved state keeps of the unit, its program, its uniforms and
-    /// where the uploads to them are.
+    /// what a save state keeps of the unit, its program, its uniforms and where the uploads to them are
     pub fn saved(&self) -> crate::state::UnitState {
         crate::state::UnitState {
             program: self.program.to_vec(),
@@ -134,7 +129,7 @@ impl ShaderUnit {
         }
     }
 
-    /// the unit as a saved state had it, false when it does not fit.
+    /// the unit as a save state had it, false when it doesn't fit
     pub fn restore(&mut self, state: &crate::state::UnitState) -> bool {
         if state.program.len() != PROGRAM_SIZE || state.descriptors.len() != DESCRIPTOR_SIZE || state.float_uniforms.len() != FLOAT_UNIFORMS {
             return false;
@@ -175,8 +170,7 @@ impl ShaderUnit {
         }
     }
 
-    /// decodes the program, if it changed, before running it on many
-    /// vertices.
+    /// decodes the program if it changed, b4 running it on lots of vertices
     pub fn prepare(&mut self) {
         if self.decoded.is_some() {
             return;
@@ -196,8 +190,7 @@ impl ShaderUnit {
         self.decoded = Some(program);
     }
 
-    /// a copy to shade a draw with on another thread, without the programs
-    /// decoded before.
+    /// a copy to shade a draw w/ on another thread, w/o the programs decoded b4
     pub fn for_draw(&self) -> ShaderUnit {
         ShaderUnit {
             program: self.program.clone(),
@@ -218,8 +211,7 @@ impl ShaderUnit {
         }
     }
 
-    /// whether the unit shades as other does: the same program from the
-    /// same entry point, with the same uniforms, NaNs included.
+    /// does the unit shade like other does, the same program from the same entry point w/ the same uniforms, NaNs included
     pub fn runs_like(&self, other: &ShaderUnit) -> bool {
         self.entry_point == other.entry_point
             && self.bool_uniforms == other.bool_uniforms
@@ -228,14 +220,12 @@ impl ShaderUnit {
             && self.float_uniforms.iter().zip(other.float_uniforms.iter()).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
     }
 
-    /// the input registers the program reads, one bit each, all of them
-    /// until it is prepared.
+    /// the input registers the program reads, one bit each, all of them till it's prepared
     pub fn inputs_read(&self) -> u16 {
         self.decoded.as_ref().map_or(u16::MAX, |program| program.inputs)
     }
 
-    /// a hash of the program and its descriptors, the same for the same
-    /// words.
+    /// a hash of the program and its descriptors, the same for the same words
     pub fn fingerprint(&self) -> u64 {
         if let Some(program) = &self.decoded {
             return program.fingerprint;
@@ -243,13 +233,12 @@ impl ShaderUnit {
         self.runs().map(run_hash).fold(0, mix)
     }
 
-    /// the program's runs of words, then the descriptors'.
+    /// the program's runs of words, then the descriptors'
     fn runs(&self) -> impl Iterator<Item = &[u32; RUN]> {
         self.program.as_chunks::<RUN>().0.iter().chain(self.descriptors.as_chunks::<RUN>().0)
     }
 
-    /// the fingerprint, hashing again only the runs that differ from the
-    /// last time.
+    /// the fingerprint, only hashing again the runs that differ from last time
     fn fingerprint_again(&mut self) -> u64 {
         let mut hashed = self.hashed.take().unwrap_or_else(|| Box::new(Hashed { runs: [[0; RUN]; RUNS], hashes: [run_hash(&[0; RUN]); RUNS] }));
         for ((run, kept), hash) in self.runs().zip(hashed.runs.iter_mut()).zip(hashed.hashes.iter_mut()) {
@@ -263,15 +252,14 @@ impl ShaderUnit {
         fingerprint
     }
 
-    /// starts a float uniform upload at the register the raw value names.
+    /// starts a float uniform upload at the register the raw value names
     pub fn set_float_uniform_index(&mut self, raw: u32) {
         self.float_uniform_index = (raw & 0x7F) as usize;
         self.float_uniform_component = 0;
         self.float_uniform_wide = raw & 0x8000_0000 != 0;
     }
 
-    /// float uniforms arrive component by component, three words carry four
-    /// packed 24-bit floats, or four words carry plain singles.
+    /// float uniforms arrive component by component, three words carry four packed 24 bit floats, or four words carry plain singles
     #[inline]
     pub fn upload_float_uniform(&mut self, word: u32) {
         let needed = if self.float_uniform_wide { 4 } else { 3 };
@@ -286,9 +274,8 @@ impl ShaderUnit {
         self.set_float_uniform(self.float_uniform_staging, self.float_uniform_wide);
     }
 
-    /// float uniform words in a row, as upload_float_uniform takes them,
-    /// a whole vector at a time once a vector starts. a draw's matrices
-    /// come this way, most of the words in a command list.
+    /// float uniform words in a row like upload_float_uniform takes them, a whole vector at a time once a vector starts
+    /// a draw's matrices come this way, most of the words in a command list
     pub fn upload_float_uniforms(&mut self, mut words: &[u32]) {
         // the rest of a vector the words before left unfinished
         while self.float_uniform_component != 0 {
@@ -308,13 +295,11 @@ impl ShaderUnit {
         }
     }
 
-    /// uploads the whole vectors of n words at the start of words, and
-    /// gives back the words after them.
+    /// uploads the whole vectors of n words at the start of words and gives back the words after them
     #[inline]
     fn upload_vectors<'a, const N: usize>(&mut self, words: &'a [u32]) -> &'a [u32] {
         let (vectors, rest) = words.as_chunks::<N>();
-        // staged as a word at a time stages them, the last vector's words
-        // stay there
+        // staged like a word at a time stages them, the last vector's words stay there
         let mut staged = self.float_uniform_staging;
         for vector in vectors {
             staged[..N].copy_from_slice(vector);
@@ -324,8 +309,7 @@ impl ShaderUnit {
         rest
     }
 
-    /// decodes a vector's staged words into the uniform the index names,
-    /// and moves the index on.
+    /// decodes a vector's staged words into the uniform the index names and moves the index on
     #[inline(always)]
     fn set_float_uniform(&mut self, staged: [u32; 4], wide: bool) {
         let value = if wide {
@@ -336,8 +320,7 @@ impl ShaderUnit {
                 f32::from_bits(staged[0]),
             ]
         } else {
-            // the four components are packed most significant first across
-            // three words.
+            // the four components are packed most significant first across three words
             [
                 isa::decode_float24(staged[2] & 0x00FF_FFFF),
                 isa::decode_float24(((staged[1] & 0x0000_FFFF) << 8) | (staged[2] >> 24)),
@@ -361,8 +344,7 @@ impl ShaderUnit {
         self.float_uniform_index += 1;
     }
 
-    /// the upload cursors, the staged words and the programs decoded, to
-    /// tell two units apart in tests.
+    /// the upload cursors, the staged words and the programs decoded, to tell two units apart in tests
     #[cfg(test)]
     pub(crate) fn cursors(&self) -> (usize, usize, bool, [u32; 4], Option<u64>, Vec<u64>) {
         let mut decoded_before: Vec<u64> = self.decoded_before.keys().copied().collect();
@@ -378,29 +360,29 @@ impl ShaderUnit {
     }
 }
 
-/// per-vertex shader state.
+/// per vertex shader state
 pub struct ShaderState {
     pub input: [Vec4; INPUT_REGISTERS],
     pub output: [Vec4; OUTPUT_REGISTERS],
     temp: [Vec4; TEMP_REGISTERS],
     address: [i32; 3],
     condition: [bool; 2],
-    /// open calls, if bodies and loops, innermost last.
+    /// open calls, if bodies and loops, innermost last
     blocks: Vec<Block>,
 }
 
-/// a range of instructions that, once finished, sends execution elsewhere.
+/// a range of instructions that sends execution elsewhere once finished
 #[derive(Debug, Clone, Copy)]
 struct Block {
-    /// the address just past the block's last instruction.
+    /// the addr just past the block's last instruction
     end: u32,
-    /// where execution goes once the block is done.
+    /// where execution goes once the block is done
     return_address: u32,
-    /// further iterations to run, zero for anything but a loop.
+    /// further iterations to run, zero for anything but a loop
     repeat: u32,
-    /// added to the loop counter each time the block completes.
+    /// added to the loop counter each time the block completes
     increment: i32,
-    /// where each further iteration starts.
+    /// where each further iteration starts
     start: u32,
     is_loop: bool,
 }
@@ -431,7 +413,7 @@ impl ShaderState {
         self.blocks.clear();
     }
 
-    /// enters a block starting at start and running count instructions.
+    /// enters a block starting at start and running count instructions
     fn enter(&mut self, start: u32, count: u32, return_address: u32) -> u32 {
         self.blocks.push(Block {
             end: start + count,
@@ -445,36 +427,34 @@ impl ShaderState {
     }
 }
 
-/// what a geometry shader's emit produces, up to three vertices at a time,
-/// sent on as a triangle when setemit says the next one completes it.
+/// what a geometry shader's emit makes, up to three vertices at a time, sent on as a triangle when setemit says the next one completes it
 #[derive(Default)]
 pub struct Emitter {
     slots: [[Vec4; OUTPUT_REGISTERS]; 3],
     slot: usize,
     completes_primitive: bool,
-    /// finished triangles, as each vertex's output registers.
+    /// finished triangles, as each vertex's output registers
     pub triangles: Vec<[[Vec4; OUTPUT_REGISTERS]; 3]>,
 }
 
-/// one source of an instruction, with its descriptor applied ahead of time.
+/// one source of an instruction, w/ its descriptor applied ahead of time
 #[derive(Debug, Clone, Copy, Default)]
 struct Operand {
     register: u32,
-    /// the component each one takes.
+    /// the component each one takes
     swizzle: [u8; 4],
     negate: bool,
-    /// the address register that offsets it, zero for none.
+    /// the addr register that offsets it, zero for none
     index: u32,
 }
 
-/// an instruction with everything it reads from its encoding and its
-/// descriptor worked out, which only the program changing changes.
+/// an instruction w/ everything it reads from its encoding and its descriptor worked out, only the program changing changes it
 #[derive(Debug, Clone, Copy)]
 struct Op {
     instruction: Instruction,
     opcode: OpCode,
     destination: u32,
-    /// the components written, the most significant bit being x.
+    /// the components written, the most significant bit is x
     mask: u32,
     sources: [Operand; 3],
 }
@@ -491,8 +471,7 @@ impl Op {
                 let descriptor =
                     OperandDescriptor(descriptors[instruction.mad_descriptor_index() as usize % DESCRIPTOR_SIZE]);
                 let (src1, src2, src3) = instruction.mad_sources();
-                // the address register applies to whichever source is the
-                // wide one
+                // the addr register applies to whichever source is the wide one
                 let index = instruction.mad_address_register_index();
                 let (index2, index3) = if opcode == OpCode::MadI { (0, index) } else { (index, 0) };
                 Op {
@@ -511,8 +490,7 @@ impl Op {
                 let descriptor =
                     OperandDescriptor(descriptors[instruction.descriptor_index() as usize % DESCRIPTOR_SIZE]);
                 let (src1, src2) = instruction.sources();
-                // only the wide operand can be a uniform, and only a uniform
-                // read can be indexed by an address register
+                // only the wide operand can be a uniform, and only a uniform read can be indexed by an addr register
                 let index = instruction.address_register_index();
                 let (index1, index2) = if opcode.is_inverted() { (0, index) } else { (index, 0) };
                 Op {
@@ -531,14 +509,13 @@ impl Op {
     }
 }
 
-/// a shader unit's program, decoded once to be run on every vertex.
+/// a shader unit's program, decoded once to be run on every vertex
 pub struct Program {
     ops: Box<[Op]>,
-    /// the input registers anything reads and the output registers
-    /// anything writes, one bit each.
+    /// the input registers anything reads and the output registers anything writes, one bit each
     inputs: u16,
     outputs: u16,
-    /// a hash of the words it came from, which the GPU keeps programs by.
+    /// a hash of the words it came from, which the GPU keeps programs by
     fingerprint: u64,
 }
 
@@ -570,24 +547,20 @@ impl Program {
     }
 }
 
-/// an if's body when it is taken, its else when it is not, and where both
-/// come back to, as the interpreter's blocks have them.
+/// an if's body when it's taken, its else when it isn't, and where both come back to, like the interpreter's blocks have them
 fn if_ranges(pc: u32, destination: u32, count: u32) -> ((u32, u32), (u32, u32), u32) {
     let then_end = (pc + 1) + (destination - (pc + 1).min(destination));
     ((pc + 1, then_end), (destination, destination + count), destination + count)
 }
 
 impl Program {
-    /// the float uniforms what lands in the output registers given can come
-    /// from, in what the program can run from its entry point, one bit
-    /// each, those read as they are and those read through an address
-    /// register, which can be any from the one named on. the address
-    /// registers and the conditions are left out, they pick what runs
-    /// rather than feed what it works out.
+    /// the float uniforms what lands in the given output registers can come from,
+    /// in what the program can run from its entry point, one bit each
+    /// the ones read as they are and the ones read thru an addr register, which can be any from the one named on
+    /// the addr registers and the conditions are left out, they pick what runs instead of feeding what it works out
     pub(crate) fn uniforms_feeding(&self, entry: u32, outputs: u16) -> (u128, u128) {
         let reached = self.reached(entry);
-        // outputs 0x00 to 0x0F and temporaries 0x10 to 0x1F, as both
-        // destinations and sources number them
+        // outputs 0x00 to 0x0F and temps 0x10 to 0x1F, like both destinations and sources number them
         let mut wanted = outputs as u32;
         let (mut uniforms, mut indexed) = (0u128, 0u128);
         loop {
@@ -618,8 +591,7 @@ impl Program {
         }
     }
 
-    /// the instructions the program can run from its entry point, through
-    /// whichever way each branch goes.
+    /// the instructions the program can run from its entry point, thru whichever way each branch goes
     fn reached(&self, entry: u32) -> Vec<bool> {
         let mut reached = vec![false; self.ops.len()];
         let mut walked = std::collections::HashSet::new();
@@ -664,16 +636,13 @@ impl Program {
 }
 
 impl ShaderUnit {
-    /// the float uniforms what lands in the output registers given comes
-    /// from, see Program::uniforms_feeding, all of them until the program
-    /// is prepared, as those that only these outputs read and those that
-    /// the texture coordinates' outputs can read through an address
-    /// register too, which a uniform the coordinates read as it is never
-    /// is. a palette of matrices that place the vertices is of the first,
-    /// also when the lighting reads it. a block of uniforms that a sprite
-    /// drawn among others finds both its place and its offset into its
-    /// sheet of sprites in, or a palette that a title's shader for every
-    /// material keeps such offsets in too, is of the second.
+    /// the float uniforms what lands in the given output registers comes from (see Program::uniforms_feeding),
+    /// all of them till the program is prepared
+    /// the ones only these outputs read, and the ones the texture coords' outputs can read thru an addr register
+    /// too, a uniform the coords read as is never is
+    /// a palette of matrices that place the vertices is of the first kind, also when the lighting reads it
+    /// a block of uniforms where a sprite drawn among others finds both its place and its offset into its sprite
+    /// sheet, or a palette where a title's shader for every material keeps such offsets too, is of the second
     pub(crate) fn uniforms_feeding(&self, outputs: u16, coordinates: u16) -> (u128, u128) {
         let Some(program) = &self.decoded else { return ((1 << FLOAT_UNIFORMS) - 1, 0) };
         let (direct, indexed) = program.uniforms_feeding(self.entry_point, outputs);
@@ -683,8 +652,7 @@ impl ShaderUnit {
     }
 }
 
-/// runs the vertex shader over many vertices, a batch of them at a time,
-/// giving what running it on each would give.
+/// runs the vertex shader over lots of vertices, a batch of them at a time, giving what running it on each would give
 pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
     let decoded;
     let program = match &unit.decoded {
@@ -694,11 +662,11 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
             &decoded
         }
     };
-    // tracing NaNs is the interpreter's
+    // tracing NaNs is the interpreter's job
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
-    // the program compiled, the batches it gives back shaded the way below
+    // the program compiled, the batches it gives back get shaded the way below
     #[cfg(feature = "jit")]
     if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
         let mut uniforms = None;
@@ -724,7 +692,7 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
     outputs
 }
 
-/// runs the shader over one vertex.
+/// runs the shader over one vertex
 pub fn run(unit: &ShaderUnit, state: &mut ShaderState) {
     match &unit.decoded {
         Some(program) => execute(unit, program, state, None),
@@ -732,9 +700,8 @@ pub fn run(unit: &ShaderUnit, state: &mut ShaderState) {
     }
 }
 
-/// runs a geometry shader over many primitives' inputs, a batch of them
-/// at a time, giving each one's triangles in order, what running it on
-/// each would give.
+/// runs a geometry shader over lots of primitives' inputs, a batch of them at a time,
+/// giving each one's triangles in order, what running it on each would give
 pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<Vec<batch::Triangle>> {
     let decoded;
     let program = match &unit.decoded {
@@ -777,8 +744,7 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
     triangles
 }
 
-/// runs a geometry shader over one primitive's worth of input, collecting
-/// what it emits.
+/// runs a geometry shader over one primitive's worth of input, collecting what it emits
 pub fn run_geometry(unit: &ShaderUnit, state: &mut ShaderState, emitter: &mut Emitter) {
     match &unit.decoded {
         Some(program) => execute(unit, program, state, Some(emitter)),
@@ -788,17 +754,16 @@ pub fn run_geometry(unit: &ShaderUnit, state: &mut ShaderState, emitter: &mut Em
 
 fn execute(unit: &ShaderUnit, program: &Program, state: &mut ShaderState, mut emitter: Option<&mut Emitter>) {
     state.reset();
-    // debugging aid, RUST_LOG=zakuro_gpu::shader::nan=trace reports the
-    // first instruction of each run whose result is NaN, with its operands.
+    // debugging aid, `RUST_LOG=zakuro_gpu::shader::nan=trace` reports the first instruction of each run whose
+    // result is NaN, w/ its operands
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut nan_reported = false;
     let mut pc = unit.entry_point;
-    // a program that never ends is a decoding bug, cap it rather than hang.
+    // a program that never ends is a decoding bug, cap it instead of hanging
     let mut budget = 0u32;
 
     loop {
-        // finishing a block, go round a loop again, or return to whatever
-        // follows it. Several blocks can end at the same address.
+        // finishing a block, go round a loop again or return to whatever follows it, several blocks can end at the same addr
         while let Some(top) = state.blocks.last_mut() {
             if pc != top.end {
                 break;
@@ -862,10 +827,10 @@ fn execute(unit: &ShaderUnit, program: &Program, state: &mut ShaderState, mut em
             OpCode::IfC | OpCode::IfU => {
                 let (destination, count) = instruction.flow_target();
                 next = if flow_condition(unit, state, instruction) {
-                    // run the body, then skip the else block.
+                    // run the body, then skip the else block
                     state.enter(pc + 1, destination - (pc + 1).min(destination), destination + count)
                 } else {
-                    // run the else block, then carry on after it.
+                    // run the else block, then carry on after it
                     state.enter(destination, count, destination + count)
                 };
             }
@@ -886,7 +851,7 @@ fn execute(unit: &ShaderUnit, program: &Program, state: &mut ShaderState, mut em
                 if instruction.opcode() == OpCode::Break
                     || flow_condition(unit, state, instruction)
                 {
-                    // leave the innermost loop, and any if or call inside it.
+                    // leave the innermost loop, and any if or call inside it
                     while let Some(block) = state.blocks.pop() {
                         if block.is_loop {
                             next = block.return_address;
@@ -909,7 +874,7 @@ fn execute(unit: &ShaderUnit, program: &Program, state: &mut ShaderState, mut em
     }
 }
 
-/// the registers an instruction reads and their values, for tracing.
+/// the registers an instruction reads and their values, for tracing
 fn operand_values(unit: &ShaderUnit, state: &ShaderState, instruction: Instruction) -> Vec<(u32, Vec4)> {
     let registers: Vec<u32> = match instruction.opcode() {
         OpCode::Mad | OpCode::MadI => {
@@ -927,7 +892,7 @@ fn operand_values(unit: &ShaderUnit, state: &ShaderState, instruction: Instructi
         .collect()
 }
 
-/// logs the instruction if it just produced the run's first NaN.
+/// logs the instruction if it just made the run's first NaN
 fn report_nan(state: &ShaderState, pc: u32, instruction: Instruction, operands: &[(u32, Vec4)]) -> bool {
     let nan = |v: &Vec4| v.iter().any(|c| c.is_nan());
     if !state.temp.iter().chain(state.output.iter()).any(nan) {
@@ -945,14 +910,14 @@ fn report_nan(state: &ShaderState, pc: u32, instruction: Instruction, operands: 
     true
 }
 
-/// applies an address register to a uniform operand.
+/// applies an addr register to a uniform operand
 fn indexed(state: &ShaderState, register: u32, index: u32) -> u32 {
     if register < 0x20 || index == 0 {
         return register;
     }
     let offset = state.address[(index - 1) as usize % 3];
     let uniform = (register as i32 - 0x20).wrapping_add(offset);
-    // out of range reads fall on no uniform at all.
+    // out of range reads fall on no uniform at all
     if (0..FLOAT_UNIFORMS as i32).contains(&uniform) {
         uniform as u32 + 0x20
     } else {
@@ -972,7 +937,7 @@ fn source_value(unit: &ShaderUnit, state: &ShaderState, register: u32) -> Vec4 {
     }
 }
 
-/// a source's value, swizzled and negated as its descriptor says.
+/// a source's value, swizzled and negated like its descriptor says
 #[inline]
 fn operand(unit: &ShaderUnit, state: &ShaderState, operand: &Operand) -> Vec4 {
     let register = indexed(state, operand.register, operand.index);
@@ -993,14 +958,12 @@ fn arithmetic(unit: &ShaderUnit, state: &mut ShaderState, op: &Op) {
     let result: Vec4 = match op.opcode {
         OpCode::Add => component_wise(src1, src2, |a, b| a + b),
         OpCode::Mul => component_wise(src1, src2, multiply),
-        // written so NaN behaves as it does on hardware, max(0, NaN) is NaN
-        // but max(NaN, 0) is 0.
+        // written so NaN acts like on hardware, max(0, NaN) is NaN but max(NaN, 0) is 0
         OpCode::Max => component_wise(src1, src2, |a, b| if a > b { a } else { b }),
         OpCode::Min => component_wise(src1, src2, |a, b| if a < b { a } else { b }),
         OpCode::Dp3 => [dot(&src1[..3], &src2[..3]); 4],
         OpCode::Dp4 => [dot(&src1, &src2); 4],
-        // dph takes the fourth component of the first operand as one, which
-        // is how a position is transformed without padding it first.
+        // dph takes the first operand's fourth component as one, that's how a position gets transformed w/o padding it first
         OpCode::Dph | OpCode::DphI => [dot(&src1[..3], &src2[..3]) + src2[3]; 4],
         OpCode::Mov => src1,
         OpCode::Flr => [
@@ -1019,12 +982,11 @@ fn arithmetic(unit: &ShaderUnit, state: &mut ShaderState, op: &Op) {
         OpCode::Slt | OpCode::SltI => {
             component_wise(src1, src2, |a, b| (a < b) as u32 as f32)
         }
-        // dst builds the classic attenuation vector (1, d, d², 1/d).
+        // dst builds the classic attenuation vector (1, d, d², 1/d)
         OpCode::Dst | OpCode::DstI => {
             [1.0, multiply(src1[1], src2[1]), src1[2], src2[3]]
         }
-        // prepares a lighting computation, and records which of the two
-        // terms that matter were non-negative.
+        // prepares a lighting computation and records which of the two terms that matter were non negative
         OpCode::LitP => {
             state.condition = [src1[0] >= 0.0, src1[3] >= 0.0];
             [
@@ -1073,12 +1035,11 @@ fn multiply_add(unit: &ShaderUnit, state: &mut ShaderState, op: &Op) {
     write_masked(state, op.destination, op.mask, result);
 }
 
-/// the shader's multiply, which gives zero rather than NaN for zero times
-/// infinity.
+/// the shader's multiply, it gives zero instead of NaN for zero times infinity
 #[inline(always)]
 fn multiply(a: f32, b: f32) -> f32 {
     let product = a * b;
-    // without short circuits, so that it stays a select many lanes do at once
+    // w/o short circuits, so it stays a select lots of lanes do at once
     if product.is_nan() & !a.is_nan() & !b.is_nan() {
         0.0
     } else {
@@ -1102,7 +1063,7 @@ fn write_masked(state: &mut ShaderState, register: u32, mask: u32, value: Vec4) 
         0x10..=0x1F => &mut state.temp[(register - 0x10) as usize],
         _ => return,
     };
-    // the mask's most significant bit selects x.
+    // the mask's most significant bit picks x
     for component in 0..4 {
         if mask & (0b1000 >> component) != 0 {
             slot[component] = value[component];
@@ -1127,8 +1088,7 @@ fn flow_condition(unit: &ShaderUnit, state: &ShaderState, instruction: Instructi
     match instruction.opcode() {
         OpCode::Call => true,
         OpCode::CallU | OpCode::IfU => unit.bool_uniforms & (1 << instruction.bool_index()) != 0,
-        // jmpu can test for either value, the low bit of its (otherwise
-        // unused) count field inverts the condition.
+        // jmpu can test for either value, the low bit of its (otherwise unused) count field flips the condition
         OpCode::JmpU => {
             let set = unit.bool_uniforms & (1 << instruction.bool_index()) != 0;
             set == (instruction.flow_target().1 & 1 == 0)
@@ -1162,12 +1122,11 @@ mod tests {
         unit
     }
 
-    /// descriptor 0, write every component, identity swizzle on both sources.
+    /// descriptor 0, write every component, identity swizzle on both sources
     const IDENTITY: u32 = 0xF | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
 
-    /// the fingerprint prepare works out run by run is the one worked out
-    /// over every word, after uploads anywhere in the program and the
-    /// descriptors, words written straight in, and the same words again.
+    /// the fingerprint prepare works out run by run is the one worked out over every word,
+    /// after uploads anywhere in the program and descriptors, words written straight in, and the same words again
     #[test]
     fn fingerprints_hashed_again_by_runs_are_whole_ones() {
         let mut unit = ShaderUnit::new();
@@ -1207,11 +1166,11 @@ mod tests {
             assert_eq!(unit.fingerprint(), whole, "round {round}");
             seen.insert(whole);
         }
-        // every round but the fifteen uploading the same words changed it
+        // every round except the fifteen uploading the same words changed it
         assert_eq!(seen.len(), 45);
     }
 
-    /// a little random number generator, the same numbers every run.
+    /// a lil random number generator, same numbers every run
     struct Random(u64);
 
     impl Random {
@@ -1224,7 +1183,7 @@ mod tests {
             self.next() % n
         }
 
-        /// mostly ordinary numbers, now and then a zero, an infinity or a NaN.
+        /// mostly ordinary numbers, now and then a zero, an infinity or a NaN
         fn float(&mut self) -> f32 {
             match self.below(40) {
                 0 => 0.0,
@@ -1237,7 +1196,7 @@ mod tests {
         }
     }
 
-    /// what shading each vertex on its own gives.
+    /// what shading each vertex on its own gives
     fn one_by_one(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
         inputs
             .iter()
@@ -1250,7 +1209,7 @@ mod tests {
             .collect()
     }
 
-    /// the batches alone, without the program compiled.
+    /// the batches alone, w/o the program compiled
     fn batched(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
         let program = unit.decoded.as_ref().expect("a prepared unit");
         let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
@@ -1262,8 +1221,8 @@ mod tests {
         outputs
     }
 
-    /// the unit's program compiles at each tier, as it has to wherever there
-    /// is a compiler, and shades the inputs as one vertex at a time does.
+    /// the unit's program compiles at each tier (it has to wherever there's a compiler) and shades the inputs like
+    /// one vertex at a time does
     #[cfg_attr(not(feature = "jit"), allow(unused_variables))]
     fn assert_compiled(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]], single: &[[Vec4; OUTPUT_REGISTERS]]) {
         #[cfg(feature = "jit")]
@@ -1280,19 +1239,18 @@ mod tests {
         }
     }
 
-    /// the same results, a NaN matching any NaN and zeros their sign.
+    /// the same results, a NaN matching any NaN and zeros their sign
     fn same(a: &[[Vec4; OUTPUT_REGISTERS]], b: &[[Vec4; OUTPUT_REGISTERS]]) -> bool {
         let same = |x: f32, y: f32| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits();
         a.len() == b.len() && a.iter().flatten().flatten().zip(b.iter().flatten().flatten()).all(|(&x, &y)| same(x, y))
     }
 
-    /// the uniforms that feed an output are those its value comes from,
-    /// through temporaries, not those of other outputs, and one read
-    /// through an address register can be any from it on. a program past
-    /// the end or not called is not looked at.
+    /// the uniforms that feed an output are the ones its value comes from, thru temps, not those of other outputs,
+    /// and one read thru an addr register can be any from it on
+    /// a program past the end or not called doesn't get looked at
     #[test]
     fn the_uniforms_feeding_an_output_are_followed_through_the_program() {
-        // op, destination, address register, wide source, narrow source
+        // op, destination, addr register, wide source, narrow source
         let arithmetic = |op: u32, destination: u32, index: u32, wide: u32, narrow: u32| {
             (op << 26) | (destination << 21) | (index << 19) | (wide << 12) | (narrow << 7)
         };
@@ -1312,9 +1270,8 @@ mod tests {
         assert_eq!(unit.uniforms_feeding(0b001, 0), (1 << 0, 0));
         assert_eq!(unit.uniforms_feeding(0b011, 0), (1 << 0 | 1 << 5 | 1 << 6, 0));
         assert_eq!(unit.uniforms_feeding(0b100, 0), (1 << 9, 0));
-        // o0 = c[a0.x + 20] . v0, o1 = c[a0.x + 20] . v1, o2 = c94 + v1, a
-        // palette that the lighting in o1 reads too, and a texture's
-        // coordinates in o2
+        // o0 = c[a0.x + 20] . v0, o1 = c[a0.x + 20] . v1, o2 = c94 + v1, a palette the lighting in o1 reads too,
+        // and a texture's coords in o2
         let indexed = [
             arithmetic(dp4, 0x00, 1, 0x20 + 20, 0x00),
             arithmetic(dp4, 0x01, 1, 0x20 + 20, 0x01),
@@ -1325,9 +1282,9 @@ mod tests {
         unit.prepare();
         let palette = ((1 << 96) - 1) & !((1 << 20) - 1);
         assert_eq!(unit.uniforms_feeding(0b001, 0b100), (palette & !(1 << 94), 0), "the sprite's offset is not the palette's");
-        // o0 = c[a0.x + 20] . v0, o2 = c[a0.x + 30], a sprite's block of
-        // uniforms, its place and its offset in its sheet, of which only
-        // what the place reads before the offset's reach is its own
+        // o0 = c[a0.x + 20] . v0, o2 = c[a0.x + 30],
+        // a sprite's block of uniforms (its place and its offset in its sheet),
+        // only what the place reads b4 the offset's reach is its own
         let sprites = [arithmetic(dp4, 0x00, 1, 0x20 + 20, 0x00), arithmetic(mov, 0x02, 1, 0x20 + 30, 0x00), end];
         let mut unit = unit_with(&sprites, &[IDENTITY]);
         unit.prepare();
@@ -1335,9 +1292,8 @@ mod tests {
         assert_eq!(unit.uniforms_feeding(0b001, 0b100), (own, ((1 << 96) - 1) & !((1 << 30) - 1)));
     }
 
-    /// the batches give exactly what the interpreter gives, over programs
-    /// made of every arithmetic instruction with random registers,
-    /// swizzles, masks and address registers.
+    /// the batches give exactly what the interpreter gives,
+    /// over programs made of every arithmetic instruction w/ random registers, swizzles, masks and addr registers
     #[test]
     fn batches_shade_like_the_interpreter() {
         let mut random = Random(1);
@@ -1352,7 +1308,7 @@ mod tests {
                 *descriptor = (random.next() & 0x7FFF_FFF0) | (random.below(15) + 1);
             }
             let mut program = Vec::new();
-            // address registers from an input, for the indexed reads after
+            // addr registers from an input, for the indexed reads after
             program.push((0x12 << 26) | (random.below(16) << 12) | random.below(32));
             for _ in 0..24 {
                 let (destination, index, descriptor) = (random.below(32), random.below(4), random.below(32));
@@ -1399,9 +1355,8 @@ mod tests {
         }
     }
 
-    /// programs whose vertices branch apart every way the shader can, an
-    /// if and else, a conditional jump, a loop left early and a call, come
-    /// out the same batched as one vertex at a time.
+    /// programs whose vertices branch apart every way the shader can (an if and else, a conditional jump,
+    /// a loop left early and a call) come out the same batched as one vertex at a time
     #[test]
     fn batches_that_branch_apart_shade_like_the_interpreter() {
         let mut random = Random(3);
@@ -1482,10 +1437,9 @@ mod tests {
         }
     }
 
-    /// ifs nested in ifs, on conditions and on booleans, jumps ahead and
-    /// ifs and elses made of jumps, in loops and in a call too, whose
-    /// vertices part ways at every one, come out the same compiled as one
-    /// vertex at a time, without a batch going back.
+    /// ifs nested in ifs, on conditions and on booleans, jumps ahead and ifs and elses made of jumps,
+    /// in loops and in a call too, whose vertices part ways at every one,
+    /// come out the same compiled as one vertex at a time, w/o a batch going back
     #[test]
     fn parted_branches_shade_like_the_interpreter() {
         fn block(random: &mut Random, program: &mut Vec<u32>, depth: u32) {
@@ -1506,9 +1460,8 @@ mod tests {
                         program[at] = (0x29 << 26) | (((program.len() - 1) as u32) << 10);
                     }
                     5 | 6 => {
-                        // a jump ahead over a block, or over the block that
-                        // is an else, the one before it, the then, ending in
-                        // a jump on a boolean over it
+                        // a jump ahead over a block, or over the block that's an else (the one b4 it,
+                        // the then) ending in a jump on a boolean over it
                         let at = program.len();
                         program.push(0);
                         block(random, program, depth + 1);
@@ -1563,7 +1516,7 @@ mod tests {
             }
             unit.bool_uniforms = random.next() as u16;
             unit.int_uniforms[0] = [random.below(3) as u8, 0, 1, 0];
-            // the address registers and conditions from the inputs first
+            // the addr registers and conditions from the inputs first
             let mut program = vec![(0x12 << 26) | (random.below(16) << 12) | random.below(32)];
             block(&mut random, &mut program, 0);
             // a call to a routine past the end
@@ -1592,8 +1545,7 @@ mod tests {
         }
     }
 
-    /// how fast a typical transform and lighting program shades, compared
-    /// with one vertex at a time, cargo test -- --ignored --nocapture.
+    /// how fast a typical transform and lighting program shades compared w/ one vertex at a time, `cargo test -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn batch_speed() {
@@ -1605,9 +1557,8 @@ mod tests {
         unit.descriptors[0] = IDENTITY;
         let dp4 = |dest: u32, uniform: u32, src: u32| (0x02 << 26) | (dest << 21) | (uniform << 12) | (src << 7);
         let mut program = Vec::new();
-        // four dot products into r0, four into o0, a multiply-add, a
-        // max, a mul, a mov, the kind of thing a vertex program does,
-        // eight times over, about as long as the programs titles run
+        // four dot products into r0, four into o0, a multiply add, a max, a mul, a mov,
+        // the kind of stuff a vertex program does, eight times over, about as long as the programs titles run
         for _ in 0..8 {
             for i in 0..4 {
                 program.push(dp4(0x10, 0x20 + i, 0));
@@ -1625,8 +1576,7 @@ mod tests {
             unit.program[i] = word;
         }
         unit.prepare();
-        // a draw's worth, which the cache holds, as a draw's inputs are,
-        // shaded many times over
+        // a draw's worth, which the cache holds like a draw's inputs, shaded lots of times over
         let inputs: Vec<[Vec4; INPUT_REGISTERS]> =
             (0..4096).map(|_| std::array::from_fn(|_| std::array::from_fn(|_| (random.next() % 100) as f32 / 50.0))).collect();
         const TIMES: usize = 50;
@@ -1653,7 +1603,7 @@ mod tests {
         );
     }
 
-    /// the compiled program alone, many times over, for a profiler.
+    /// the compiled program alone, lots of times over, for a profiler
     #[test]
     #[ignore]
     fn compiled_speed() {
@@ -1694,12 +1644,10 @@ mod tests {
         println!("compiled {:.3} ns an instruction a vertex", start.elapsed().as_secs_f64() * 1e9 / instructions);
     }
 
-    /// a branch half the vertices take and half do not still sends each
-    /// its own way.
+    /// a branch half the vertices take and half don't still sends each its own way
     #[test]
     fn a_branch_that_splits_a_batch() {
-        // cmp c0, v0 with x less than, so v0 above zero, then an if on x,
-        // taking mov o0, c1 or the else, mov o0, c2
+        // cmp c0, v0 w/ x less than, so v0 above zero, then an if on x, taking mov o0, c1 or the else, mov o0, c2
         let cmp = (0x2E << 26) | (2 << 24) | (0x20 << 12);
         let ifc = (0x28 << 26) | (1 << 25) | (2 << 22) | (3 << 10) | 1;
         let then = (0x13 << 26) | (0x21 << 12);
@@ -1722,8 +1670,7 @@ mod tests {
         assert!(same(&outputs, &one_by_one(&unit, &inputs)));
     }
 
-    /// zero times infinity is zero compiled as in the interpreter, without
-    /// the batch going back.
+    /// zero times infinity is zero compiled like in the interpreter, w/o the batch going back
     #[test]
     fn zero_times_infinity_stays_compiled() {
         // mul o0, c0, v0, then dp4 o1, c0, v0
@@ -1746,7 +1693,7 @@ mod tests {
         assert_eq!(jit::compiled(&unit, unit.decoded.as_ref().expect("prepared")).expect("compiled").returned(), 0);
     }
 
-    /// a loop adds up the uniforms its counter walks over.
+    /// a loop adds up the uniforms its counter walks over
     #[test]
     fn a_loop_walks_uniforms_the_same_way() {
         // loop i0 over add r0, r0, c0[aL], then mov o0, r0
@@ -1790,7 +1737,7 @@ mod tests {
 
     #[test]
     fn honours_the_destination_mask() {
-        // only the x and z components are written.
+        // only the x and z components are written
         let descriptor = 0b1010 | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
         let unit = unit_with(&[0x13 << 26, 0x22 << 26], &[descriptor]);
         let mut state = ShaderState::new();
@@ -1799,8 +1746,7 @@ mod tests {
         assert_eq!(state.output[0], [1.0, 0.0, 3.0, 0.0]);
     }
 
-    /// a temporary read before anything is written to it holds a w of 1,
-    /// shaded on its own or in a batch.
+    /// a temp read b4 anything gets written to it holds a w of 1, shaded on its own or in a batch
     #[test]
     fn an_unwritten_temporary_has_a_w_of_one() {
         // mov o0, r15, end
@@ -1810,18 +1756,17 @@ mod tests {
         assert_eq!(run_vertices(&unit, &inputs)[0][0], [0.0, 0.0, 0.0, 1.0]);
     }
 
-    /// a shader with no end must still terminate.
+    /// a shader w/ no end must still stop
     #[test]
     fn a_runaway_program_stops() {
-        // jmp 0, forever.
+        // jmp 0, forever (and ever)
         let jump = 0x2C << 26;
         let unit = unit_with(&[jump], &[IDENTITY]);
         let mut state = ShaderState::new();
         run(&unit, &mut state);
     }
 
-    /// a program that never ends stops where the interpreter stops it, the
-    /// compiled code giving the batch back once it runs that long.
+    /// a program that never ends stops where the interpreter stops it, the compiled code giving the batch back once it runs that long
     #[test]
     fn a_runaway_program_stops_the_same_compiled() {
         // jmpc 0 on a condition that holds, forever
@@ -1833,9 +1778,8 @@ mod tests {
         assert!(same(&run_vertices(&unit, &inputs), &single));
     }
 
-    /// a break outside any loop leaves the call that came to it and goes on
-    /// after itself, before that call, forever, and stops compiled where the
-    /// interpreter stops it.
+    /// a break outside any loop leaves the call that came to it and goes on after itself, b4 that call, forever,
+    /// and stops compiled where the interpreter stops it
     #[test]
     fn a_break_outside_a_loop_stops_the_same_compiled() {
         // break, then call 0 for one instruction
@@ -1847,8 +1791,7 @@ mod tests {
         assert!(same(&run_vertices(&unit, &inputs), &single));
     }
 
-    /// a program calling itself goes too deep to compile, and the batches
-    /// shade it.
+    /// a program calling itself goes too deep to compile, and the batches shade it
     #[test]
     fn a_program_too_deep_to_compile_still_shades() {
         // call 0 for one instruction, which calls it again
@@ -1874,7 +1817,7 @@ mod tests {
         assert_eq!(state.output[0], [10.0; 4]);
     }
 
-    /// descriptor with identity swizzles on all three sources.
+    /// descriptor with identity swizzles on all three sources
     const IDENTITY3: u32 = IDENTITY | (0b00_01_10_11 << 23);
 
     #[test]
@@ -1915,8 +1858,7 @@ mod tests {
         assert_eq!(state.output[0], [102.0, 104.0, 106.0, 108.0]);
     }
 
-    /// a loop runs its whole body count + 1 times, not just its last
-    /// instruction.
+    /// a loop runs its whole body count + 1 times, not just its last instruction
     #[test]
     fn a_loop_repeats_its_whole_body() {
         // 0  loop i0, last = 2
@@ -1936,7 +1878,7 @@ mod tests {
         let mut state = ShaderState::new();
         state.input[0] = [1.0; 4];
         run(&unit, &mut state);
-        // three iterations of two additions each, onto r0's (0, 0, 0, 1).
+        // three iterations of two additions each, onto r0's (0, 0, 0, 1)
         assert_eq!(state.output[0], [6.0, 6.0, 6.0, 7.0]);
     }
 
@@ -1957,8 +1899,7 @@ mod tests {
         assert_eq!(state.output[0], ZERO, "b0 is false, so the move is skipped");
     }
 
-    /// a program decoded ahead of time is decoded again once the command
-    /// list uploads another.
+    /// a program decoded ahead of time gets decoded again once the command list uploads another
     #[test]
     fn uploading_a_program_decodes_it_again() {
         let mut unit = unit_with(&[0x13 << 26, 0x22 << 26], &[IDENTITY]);
@@ -1976,15 +1917,14 @@ mod tests {
         assert_eq!(state.output[0], [11.0, 22.0, 33.0, 44.0]);
     }
 
-    /// float uniforms sent as a run land as they do a word at a time,
-    /// packed and wide, starting part way through a vector or not, ending
-    /// part way through one or not, past the last uniform too.
+    /// float uniforms sent as a run land like they do a word at a time, packed and wide,
+    /// starting partway thru a vector or not, ending partway thru one or not, past the last uniform too
     #[test]
     fn uniforms_sent_as_a_run_land_as_one_word_at_a_time() {
         let mut random = Random(7);
         for case in 0..2000 {
             let mut runs = ShaderUnit::new();
-            // a wide upload before leaves a fourth staged word behind
+            // a wide upload b4 leaves a fourth staged word behind
             runs.set_float_uniform_index(0x8000_0000);
             for _ in 0..random.below(5) {
                 runs.upload_float_uniform(random.next());
@@ -2014,8 +1954,7 @@ mod tests {
         assert!(multiply(f32::NAN, 1.0).is_nan());
     }
 
-    /// a geometry shader turning one point into a triangle, three emits,
-    /// the last one completing the primitive.
+    /// a geometry shader turning one point into a triangle, three emits, the last one completing the primitive
     #[test]
     fn a_geometry_shader_emits_triangles() {
         let setemit = |slot: u32, primitive: bool| (0x2B << 26) | (slot << 24) | ((primitive as u32) << 23);

@@ -1,9 +1,7 @@
-//! mic:u, the microphone. what it hears comes from the frontend, see
-//! crate::microphone, and goes into the block the title shares with the
-//! service, at the rate and in the encoding the title asks for, round and
-//! round or once through. the block's last word says where in it the next
-//! sample goes, and the buffer full event is signaled each time the samples
-//! reach the end.
+//! mic:u, the microphone
+//! what it hears comes from the frontend (see `crate::microphone`) and goes into the block the title shares w/ the
+//! service, at the rate and encoding the title asks for, round and round or once thru
+//! the block's last word says where the next sample goes, and the buffer full event gets signaled each time the samples hit the end
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, ObjectId};
@@ -12,25 +10,24 @@ use crate::kernel::thread::CPU_CLOCK_HZ;
 use crate::System;
 use zakuro_common::result::errors;
 
-/// the encodings, unsigned and signed, of 8 and 16 bits.
+/// the encodings, unsigned and signed, 8 and 16 bit
 const PCM8: u8 = 0;
 const PCM16: u8 = 1;
 const PCM8_SIGNED: u8 = 2;
 const PCM16_SIGNED: u8 = 3;
 
-/// cycles between samples at a rate, the fastest one every 8192 cycles as
-/// the DSP's, 32728 a second, the others a half, a third and a quarter of
-/// it, which are the 32730, 16360, 10910 and 8180 Hz they go by.
+/// cycles between samples at a rate, the fastest every 8192 cycles like the DSP's (32728 a second),
+/// the others a half, a third and a quarter of it
+/// that's the 32730, 16360, 10910 and 8180 Hz they go by
 fn sample_ticks(rate: u8) -> u64 {
     8192 * (rate.min(3) as u64 + 1)
 }
 
-/// samples a second at a rate.
+/// samples a second at a rate
 fn sample_rate(rate: u8) -> f64 {
     CPU_CLOCK_HZ as f64 / sample_ticks(rate) as f64
 }
 
-/// an encoding as it is called.
 fn encoding_name(encoding: u8) -> &'static str {
     match encoding {
         PCM8 => "8 bits unsigned",
@@ -41,14 +38,14 @@ fn encoding_name(encoding: u8) -> &'static str {
     }
 }
 
-/// bytes a sample takes in an encoding.
+/// bytes a sample takes in an encoding
 fn sample_bytes(encoding: u8) -> u32 {
     if encoding & 1 == 0 { 1 } else { 2 }
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MicState {
-    /// the block the title shares and the size it gave.
+    /// the block the title shares and the size it gave
     block: Option<ObjectId>,
     block_size: u32,
     sampling: Option<Sampling>,
@@ -57,30 +54,30 @@ pub struct MicState {
     clamp: bool,
     allow_shell_closed: bool,
     client_version: u32,
-    /// the buffer full event, made the first time it is asked for.
+    /// the buffer full event, made the first time it's asked for
     event: Option<ObjectId>,
 }
 
 impl MicState {
-    /// whether a title samples.
+    /// is a title sampling
     pub fn is_sampling(&self) -> bool {
         self.sampling.is_some()
     }
 }
 
-/// what the title asked for when it started sampling, and how far it got.
+/// what the title asked for when it started sampling, and how far it got
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Sampling {
     encoding: u8,
     rate: u8,
-    /// where in the block the samples go and how many bytes they take.
+    /// where in the block the samples go and how many bytes they take
     offset: u32,
     size: u32,
-    /// round and round, or once through.
+    /// round and round or once thru
     looping: bool,
-    /// where the next sample goes, from offset.
+    /// where the next sample goes, from offset
     position: u32,
-    /// the tick the next sample is due at.
+    /// the tick the next sample is due at
     next: u64,
 }
 
@@ -96,8 +93,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             unmap(system);
             match system.kernel.resolve(handle) {
                 Some(object) => {
-                    // the service holds on to it, a title closing its handle
-                    // must not take it away
+                    // the service keeps it, a title closing its handle must not take it away
                     system.kernel.objects.add_ref(object);
                     system.services.mic.block = Some(object);
                     system.services.mic.block_size = size;
@@ -170,8 +166,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 3, handle);
             true
         }
-        // SetGain(gain), how much the microphone's sound is raised, which a
-        // host's microphone has done already
+        // SetGain(gain), how much the mic's sound is boosted, a host mic already did that
         0x0008 => {
             system.services.mic.gain = word(system, 1) as u8;
             buffer.reply(&mut system.memory, command, &[]);
@@ -195,9 +190,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, command, &[power as u32]);
             true
         }
-        // SetIirFilterMic(size, filter), a filter on what the microphone
-        // hears, which the sound from a host's has no need of. the filter's
-        // buffer goes back to the title
+        // SetIirFilterMic(size, filter), a filter on what the mic hears, the host's sound doesn't need it
+        // the filter's buffer goes back to the title
         0x000C => {
             reply_with_buffers(system, buffer, header);
             true
@@ -230,8 +224,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
     }
 }
 
-/// a successful reply, with the request's buffer descriptors handed back as
-/// they came.
+/// a successful reply, w/ the request's buffer descriptors handed back as they came
 fn reply_with_buffers(system: &mut System, buffer: &CommandBuffer, header: Header) {
     let first = 1 + header.normal_params();
     let translate: Vec<u32> = (0..header.translate_params()).map(|i| buffer.get(&mut system.memory, first + i)).collect();
@@ -242,14 +235,14 @@ fn reply_with_buffers(system: &mut System, buffer: &CommandBuffer, header: Heade
     }
 }
 
-/// stops sampling, telling the frontend's microphone.
+/// stops sampling and tells the frontend's mic
 fn stop(system: &mut System) {
     if system.services.mic.sampling.take().is_some() {
         sampling(system);
     }
 }
 
-/// lets go of the block.
+/// lets go of the block
 fn unmap(system: &mut System) {
     if let Some(object) = system.services.mic.block.take() {
         system.kernel.objects.release(object);
@@ -257,7 +250,7 @@ fn unmap(system: &mut System) {
     system.services.mic.block_size = 0;
 }
 
-/// tells the frontend's microphone whether a title samples.
+/// tells the frontend's mic if a title's sampling
 pub(crate) fn sampling(system: &mut System) {
     let on = system.services.mic.sampling.is_some();
     if let Some(microphone) = &mut system.microphone {
@@ -265,7 +258,7 @@ pub(crate) fn sampling(system: &mut System) {
     }
 }
 
-/// the buffer full event, made the first time it is asked for.
+/// the buffer full event, made the first time it's asked for
 fn event(system: &mut System) -> ObjectId {
     if let Some(event) = system.services.mic.event {
         return event;
@@ -277,8 +270,7 @@ fn event(system: &mut System) -> ObjectId {
     object
 }
 
-/// where the block's bytes are and how many the title said it has, when
-/// there is one.
+/// where the block's bytes are and how many the title said it has, when there's one
 fn block(system: &System) -> Option<(u32, u32)> {
     let object = system.services.mic.block?;
     match system.kernel.objects.get(object) {
@@ -287,7 +279,7 @@ fn block(system: &System) -> Option<(u32, u32)> {
     }
 }
 
-/// writes into the block, when there is one and the bytes fit.
+/// writes into the block, when there's one and the bytes fit
 fn write(system: &mut System, offset: u32, bytes: &[u8]) {
     let Some((paddr, size)) = block(system) else { return };
     if offset as u64 + bytes.len() as u64 <= size as u64 {
@@ -295,8 +287,7 @@ fn write(system: &mut System, offset: u32, bytes: &[u8]) {
     }
 }
 
-/// writes where the next sample goes into the block's last word, from the
-/// block's start.
+/// writes where the next sample goes (from the block's start) into the block's last word
 fn write_position(system: &mut System) {
     let Some(sampling) = system.services.mic.sampling else { return };
     let Some((_, size)) = block(system) else { return };
@@ -305,7 +296,7 @@ fn write_position(system: &mut System) {
     }
 }
 
-/// what was heard in an encoding.
+/// what was heard, in an encoding
 fn encode(heard: &[f32], encoding: u8) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(heard.len() * 2);
     for &sample in heard {
@@ -320,8 +311,7 @@ fn encode(heard: &[f32], encoding: u8) -> Vec<u8> {
     bytes
 }
 
-/// writes the samples due into the block, signaling the event at its end,
-/// where sampling starts over or stops.
+/// writes the samples due into the block, signaling the event at its end, where sampling starts over or stops
 pub fn tick(system: &mut System) {
     let Some(mut sampling) = system.services.mic.sampling else { return };
     let now = system.cpu.cycles;
@@ -337,8 +327,7 @@ pub fn tick(system: &mut System) {
     }
     let due = (now - sampling.next) / ticks + 1;
     sampling.next += due * ticks;
-    // more than the buffer holds, after a long stall, and only the latest
-    // fill it
+    // more than the buffer holds after a long stall, only the latest fill it
     let count = due.min(room as u64) as usize;
     let mut heard = vec![0.0f32; count];
     if let Some(microphone) = &mut system.microphone {
@@ -384,8 +373,7 @@ mod tests {
     use crate::services::{handle_request, Target};
     use std::sync::{Arc, Mutex};
 
-    /// a microphone that counts its samples up, 1/1000 more each, and tells
-    /// whether it was asked to listen.
+    /// a mic that counts its samples up, 1/1000 more each, and tells if it was asked to listen
     struct Counting {
         next: f32,
         on: Arc<Mutex<bool>>,
@@ -404,8 +392,7 @@ mod tests {
         }
     }
 
-    /// a system with a block of size bytes the title shares with mic:u, and
-    /// a way to send it requests.
+    /// a system w/ a block of size bytes the title shares w/ mic:u, and a way to send it requests
     fn with_block(size: u32) -> (System, impl Fn(&mut System, &[u32]) -> u32, u32) {
         let (mut system, buffer) = system_with_thread();
         let block = system.memory.phys.allocate(crate::memory::MemoryRegion::Base, size.next_multiple_of(0x1000)).unwrap();
@@ -435,9 +422,8 @@ mod tests {
         u32::from_le_bytes(word)
     }
 
-    /// what the frontend's microphone hears lands in the block at the rate
-    /// the title asked for, 16 bits signed, round and round, the last word
-    /// saying where the next sample goes, and the event at each turn.
+    /// what the frontend's mic hears lands in the block at the rate the title asked for, 16 bit signed,
+    /// round and round, the last word saying where the next sample goes, and the event at each lap
     #[test]
     fn samples_go_round_the_buffer() {
         let size = 0x1000;
@@ -480,8 +466,7 @@ mod tests {
         assert!(!*on.lock().unwrap(), "and off when it stops");
     }
 
-    /// once through, 8 bits unsigned at an offset, sampling stops at the
-    /// end of the buffer, the bytes after it untouched.
+    /// once thru, 8 bit unsigned at an offset, sampling stops at the end of the buffer and the bytes after it stay untouched
     #[test]
     fn once_through_stops_at_the_end() {
         let (mut system, request, block) = with_block(0x1000);
@@ -502,7 +487,7 @@ mod tests {
     }
 
     /// the encodings put silence and the loudest sound where the console
-    /// does.
+    /// does
     #[test]
     fn encodings() {
         assert_eq!(encode(&[0.0, 1.0, -1.0], PCM8), [128, 255, 1]);
@@ -511,8 +496,7 @@ mod tests {
         assert_eq!(encode(&[-1.0], PCM16_SIGNED), (-32767i16).to_le_bytes());
     }
 
-    /// no microphone from the frontend is silence, and the settings a
-    /// title reads back are the ones it set.
+    /// no mic from the frontend means silence, and the settings a title reads back are the ones it set
     #[test]
     fn settings_come_back_and_silence_without_a_microphone() {
         let (mut system, request, block) = with_block(0x1000);

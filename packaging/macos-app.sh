@@ -1,6 +1,5 @@
 #!/bin/sh
-# packs the macOS binary as Zakuro.app, with MoltenVK inside so that the 3D
-# draws on the GPU with nothing else installed, and zips it.
+# packs the macOS binary as Zakuro.app, w/ MoltenVK inside so the 3D draws on the GPU w/ nothing else installed, and zips it
 #
 #   macos-app.sh <binary> <version> <output.zip>
 set -eu
@@ -30,7 +29,7 @@ cp "$here/Info.plist" "$contents/Info.plist"
     -c "Set :CFBundleVersion $version" \
     "$contents/Info.plist"
 
-# the icon at every size macOS asks for, each with its double
+# the icon at every size macOS asks for, each w/ its double
 icons=$work/zakuro.iconset
 mkdir "$icons"
 for size in 16 32 128 256; do
@@ -41,6 +40,6 @@ done
 cp "$here/zakuro.png" "$icons/icon_512x512.png"
 iconutil -c icns "$icons" -o "$contents/Resources/zakuro.icns"
 
-# signed for no one, which is what lets it run on Apple silicon at all
+# signed for nobody, that's what lets it run on Apple silicon at all
 codesign --force --deep --sign - "$work/Zakuro.app"
 ditto -c -k --keepParent "$work/Zakuro.app" "$output"

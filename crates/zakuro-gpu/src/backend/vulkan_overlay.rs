@@ -1,4 +1,4 @@
-//! the overlay, drawn with Vulkan over the screens in the same render pass.
+//! the overlay, drawn w/ Vulkan over the screens in the same render pass
 
 use std::collections::HashMap;
 
@@ -10,10 +10,10 @@ use super::{Overlay, OverlayTexture, OverlayVertex, PresentError};
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/overlay.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/overlay.frag.spv");
 
-/// textures the overlay may have at once.
+/// textures the overlay may have at once
 const MAX_TEXTURES: u32 = 256;
 
-/// what the shaders take besides the triangles.
+/// what the shaders take besides the triangles
 #[repr(C)]
 struct Push {
     size: [f32; 2],
@@ -26,11 +26,11 @@ struct Texture {
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     descriptor: vk::DescriptorSet,
-    /// never drawn into yet, so its contents need not be kept.
+    /// never drawn into yet, so its contents don't need keeping
     fresh: bool,
 }
 
-/// memory the CPU writes and the GPU reads, mapped for good.
+/// memory the CPU writes and the GPU reads, mapped for good
 struct Buffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -38,7 +38,7 @@ struct Buffer {
     mapped: *mut u8,
 }
 
-/// what may only go once the GPU is done with the frame that used it.
+/// what may only go once the GPU's done w/ the frame that used it
 enum Garbage {
     Texture(Texture),
     Buffer(Buffer),
@@ -49,17 +49,16 @@ pub(super) struct OverlayPainter {
     descriptor_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    /// nearest, then linear.
+    /// nearest, then linear
     samplers: [vk::Sampler; 2],
     textures: HashMap<u64, Texture>,
-    /// each frame in flight's vertices and indices.
+    /// each frame in flight's vertices and indices
     geometry: Vec<Option<Buffer>>,
-    /// what each frame in flight leaves to destroy once it is done.
+    /// what each frame in flight leaves to destroy once it's done
     garbage: Vec<Vec<Garbage>>,
-    /// where the indices start in this frame's buffer.
+    /// where the indices start in this frame's buffer
     index_offset: u64,
-    /// texture changes and frees from frames that were never drawn, which
-    /// still have to happen, the overlay sends each only once.
+    /// texture changes and frees from frames that never got drawn, they still have to happen since the overlay sends each only once
     pending: Vec<OverlayTexture>,
     pending_free: Vec<u64>,
     srgb: bool,
@@ -129,8 +128,7 @@ impl OverlayPainter {
         })
     }
 
-    /// keeps what an overlay changes for the next frame drawn, when this one
-    /// is not.
+    /// keeps what an overlay changes for the next frame drawn, when this one isn't
     pub(super) fn defer(&mut self, overlay: &Overlay) {
         self.pending.extend(overlay.textures.iter().map(|texture| OverlayTexture {
             id: texture.id,
@@ -142,16 +140,14 @@ impl OverlayPainter {
         self.pending_free.extend_from_slice(&overlay.free);
     }
 
-    /// what the frame that last used this slot left behind can go, the
-    /// caller having waited for it.
+    /// what the frame that last used this slot left behind can go, the caller waited for it
     pub(super) fn begin_frame(&mut self, device: &ash::Device, frame: usize) {
         for garbage in self.garbage[frame].drain(..) {
             destroy(device, self.descriptor_pool, garbage);
         }
     }
 
-    /// records the texture changes and fills this frame's geometry, before
-    /// the render pass starts.
+    /// records the texture changes and fills this frame's geometry, b4 the render pass starts
     pub(super) fn upload(
         &mut self,
         device: &ash::Device,
@@ -174,13 +170,12 @@ impl OverlayPainter {
             }
             let Some(target) = self.textures.get_mut(&texture.id) else { continue };
             let staging = make_buffer(device, memory, texture.pixels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            // SAFETY: the buffer is mapped and as long as the pixels
+            // safe bc the buffer is mapped and as long as the pixels
             unsafe { std::ptr::copy_nonoverlapping(texture.pixels.as_ptr(), staging.mapped, texture.pixels.len()) };
             let [x, y] = texture.offset.unwrap_or([0, 0]);
             let from = if target.fresh { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
             transition(device, command_buffer, target.image, from, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-            // SAFETY: recording, outside a render pass, into an image in the
-            // layout the copy wants
+            // safe bc we're recording, outside a render pass, into an image in the layout the copy wants
             unsafe {
                 device.cmd_copy_buffer_to_image(
                     command_buffer,
@@ -226,8 +221,7 @@ impl OverlayPainter {
         let (mut vertex_at, mut index_at) = (0usize, self.index_offset as usize);
         for mesh in &overlay.meshes {
             let vertex_bytes = mesh.vertices.len() * size_of::<OverlayVertex>();
-            // SAFETY: the buffer holds every mesh's vertices and indices,
-            // and the vertex type is plain data
+            // safe bc the buffer holds every mesh's vertices and indices, and the vertex type is plain data
             unsafe {
                 std::ptr::copy_nonoverlapping(mesh.vertices.as_ptr() as *const u8, buffer.mapped.add(vertex_at), vertex_bytes);
                 std::ptr::copy_nonoverlapping(mesh.indices.as_ptr() as *const u8, buffer.mapped.add(index_at), mesh.indices.len() * 4);
@@ -238,15 +232,14 @@ impl OverlayPainter {
         Ok(())
     }
 
-    /// records the draws, inside the render pass.
+    /// records the draws, inside the render pass
     pub(super) fn draw(&self, device: &ash::Device, command_buffer: vk::CommandBuffer, frame: usize, overlay: &Overlay, extent: vk::Extent2D) {
         let Some(buffer) = &self.geometry[frame] else { return };
         if overlay.meshes.is_empty() || extent.width == 0 || extent.height == 0 {
             return;
         }
         let push = Push { size: [extent.width as f32, extent.height as f32], srgb: self.srgb as u32, _pad: 0 };
-        // SAFETY: recording inside the render pass the pipeline was made for,
-        // with buffers the upload filled for this frame
+        // safe bc we're recording inside the render pass the pipeline was made for, w/ buffers the upload filled for this frame
         unsafe {
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             device.cmd_set_viewport(
@@ -277,7 +270,7 @@ impl OverlayPainter {
             let [left, top, right, bottom] = mesh.clip;
             let (right, bottom) = (right.min(extent.width), bottom.min(extent.height));
             if let (Some(texture), true) = (self.textures.get(&mesh.texture), left < right && top < bottom && count > 0) {
-                // SAFETY: as above
+                // safe for the same reason
                 unsafe {
                     device.cmd_set_scissor(
                         command_buffer,
@@ -303,7 +296,7 @@ impl OverlayPainter {
         }
     }
 
-    /// textures the overlay no longer needs, gone once this frame is done.
+    /// textures the overlay doesn't need anymore, gone once this frame's done
     pub(super) fn free(&mut self, frame: usize, overlay: &Overlay) {
         let pending = std::mem::take(&mut self.pending_free);
         for id in pending.iter().chain(&overlay.free) {
@@ -321,7 +314,7 @@ impl OverlayPainter {
         linear: bool,
     ) -> Result<Texture, PresentError> {
         let format = vk::Format::R8G8B8A8_UNORM;
-        // SAFETY: plain object creation on a live device
+        // safe bc it's plain object creation on a live device
         unsafe {
             let image = device
                 .create_image(
@@ -395,7 +388,7 @@ impl OverlayPainter {
         for (_, texture) in self.textures.drain() {
             destroy(device, pool, Garbage::Texture(texture));
         }
-        // SAFETY: the device is idle, the caller waited for it
+        // safe bc the device is idle, the caller waited for it
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -409,7 +402,7 @@ impl OverlayPainter {
 }
 
 fn destroy(device: &ash::Device, pool: vk::DescriptorPool, garbage: Garbage) {
-    // SAFETY: the GPU finished every frame that used it
+    // safe bc the GPU finished every frame that used it
     unsafe {
         match garbage {
             Garbage::Texture(texture) => {
@@ -434,7 +427,7 @@ fn make_buffer(
     size: u64,
     usage: vk::BufferUsageFlags,
 ) -> Result<Buffer, PresentError> {
-    // SAFETY: plain object creation on a live device
+    // safe bc it's plain object creation on a live device
     unsafe {
         let buffer = device
             .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)
@@ -505,7 +498,7 @@ fn create_pipeline(
         .line_width(1.0);
     let multisample =
         vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    // premultiplied alpha over what is already drawn
+    // premultiplied alpha over what's already drawn
     let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
         .src_color_blend_factor(vk::BlendFactor::ONE)

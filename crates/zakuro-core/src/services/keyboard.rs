@@ -1,6 +1,5 @@
-//! the software keyboard, the library applet a title starts to have a name
-//! or some other text typed in. the title waits while it is open, the
-//! frontend shows it and answers with the text and the button pressed.
+//! the software keyboard, the library applet a title starts to get a name or some other text typed in
+//! the title waits while it's open, the frontend shows it and answers w/ the text and the button pressed
 
 use crate::kernel::object::{KObject, ObjectId};
 use crate::services::apt::{self, Parameter};
@@ -8,11 +7,11 @@ use crate::System;
 
 pub const APPLET_ID: u32 = 0x401;
 
-// where the fields the keyboard reads and writes sit in its configuration
+// where the fields the keyboard reads and writes sit in its config
 const BUTTON_COUNT: usize = 0x04;
 const VALID_INPUT: usize = 0x08;
 const MAX_TEXT_LENGTH: usize = 0x20;
-/// three labels of up to 16 UTF-16 units, each with its terminating zero.
+/// three labels of up to 16 UTF 16 units, each w/ its terminating zero
 const BUTTON_TEXT: usize = 0x26;
 const BUTTON_TEXT_UNITS: usize = 17;
 const HINT_TEXT: usize = 0x90;
@@ -22,20 +21,20 @@ const INITIAL_TEXT_OFFSET: usize = 0x120;
 const RESULT: usize = 0x138;
 const TEXT_OFFSET: usize = 0x144;
 const TEXT_LENGTH: usize = 0x148;
-/// the configuration is at least this long to hold the fields above.
+/// the config is at least this long to hold the fields above
 const CONFIG_SIZE: usize = 0x14C;
 
-/// what a title asks the keyboard for.
+/// what a title asks the keyboard for
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Request {
     pub hint: String,
-    /// the text the keyboard starts with.
+    /// the text the keyboard starts with
     pub text: String,
-    /// the longest text it takes, in UTF-16 units.
+    /// the longest text it takes, in UTF 16 units
     pub max_length: usize,
-    /// the buttons' labels, left to right, the last one confirms.
+    /// the buttons' labels, left to right, the last one confirms
     pub buttons: Vec<String>,
-    /// what the text has to be for the confirming button to take it.
+    /// what the text has to be for the confirm button to take it
     pub valid: Valid,
 }
 
@@ -45,7 +44,7 @@ pub enum Valid {
     NotEmpty,
     NotEmptyNotBlank,
     NotBlank,
-    /// exactly the longest length.
+    /// exactly the max length
     FixedLength,
 }
 
@@ -62,7 +61,7 @@ impl Valid {
 }
 
 impl Request {
-    /// whether the confirming button takes text.
+    /// does the confirm button take text
     pub fn accepts(&self, text: &str) -> bool {
         let length = text.encode_utf16().count();
         let blank = !text.is_empty() && text.chars().all(char::is_whitespace);
@@ -77,17 +76,16 @@ impl Request {
     }
 }
 
-/// a keyboard a title started and waits on.
+/// a keyboard a title started and waits on
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Pending {
     pub request: Request,
     config: Vec<u8>,
-    /// the block the text goes back in.
+    /// the block the text goes back in
     memory: Option<ObjectId>,
 }
 
-/// opens the keyboard with the configuration a title sent and the block
-/// it shares for the text.
+/// opens the keyboard w/ the config a title sent and the block it shares for the text
 pub fn start(system: &mut System, mut config: Vec<u8>, memory: Option<ObjectId>) {
     config.resize(config.len().max(CONFIG_SIZE), 0);
     let word = |at: usize| u32::from_le_bytes(config[at..at + 4].try_into().unwrap());
@@ -98,8 +96,7 @@ pub fn start(system: &mut System, mut config: Vec<u8>, memory: Option<ObjectId>)
         _ => &["Cancel", "I Forgot", "OK"],
     };
     let label = |slot: usize| utf16(&config[BUTTON_TEXT + slot * BUTTON_TEXT_UNITS * 2..], BUTTON_TEXT_UNITS);
-    // two buttons can be labeled in the left and right slots, the middle
-    // one left empty
+    // two buttons can get labels in the left and right slots, the middle one left empty
     let slots: &[usize] = match buttons {
         2 if label(1).is_empty() => &[0, 2],
         _ => &[0, 1, 2],
@@ -139,13 +136,12 @@ pub fn start(system: &mut System, mut config: Vec<u8>, memory: Option<ObjectId>)
     system.services.apt.keyboard = Some(Pending { request, config, memory });
 }
 
-/// what the keyboard a title waits on asks for.
+/// what the keyboard a title waits on asks for
 pub fn request(system: &System) -> Option<&Request> {
     system.services.apt.keyboard.as_ref().map(|pending| &pending.request)
 }
 
-/// closes the keyboard with the text typed and the button pressed, zero
-/// being the leftmost. the text goes at the start of the shared block.
+/// closes the keyboard w/ the text typed and the button pressed (zero is the leftmost), the text goes at the start of the shared block
 pub fn answer(system: &mut System, text: &str, button: usize) {
     let Some(pending) = system.services.apt.keyboard.take() else { return };
     let mut config = pending.config;
@@ -179,7 +175,7 @@ pub fn answer(system: &mut System, text: &str, button: usize) {
     );
 }
 
-/// where the shared block is and how big.
+/// where the shared block is and how big
 fn block(system: &System, memory: Option<ObjectId>) -> Option<(u32, u32)> {
     match system.kernel.objects.get(memory?)? {
         KObject::SharedMemory(block) => Some((block.paddr, block.size)),
@@ -187,7 +183,7 @@ fn block(system: &System, memory: Option<ObjectId>) -> Option<(u32, u32)> {
     }
 }
 
-/// UTF-16 text of at most units units, up to its terminating zero.
+/// UTF 16 text of at most units units, up to its terminating zero
 fn utf16(bytes: &[u8], units: usize) -> String {
     let units: Vec<u16> = bytes
         .as_chunks::<2>()
@@ -219,8 +215,7 @@ mod tests {
         assert!(!request.accepts("Linkkkkkk"));
     }
 
-    /// the text and the button go back where titles look for them, in a
-    /// configuration laid out the way the SDK lays it out.
+    /// the text and the button go back where titles look for them, in a config laid out like the SDK does
     #[test]
     fn the_answer_goes_where_titles_read_it() {
         use crate::kernel::object::SharedMemory;

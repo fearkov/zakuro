@@ -1,6 +1,5 @@
-//! cheats, Gateway and Action Replay codes, in the file Citra and Azahar keep
-//! them in, cheats/<title id>.txt in the data folder, so that one made for
-//! them works here as it is. the cheats that are on run once a frame.
+//! cheats, Gateway and Action Replay codes, in the file Citra and Azahar use (cheats/<title id>.txt in the data folder)
+//! so theirs work here as is, enabled ones run once a frame
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,35 +11,31 @@ use zakuro_cpu::Bus;
 
 use crate::System;
 
-/// one cheat, its name, whether it is on, and its code.
+/// one cheat, its name, whether it's on, and its code
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cheat {
     pub name: String,
     pub enabled: bool,
-    /// the lines after a * in the file, besides the one that turns it on.
+    /// lines after a * in the file, besides the one turning it on
     pub notes: Vec<String>,
-    /// its lines as written, "XXXXXXXX YYYYYYYY" each.
+    /// its lines as written, "XXXXXXXX YYYYYYYY" each
     lines: Vec<String>,
     code: Vec<Option<Line>>,
-    /// one of Zakuro's enhancements rather than the player's, which stays
-    /// out of the cheat file.
+    /// one of zakuro's enhancements, not the player's, stays out of the cheat file
     pub builtin: bool,
-    /// what an enhancement's code overwrote, by address, put back once it
-    /// is turned off. a player's cheat keeps what it wrote, as in Citra: the
-    /// money a cheat gave stays.
+    /// what an enhancement's code overwrote by addr, put back when it's turned off
+    /// a player's cheat keeps what it wrote like in Citra, free money stays free money
     pub(crate) overwrote: BTreeMap<u32, Overwrote>,
 }
 
-/// a byte an enhancement changed: what it held before the enhancement
-/// first wrote it, and what the enhancement wrote last.
+/// a byte an enhancement changed, what it held b4 the first write and what the enhancement wrote last
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Overwrote {
     pub original: u8,
     pub wrote: u8,
 }
 
-/// a line of code taken apart, its type being its first digit, or its first
-/// two when that is D.
+/// a code line taken apart, type is its first digit (first two when that's D)
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Line {
     kind: u8,
@@ -49,11 +44,10 @@ struct Line {
     value: u32,
 }
 
-/// the line Citra writes in a cheat that is on.
+/// the line Citra writes in an enabled cheat
 const ENABLED: &str = "*citra_enabled";
 
-/// lines one cheat runs in a frame at most, so that a loop that never ends
-/// does not stop the game.
+/// max lines one cheat runs per frame, so an infinite loop doesn't freeze the game
 const MOST_STEPS: usize = 100_000;
 
 impl Line {
@@ -71,7 +65,7 @@ impl Line {
     }
 }
 
-/// whether a line is a code, "XXXXXXXX YYYYYYYY".
+/// is a line a code, "XXXXXXXX YYYYYYYY"
 pub fn is_code(line: &str) -> bool {
     Line::parse(line).is_some()
 }
@@ -87,18 +81,17 @@ impl Cheat {
     }
 }
 
-/// the file of a title's cheats.
+/// a title's cheat file
 pub fn path(data_dir: &Path, program_id: u64) -> PathBuf {
     data_dir.join("cheats").join(format!("{program_id:016X}.txt"))
 }
 
-/// the cheats in a file of Citra's, none when there is no file.
+/// the cheats in a Citra cheat file, none when there's no file
 pub fn load(path: &Path) -> Vec<Cheat> {
     std::fs::read(path).map(|bytes| parse(&String::from_utf8_lossy(&bytes))).unwrap_or_default()
 }
 
-/// cheats as Citra writes them, a name in brackets, the notes and whether it
-/// is on after a *, then the code.
+/// cheats as Citra writes them, a name in brackets, notes and on state after a *, then the code
 pub fn parse(text: &str) -> Vec<Cheat> {
     let mut cheats = Vec::new();
     let (mut name, mut notes, mut lines, mut enabled) = (String::new(), Vec::new(), Vec::new(), false);
@@ -131,7 +124,7 @@ pub fn parse(text: &str) -> Vec<Cheat> {
     cheats
 }
 
-/// cheats as Citra writes them, for its file.
+/// cheats as Citra writes them, for its file
 pub fn to_text(cheats: &[Cheat]) -> String {
     let mut text = String::new();
     for cheat in cheats.iter().filter(|cheat| !cheat.builtin) {
@@ -152,7 +145,7 @@ pub fn to_text(cheats: &[Cheat]) -> String {
     text
 }
 
-/// writes the cheats to their file, and the folder it is in.
+/// writes the cheats to their file (and its folder)
 pub fn save(path: &Path, cheats: &[Cheat]) -> std::io::Result<()> {
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder)?;
@@ -160,26 +153,26 @@ pub fn save(path: &Path, cheats: &[Cheat]) -> std::io::Result<()> {
     std::fs::write(path, to_text(cheats))
 }
 
-/// what a cheat's code keeps between its lines.
+/// what a cheat's code keeps between its lines
 #[derive(Default)]
 struct State {
     reg: u32,
     offset: u32,
-    /// the conditions failed and not yet closed, the lines meanwhile skipped.
+    /// conditions failed and not closed yet, lines skipped meanwhile
     if_flag: u32,
     loop_count: u32,
     loop_back_line: usize,
     loop_flag: bool,
 }
 
-/// where code lies in memory, the executable's text and the modules'.
+/// where code lives in memory, the exe's text and the modules'
 struct CodeRanges {
     text: (u32, u32),
     modules: Vec<(u32, u32)>,
-    /// what the cheats changed of them, the text and the modules by index.
+    /// what the cheats changed of them, the text and the modules by index
     text_changed: bool,
     modules_changed: Vec<usize>,
-    /// what the enhancement running overwrote, none for a player's cheat.
+    /// what the running enhancement overwrote, none for a player's cheat
     overwrote: Option<BTreeMap<u32, Overwrote>>,
 }
 
@@ -205,10 +198,9 @@ impl CodeRanges {
     }
 }
 
-/// runs the cheats that are on, once a frame, and puts back what an
-/// enhancement turned off had overwritten. a cheat that changes code has
-/// what was recompiled of it checked again, so that the interpreter runs the
-/// functions it changed, and the recompiled code those put back.
+/// runs enabled cheats once a frame and puts back what a disabled enhancement overwrote
+/// a cheat that changes code gets its recompiled bits rechecked,
+/// so the interpreter runs the funcs it changed and recompiled code those put back
 pub fn run(system: &mut System) {
     if !system.cheats.iter().any(|cheat| cheat.enabled || !cheat.overwrote.is_empty()) {
         return;
@@ -248,8 +240,7 @@ pub fn run(system: &mut System) {
     }
 }
 
-/// writes back the bytes an enhancement overwrote, where memory still
-/// holds what it wrote, so that what the game changed since stays.
+/// writes back the bytes an enhancement overwrote where memory still holds what it wrote, so the game's own changes since stay
 fn restore(system: &mut System, ranges: &mut CodeRanges, overwrote: BTreeMap<u32, Overwrote>) {
     for (addr, Overwrote { original, wrote }) in overwrote {
         if mapped(system, addr, 1) && system.memory.read8(addr) == wrote {
@@ -273,8 +264,8 @@ fn read(system: &mut System, addr: u32, size: u32) -> u32 {
     }
 }
 
-/// writes value at addr, when memory there is mapped and holds another.
-/// code the game can't write gets written all the same, as a Gateway does.
+/// writes value at addr when it's mapped and holds smth else
+/// code the game can't write gets written anyway, like a Gateway does
 fn write(system: &mut System, ranges: &mut CodeRanges, addr: u32, size: u32, value: u32) {
     if !mapped(system, addr, size) || read(system, addr, size) == value & (u32::MAX >> (32 - size * 8)) {
         return;
@@ -289,7 +280,7 @@ fn write(system: &mut System, ranges: &mut CodeRanges, addr: u32, size: u32, val
     let writable = system.memory.mapping_at(addr).is_some_and(|mapping| mapping.permission.contains(crate::memory::Permission::WRITE));
     match size {
         _ if !writable => {
-            // the words the bytes are in, each written whole
+            // the words the bytes live in, each written whole
             for (i, byte) in value.to_le_bytes().into_iter().take(size as usize).enumerate() {
                 let at = addr.wrapping_add(i as u32);
                 let (word_at, shift) = (at & !3, (at & 3) * 8);
@@ -304,7 +295,7 @@ fn write(system: &mut System, ranges: &mut CodeRanges, addr: u32, size: u32, val
     ranges.wrote(addr);
 }
 
-/// runs a cheat's code, the way Citra and Azahar run it.
+/// runs a cheat's code the way Citra and Azahar do
 fn execute(system: &mut System, code: &[Option<Line>], pad: u32, ranges: &mut CodeRanges) {
     let null = Line { kind: 0xFF, first: 0, address: 0, value: 0 };
     let line_at = |n: usize| code.get(n).copied().flatten().unwrap_or(null);
@@ -315,8 +306,7 @@ fn execute(system: &mut System, code: &[Option<Line>], pad: u32, ranges: &mut Co
         let line = line_at(n);
         let addr = line.address.wrapping_add(s.offset);
         if s.if_flag > 0 {
-            // skipped, though conditions inside still nest and patches
-            // still skip their data
+            // skipped, but conditions inside still nest and patches still skip their data
             match line.kind {
                 0x3..=0xA | 0xDD => s.if_flag += 1,
                 0xE => n = patch(system, ranges, &line, &s, code, n),
@@ -380,7 +370,7 @@ fn execute(system: &mut System, code: &[Option<Line>], pad: u32, ranges: &mut Co
                 s.reg = read(system, line.value.wrapping_add(s.offset), size);
             }
             0xDC => s.offset = s.offset.wrapping_add(line.value),
-            // the buttons held
+            // held buttons
             0xDD => {
                 if pad & line.value != line.value {
                     s.if_flag += 1;
@@ -393,9 +383,8 @@ fn execute(system: &mut System, code: &[Option<Line>], pad: u32, ranges: &mut Co
     }
 }
 
-/// an E code, value bytes to write at its address, taken from the lines
-/// after it, both of their words. the last line of its data, where the code
-/// goes on after.
+/// an E code, value bytes to write at its addr taken from the following lines (both their words)
+/// returns the last data line, where the code continues after
 fn patch(system: &mut System, ranges: &mut CodeRanges, line: &Line, s: &State, code: &[Option<Line>], n: usize) -> usize {
     let word = |n: usize, first: bool| code.get(n).copied().flatten().map_or(0, |line| if first { line.first } else { line.value });
     if s.if_flag > 0 {
@@ -442,7 +431,7 @@ mod tests {
         assert_eq!(parse(&to_text(&cheats)), cheats);
     }
 
-    /// each kind of line does to memory what it does in Citra.
+    /// each line kind does to memory what it does in Citra
     #[test]
     fn codes_write_compare_loop_and_patch() {
         use zakuro_fs::testing::{ncch, write as write_file};
@@ -474,8 +463,7 @@ mod tests {
         std::fs::remove_file(rom).unwrap();
     }
 
-    /// an enhancement turned off puts back what it overwrote, but not a
-    /// byte the game changed since, and a player's cheat keeps what it wrote.
+    /// a disabled enhancement puts back what it overwrote except bytes the game changed since, a player's cheat keeps its writes
     #[test]
     fn an_enhancement_turned_off_puts_back_what_it_overwrote() {
         use crate::memory::{MemoryRegion, MemoryState, Permission};
@@ -499,7 +487,7 @@ mod tests {
         for cheat in &mut system.cheats {
             cheat.enabled = false;
         }
-        // the game wrote one of the enhancement's bytes in the meantime
+        // the game wrote one of the enhancement's bytes meanwhile
         system.memory.write_bytes(0x0800_0011, &[0x99]);
         run(&mut system);
         system.memory.read_bytes(0x0800_0010, &mut memory);

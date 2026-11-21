@@ -1,4 +1,4 @@
-//! branches, status register transfers and coprocessor access.
+//! branches, status register transfers and coprocessor access
 
 use zakuro_common::bits::{bit, bits, sign_extend};
 
@@ -15,11 +15,11 @@ pub fn branch<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-/// BX and BLX with a register operand.
+/// BX and BLX with a register operand
 pub fn branch_exchange<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     let rm = (op & 0xF) as usize;
     let target = cpu.regs[rm];
-    // bits 7:4 are 0b0011 for BLX, 0b0001 for BX.
+    // bits 7 to 4 are 0b0011 for BLX, 0b0001 for BX
     if bits(op, 4, 7) == 0b0011 {
         cpu.regs[LR] = cpu.regs[PC].wrapping_sub(4);
     }
@@ -27,7 +27,7 @@ pub fn branch_exchange<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<E
     None
 }
 
-/// BLX label, the unconditional form that always switches to Thumb.
+/// BLX label, the unconditional form that always switches to Thumb
 pub fn branch_link_exchange_immediate<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     let offset = (sign_extend(op & 0x00FF_FFFF, 24) << 2) | ((bit(op, 24) as i32) << 1);
     let target = cpu.regs[PC].wrapping_add(offset as u32);
@@ -72,8 +72,7 @@ pub fn msr<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
         cpu.spsr = psr;
     } else {
         let privileged = cpu.cpsr.mode.is_privileged();
-        // a mode change has to go through switch_mode so the banked
-        // registers follow.
+        // a mode change has to go thru switch_mode so the banked registers follow
         let mut psr = cpu.cpsr;
         psr.write_masked(value, field_mask, privileged);
         if privileged && field_mask & 0b0001 != 0 && psr.mode != cpu.cpsr.mode {
@@ -86,7 +85,7 @@ pub fn msr<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     None
 }
 
-/// MRC / MCR. Only CP15 and the VFP coprocessors exist on this core.
+/// MRC / MCR, only CP15 and the VFP coprocessors exist on this core
 pub fn coprocessor_register<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     let cp = bits(op, 8, 11);
     let opc1 = bits(op, 21, 23);
@@ -101,8 +100,7 @@ pub fn coprocessor_register<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Opt
             if load {
                 let value = cpu.cp15.read(opc1, crn, crm, opc2);
                 if rd == 15 {
-                    // MRC with Rd as r15 writes the condition flags rather
-                    // than branching.
+                    // MRC w/ Rd as r15 writes the condition flags instead of branching
                     cpu.cpsr.n = bit(value, 31);
                     cpu.cpsr.z = bit(value, 30);
                     cpu.cpsr.c = bit(value, 29);
@@ -128,9 +126,8 @@ pub fn coprocessor_register<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Opt
 }
 
 pub fn supervisor_call<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
-    // the PC has already been advanced past the instruction by the fetch loop,
-    // but it still carries the pipeline offset, rewind it so the kernel
-    // resumes at the next instruction.
+    // the fetch loop already moved the PC past the instruction but it still carries the pipeline offset,
+    // rewind it so the kernel resumes at the next instruction
     let next = cpu.regs[PC].wrapping_sub(4);
     cpu.regs[PC] = next;
     cpu.branch(next);
@@ -145,10 +142,10 @@ pub fn breakpoint<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> 
     })
 }
 
-/// CPS, SETEND and the ARMv6K hint instructions.
+/// CPS, SETEND and the ARMv6K hint instructions
 pub fn hint_or_cps<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit> {
     if bits(op, 20, 27) == 0b0001_0000 {
-        // CPS. Only meaningful in a privileged mode.
+        // CPS, only means something in a privileged mode
         if cpu.cpsr.mode.is_privileged() {
             let imod = bits(op, 18, 19);
             let mmod = bit(op, 17);
@@ -170,6 +167,6 @@ pub fn hint_or_cps<B: Bus>(cpu: &mut Cpu, _bus: &mut B, op: u32) -> Option<Exit>
         }
         return None;
     }
-    // SETEND and the hints, nothing to do.
+    // SETEND and the hints, nothing to do
     None
 }

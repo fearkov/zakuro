@@ -1,4 +1,4 @@
-//! CRO/CRS dynamic modules, loading, rebasing and linking.
+//! CRO and CRS dynamic modules, loading, rebasing and linking
 
 pub mod format;
 
@@ -10,37 +10,35 @@ use zakuro_cpu::Bus;
 use crate::memory::Memory;
 use format::*;
 
-/// a module the loader has linked in.
+/// a module the loader linked in
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Module {
     pub name: String,
     pub base: VAddr,
     pub size: u32,
-    /// exported symbol name to address.
+    /// exported symbol name to addr
     pub exports: HashMap<String, VAddr>,
-    /// exported symbols addressed by index rather than by name.
+    /// exported symbols by index instead of name
     pub indexed_exports: Vec<VAddr>,
-    /// addresses of the module's segments, by segment index.
+    /// addrs of the module's segments, by index
     pub segments: Vec<VAddr>,
     pub auto_link: bool,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CroManager {
-    /// the static module, which holds the symbols the main executable exports.
+    /// the static module, holds what the main exe exports
     pub crs: Option<VAddr>,
-    /// loaded modules, oldest first. The CRS is not in here.
+    /// loaded modules oldest first, the CRS isn't in here
     pub modules: Vec<Module>,
-    /// imports we could not resolve, for diagnostics.
+    /// imports we couldn't resolve, for diagnostics
     pub unresolved: Vec<String>,
-    /// modules ldr:ro gave memory of their own, by where they run, the
-    /// buffer the title loaded them from, the memory and how much of the
-    /// module fixing left.
+    /// modules ldr:ro gave their own memory, by where they run
+    /// the buffer the title loaded them from, the memory, and how much fixing left
     pub copies: HashMap<VAddr, Copy>,
 }
 
-/// a module running from memory of its own rather than from the title's
-/// buffer.
+/// a module running from its own memory instead of the title's buffer
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Copy {
     pub buffer: VAddr,
@@ -57,11 +55,9 @@ pub enum CroError {
 
 type Result<T> = std::result::Result<T, CroError>;
 
-// ---------------------------------------------------------------------------
-// Raw field access
-// ---------------------------------------------------------------------------
+// raw field access
 
-/// reads one header field of the module at base.
+/// reads one header field of the module at base
 fn field(memory: &mut Memory, base: VAddr, offset: u32) -> u32 {
     memory.read32(base + offset)
 }
@@ -70,15 +66,11 @@ fn set_field(memory: &mut Memory, base: VAddr, offset: u32, value: u32) {
     memory.write32(base + offset, value);
 }
 
-// ---------------------------------------------------------------------------
-// The lists the title walks
-// ---------------------------------------------------------------------------
+// the lists the title walks
 
-/// puts a module at the end of the list it goes in, which the title walks
-/// from the static module to find what modules export. the static module's
-/// next field heads the modules that link on their own, its previous field
-/// the others. a list's head keeps its tail in its previous field, and the
-/// tail has no next.
+/// adds a module to the end of its list, the title walks it from the static module to find exports
+/// the static module's next field heads the self linking modules, its previous field the others
+/// a list's head keeps its tail in its previous field, the tail has no next
 fn register(memory: &mut Memory, crs: VAddr, base: VAddr, auto_link: bool) {
     let head_field = if auto_link { header::NEXT_CRO } else { header::PREVIOUS_CRO };
     let head = field(memory, crs, head_field);
@@ -94,12 +86,11 @@ fn register(memory: &mut Memory, crs: VAddr, base: VAddr, auto_link: bool) {
     set_field(memory, base, header::NEXT_CRO, 0);
 }
 
-/// takes a module out of the list it is in.
+/// takes a module out of its list
 fn unregister(memory: &mut Memory, crs: VAddr, base: VAddr) {
     let next = field(memory, base, header::NEXT_CRO);
     let previous = field(memory, base, header::PREVIOUS_CRO);
-    // one in a list has a previous, itself when alone. one loaded before
-    // the lists were kept, from an older saved state, is in none
+    // one in a list has a previous (itself when alone), one loaded b4 lists were kept (older saved state) is in none
     if previous == 0 {
         return;
     }
@@ -114,7 +105,7 @@ fn unregister(memory: &mut Memory, crs: VAddr, base: VAddr) {
         set_field(memory, previous, header::NEXT_CRO, next);
         set_field(memory, next, header::PREVIOUS_CRO, previous);
     } else {
-        // the tail, the one before it is the tail now
+        // the tail, the one b4 it is the tail now
         set_field(memory, previous, header::NEXT_CRO, 0);
         for head_field in heads {
             let head = field(memory, crs, head_field);
@@ -148,7 +139,7 @@ fn set_segment(memory: &mut Memory, base: VAddr, index: u32, value: &Segment) {
     memory.write32(entry + 8, value.kind as u32);
 }
 
-/// resolves a segment tag to an address inside the module.
+/// segment tag to an addr inside the module
 fn tag_to_address(memory: &mut Memory, base: VAddr, tag: SegmentTag) -> Option<VAddr> {
     let entry = segment(memory, base, tag.segment())?;
     if tag.offset() >= entry.size {
@@ -164,11 +155,9 @@ fn read_string(memory: &mut Memory, address: VAddr) -> String {
     memory.read_cstring(address, 512)
 }
 
-// ---------------------------------------------------------------------------
-// Relocation
-// ---------------------------------------------------------------------------
+// relocation
 
-/// applies one relocation.
+/// applies one reloc
 fn apply_relocation(
     memory: &mut Memory,
     target: VAddr,
@@ -190,15 +179,12 @@ fn apply_relocation(
         RelocationType::RelativeAddress => {
             write(memory, symbol.wrapping_add(addend).wrapping_sub(target_final));
         }
-        // no title has been seen to use these, a module that did would end up
-        // calling the wrong address, so say so rather than writing something
-        // plausible.
+        // no title's been seen using these, a module that did would call the wrong addr, so complain instead of writing smth plausible
         other => log::warn!("CRO relocation type {other:?} is not implemented"),
     }
 }
 
-/// walks a batch of external relocations, applying each with symbol, and
-/// records whether the batch is now resolved.
+/// walks a batch of external relocs, applying each w/ symbol, and records if the batch is resolved now
 fn apply_relocation_batch(
     memory: &mut Memory,
     base: VAddr,
@@ -221,13 +207,13 @@ fn apply_relocation_batch(
             break;
         }
         address += RELOCATION_ENTRY_SIZE;
-        // a malformed table must not loop forever.
+        // a malformed table mustn't loop forever
         if address > batch + RELOCATION_ENTRY_SIZE * 0x1000 {
             log::warn!("CRO relocation batch at 0x{batch:08X} has no end marker");
             break;
         }
     }
-    // the third byte of the first entry records whether the batch is resolved.
+    // the first entry's 3rd byte says if the batch is resolved
     memory.write8(batch + 6, resolved as u8);
 }
 
@@ -235,15 +221,13 @@ fn batch_is_resolved(memory: &mut Memory, batch: VAddr) -> bool {
     memory.read8(batch + 6) != 0
 }
 
-/// the module's own handler for imports nothing provides, which they point
-/// at until something does and again once it goes.
+/// the module's own handler for imports nobody provides, they point there till smth does and again once it leaves
 fn unresolved_symbol(memory: &mut Memory, base: VAddr) -> VAddr {
     let tag = SegmentTag(field(memory, base, header::ON_UNRESOLVED_SEGMENT_TAG));
     tag_to_address(memory, base, tag).unwrap_or(0)
 }
 
-/// the size of one entry of each table the header lists from the module
-/// name on, one for the ones counted in bytes.
+/// entry size of each table the header lists from the module name on, 1 for the byte counted ones
 const TABLE_ENTRY_SIZES: [u32; 15] = [
     1,
     SEGMENT_ENTRY_SIZE,
@@ -262,9 +246,8 @@ const TABLE_ENTRY_SIZES: [u32; 15] = [
     RELOCATION_ENTRY_SIZE,
 ];
 
-/// the first table each fix level drops, what comes after it goes too.
-/// level 1 drops what only loading needed, 2 the imports as well and 3 the
-/// exports.
+/// first table each fix level drops, everything after it goes too
+/// level 1 drops what only loading needed, 2 the imports too, 3 the exports
 const FIX_BARRIERS: [u32; 4] = [
     header::SIZE,
     header::STATIC_ANONYMOUS_SYMBOL_TABLE_OFFSET,
@@ -272,13 +255,10 @@ const FIX_BARRIERS: [u32; 4] = [
     header::EXPORT_NAMED_SYMBOL_TABLE_OFFSET,
 ];
 
-// ---------------------------------------------------------------------------
-// Rebasing
-// ---------------------------------------------------------------------------
+// rebasing
 
 impl CroManager {
-    /// prepares a module that the guest has just read into memory, turns every
-    /// stored offset into an address and applies its internal relocations.
+    /// preps a module the guest just read into memory, turns every stored offset into an addr and applies its internal relocs
     #[allow(clippy::too_many_arguments)]
     fn rebase(
         &mut self,
@@ -297,8 +277,7 @@ impl CroManager {
             return Err(CroError::NotACro);
         }
 
-        // every (offset, size) pair from the code segment onwards holds a file
-        // offset that becomes an address.
+        // every (offset, size) pair from the code segment on holds a file offset that becomes an addr
         let name_offset = field(memory, base, header::NAME_OFFSET);
         if name_offset != 0 {
             set_field(memory, base, header::NAME_OFFSET, name_offset + base);
@@ -312,8 +291,7 @@ impl CroManager {
             offset_field += 8;
         }
 
-        // segments, code and read-only data stay in the module's buffer, while
-        // data and BSS are given their own.
+        // code and rodata segments stay in the module's buffer, data and BSS get their own
         let segment_num = field(memory, base, header::SEGMENT_NUM);
         if log::log_enabled!(log::Level::Debug) {
             let table = field(memory, base, header::SEGMENT_TABLE_OFFSET);
@@ -340,9 +318,7 @@ impl CroManager {
             let Some(mut entry) = segment(memory, base, index) else {
                 continue;
             };
-            // the static module's segment table does not describe itself, it
-            // describes the main executable, so its offsets are already
-            // absolute addresses.
+            // the static module's segment table describes the main exe, not itself, so its offsets are already absolute
             if is_static {
                 continue;
             }
@@ -433,7 +409,7 @@ impl CroManager {
         Ok(())
     }
 
-    /// relocations that point within the module itself.
+    /// relocs pointing inside the module itself
     fn apply_internal_relocations(
         &self,
         memory: &mut Memory,
@@ -457,9 +433,7 @@ impl CroManager {
                 continue;
             }
             let target_final = target_segment.offset + tag.offset();
-            // a relocation into the data segment has to be written to the copy
-            // still sitting in the module's buffer, because the guest has not
-            // moved it yet.
+            // a reloc into the data segment goes to the copy still in the module's buffer, the guest hasn't moved it yet
             let target = if target_segment.kind == SegmentType::Data {
                 previous_data_segment + tag.offset()
             } else {
@@ -473,8 +447,7 @@ impl CroManager {
         }
     }
 
-    /// points every import at the module's unresolved handler and marks it
-    /// unresolved, which is the state a freshly loaded module starts in.
+    /// points every import at the module's unresolved handler and marks it unresolved, how a fresh module starts
     fn reset_external_relocations(&self, memory: &mut Memory, base: VAddr) {
         let unresolved = unresolved_symbol(memory, base);
         let table = field(memory, base, header::EXTERNAL_RELOCATION_TABLE_OFFSET);
@@ -493,14 +466,12 @@ impl CroManager {
         }
     }
 
-    /// drops the tables the fix level says the module no longer needs, so
-    /// the title can take back the memory they are in, and returns how much
-    /// of the module is left.
+    /// drops the tables the fix level says aren't needed so the title can reclaim that memory, returns how much is left
     fn fix(&self, memory: &mut Memory, base: VAddr, size: u32, level: u32) -> u32 {
         let Some(&barrier) = FIX_BARRIERS.get(level as usize).filter(|_| level != 0) else {
             return 0;
         };
-        // what is kept ends with the code or the last table before the barrier
+        // what's kept ends w/ the code or the last table b4 the barrier
         let mut end = field(memory, base, header::CODE_OFFSET) + field(memory, base, header::CODE_SIZE);
         let mut offset = header::MODULE_NAME_OFFSET;
         for entry_size in TABLE_ENTRY_SIZES {
@@ -516,7 +487,7 @@ impl CroManager {
             offset += 8;
         }
         let fixed = zakuro_common::bits::align_up(end.saturating_sub(base), 0x1000).min(size);
-        // the dropped tables point where the module now ends, and are empty
+        // dropped tables point where the module now ends, empty
         let mut offset = barrier;
         while offset <= header::STATIC_RELOCATION_TABLE_OFFSET {
             set_field(memory, base, offset, base + fixed);
@@ -526,7 +497,7 @@ impl CroManager {
         fixed
     }
 
-    /// builds the symbol index for a module that has just been rebased.
+    /// builds the symbol index for a freshly rebased module
     fn index_exports(&self, memory: &mut Memory, base: VAddr) -> (HashMap<String, VAddr>, Vec<VAddr>) {
         let mut named = HashMap::new();
         let table = field(memory, base, header::EXPORT_NAMED_SYMBOL_TABLE_OFFSET);
@@ -567,10 +538,9 @@ impl CroManager {
             .collect()
     }
 
-    // -- linking ------------------------------------------------------------
+    // linking
 
-    /// looks a symbol up in the static module, then in the modules linked
-    /// automatically in the order they were loaded, as ldr:ro does.
+    /// looks a symbol up in the static module, then in auto linked modules in load order, like ldr:ro
     fn lookup(&self, name: &str) -> Option<VAddr> {
         self.modules
             .iter()
@@ -582,7 +552,7 @@ impl CroManager {
         self.modules.iter().find(|m| m.name == name)
     }
 
-    /// resolves the named symbols a module imports.
+    /// resolves the named symbols a module imports
     fn apply_import_named_symbols(&mut self, memory: &mut Memory, base: VAddr) {
         let table = field(memory, base, header::IMPORT_NAMED_SYMBOL_TABLE_OFFSET);
         let count = field(memory, base, header::IMPORT_NAMED_SYMBOL_NUM);
@@ -606,8 +576,7 @@ impl CroManager {
         }
     }
 
-    /// resolves the indexed and anonymous symbols a module imports from the
-    /// specific modules it names.
+    /// resolves the indexed and anonymous symbols a module imports from the modules it names
     fn apply_module_imports(&mut self, memory: &mut Memory, base: VAddr) {
         let table = field(memory, base, header::IMPORT_MODULE_TABLE_OFFSET);
         let count = field(memory, base, header::IMPORT_MODULE_NUM);
@@ -659,7 +628,7 @@ impl CroManager {
         }
     }
 
-    /// resolves imports in modules already loaded that this module satisfies.
+    /// resolves imports in already loaded modules that this one satisfies
     fn apply_exports_to_loaded(&mut self, memory: &mut Memory, new_index: usize) {
         let new_module = self.modules[new_index].clone();
 
@@ -683,7 +652,7 @@ impl CroManager {
                 }
             }
 
-            // and the indexed/anonymous symbols they import from us by name.
+            // plus the indexed and anonymous symbols they import from us by name
             let table = field(memory, base, header::IMPORT_MODULE_TABLE_OFFSET);
             let count = field(memory, base, header::IMPORT_MODULE_NUM);
             for i in 0..count {
@@ -733,10 +702,9 @@ impl CroManager {
         }
     }
 
-    // -- public API ---------------------------------------------------------
+    // public api
 
-    /// ldr:ro Initialize, registers the static module, whose exports every
-    /// other module links against.
+    /// ldr:ro Initialize, registers the static module everyone links against
     pub fn initialize(&mut self, memory: &mut Memory, base: VAddr, size: u32) -> Result<()> {
         self.rebase(memory, base, size, 0, 0, 0, 0, true)?;
         self.reset_external_relocations(memory, base);
@@ -745,7 +713,7 @@ impl CroManager {
         let segments = self.read_segments(memory, base);
         let name_offset = field(memory, base, header::MODULE_NAME_OFFSET);
         let name = read_string(memory, name_offset);
-        // no module hangs off it yet
+        // nothing hangs off it yet
         set_field(memory, base, header::NEXT_CRO, 0);
         set_field(memory, base, header::PREVIOUS_CRO, 0);
 
@@ -767,7 +735,7 @@ impl CroManager {
         Ok(())
     }
 
-    /// ldr:ro LoadCRO, rebases, relocates and links a module.
+    /// ldr:ro LoadCRO, rebases, relocates and links a module
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         &mut self,
@@ -812,8 +780,7 @@ impl CroManager {
             register(memory, crs, base, auto_link);
         }
 
-        // link it against what is already there, then let what is already
-        // there link against it.
+        // link it against what's there, then let what's there link against it
         self.apply_import_named_symbols(memory, base);
         self.apply_module_imports(memory, base);
         self.apply_exports_to_loaded(memory, index);
@@ -824,12 +791,11 @@ impl CroManager {
             self.modules.len()
         );
 
-        // the guest learns from the fixed size how much of its buffer it may
-        // take back.
+        // the guest learns from the fixed size how much of its buffer it can take back
         Ok(self.fix(memory, base, size, fix_level))
     }
 
-    /// ldr:ro UnloadCRO.
+    /// ldr:ro UnloadCRO
     pub fn unload(&mut self, memory: &mut Memory, base: VAddr) {
         let Some(index) = self.modules.iter().position(|m| m.base == base) else {
             return;
@@ -837,10 +803,9 @@ impl CroManager {
         let module = self.modules.remove(index);
         log::debug!("ldr:ro: unloaded '{}'", module.name);
 
-        // anything that linked against it goes back to its own unresolved
-        // handler, or it would keep calling into memory the guest is about to
-        // reuse. named imports go by the name, the ones by index and the
-        // anonymous ones by the module they name.
+        // anything linked against it goes back to its own unresolved handler,
+        // else it'd keep calling into memory the guest is about to reuse
+        // named imports go by name, indexed and anonymous ones by the module they name
         for other in self.modules.clone().iter().filter(|other| other.auto_link) {
             let other_base = other.base;
             let unresolved = unresolved_symbol(memory, other_base);
@@ -889,7 +854,7 @@ impl CroManager {
         unrebase(memory, base);
     }
 
-    /// number of modules currently linked, for the diagnostics overlay.
+    /// modules linked rn, for the diagnostics overlay
     pub fn len(&self) -> usize {
         self.modules.len()
     }
@@ -899,7 +864,7 @@ impl CroManager {
     }
 }
 
-/// adds the module's base to a set of offset fields in every entry of a table.
+/// adds the module's base to some offset fields in every entry of a table
 fn rebase_table(
     memory: &mut Memory,
     base: VAddr,
@@ -911,7 +876,7 @@ fn rebase_table(
     move_table(memory, base, table_field, count_field, entry_size, offsets, true);
 }
 
-/// turns the offsets a table's entries hold into addresses, or back.
+/// turns a table's entry offsets into addrs, or back
 fn move_table(
     memory: &mut Memory,
     base: VAddr,
@@ -938,8 +903,7 @@ fn move_table(
     }
 }
 
-/// the tables whose entries point elsewhere in the module, and where in an
-/// entry the pointers are.
+/// tables whose entries point elsewhere in the module, and where in an entry the pointers are
 const POINTER_TABLES: [(u32, u32, u32, &[u32]); 5] = [
     (header::EXPORT_NAMED_SYMBOL_TABLE_OFFSET, header::EXPORT_NAMED_SYMBOL_NUM, EXPORT_NAMED_SYMBOL_ENTRY_SIZE, &[0]),
     (header::IMPORT_MODULE_TABLE_OFFSET, header::IMPORT_MODULE_NUM, IMPORT_MODULE_ENTRY_SIZE, &[0, 4, 12]),
@@ -948,8 +912,7 @@ const POINTER_TABLES: [(u32, u32, u32, &[u32]); 5] = [
     (header::IMPORT_ANONYMOUS_SYMBOL_TABLE_OFFSET, header::IMPORT_ANONYMOUS_SYMBOL_NUM, IMPORT_ANONYMOUS_SYMBOL_ENTRY_SIZE, &[4]),
 ];
 
-/// puts a module back the way its file has it, offsets rather than
-/// addresses, which is how ldr:ro hands the buffer back to the title.
+/// puts a module back the way its file has it (offsets not addrs), that's how ldr:ro hands the buffer back to the title
 fn unrebase(memory: &mut Memory, base: VAddr) {
     for (table, count, entry_size, offsets) in POINTER_TABLES {
         move_table(memory, base, table, count, entry_size, offsets, false);
@@ -986,7 +949,7 @@ mod tests {
     use super::*;
     use crate::memory::{MemoryRegion, MemoryState, Permission};
 
-    /// the static module's header and four modules', in memory of their own.
+    /// the static module's header plus four modules', in their own memory
     fn headers() -> (crate::System, VAddr, [VAddr; 4]) {
         let mut system = crate::System::new(crate::Config::default());
         let block = system.memory.phys.allocate(MemoryRegion::Application, 0x1000).unwrap();
@@ -995,13 +958,12 @@ mod tests {
         (system, at(0), [at(1), at(2), at(3), at(4)])
     }
 
-    /// a header's next and previous fields.
+    /// a header's next and previous fields
     fn links(memory: &mut Memory, base: VAddr) -> (VAddr, VAddr) {
         (field(memory, base, header::NEXT_CRO), field(memory, base, header::PREVIOUS_CRO))
     }
 
-    /// modules join the end of their list and leave it from anywhere in it,
-    /// and the title walking it from the static module finds them in order.
+    /// modules join the end of their list and leave from anywhere, the title walking it from the static module finds them in order
     #[test]
     fn modules_go_in_and_out_of_the_lists_the_title_walks() {
         let (mut system, crs, [a, b, c, d]) = headers();
@@ -1026,7 +988,7 @@ mod tests {
         unregister(memory, crs, b);
         unregister(memory, crs, d);
         assert_eq!(links(memory, crs), (0, 0), "the last ones");
-        // one in no list, from before the lists were kept, stays out
+        // one in no list (from b4 lists were kept) stays out
         register(memory, crs, a, true);
         unregister(memory, crs, c);
         assert_eq!((links(memory, crs), links(memory, a)), ((a, 0), (0, a)), "in none");

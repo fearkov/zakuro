@@ -1,42 +1,40 @@
-//! builds a RomFS level-3 image.
+//! builds a RomFS level 3 image
 
-/// a file to place in the built image.
+/// a file to place in the built image
 pub struct BuildFile {
-    /// path from the root, e.g. US/country_LZ.bin. Only forward slashes.
+    /// path from the root, like US/country_LZ.bin, forward slashes only
     pub path: String,
     pub data: Vec<u8>,
 }
 
 const INVALID: u32 = 0xFFFF_FFFF;
 
-/// one directory while the tree is being assembled.
+/// one dir while the tree's being put together
 pub(crate) struct Dir {
     pub(crate) name: String,
     pub(crate) parent: usize,
     pub(crate) children: Vec<usize>,
     pub(crate) files: Vec<usize>,
-    /// offset in the built metadata table, filled in during layout.
+    /// offset in the built metadata table, filled in during layout
     pub(crate) offset: u32,
 }
 
-/// one file while the tree is being assembled.
+/// one file while the tree's being put together
 pub(crate) struct File {
     pub(crate) name: String,
     pub(crate) parent: usize,
-    /// offset from the start of the file data.
+    /// offset from the start of the file data
     pub(crate) data_offset: u64,
     pub(crate) data_size: u64,
     pub(crate) offset: u32,
 }
 
-/// builds a level-3 RomFS image containing files, kept in a nameless
-/// directory under the root as the system's archives keep theirs.
+/// builds a level 3 RomFS image w/ files, kept in a nameless dir under the root like the system's archives keep theirs
 pub fn build(files: &[BuildFile]) -> Vec<u8> {
     assemble(files, true)
 }
 
-/// builds an image with files under a nameless directory, or at the root
-/// as a game's RomFS has them.
+/// builds an image w/ files under a nameless dir, or at the root like a game's RomFS has them
 pub(crate) fn assemble(files: &[BuildFile], nameless: bool) -> Vec<u8> {
     let root = Dir {
         name: String::new(),
@@ -90,8 +88,7 @@ pub(crate) fn assemble(files: &[BuildFile], nameless: bool) -> Vec<u8> {
             };
         }
 
-        // file data is 16-byte aligned, which is what a real image does and
-        // what keeps a reader's 64-bit offsets from straddling a boundary.
+        // file data is 16 byte aligned, like a real image, and that keeps a reader's 64 bit offsets from straddling a boundary
         while data.len() % 16 != 0 {
             data.push(0);
         }
@@ -114,11 +111,9 @@ pub(crate) fn assemble(files: &[BuildFile], nameless: bool) -> Vec<u8> {
     out
 }
 
-/// the header and the metadata tables for a tree whose root is dirs[0],
-/// padded up to where the file data starts.
+/// the header and metadata tables for a tree whose root is dirs[0], padded up to where the file data starts
 pub(crate) fn metadata(dirs: &mut [Dir], entries: &mut [File]) -> Vec<u8> {
-    // lay the metadata tables out so every entry knows its own offset before
-    // anything has to write a sibling or child pointer to it.
+    // lay the metadata tables out so every entry knows its own offset b4 anything has to write a sibling or child ptr to it
     let mut dir_meta_size = 0u32;
     for dir in dirs.iter_mut() {
         dir.offset = dir_meta_size;
@@ -130,8 +125,7 @@ pub(crate) fn metadata(dirs: &mut [Dir], entries: &mut [File]) -> Vec<u8> {
         file_meta_size += file_entry_size(&file.name);
     }
 
-    // every entry's next sibling, found in one pass, a directory in a game's
-    // RomFS can hold thousands of files.
+    // every entry's next sibling, found in one pass, a dir in a game's RomFS can hold thousands of files
     let mut next_dir = vec![INVALID; dirs.len()];
     let mut next_file = vec![INVALID; entries.len()];
     for dir in dirs.iter() {
@@ -155,8 +149,7 @@ pub(crate) fn metadata(dirs: &mut [Dir], entries: &mut [File]) -> Vec<u8> {
         let first_child = dir.children.first().map_or(INVALID, |&c| dirs[c].offset);
         let first_file = dir.files.first().map_or(INVALID, |&f| entries[f].offset);
 
-        // the root is in the hash table too, a game's lookups start from the
-        // nameless directory under offset 0 and find the root itself.
+        // the root is in the hash table too, a game's lookups start from the nameless dir under offset 0 and find the root itself
         let bucket = hash(parent, &dir.name) as usize % dir_buckets;
         let next_hash = dir_hash[bucket];
         dir_hash[bucket] = dir.offset;
@@ -186,8 +179,7 @@ pub(crate) fn metadata(dirs: &mut [Dir], entries: &mut [File]) -> Vec<u8> {
         write_name(&mut file_meta, &file.name);
     }
 
-    // header, its own size, then (offset, size) for each of the four tables,
-    // then where the file data starts. Every table is 4-byte aligned.
+    // header, its own size, then (offset, size) for each of the four tables, then where the file data starts, every table is 4 byte aligned
     const HEADER_SIZE: u32 = 0x28;
     let dir_hash_offset = HEADER_SIZE;
     let dir_hash_size = (dir_hash.len() * 4) as u32;
@@ -249,7 +241,7 @@ fn write_name(out: &mut Vec<u8>, name: &str) {
     }
 }
 
-/// the hash a name lands on, as the console's own lookup computes it.
+/// the hash a name lands on, like the console's own lookup computes it
 fn hash(parent: u32, name: &str) -> u32 {
     let mut hash = parent ^ 123_456_789;
     for unit in name.encode_utf16() {
@@ -259,11 +251,9 @@ fn hash(parent: u32, name: &str) -> u32 {
     hash
 }
 
-/// bucket count for a hash table holding entries, using the same shape the
-/// console's own images do, odd, and a little larger than the entry count.
+/// bucket count for a hash table holding entries, same shape the console's own images use, odd and a bit bigger than the entry count
 fn bucket_count(entries: usize) -> usize {
-    // diagnostic, a large prime table makes the bucket a title reads reveal
-    // the hash of the name it is looking for, which is otherwise invisible.
+    // diagnostic, a big prime table makes the bucket a title reads reveal the hash of the name it's looking for, otherwise you can't see it
     if let Ok(forced) = std::env::var("ZAKURO_ROMFS_BUCKETS") {
         if let Ok(forced) = forced.parse::<usize>() {
             return forced;
@@ -298,8 +288,7 @@ mod tests {
     use super::*;
     use crate::romfs::RomFs;
 
-    /// a built image has to read back through the parser that reads real
-    /// cartridges, or it is not a RomFS, just bytes shaped like one.
+    /// a built image has to read back thru the parser that reads real cartridges, or it's not a RomFS, just bytes shaped like one
     #[test]
     fn a_built_image_reads_back_through_the_parser() {
         let image = build(&[
@@ -332,8 +321,7 @@ mod tests {
         assert_eq!(&image[start..start + 40], &[9; 40]);
     }
 
-    /// looks a name up the way the console does, hash it, index the bucket
-    /// table, then walk the collision chain.
+    /// looks a name up like the console does, hash it, index the bucket table, then walk the collision chain
     fn hash_lookup(image: &[u8], parent_offset: u32, name: &str, files: bool) -> Option<u32> {
         let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
         let (table_offset, table_size, meta_offset) = if files {
@@ -381,8 +369,7 @@ mod tests {
             },
         ]);
 
-        // a title starts by resolving the nameless directory in the root,
-        // exactly as this does, and everything else hangs off that.
+        // a title starts by resolving the nameless dir in the root exactly like this does, and everything else hangs off that
         let content_root =
             hash_lookup(&image, 0, "", false).expect("the nameless root should hash-resolve");
 
@@ -397,13 +384,11 @@ mod tests {
         hash_lookup(&image, jp, "country_LZ.bin", true)
             .expect("the JP country table should hash-resolve");
 
-        // a name that is not there must not resolve to a neighbour that
-        // happens to share a bucket.
+        // a name that isn't there must not resolve to a neighbor that happens to share a bucket
         assert!(hash_lookup(&image, us, "missing.bin", true).is_none());
     }
 
-    /// a game's RomFS keeps its files at the root, and a game finds the
-    /// root itself as the nameless directory under offset 0.
+    /// a game's RomFS keeps its files at the root, and a game finds the root itself as the nameless dir under offset 0
     #[test]
     fn a_game_finds_the_root_through_the_hash_table() {
         let image = assemble(&[BuildFile { path: "Data/file.bin".into(), data: vec![1] }], false);

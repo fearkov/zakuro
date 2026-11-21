@@ -1,15 +1,12 @@
-//! y2r:u, the hardware that turns YUV video frames into RGB images, which
-//! titles play movies through. a conversion runs as soon as it starts and
-//! signals its end at once, the arithmetic being the hardware's own as
-//! Citra worked it out.
+//! y2r:u, the hardware that turns YUV video frames into RGB images, titles play movies thru it
+//! a conversion runs as soon as it starts and signals its end right away, the math is the hardware's own as Citra worked it out
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::ObjectId;
 use crate::kernel::sync::ResetType;
 use crate::System;
 
-/// the coefficients of the four standard conversions, ITU-R BT.601 and 709,
-/// full range and scaled.
+/// the coefficients of the four standard conversions, ITU R BT.601 and 709, full range and scaled
 const STANDARD: [[i32; 8]; 4] = [
     [0x100, 0x166, 0xB6, 0x58, 0x1C5, -0x166F, 0x10EE, -0x1C5B],
     [0x100, 0x193, 0x77, 0x2F, 0x1DB, -0x1933, 0xA7C, -0x1D51],
@@ -17,8 +14,7 @@ const STANDARD: [[i32; 8]; 4] = [
     [0x12A, 0x1CA, 0x88, 0x36, 0x21C, -0x1F04, 0x99C, -0x2421],
 ];
 
-/// a buffer a conversion reads from or writes to, in pieces of transfer
-/// bytes with gap bytes skipped after each.
+/// a buffer a conversion reads from or writes to, in pieces of transfer bytes w/ gap bytes skipped after each
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct Buffer {
     address: u32,
@@ -31,7 +27,7 @@ pub struct Y2rState {
     input_format: u32,
     output_format: u32,
     rotation: u32,
-    /// the output in 8x8 tiles, the way textures are, rather than in rows.
+    /// the output in 8x8 tiles like textures, instead of rows
     tiled: bool,
     line_width: u32,
     lines: u32,
@@ -45,27 +41,26 @@ pub struct Y2rState {
     v: Buffer,
     yuyv: Buffer,
     output: Buffer,
-    /// signalled at the end of each conversion.
+    /// signaled at the end of each conversion
     event: Option<ObjectId>,
     #[serde(skip)]
     scratch: Scratch,
 }
 
-/// what a conversion works in, kept from one to the next, a movie
-/// converting a frame at a time.
+/// what a conversion works in, kept from one to the next since a movie converts a frame at a time
 #[derive(Default)]
 struct Scratch {
-    /// the samples gathered, Y, U and V, or the YUYV stream in the first.
+    /// the samples gathered, Y, U and V, or the YUYV stream in the first
     planes: [Vec<u8>; 3],
-    /// a transfer's worth of 16 bit samples.
+    /// a transfer's worth of 16 bit samples
     piece: Vec<u8>,
-    /// a YUYV line taken apart into its Y, U and V.
+    /// a YUYV line split into its Y, U and V
     line: [Vec<u8>; 3],
-    /// the chroma terms of a line, red, green and blue, one a pixel.
+    /// the chroma terms of a line, red, green and blue, one a pixel
     chroma: [Vec<i32>; 3],
-    /// eight lines of pixels in the output format.
+    /// eight lines of pixels in the output format
     pixels: Vec<u32>,
-    /// the image as it goes to the output buffer.
+    /// the image as it goes to the output buffer
     out: Vec<u8>,
 }
 
@@ -162,8 +157,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.set(&mut system.memory, 2, Descriptor::handles(1));
             buffer.set(&mut system.memory, 3, handle);
         }
-        // SetSendingY / U / V / YUYV(address, image size, transfer unit,
-        // gap, process), SetReceiving the same for the output
+        // SetSendingY / U / V / YUYV(addr, image size, transfer unit, gap, process), SetReceiving the same for the output
         0x0010..=0x0013 | 0x0018 => {
             let target = Buffer {
                 address: word(system, 1),
@@ -180,8 +174,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             }
             reply(system, &[]);
         }
-        // IsFinishedSendingYuv / Y / U / V, IsFinishedReceiving, every
-        // conversion being done as soon as it starts
+        // IsFinishedSendingYuv / Y / U / V, IsFinishedReceiving, every conversion's done as soon as it starts
         0x0014..=0x0017 | 0x0019 => reply(system, &[1]),
         // SetInputLineWidth / GetInputLineWidth
         0x001A => {
@@ -233,8 +226,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let value = state(system).alpha;
             reply(system, &[value]);
         }
-        // SetDitheringWeightParams / GetDitheringWeightParams, which only
-        // change what dithering does, and dithering is not done
+        // SetDitheringWeightParams / GetDitheringWeightParams, they only change what dithering does, and we don't dither
         0x0024 => reply(system, &[]),
         0x0025 => reply(system, &[0; 8]),
         // StartConversion
@@ -248,8 +240,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         0x0027 => reply(system, &[]),
         0x0028 => reply(system, &[0]),
         0x002A => reply(system, &[0]),
-        // SetPackageParameter(formats, rotation and alignment, line width
-        // and lines, coefficient and alpha)
+        // SetPackageParameter(formats, rotation and alignment, line width and lines, coefficient and alpha)
         0x0029 => {
             let (first, second, third) = (word(system, 1), word(system, 2), word(system, 3));
             let y2r = state(system);
@@ -287,7 +278,7 @@ fn state(system: &mut System) -> &mut Y2rState {
     &mut system.services.y2r
 }
 
-/// the end event, made the first time a title asks for it and held on to.
+/// the end event, made the first time a title asks for it and held on to
 fn event(system: &mut System) -> ObjectId {
     if let Some(object) = system.services.y2r.event {
         return object;
@@ -301,9 +292,8 @@ fn event(system: &mut System) -> ObjectId {
     object
 }
 
-/// count bytes of a buffer into out, a transfer's worth at a time with the
-/// gaps skipped, keeping one byte of every width. every transfer is read
-/// whole, the last one too.
+/// count bytes of a buffer into out, a transfer's worth at a time w/ the gaps skipped, keeping one byte of every width
+/// every transfer gets read whole, the last one too
 fn gather(system: &mut System, from: Buffer, count: usize, width: usize, out: &mut Vec<u8>, piece: &mut Vec<u8>) {
     let transfer = (from.transfer as usize).max(width);
     let step = transfer as u32 + from.gap as u32;
@@ -327,8 +317,7 @@ fn gather(system: &mut System, from: Buffer, count: usize, width: usize, out: &m
     }
 }
 
-/// writes bytes to a buffer, a transfer's worth at a time with the gaps
-/// skipped.
+/// writes bytes to a buffer, a transfer's worth at a time w/ the gaps skipped
 fn scatter(system: &mut System, to: Buffer, bytes: &[u8]) {
     let transfer = (to.transfer as usize).max(1);
     let mut address = to.address;
@@ -338,22 +327,19 @@ fn scatter(system: &mut System, to: Buffer, bytes: &[u8]) {
     }
 }
 
-/// the coefficients of a conversion, as the hardware's arithmetic goes once
-/// its shifts are put together: a channel is the term of the pixel's Y and
-/// a term of its U and V added, shifted down eight and clamped to a byte,
-/// bit for bit what the hardware gives. it shifts down three, adds the
-/// channel's offset and shifts down five more, and ((a >> 3) + k) >> 5 is
-/// (a + 8k) >> 8.
+/// the coefficients of a conversion, as the hardware's math goes once its shifts get put together
+/// a channel is the term of the pixel's Y plus a term of its U and V, shifted down eight and clamped to a byte,
+/// bit for bit what the hardware gives
+/// it shifts down three, adds the channel's offset and shifts down five more, and ((a >> 3) + k) >> 5 is (a + 8k) >> 8
 #[derive(Debug, Clone, Copy)]
 struct Terms {
-    /// the coefficients multiplying Y, V for red, V and U for green and U
-    /// for blue, halfwords all, which the vector code does better with.
+    /// the coefficients multiplying Y, V for red, V and U for green and U for blue, all halfwords, the vector code likes those better
     luma: i16,
     red_v: i16,
     green_v: i16,
     green_u: i16,
     blue_u: i16,
-    /// eight times the offset of each channel.
+    /// eight times the offset of each channel
     red: i32,
     green: i32,
     blue: i32,
@@ -378,7 +364,7 @@ impl Terms {
         self.luma as i32 * y as i32
     }
 
-    /// the red, green and blue terms of a U and V.
+    /// the red, green and blue terms of a U and V
     #[inline(always)]
     fn chroma(&self, u: u8, v: u8) -> [i32; 3] {
         let (u, v) = (u as i32, v as i32);
@@ -390,26 +376,23 @@ impl Terms {
     }
 }
 
-/// a channel from the sum of its terms. the clamp goes through 16 bits,
-/// where the vector unit has a minimum and a maximum, 32 bits having none
-/// before SSE4.1.
+/// a channel from the sum of its terms
+/// the clamp goes thru 16 bits where the vector unit has a min and a max, 32 bits has none b4 SSE4.1
 #[inline(always)]
 fn channel(sum: i32) -> u32 {
     ((sum >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16).clamp(0, 0xFF) as u32
 }
 
-/// how the input of a conversion is laid out.
+/// how a conversion's input is laid out
 #[derive(Debug, Clone, Copy)]
 enum Layout {
-    /// planes of Y, U and V, a line of U and V going with this many lines
-    /// of Y.
+    /// planes of Y, U and V, a line of U and V goes w/ this many lines of Y
     Planar { lines_per_chroma: usize },
-    /// a pair of pixels in four bytes, their Y, U, Y and V in turn.
+    /// a pair of pixels in four bytes, their Y, U, Y and V in turn
     Yuyv,
 }
 
-/// the chroma terms of a line's pixels, the two of a U and V getting the
-/// same.
+/// the chroma terms of a line's pixels, the two of a U and V get the same
 fn chroma_terms(terms: &Terms, u: &[u8], v: &[u8], chroma: &mut [Vec<i32>; 3]) {
     let [red, green, blue] = chroma;
     let pairs = u.len();
@@ -422,8 +405,7 @@ fn chroma_terms(terms: &Terms, u: &[u8], v: &[u8], chroma: &mut [Vec<i32>; 3]) {
     }
 }
 
-/// a line's pixels from its Y and chroma terms, as pack puts red, green and
-/// blue together.
+/// a line's pixels from its Y and chroma terms, like pack puts red, green and blue together
 #[inline(always)]
 fn line_pixels(terms: &Terms, luma: &[u8], chroma: &[Vec<i32>; 3], pixels: &mut [u32], pack: impl Fn(u32, u32, u32) -> u32) {
     let width = pixels.len();
@@ -434,16 +416,15 @@ fn line_pixels(terms: &Terms, luma: &[u8], chroma: &[Vec<i32>; 3], pixels: &mut 
     }
 }
 
-/// writes two pixels side by side, BYTES of each.
+/// writes two pixels side by side, BYTES of each
 #[inline(always)]
 fn put<const BYTES: usize>(pair: &[u32; 2], out: &mut [u8]) {
     let both = pair[0] as u64 | (pair[1] as u64) << (8 * BYTES);
     out.copy_from_slice(&both.to_le_bytes()[..2 * BYTES]);
 }
 
-/// puts a strip's pixels in its part of the output, in rows or in 8x8 tiles
-/// in the order their pixels go in a texture, two at a time, as the two of
-/// an even and odd column are side by side in a tile too.
+/// puts a strip's pixels in its part of the output, in rows or in 8x8 tiles in the order their pixels go in a texture
+/// two at a time, since the two of an even and odd column sit side by side in a tile too
 fn place<const BYTES: usize>(pixels: &[u32], width: usize, rows: usize, tiled: bool, out: &mut [u8]) {
     use zakuro_gpu::format::morton_interleave;
     if !tiled {
@@ -472,8 +453,7 @@ fn place<const BYTES: usize>(pixels: &[u32], width: usize, rows: usize, tiled: b
     }
 }
 
-/// converts what was gathered into the output, eight lines at a time, BYTES
-/// a pixel, a line's pixels first and then their places.
+/// converts what was gathered into the output, eight lines at a time, BYTES a pixel, a line's pixels first and then their places
 fn convert_strips<const BYTES: usize>(
     scratch: &mut Scratch,
     layout: Layout,
@@ -497,8 +477,7 @@ fn convert_strips<const BYTES: usize>(
             let at = strip + y;
             let luma_line = match layout {
                 Layout::Planar { lines_per_chroma } => {
-                    // the terms of a chroma line once for the two lines of
-                    // 4:2:0 that share it
+                    // the terms of a chroma line once for the two 4:2:0 lines sharing it
                     let chroma_line = at / lines_per_chroma;
                     if shared != Some(chroma_line) {
                         let (u, v) = (&chroma_u[chroma_line * half..][..half], &chroma_v[chroma_line * half..][..half]);
@@ -528,7 +507,7 @@ fn convert_strips<const BYTES: usize>(
     }
 }
 
-/// runs the conversion the title set up.
+/// runs the conversion the title set up
 fn convert(system: &mut System) {
     let state = &system.services.y2r;
     let (width, lines) = (state.line_width as usize, state.lines as usize);
@@ -567,8 +546,7 @@ fn convert(system: &mut System) {
         }
     };
     let bytes = match output_format {
-        // 32 bit with alpha first in memory and then blue, green and red, 24
-        // bit without the alpha, the way the GPU has them
+        // 32 bit w/ alpha first in memory then blue, green and red, 24 bit w/o the alpha, like the GPU has them
         0 => {
             let alpha = alpha as u32;
             convert_strips::<4>(&mut scratch, layout, &terms, width, lines, tiled, |r, g, b| alpha | b << 8 | g << 16 | r << 24);
@@ -578,7 +556,7 @@ fn convert(system: &mut System) {
             convert_strips::<3>(&mut scratch, layout, &terms, width, lines, tiled, |r, g, b| b | g << 8 | r << 16);
             3
         }
-        // 16 bit 5-5-5-1 and 5-6-5
+        // 16 bit 5551 and 565
         2 => {
             let alpha = (alpha >= 0x80) as u32;
             convert_strips::<2>(&mut scratch, layout, &terms, width, lines, tiled, |r, g, b| (r >> 3) << 11 | (g >> 3) << 6 | (b >> 3) << 1 | alpha);
@@ -603,8 +581,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    /// the conversion as it was before it went a line at a time, kept to
-    /// check the new one against.
+    /// the conversion as it was b4 it went a line at a time, kept to check the new one against
     mod oracle {
         use super::super::{Buffer, System};
 
@@ -692,8 +669,7 @@ mod tests {
                 _ => zakuro_gpu::format::ColorFormat::Rgb565,
             };
             let bytes = color.bytes_per_pixel();
-            // eight lines at a time, in rows or in 8x8 tiles in the order their
-            // pixels go in a texture
+            // eight lines at a time, in rows or in 8x8 tiles in the order their pixels go in a texture
             let mut out = vec![0u8; pixels * bytes];
             let mut at = 0;
             for strip in (0..lines).step_by(8) {
@@ -723,18 +699,18 @@ mod tests {
         }
     }
 
-    /// one pixel the way a conversion works it out.
+    /// one pixel the way a conversion works it out
     fn rgb(c: &[i32; 8], y: u8, u: u8, v: u8) -> [u8; 3] {
         let terms = Terms::new(c);
         let luma = terms.luma(y);
         terms.chroma(u, v).map(|term| channel(luma + term) as u8)
     }
 
-    /// black, white and grey come out the way BT.601 says, full range.
+    /// black, white and grey come out like BT.601 says, full range
     #[test]
     fn converts_with_the_hardware_arithmetic() {
         let c = &STANDARD[0];
-        // the coefficients round, a channel can be one off
+        // the coefficients round, a channel can be off by one
         assert!(rgb(c, 0, 128, 128).iter().all(|&v| v <= 1));
         assert!(rgb(c, 255, 128, 128).iter().all(|&v| v >= 254));
         let grey = rgb(c, 128, 128, 128);
@@ -744,7 +720,7 @@ mod tests {
         assert!(red[0] > 240 && red[1] < 15 && red[2] < 15, "{red:?}");
     }
 
-    /// numbers for the random cases, the same every run.
+    /// numbers for the random cases, the same every run
     struct Random(u64);
 
     impl Random {
@@ -767,9 +743,8 @@ mod tests {
         }
     }
 
-    /// the folded arithmetic gives what the hardware's does for every Y, U
-    /// and V, under the standard coefficients, random ones and ones whose
-    /// sums go past what 16 bits hold.
+    /// the folded math gives what the hardware's does for every Y, U and V, under the standard coefficients,
+    /// random ones and ones whose sums go past 16 bits
     #[test]
     fn folds_the_arithmetic_exactly() {
         let mut random = Random(1);
@@ -788,9 +763,8 @@ mod tests {
         }
     }
 
-    /// a strip's pixels go where the GPU looks for them in a texture, a whole
-    /// strip and a last one of four lines alike, and in rows otherwise, at
-    /// every pixel size.
+    /// a strip's pixels go where the GPU looks for them in a texture (a whole strip and a last one of four lines
+    /// alike), and in rows otherwise, at every pixel size
     #[test]
     fn places_pixels_where_textures_have_them() {
         fn check<const BYTES: usize>(width: usize, rows: usize, alignments: &[bool]) {
@@ -820,7 +794,7 @@ mod tests {
         }
     }
 
-    /// guest memory the cases convert in, the pages around it unmapped.
+    /// guest memory the cases convert in, the pages around it unmapped
     const BASE: u32 = 0x0800_0000;
     const SIZE: u32 = 0x10_0000;
 
@@ -831,7 +805,7 @@ mod tests {
         system
     }
 
-    /// noise over all of the memory.
+    /// noise over all of the memory
     fn fill(system: &mut System, random: &mut Random) {
         let noise: Vec<u8> = (0..SIZE / 4).flat_map(|_| random.next().to_le_bytes()).collect();
         system.memory.write_bytes(BASE, &noise);
@@ -843,19 +817,17 @@ mod tests {
         bytes
     }
 
-    /// how many times each unmapped page was touched so far.
+    /// how many times each unmapped page got touched so far
     fn faults(system: &System) -> BTreeMap<u32, u32> {
         system.memory.fault_summary().into_iter().collect()
     }
 
-    /// how many more times each unmapped page was touched by after than by
-    /// before.
+    /// how many more times each unmapped page got touched by after than by before
     fn touched(before: &BTreeMap<u32, u32>, after: &BTreeMap<u32, u32>) -> BTreeMap<u32, u32> {
         after.iter().map(|(&page, &count)| (page, count - before.get(&page).copied().unwrap_or(0))).filter(|&(_, count)| count > 0).collect()
     }
 
-    /// a buffer in the mapped memory or running off it, with transfers and
-    /// gaps of every kind.
+    /// a buffer in the mapped memory or running off it, w/ transfers and gaps of every kind
     fn buffer(random: &mut Random, width: usize) -> Buffer {
         let transfer = match random.below(6) {
             0 => random.below(4),
@@ -879,9 +851,8 @@ mod tests {
         Buffer { address, transfer, gap }
     }
 
-    /// converts with the old code and then the new from the same memory and
-    /// settings, and checks the two leave memory the same and touch the same
-    /// unmapped pages as often.
+    /// converts w/ the old code then the new from the same memory and settings,
+    /// and checks both leave memory the same and touch the same unmapped pages as often
     fn compare(system: &mut System, case: &str) {
         let before = memory(system);
         let first = faults(system);
@@ -898,9 +869,8 @@ mod tests {
         assert_eq!(touched(&first, &second), touched(&second, &third), "{case}: unmapped pages");
     }
 
-    /// conversions of every input and output format, rotation, alignment,
-    /// set of coefficients, alpha and size come out as they did before,
-    /// read from and written to buffers cut up every way.
+    /// conversions of every input and output format, rotation, alignment, coefficient set,
+    /// alpha and size come out like b4, read from and written to buffers cut up every way
     #[test]
     fn converts_as_before() {
         let mut system = system();
@@ -915,8 +885,7 @@ mod tests {
                 _ => 8 * (1 + random.below(12)) as usize,
             };
             let mut lines = 1 + random.below(40) as usize;
-            // the shapes the old code ran off its buffers on are checked on
-            // their own
+            // the shapes the old code ran off its buffers on get checked on their own
             if (input_format == 1 || input_format == 3) && lines % 2 == 1 {
                 lines += 1;
             }
@@ -931,7 +900,7 @@ mod tests {
             y2r.line_width = width as u32;
             y2r.lines = lines as u32;
             y2r.coefficients = random.coefficients();
-            // the 5-5-5-1 bit turns on at 0x80 of the low byte
+            // the 5551 alpha bit turns on at 0x80 of the low byte
             y2r.alpha = [0x7F, 0x80, 0x17F, 0x180, random.below(0x10000)][random.below(5) as usize];
             for target in [&mut y2r.y, &mut y2r.u, &mut y2r.v, &mut y2r.yuyv, &mut y2r.output] {
                 *target = buffer(&mut random, width);
@@ -941,9 +910,7 @@ mod tests {
         }
     }
 
-    /// the frames two titles play their movies in, MH4U's lines one after
-    /// another and Kirby's with gaps, come out as they did before in every
-    /// output format.
+    /// the frames two titles play their movies in (MH4U's lines one after another, Kirby's w/ gaps) come out like b4 in every output format
     #[test]
     fn converts_movie_frames_as_before() {
         let mut system = system();
@@ -975,9 +942,7 @@ mod tests {
         }
     }
 
-    /// eight and 16 bit samples are gathered as they were, a transfer at a
-    /// time whatever its size, the reads the same down to the unmapped pages
-    /// they touch.
+    /// 8 and 16 bit samples get gathered like b4, a transfer at a time whatever its size, same reads down to the unmapped pages they touch
     #[test]
     fn gathers_as_before() {
         let mut system = system();
@@ -999,10 +964,9 @@ mod tests {
         }
     }
 
-    /// the shapes the old code ran off its buffers on, 4:2:0 with an odd
-    /// number of lines and tiles cut short but for a strip of four lines
-    /// one tile wide, still stop a conversion, and the ones it took still
-    /// convert the same.
+    /// the shapes the old code ran off its buffers on (4:2:0 w/ an odd number of lines,
+    /// tiles cut short except a strip of four lines one tile wide) still stop a conversion,
+    /// and the ones it took still convert the same
     #[test]
     fn stops_where_it_stopped() {
         let mut system = system();

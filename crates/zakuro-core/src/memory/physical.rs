@@ -1,8 +1,8 @@
-//! physical memory and the FCRAM page allocator.
+//! physical memory and the FCRAM page allocator
 
 use zakuro_common::memory_map::*;
 
-/// which of the kernel's three FCRAM regions an allocation comes from.
+/// which of the kernel's three FCRAM regions an allocation comes from
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryRegion {
     Application,
@@ -10,37 +10,33 @@ pub enum MemoryRegion {
     Base,
 }
 
-/// a contiguous run of physical pages.
+/// a contiguous run of physical pages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PhysicalBlock {
     pub addr: u32,
     pub size: u32,
 }
 
-/// backing store for every physical memory the CPU can reach.
+/// backing store for all physical memory the cpu can reach
 pub struct PhysicalMemory {
     pub fcram: Box<[u8]>,
     pub vram: Box<[u8]>,
     pub dsp_ram: Box<[u8]>,
-    /// AXI WRAM.
+    /// AXI WRAM
     pub axi_wram: Box<[u8]>,
 
-    /// one bit per FCRAM page, set when allocated.
+    /// a bit per FCRAM page, set when allocated
     allocated: Vec<bool>,
-    /// region boundaries as page indices into allocated.
+    /// region bounds as page indices into allocated
     regions: [(u32, u32); 3],
 }
 
 impl PhysicalMemory {
-    /// app_bytes comes from the exheader's system mode, the rest of FCRAM is
-    /// split between the SYSTEM and BASE regions the way the retail kernel
-    /// does it.
+    /// app_bytes comes from the exheader's system mode, the rest of FCRAM splits into SYSTEM and BASE like the retail kernel does
     pub fn new(new3ds: bool, app_bytes: u32) -> PhysicalMemory {
         let total = fcram_size(new3ds);
         let app = app_bytes.min(total);
-        // retail Old3DS gives SYSTEM 32 MiB and BASE whatever is left, the
-        // New3DS extra 128 MiB all goes to the application region when the
-        // title asks for it.
+        // retail old 3DS gives SYSTEM 32 MiB and BASE the rest, the new 3DS's extra 128 MiB all goes to the app region when the title asks
         let system = (total - app).min(32 * 1024 * 1024);
         let base = total - app - system;
 
@@ -63,13 +59,13 @@ impl PhysicalMemory {
         }
     }
 
-    /// the kernel's read-only configuration page, at the start of AXI WRAM.
+    /// the kernel's readonly config page at the start of AXI WRAM
     pub fn config_mem_mut(&mut self) -> &mut [u8] {
         let offset = (CONFIG_MEM_VADDR - AXI_WRAM_PADDR) as usize;
         &mut self.axi_wram[offset..offset + CONFIG_MEM_SIZE as usize]
     }
 
-    /// the page the kernel keeps updating with time, battery and wifi state.
+    /// the page the kernel keeps updating w/ time, battery and wifi state
     pub fn shared_page_mut(&mut self) -> &mut [u8] {
         let offset = (SHARED_PAGE_VADDR - AXI_WRAM_PADDR) as usize;
         &mut self.axi_wram[offset..offset + SHARED_PAGE_SIZE as usize]
@@ -100,7 +96,7 @@ impl PhysicalMemory {
         self.region_size(region) - self.region_used(region)
     }
 
-    /// allocates size bytes of physically contiguous FCRAM.
+    /// allocates size bytes of physically contiguous FCRAM
     pub fn allocate(&mut self, region: MemoryRegion, size: u32) -> Option<PhysicalBlock> {
         let needed = (align_up(size, PAGE_SIZE) / PAGE_SIZE) as usize;
         if needed == 0 {
@@ -134,10 +130,8 @@ impl PhysicalMemory {
         None
     }
 
-    /// allocates size bytes of physically contiguous FCRAM from the top of
-    /// the region, where the kernel puts a process's code, stack and heap,
-    /// keeping the bottom for the linear heap, so the linear heap gives out
-    /// the addresses the console does, which cheats count on.
+    /// allocates size bytes of physically contiguous FCRAM from the region's top, where the kernel puts a process's code, stack and heap
+    /// the bottom stays for the linear heap, so it hands out the same addrs as the console (cheats count on that)
     pub fn allocate_top(&mut self, region: MemoryRegion, size: u32) -> Option<PhysicalBlock> {
         let needed = (align_up(size, PAGE_SIZE) / PAGE_SIZE) as usize;
         if needed == 0 {
@@ -179,9 +173,7 @@ impl PhysicalMemory {
         }
     }
 
-    /// host slice backing a physical address range, if it is real memory.
-    /// the physical address a host pointer into one of the memories stands
-    /// for, the way the page tables hold it.
+    /// the physical addr a host ptr into one of the memories stands for, like the page tables hold it
     pub fn paddr_of(&self, pointer: *const u8) -> Option<u32> {
         [
             (VRAM_PADDR, &self.vram),
@@ -196,13 +188,12 @@ impl PhysicalMemory {
         })
     }
 
-    /// which pages are allocated and how the regions split them, for a
-    /// saved state.
+    /// which pages are allocated and how the regions split them, for a saved state
     pub fn allocation(&self) -> (Vec<bool>, [(u32, u32); 3]) {
         (self.allocated.clone(), self.regions)
     }
 
-    /// the allocation a saved state had, false when it does not fit.
+    /// the allocation a saved state had, false when it doesn't fit
     pub fn set_allocation(&mut self, allocated: Vec<bool>, regions: [(u32, u32); 3]) -> bool {
         if allocated.len() != self.allocated.len() {
             return false;
@@ -252,7 +243,7 @@ mod tests {
         phys.free(a);
         assert_eq!(phys.region_used(MemoryRegion::Application), 0x1000);
 
-        // the freed hole is reused.
+        // the freed hole gets reused
         let c = phys.allocate(MemoryRegion::Application, 0x2000).unwrap();
         assert_eq!(c.addr, FCRAM_PADDR);
     }

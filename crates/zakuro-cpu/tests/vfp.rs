@@ -1,10 +1,10 @@
-//! VFPv2 tests.
+//! VFPv2 tests
 
 mod common;
 
 use common::{assert_flags, assert_reg, run_with, DATA_BASE};
 
-/// seeds single-precision registers before the program runs.
+/// seeds single precision registers b4 the program runs
 fn with_singles(source: &str, values: &[(usize, f32)]) -> Option<common::Run> {
     let values = values.to_vec();
     run_with(source, move |cpu, _| {
@@ -33,8 +33,7 @@ fn single_precision_arithmetic() {
 
 #[test]
 fn double_moves_keep_two_singles_under_flush_to_zero() {
-    // titles pass two singles in a double register, whose bits read as a
-    // subnormal double when the high one is zero, and flushing zeroes both
+    // titles pass two singles in a double register, its bits read as a subnormal double when the high one is zero, and flushing zeroes both
     let Some(r) = run_with(
         "vmov.f64 d8, d0
          vneg.f64 d9, d0
@@ -103,7 +102,7 @@ fn unary_operations() {
 }
 
 /// VCMP writes FPSCR, and VMRS APSR_nzcv copies those bits into the ARM
-/// condition flags so ordinary conditional instructions can branch on them.
+/// condition flags so ordinary conditional instructions can branch on them
 #[test]
 fn compare_then_transfer_flags_equal() {
     let Some(r) = with_singles(
@@ -170,7 +169,7 @@ fn conversions_between_integers_and_floats() {
         "vcvt.s32.f32 s4, s0
          vcvt.u32.f32 s5, s1
          vcvt.f32.s32 s6, s2",
-        // s2 holds the bit pattern of the integer -7.
+        // s2 holds the bit pattern of the integer -7
         &[(0, -2.75), (1, 300.9)],
     )
     .and_then(|_| {
@@ -187,7 +186,7 @@ fn conversions_between_integers_and_floats() {
     }) else {
         return;
     };
-    // VCVT to integer rounds towards zero.
+    // VCVT to integer rounds toward zero
     assert_eq!(r.cpu.vfp.regs[4] as i32, -2);
     assert_eq!(r.cpu.vfp.regs[5], 300);
     assert_eq!(r.f32_reg(6), -7.0);
@@ -195,7 +194,7 @@ fn conversions_between_integers_and_floats() {
 
 #[test]
 fn conversions_between_single_and_double() {
-    // s12 deliberately does not overlap d2 (which aliases s4 and s5).
+    // s12 doesn't overlap d2 on purpose (it aliases s4 and s5)
     let Some(r) = run_with(
         "vcvt.f64.f32 d2, s0
          vcvt.f32.f64 s12, d3",
@@ -288,7 +287,7 @@ fn move_between_core_and_vfp_registers() {
     assert_reg!(r, 5, 0x2222_2222);
 }
 
-/// the single and double register files alias, d1 covers s2 and s3.
+/// the single and double register files alias, d1 covers s2 and s3
 #[test]
 fn single_and_double_registers_alias() {
     let Some(r) = run_with("vmov s2, r0\n vmov s3, r1", |cpu, _| {
@@ -310,8 +309,7 @@ fn fpscr_round_trips_through_vmsr() {
     assert_reg!(r, 1, 0x00C0_0000);
 }
 
-/// short vectors, with FPSCR.LEN = 3 (four elements) a single vadd whose
-/// destination is outside bank 0 adds four register pairs.
+/// short vectors, w/ FPSCR.LEN = 3 (four elements) a single vadd whose destination is outside bank 0 adds four register pairs
 #[test]
 fn short_vector_add_covers_four_registers() {
     let Some(r) = with_singles(
@@ -333,7 +331,7 @@ fn short_vector_add_covers_four_registers() {
 }
 
 /// a second operand in bank 0 is a scalar applied to every element, and a
-/// destination in bank 0 makes the whole operation scalar.
+/// destination in bank 0 makes the whole operation scalar
 #[test]
 fn short_vectors_mix_with_scalars() {
     let Some(r) = with_singles(
@@ -355,7 +353,7 @@ fn short_vectors_mix_with_scalars() {
 }
 
 /// elements wrap around within their bank, and a stride of two skips
-/// every other register.
+/// every other register
 #[test]
 fn short_vectors_wrap_within_their_bank() {
     let Some(r) = with_singles(
@@ -367,7 +365,7 @@ fn short_vectors_wrap_within_their_bank() {
     ) else {
         return;
     };
-    // length 2, stride 2, s14 <- s22, then s8 (14 + 2 wraps to 8) <- s16.
+    // length 2, stride 2, s14 gets s22, then s8 (14 + 2 wraps to 8) gets s16
     assert_eq!(r.f32_reg(14), 1.0);
     assert_eq!(r.f32_reg(8), 2.0);
 }

@@ -1,11 +1,11 @@
-//! err:f, the fatal error reporter.
+//! err:f, the fatal error reporter
 
 use zakuro_cpu::Bus;
 
 use crate::kernel::ipc::{CommandBuffer, Header};
 use crate::System;
 
-/// ERRF_ErrType.
+/// ERRF_ErrType
 fn error_type_name(value: u8) -> &'static str {
     match value {
         0 => "generic",
@@ -43,7 +43,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             log::error!("  rev     {revision_high}.{revision_low}");
 
             match kind {
-                // A CPU exception carries register state.
+                // a CPU exception carries register state
                 3 => {
                     let exception_type = word(system, 5) & 0xFF;
                     log::error!(
@@ -54,7 +54,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                         log::error!("  r{i} = 0x{:08X}", word(system, 7 + i));
                     }
                 }
-                // everything else may carry a message.
+                // everything else may carry a message
                 _ => {
                     let address = buffer.address() + 5 * 4;
                     let mut bytes = [0u8; 0x60];

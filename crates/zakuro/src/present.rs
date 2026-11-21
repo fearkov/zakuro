@@ -1,4 +1,4 @@
-//! wiring a presentation backend to a winit window.
+//! wiring a presentation backend to a winit window
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
@@ -14,8 +14,7 @@ use zakuro_gpu::backend::gl::GlPresenter;
 use zakuro_gpu::backend::vulkan::VulkanPresenter;
 use zakuro_gpu::{Overlay, PresentError, Presenter, RendererKind, ScreenImage, ScreenLayout, ScreenOrientation, SharedDevice};
 
-// exactly one backend exists per process, so the size of the largest variant
-// is not worth an extra allocation to avoid.
+// exactly one backend exists per process, so the size of the largest variant isn't worth an extra allocation to avoid
 #[allow(clippy::large_enum_variant)]
 pub enum Backend {
     OpenGl {
@@ -24,8 +23,7 @@ pub enum Backend {
         surface: Surface<WindowSurface>,
     },
     Vulkan(VulkanPresenter),
-    /// no window output, used when a backend could not start but the emulator
-    /// should still run.
+    /// no window output, used when a backend couldn't start but the emulator should still run
     None,
 }
 
@@ -75,8 +73,7 @@ impl Backend {
         }
     }
 
-    /// whether showing a frame waits for the display, the OpenGL swap waits
-    /// for the vertical blank.
+    /// does showing a frame wait for the display, the OpenGL swap waits for vblank
     pub fn waits_for_display(&self) -> bool {
         match self {
             Backend::OpenGl { .. } => true,
@@ -85,8 +82,7 @@ impl Backend {
         }
     }
 
-    /// the Vulkan presenter's device, for the renderer to draw on so the
-    /// screens are shown straight from it, when the two can share one.
+    /// the Vulkan presenter's device, for the renderer to draw on so the screens get shown straight from it, when the two can share one
     pub fn shared_device(&self) -> Option<std::sync::Arc<SharedDevice>> {
         match self {
             Backend::Vulkan(presenter) => presenter.shared_device(),
@@ -166,7 +162,7 @@ fn create_opengl(
     let (window, config) = DisplayBuilder::new()
         .with_window_attributes(Some(attributes))
         .build(event_loop, template, |configs| {
-            // any config will do, prefer more color bits if offered.
+            // any config will do, prefer more color bits if offered
             configs
                 .reduce(|best, candidate| {
                     if candidate.num_samples() > best.num_samples() {
@@ -186,7 +182,7 @@ fn create_opengl(
         .as_raw();
 
     let display = config.display();
-    // ask for 3.3 core, which is what the presentation shaders need.
+    // ask for 3.3 core, that's what the presentation shaders need
     let context_attributes = ContextAttributesBuilder::new()
         .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
         .build(Some(raw_handle));
@@ -203,8 +199,7 @@ fn create_opengl(
         .make_current(&surface)
         .map_err(|e| format!("could not make the context current: {e}"))?;
 
-    // present on vblank so the frontend's own pacing has something to work
-    // against, a failure here is not fatal.
+    // present on vblank so the frontend's own pacing has something to work against, a failure here isn't fatal
     let _ = surface.set_swap_interval(
         &context,
         SwapInterval::Wait(std::num::NonZeroU32::new(1).unwrap()),

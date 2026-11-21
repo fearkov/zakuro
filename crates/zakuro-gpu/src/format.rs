@@ -1,6 +1,6 @@
-//! pixel formats and the tiled layout the PICA200 stores images in.
+//! pixel formats and the tiled layout the PICA200 stores images in
 
-/// color formats a framebuffer or a display transfer can use.
+/// color formats a framebuffer or a display transfer can use
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColorFormat {
     Rgba8,
@@ -11,7 +11,7 @@ pub enum ColorFormat {
 }
 
 impl ColorFormat {
-    /// the format a screen or a display transfer names.
+    /// the format a screen or a display transfer names
     pub fn from_raw(value: u32) -> ColorFormat {
         match value & 7 {
             0 => ColorFormat::Rgba8,
@@ -22,8 +22,7 @@ impl ColorFormat {
         }
     }
 
-    /// the format a color buffer names, where 2 and 3 are the other way
-    /// around from screens and transfers.
+    /// the format a color buffer names, where 2 and 3 are swapped compared to screens and transfers
     pub fn from_color_buffer(value: u32) -> ColorFormat {
         match value & 7 {
             2 => ColorFormat::Rgb5A1,
@@ -32,7 +31,7 @@ impl ColorFormat {
         }
     }
 
-    /// the number a color buffer has for the format.
+    /// the number a color buffer has for the format
     pub fn color_buffer_raw(self) -> u32 {
         match self {
             ColorFormat::Rgba8 => 0,
@@ -51,10 +50,10 @@ impl ColorFormat {
         }
     }
 
-    /// decodes one pixel to straight 8-bit RGBA.
+    /// decodes one pixel to straight 8 bit RGBA
     pub fn decode(self, bytes: &[u8]) -> [u8; 4] {
         match self {
-            // the GPU stores color components in ABGR order in memory.
+            // the GPU stores color components in ABGR order in memory (bc why not)
             ColorFormat::Rgba8 => [bytes[3], bytes[2], bytes[1], bytes[0]],
             ColorFormat::Rgb8 => [bytes[2], bytes[1], bytes[0], 0xFF],
             ColorFormat::Rgb565 => {
@@ -87,7 +86,7 @@ impl ColorFormat {
         }
     }
 
-    /// encodes straight 8-bit RGBA into this format.
+    /// encodes straight 8 bit RGBA into this format
     pub fn encode(self, rgba: [u8; 4], out: &mut [u8]) {
         match self {
             ColorFormat::Rgba8 => {
@@ -140,7 +139,7 @@ const fn expand6(v: u8) -> u8 {
     (v << 2) | (v >> 4)
 }
 
-/// offset in pixels of (x, y) within an 8x8 Morton-ordered tile.
+/// offset in pixels of (x, y) in an 8x8 Morton ordered tile
 #[inline]
 pub const fn morton_interleave(x: u32, y: u32) -> u32 {
     let x = x & 7;
@@ -148,10 +147,10 @@ pub const fn morton_interleave(x: u32, y: u32) -> u32 {
     (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3)
 }
 
-/// byte offset of pixel (x, y) in a tiled image width pixels across.
+/// byte offset of pixel (x, y) in a tiled image width pixels across
 #[inline]
 pub const fn morton_offset(x: u32, y: u32, width: u32, bytes_per_pixel: u32) -> u32 {
-    // whole tiles first, then the position inside the tile.
+    // whole tiles first, then the position inside the tile
     let tile_x = x / 8;
     let tile_y = y / 8;
     let tiles_per_row = width / 8;
@@ -163,8 +162,7 @@ pub const fn morton_offset(x: u32, y: u32, width: u32, bytes_per_pixel: u32) -> 
 mod tests {
     use super::*;
 
-    /// color buffers number 5-6-5 and 5-5-5-1 the other way around from
-    /// screens and transfers.
+    /// color buffers number 565 and 5551 the other way around from screens and transfers
     #[test]
     fn color_buffers_have_their_own_numbers() {
         assert_eq!(ColorFormat::from_color_buffer(3), ColorFormat::Rgb565);
@@ -189,10 +187,10 @@ mod tests {
 
     #[test]
     fn morton_matches_known_values() {
-        // the first row of a tile interleaves to 0, 1, 4, 5, 16, 17, 20, 21.
+        // the first row of a tile interleaves to 0, 1, 4, 5, 16, 17, 20, 21
         let row: Vec<u32> = (0..8).map(|x| morton_interleave(x, 0)).collect();
         assert_eq!(row, vec![0, 1, 4, 5, 16, 17, 20, 21]);
-        // the first column interleaves to 0, 2, 8, 10, 32, 34, 40, 42.
+        // the first column interleaves to 0, 2, 8, 10, 32, 34, 40, 42
         let column: Vec<u32> = (0..8).map(|y| morton_interleave(0, y)).collect();
         assert_eq!(column, vec![0, 2, 8, 10, 32, 34, 40, 42]);
     }
@@ -207,7 +205,7 @@ mod tests {
             ColorFormat::Rgba4,
         ] {
             let mut buf = [0u8; 4];
-            // use values that survive the precision of every format.
+            // use values that survive the precision of every format
             let original = [0xFF, 0x00, 0xFF, 0xFF];
             format.encode(original, &mut buf);
             let decoded = format.decode(&buf);

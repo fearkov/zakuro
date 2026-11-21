@@ -1,4 +1,4 @@
-# builds and tests Zakuro on Linux, macOS and Windows, and keeps the Windows program
+# builds and tests zakuro on linux, macos and windows, keeps the windows build around
 name: CI
 
 on:

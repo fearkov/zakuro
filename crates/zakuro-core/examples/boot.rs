@@ -1,4 +1,4 @@
-//! cargo run -p zakuro-core --example boot -- <rom> [frames]
+//! `cargo run -p zakuro-core --example boot -- <rom> [frames]`
 
 use std::collections::BTreeSet;
 
@@ -6,7 +6,7 @@ use zakuro_core::services::hid::{InputState, PadState};
 use zakuro_core::{loader, Config, FrameOutcome};
 
 fn main() {
-    // Cranelift's JIT logs each shader it compiles whole at info
+    // Cranelift's JIT logs each shader it compiles in full at info
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,cranelift_jit=warn")).init();
 
     let mut args = std::env::args().skip(1);
@@ -17,10 +17,9 @@ fn main() {
     let frames: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(60);
 
     let config = Config {
-        // ZAKURO_NEW3DS=1 runs the title on a New 3DS.
+        // ZAKURO_NEW3DS=1 runs the title on a new 3DS
         new3ds: std::env::var("ZAKURO_NEW3DS").is_ok_and(|v| v == "1"),
-        // ZAKURO_NICK=name names the console, which tells it apart over
-        // local wireless too
+        // ZAKURO_NICK=name names the console, which also tells it apart over local wireless
         username: std::env::var("ZAKURO_NICK").unwrap_or_else(|_| "Zakuro".into()),
         console_id: std::env::var("ZAKURO_NICK").map_or(0x5A4B_0000_0000_0001, |nick| {
             nick.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3))
@@ -29,33 +28,27 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(zakuro_core::services::cfg::LANGUAGE_ENGLISH),
-        // ZAKURO_RECOMPILED=path runs the code 3dsrecomp built for the title.
+        // ZAKURO_RECOMPILED=path runs the code 3dsrecomp built for the title
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().map(Into::into),
-        // ZAKURO_FIND_RECOMPILED=1 runs the library 3dsrecomp installed for
-        // it, as the frontend does.
+        // ZAKURO_FIND_RECOMPILED=1 runs the lib 3dsrecomp installed for it, like the frontend does
         find_recompiled: std::env::var_os("ZAKURO_FIND_RECOMPILED").is_some(),
-        // ZAKURO_RASTERIZER=hardware draws on the host GPU.
+        // ZAKURO_RASTERIZER=hardware draws on the host GPU
         hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
-        // ZAKURO_RESOLUTION=3 draws at three times the console's resolution.
+        // ZAKURO_RESOLUTION=3 draws at 3x the console's resolution
         resolution: std::env::var("ZAKURO_RESOLUTION").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
-        // ZAKURO_UPDATE=file.cia runs the title with its update, and
-        // ZAKURO_DLC=a.cia:b.cia with its DLC.
+        // ZAKURO_UPDATE=file.cia runs the title w/ its update, ZAKURO_DLC=`a.cia:b.cia` w/ its DLC
         update: std::env::var_os("ZAKURO_UPDATE").map(Into::into),
         dlc: std::env::var_os("ZAKURO_DLC").map(|paths| std::env::split_paths(&paths).collect()).unwrap_or_default(),
-        // ZAKURO_DATA=dir keeps saves in dir/user and takes mods from
-        // dir/mods, the working directory's user folder and no mods without it.
+        // ZAKURO_DATA=dir keeps saves in dir/user and takes mods from dir/mods
+        // w/o it, the cwd's user folder and no mods
         data_dir: std::env::var_os("ZAKURO_DATA").map(Into::into),
-        // ZAKURO_CLOCK=milliseconds since 1900 starts the clock there, so that
-        // runs repeat exactly.
+        // ZAKURO_CLOCK=millis since 1900 starts the clock there so runs repeat exactly
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),
-        // ZAKURO_PRESENT=direct draws on a device of the kind a Vulkan
-        // presenter shares, which shows the screens straight from the GPU.
-        // ZAKURO_INTERPOLATE=1 draws the pictures in between, which takes
-        // ZAKURO_PRESENT=direct, and saves them with the screens
+        // ZAKURO_PRESENT=direct draws on a device of the kind a Vulkan presenter shares, showing the screens straight from the GPU
+        // ZAKURO_INTERPOLATE=1 draws the in between pictures (needs ZAKURO_PRESENT=direct) and saves them w/ the screens
         interpolate: std::env::var("ZAKURO_INTERPOLATE").is_ok_and(|v| v == "1"),
         skip_idle_loops: std::env::var("ZAKURO_IDLE").map_or(true, |v| v != "0"),
-        // ZAKURO_3D=0.5 is where the 3D slider is, the right eye's picture
-        // saved with the screens when the game draws one
+        // ZAKURO_3D=0.5 is the 3D slider position, the right eye's picture gets saved w/ the screens when the game draws one
         slider_3d: std::env::var("ZAKURO_3D").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
         device: std::env::var("ZAKURO_PRESENT").is_ok_and(|v| v == "direct").then(|| {
             let device = zakuro_gpu::SharedDevice::new().unwrap_or_else(|error| {
@@ -66,8 +59,7 @@ fn main() {
         }),
         ..Config::default()
     };
-    // ZAKURO_REPLAY=file plays back what ZAKURO_RECORD wrote down in the
-    // frontend, from the same clock
+    // ZAKURO_REPLAY=file plays back what ZAKURO_RECORD wrote in the frontend, from the same clock
     let mut replay = std::env::var_os("ZAKURO_REPLAY").map(|file| {
         zakuro_core::replay::Replay::open(std::path::Path::new(&file)).unwrap_or_else(|error| {
             eprintln!("could not read {}: {error}", file.to_string_lossy());
@@ -87,9 +79,8 @@ fn main() {
         system.enable_profiler();
     }
 
-    // ZAKURO_ENHANCE="60 FPS" turns on the game's enhancements of those
-    // names, separated by commas, and ZAKURO_ENHANCE_OFF_AT=frame turns them
-    // all off there, as a player does in the cheats window
+    // ZAKURO_ENHANCE="60 FPS" turns on the game's enhancements by name (comma separated)
+    // ZAKURO_ENHANCE_OFF_AT=frame turns them all off there, like a player would in the cheats window
     let enhance = std::env::var("ZAKURO_ENHANCE").unwrap_or_default();
     for cheat in system.cheats.iter_mut().filter(|cheat| cheat.builtin && enhance.split(',').any(|name| name.trim() == cheat.name)) {
         cheat.enabled = true;
@@ -97,8 +88,7 @@ fn main() {
     }
     let enhance_off_at: Option<u64> = std::env::var("ZAKURO_ENHANCE_OFF_AT").ok().and_then(|f| f.parse().ok());
 
-    // ZAKURO_ROOM_HOST=port opens a room and joins it, ZAKURO_ROOM=host:port
-    // joins one, under ZAKURO_NICK, for local wireless with another run
+    // ZAKURO_ROOM_HOST=port opens a room and joins it, ZAKURO_ROOM=`host:port` joins one, as ZAKURO_NICK, for local wireless w/ another run
     let _server = std::env::var("ZAKURO_ROOM_HOST").ok().and_then(|port| port.parse().ok()).map(|port| {
         zakuro_core::room::Server::start(port, "boot", "", 8).unwrap_or_else(|error| {
             eprintln!("could not open a room on port {port}: {error}");
@@ -117,8 +107,7 @@ fn main() {
         connection
     });
 
-    // ZAKURO_CAMERA=picture.ppm is what the cameras see, a binary PPM,
-    // whole, the way a QR code is shown to them.
+    // ZAKURO_CAMERA=picture.ppm is what the cameras see, a whole binary PPM, like showing them a QR code
     if let Some(path) = std::env::var_os("ZAKURO_CAMERA") {
         match std::fs::read(&path).ok().and_then(|bytes| read_ppm(&bytes)) {
             Some(picture) => system.camera = Some(Box::new(zakuro_core::camera::Still(std::sync::Arc::new(picture)))),
@@ -126,9 +115,8 @@ fn main() {
         }
     }
 
-    // ZAKURO_MIC=noise is what the microphone hears, blowing into it say,
-    // or ZAKURO_MIC=sound.wav, a WAV of 16-bit samples over and over, and
-    // ZAKURO_MIC_FRAMES=900-1200 hears it only between those frames
+    // ZAKURO_MIC=noise is what the mic hears (blowing into it say), or ZAKURO_MIC=sound.wav, a 16 bit WAV on loop
+    // ZAKURO_MIC_FRAMES=`900..1200` hears it only between those frames
     let mic_frame = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     if let Some(source) = std::env::var_os("ZAKURO_MIC") {
         let heard: Option<Box<dyn zakuro_core::microphone::Microphone>> = if source == "noise" {
@@ -153,67 +141,56 @@ fn main() {
 
     println!("--- booting for {frames} frames ---");
     let start = std::time::Instant::now();
-    // how long each frame took, which shows the stutter an average hides
+    // how long each frame took, shows the stutter an average hides
     let mut frame_times = Vec::with_capacity(frames as usize);
     let mut outcome = FrameOutcome::Completed;
     let mut executed = 0u64;
-    // refreshes that showed a picture in between, for frame interpolation
+    // refreshes that showed an in between picture, for frame interpolation
     let mut betweens = 0u64;
 
-    // headless runs otherwise never press a button, so a title parked on an
-    // intro or "press start" screen, which is most titles, most of the time,
-    // would sit there for the entire run no matter how many frames are given.
+    // headless runs never press a button otherwise
+    // so a title parked on an intro or "press start" screen (most titles, most of the time) sits there the whole run
     let mash_buttons = std::env::var("ZAKURO_MASH_BUTTONS").is_ok();
-    // mashing up to a frame and following ZAKURO_INPUT from there, to get
-    // through the screens before one quickly and then act on it,
-    // ZAKURO_MASH_UNTIL=4400 with ZAKURO_MASH_BUTTONS.
+    // mash up to a frame then follow ZAKURO_INPUT from there, to blitz thru the screens b4 one and act on it
+    // ZAKURO_MASH_UNTIL=4400 w/ ZAKURO_MASH_BUTTONS
     let mash_until: Option<u64> = std::env::var("ZAKURO_MASH_UNTIL").ok().and_then(|f| f.parse().ok());
 
-    // a scripted alternative for reaching a specific screen reproducibly,
-    // ZAKURO_INPUT=300:A,420:DOWN+A holds each listed button from that
-    // frame for a few frames, 500:@160x180 touches the bottom screen.
+    // scripted way to reach a given screen reproducibly
+    // ZAKURO_INPUT=`300:A,420:DOWN+A` holds each listed button from that frame for a few frames, `500:@160x180` touches the bottom screen
     let script = std::env::var("ZAKURO_INPUT")
         .map(|spec| parse_input_script(&spec))
         .unwrap_or_default();
-    // frames to save the screens at, besides the last one,
-    // ZAKURO_DUMP_AT=900,1200.
+    // frames to save the screens at besides the last one, ZAKURO_DUMP_AT=900,1200
     let dump_at: BTreeSet<u64> = std::env::var("ZAKURO_DUMP_AT")
         .map(|spec| spec.split(',').filter_map(|f| f.trim().parse().ok()).collect())
         .unwrap_or_default();
 
-    // verbose logs from one frame onwards only, so a trace of a late screen
-    // is not buried under everything before it, ZAKURO_LOG_FROM=1000 with
-    // RUST_LOG=info,zakuro_gpu=trace.
+    // verbose logs from one frame on only, so a late screen's trace isn't buried under everything b4 it
+    // ZAKURO_LOG_FROM=1000 w/ RUST_LOG=`info,zakuro_gpu=trace`
     let log_from: Option<u64> = std::env::var("ZAKURO_LOG_FROM").ok().and_then(|f| f.parse().ok());
     if log_from.is_some() {
         log::set_max_level(log::LevelFilter::Info);
     }
 
-    // everything the console played, written to a WAV at the end,
-    // ZAKURO_WAV=/tmp/zakuro.wav.
+    // everything the console played, written to a WAV at the end, ZAKURO_WAV=/tmp/zakuro.wav
     let wav = std::env::var("ZAKURO_WAV").ok();
     let mut audio: Vec<[i16; 2]> = Vec::new();
 
-    // reads both screens after every frame the way a window showing them
-    // does, for timing a run like one, ZAKURO_PRESENT=1, or ZAKURO_PRESENT=
-    // direct for one whose presenter shares the renderer's device.
+    // reads both screens after every frame like a window showing them does, to time a run like one
+    // ZAKURO_PRESENT=1, or ZAKURO_PRESENT=direct for a presenter sharing the renderer's device
     let present = std::env::var("ZAKURO_PRESENT").is_ok();
 
-    // what gets typed when a title opens the software keyboard,
-    // ZAKURO_KEYBOARD=Link.
+    // what gets typed when a title opens the software keyboard, ZAKURO_KEYBOARD=Link
     let typed = std::env::var("ZAKURO_KEYBOARD").unwrap_or_else(|_| "Zakuro".to_owned());
 
     let profile_from: Option<u64> = std::env::var("ZAKURO_PROFILE_FROM").ok().and_then(|f| f.parse().ok());
-    // ZAKURO_SWAP_AT=frame:library switches the running game to that library
-    // at that frame, as the frontend does when a recompile finishes, and
-    // with frame:library:built it first moves built over library the way
-    // 3dsrecomp installs one.
+    // ZAKURO_SWAP_AT=`frame:library` swaps the running game to that lib at that frame, like the frontend after a recompile
+    // w/ `frame:library:built` it first moves built over library the way 3dsrecomp installs one
     let swap: Option<(u64, String, Option<String>)> = std::env::var("ZAKURO_SWAP_AT").ok().and_then(|spec| {
         let mut parts = spec.splitn(3, ':');
         Some((parts.next()?.parse().ok()?, parts.next()?.to_owned(), parts.next().map(str::to_owned)))
     });
-    // ZAKURO_SAVE_AT=frame:file saves the state at that frame, and
-    // ZAKURO_LOAD=file goes on from a saved state, at its frame
+    // ZAKURO_SAVE_AT=`frame:file` saves the state at that frame, ZAKURO_LOAD=file continues from a saved state at its frame
     let save_at: Option<(u64, String)> = std::env::var("ZAKURO_SAVE_AT").ok().and_then(|spec| {
         let (at, file) = spec.split_once(':')?;
         Some((at.parse().ok()?, file.to_owned()))
@@ -232,8 +209,7 @@ fn main() {
             }
         }
     }
-    // ZAKURO_LOAD_AT=frame:file loads a saved state at that frame, once,
-    // and goes on from the state's frame
+    // ZAKURO_LOAD_AT=`frame:file` loads a saved state at that frame once and continues from the state's frame
     let mut load_at: Option<(u64, String)> = std::env::var("ZAKURO_LOAD_AT").ok().and_then(|spec| {
         let (at, file) = spec.split_once(':')?;
         Some((at.parse().ok()?, file.to_owned()))
@@ -272,8 +248,7 @@ fn main() {
                 Ok(()) => println!("frame {at}: switched to {library}"),
                 Err(error) => println!("frame {at}: could not switch, {error}"),
             }
-            // which files of the library are mapped now, a deleted one is
-            // the old library still loaded
+            // which lib files are mapped rn, a deleted one is the old lib still loaded
             let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
             let name = std::path::Path::new(library).file_name().unwrap().to_string_lossy().into_owned();
             let mapped: std::collections::BTreeSet<String> = maps
@@ -297,7 +272,7 @@ fn main() {
             let held = || script.iter().filter(|(start, ..)| (*start..*start + 6).contains(&frame));
             let buttons = held().fold(PadState::empty(), |held, (_, buttons, _)| held | *buttons);
             let touch = held().find_map(|(.., touch)| *touch);
-            // the circle pad's directions push it all the way
+            // circle pad directions push it all the way
             let axis = |plus: PadState, minus: PadState| buttons.contains(plus) as i8 as f32 - buttons.contains(minus) as i8 as f32;
             system.set_input(InputState {
                 buttons,
@@ -310,14 +285,12 @@ fn main() {
             });
         } else if mashing {
             let pressed = frame % 40 < 4;
-            // some first-boot prompts (language/EULA screens) wait for a
-            // touchscreen tap rather than a button, so tap the bottom screen's
-            // center in the same window the buttons are held.
+            // some first boot prompts (language, EULA) want a touch instead of a button,
+            // so tap the bottom screen's center while buttons are held
             let tap = (frame / 40) as u16;
             let x = 40 + (tap % 5) * 60;
             let y = 30 + ((tap / 5) % 6) * 35;
-            // cycle through every button, one at a time, so a screen that
-            // wants a specific one is not missed.
+            // cycle thru every button one at a time so a screen wanting a specific one doesn't get skipped
             const BUTTONS: [PadState; 8] = [
                 PadState::A,
                 PadState::B,
@@ -341,7 +314,7 @@ fn main() {
         outcome = system.run_frame();
         executed = frame + 1;
         betweens += system.shows_between() as u64;
-        // when a new unmapped page is touched, which frame it was
+        // which frame touched a new unmapped page
         if system.memory.fault_summary().len() != faults {
             println!("frame {executed}: touched an unmapped page");
         }
@@ -357,8 +330,7 @@ fn main() {
             }
         }
         frame_times.push(frame_start.elapsed());
-        // taken each frame as the app takes it, the samples piling up
-        // otherwise cost each audio frame a move of the whole queue
+        // taken each frame like the app does, otherwise piled up samples cost every audio frame a move of the whole queue
         let sound = system.take_audio();
         if wav.is_some() {
             audio.extend(sound);
@@ -369,7 +341,7 @@ fn main() {
             }
             for (screen, name) in SCREENS {
                 save_screen(&mut system, screen, &temp(&format!("zakuro-{name}-{executed}.ppm")));
-                // and as the GPU has them, with the pictures in between
+                // and as the GPU has them, in between pictures included
                 if system.gpu.interpolates() {
                     if let Some(own) = system.upright_screen(screen, false) {
                         save_picture(&own, &temp(&format!("zakuro-{name}-gpu-{executed}.ppm")));
@@ -382,8 +354,7 @@ fn main() {
             if let Some(matches) = system.interpolation_matches() {
                 println!("frame {executed}: {matches:?}, in between {}", system.shows_between());
             }
-            // ZAKURO_DUMP_MEM_AT=1 saves the ZAKURO_DUMP_MEM ranges with the
-            // screens too, to watch memory change from frame to frame
+            // ZAKURO_DUMP_MEM_AT=1 saves the ZAKURO_DUMP_MEM ranges w/ the screens too, to watch memory change frame to frame
             if std::env::var("ZAKURO_DUMP_MEM_AT").is_ok() {
                 for (addr, len) in std::env::var("ZAKURO_DUMP_MEM").iter().flat_map(|spec| {
                     spec.split(';')
@@ -414,8 +385,7 @@ fn main() {
     }
     println!("\n--- result ---");
     println!("outcome:       {outcome:?} after {executed} frames in {elapsed:.2?}");
-    // ZAKURO_SLOW=25 lists the frames that took longer than 25 ms, to see
-    // when a stutter happens
+    // ZAKURO_SLOW=25 lists frames over 25 ms, to see when a stutter happens
     if let Some(limit) = std::env::var("ZAKURO_SLOW").ok().and_then(|ms| ms.parse::<f64>().ok()) {
         let slow: Vec<String> = frame_times
             .iter()
@@ -571,8 +541,7 @@ fn main() {
         );
     }
 
-    // save what the screens hold, so there is something to look at as well as
-    // read.
+    // save what the screens hold so there's something to look at, not just read
     for (screen, name) in SCREENS {
         let path = temp(&format!("zakuro-{name}.ppm"));
         let distinct = save_screen(&mut system, screen, &path);
@@ -626,7 +595,7 @@ const SCREENS: [(zakuro_common::Screen, &str); 2] = [
     (zakuro_common::Screen::Bottom, "bottom"),
 ];
 
-/// writes a screen out as a PPM and returns the distinct colors on it.
+/// writes a screen as a PPM and returns its distinct colors
 fn save_screen(
     system: &mut zakuro_core::System,
     screen: zakuro_common::Screen,
@@ -646,7 +615,7 @@ fn save_screen(
         .collect()
 }
 
-/// saves a picture as a PPM.
+/// saves a picture as a PPM
 fn save_picture((pixels, width, height): &zakuro_core::Screen, path: &str) {
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     for chunk in pixels.as_chunks::<4>().0 {
@@ -655,10 +624,9 @@ fn save_picture((pixels, width, height): &zakuro_core::Screen, path: &str) {
     let _ = std::fs::write(path, ppm);
 }
 
-/// a binary PPM's picture, P6 with eight bit channels.
+/// a binary PPM's picture, P6 w/ 8 bit channels
 fn read_ppm(bytes: &[u8]) -> Option<zakuro_core::camera::Picture> {
-    // the magic, the width, the height and the largest value, apart by
-    // white space, then one more and the pixels
+    // magic, width, height and max value split by whitespace, then one more and the pixels
     let mut fields = Vec::new();
     let mut at = 0;
     while fields.len() < 4 {
@@ -679,14 +647,13 @@ fn read_ppm(bytes: &[u8]) -> Option<zakuro_core::camera::Picture> {
     Some(zakuro_core::camera::Picture { width, height, rgb, fit: zakuro_core::camera::Fit::Whole })
 }
 
-/// a file in the system's temporary directory, /tmp on Linux.
+/// a file in the system temp dir, /tmp on linux
 fn temp(name: &str) -> String {
     std::env::temp_dir().join(name).display().to_string()
 }
 
-/// parses frame:BUTTON[+BUTTON...] entries separated by commas, where @XxY
-/// touches the bottom screen at X, Y, CUP, CDOWN, CLEFT and CRIGHT push
-/// the circle pad and CSUP, CSDOWN, CSLEFT and CSRIGHT the C-stick.
+/// parses `frame:BUTTON[+BUTTON...]` entries separated by commas
+/// @XxY touches the bottom screen at X, Y, CUP CDOWN CLEFT CRIGHT push the circle pad and CSUP CSDOWN CSLEFT CSRIGHT the C stick
 fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
     spec.split(',')
         .filter_map(|entry| {
@@ -732,7 +699,7 @@ fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
         .collect()
 }
 
-/// a 16-bit stereo WAV at the DSP's rate.
+/// a 16 bit stereo WAV at the DSP's rate
 fn write_wav(path: &str, samples: &[[i16; 2]]) -> std::io::Result<()> {
     let rate = zakuro_core::AUDIO_SAMPLE_RATE.round() as u32;
     let data = (samples.len() * 4) as u32;
@@ -756,8 +723,7 @@ fn write_wav(path: &str, samples: &[[i16; 2]]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// a microphone that hears its sound only between some frames and silence
-/// otherwise, and says when the title starts and stops sampling.
+/// a mic that only hears its sound between some frames (silence otherwise) and says when the title starts and stops sampling
 struct Between {
     heard: Box<dyn zakuro_core::microphone::Microphone>,
     frames: Option<std::ops::Range<u64>>,

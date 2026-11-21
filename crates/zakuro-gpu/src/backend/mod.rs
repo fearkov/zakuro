@@ -1,4 +1,4 @@
-//! presentation backends.
+//! presentation backends
 
 #[cfg(feature = "opengl")]
 pub mod gl;
@@ -7,8 +7,7 @@ pub mod vulkan;
 #[cfg(feature = "vulkan")]
 mod vulkan_overlay;
 
-/// one screen's pixels, already converted to straight RGBA8, or where they
-/// are on the GPU, for a presenter sharing the renderer's device.
+/// one screen's pixels, already converted to straight RGBA8, or where they are on the GPU, for a presenter sharing the renderer's device
 pub struct ScreenImage<'a> {
     pub width: u32,
     pub height: u32,
@@ -22,65 +21,61 @@ impl ScreenImage<'_> {
     }
 }
 
-/// a screen's picture upright in an image of the renderer's, in the general
-/// layout, which the Vulkan presenter draws straight from when the two share
-/// a device.
+/// a screen's picture upright in one of the renderer's images, in the general layout,
+/// the Vulkan presenter draws straight from it when both share a device
 #[derive(Debug, Clone, Copy)]
 pub struct GpuScreen {
     #[cfg(feature = "vulkan")]
     pub(crate) view: ash::vk::ImageView,
-    /// where the screen's pixels lie in the image, as texture coordinates,
-    /// the corner and the size, then the corners inset by half a texel,
-    /// which filtering keeps within.
+    /// where the screen's pixels lie in the image as texture coords, the corner and the size,
+    /// then the corners inset by half a texel, filtering stays inside those
     pub(crate) area: [f32; 4],
     pub(crate) bounds: [f32; 4],
 }
 
-/// what is drawn over the screens, a user interface, as textured triangles
-/// in window pixels.
+/// what's drawn over the screens, a UI, as textured triangles in window pixels
 #[derive(Default)]
 pub struct Overlay {
-    /// textures to make or change before drawing.
+    /// textures to make or change before drawing
     pub textures: Vec<OverlayTexture>,
     pub meshes: Vec<OverlayMesh>,
-    /// textures that go away once this frame is drawn.
+    /// textures that go away once this frame is drawn
     pub free: Vec<u64>,
 }
 
-/// pixels for a texture of the overlay.
+/// pixels for a texture of the overlay
 pub struct OverlayTexture {
     pub id: u64,
-    /// where the pixels go in a texture that exists, none to make it anew at
-    /// this size.
+    /// where the pixels go in a texture that exists, none to make it fresh at this size
     pub offset: Option<[u32; 2]>,
     pub size: [u32; 2],
-    /// RGBA, premultiplied by alpha, in sRGB.
+    /// RGBA, premultiplied by alpha, in sRGB
     pub pixels: Vec<u8>,
-    /// filtered when scaled, rather than nearest.
+    /// filtered when scaled, instead of nearest
     pub linear: bool,
 }
 
-/// one corner of an overlay triangle.
+/// one corner of an overlay triangle
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OverlayVertex {
-    /// window pixels from the top left.
+    /// window pixels from the top left
     pub position: [f32; 2],
     pub uv: [f32; 2],
-    /// premultiplied sRGB.
+    /// premultiplied sRGB
     pub color: [u8; 4],
 }
 
-/// triangles of the overlay that share a texture and a clip.
+/// triangles of the overlay sharing a texture and a clip
 pub struct OverlayMesh {
     pub texture: u64,
-    /// the part of the window they may draw in, left, top, right, bottom.
+    /// the part of the window they may draw in, left, top, right, bottom
     pub clip: [u32; 4],
     pub vertices: Vec<OverlayVertex>,
     pub indices: Vec<u32>,
 }
 
-/// where a screen goes in the window, in pixels from the top left.
+/// where a screen goes in the window, in pixels from the top left
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
     pub x: f32,
@@ -89,23 +84,23 @@ pub struct Viewport {
     pub height: f32,
 }
 
-/// how the screens are arranged in the window.
+/// how the screens are arranged in the window
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreenLayout {
-    /// the top screen over the bottom one, as on the console.
+    /// the top screen over the bottom one, like on the console
     #[default]
     Stacked,
-    /// next to each other, the top screen on the left.
+    /// next to each other, the top screen on the left
     SideBySide,
-    /// the top screen alone.
+    /// the top screen alone
     TopOnly,
-    /// the bottom screen alone.
+    /// the bottom screen alone
     BottomOnly,
-    /// the top screen big, the bottom one small at its lower right.
+    /// the top screen big, the bottom one small at its lower right
     LargeTop,
 }
 
-/// the Orientation of both screens. north is up
+/// the orientation of both screens, north is up
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreenOrientation {
     #[default]
@@ -131,21 +126,20 @@ impl ScreenOrientation {
     }
 }
 
-/// how the screens' pixels are drawn when scaled to the window.
+/// how the screens' pixels are drawn when scaled to the window
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreenFilter {
-    /// blended between pixels.
+    /// blended between pixels
     #[default]
     Smooth,
-    /// whole pixels kept sharp and blended only where two meet, so that a
-    /// screen scaled by an odd amount stays crisp without stairs.
+    /// whole pixels kept sharp and blended only where two meet, so a screen scaled by an odd amount stays crisp w/o stairs
     Sharp,
-    /// every pixel a square of the nearest one.
+    /// every pixel a square of the nearest one
     Pixels,
 }
 
 impl ScreenFilter {
-    /// the number the present shaders know it by.
+    /// the number the present shaders know it by
     pub(crate) fn mode(self) -> i32 {
         match self {
             ScreenFilter::Smooth => 0,
@@ -156,8 +150,7 @@ impl ScreenFilter {
 }
 
 impl ScreenLayout {
-    /// the size the screens take up together at the console's resolution,
-    /// with the top screen top_width wide.
+    /// the size the screens take up together at the console's res, w/ the top screen top_width wide
     pub fn size(self, top_width: f32) -> (u32, u32) {
         let (width, height) = self.size_f(top_width);
         (width.ceil() as u32, height as u32)
@@ -174,18 +167,16 @@ impl ScreenLayout {
     }
 }
 
-/// the top screen's width at the console's resolution, its own shape. a
-/// wider one shows a game that a widescreen code makes draw a wider scene
-/// into the same 400x240.
+/// the top screen's width at the console's res, its own shape
+/// a wider one shows a game that a widescreen code makes draw a wider scene into the same 400x240
 pub const TOP_WIDTH: f32 = 400.0;
 
-/// the bottom screen's size next to the big top one, half the console's.
+/// the bottom screen's size next to the big top one, half the console's
 const LARGE_TOP_BOTTOM: (u32, u32) = (160, 120);
 
-/// works out where the screens go inside a window, keeping the 3DS's
-/// aspect ratio, or the top screen top_w wide, rotating and centring them, scaled by
-/// a whole number when integer asks and the window has room. a screen that
-/// does not show has no place.
+/// figures out where the screens go in a window, keeping the 3DS's aspect ratio (or the top screen top_w wide),
+/// rotating and centering them, scaled by a whole number when integer asks and the window has room
+/// a screen that doesn't show has no place
 pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, orientation: ScreenOrientation, top_w: f32, integer: bool) -> (Option<Viewport>, Option<Viewport>) {
     let (layout_width, layout_height) = arrangement.size_f(top_w);
     let (total_width, total_height) = if matches!(orientation, ScreenOrientation::East | ScreenOrientation::West) {
@@ -206,7 +197,7 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         height: 240.0 * scale,
     });
     let bottom = match arrangement {
-        // the bottom screen is narrower, so it is centered under the top one.
+        // the bottom screen is narrower, so it's centered under the top one
         ScreenLayout::Stacked => Some(Viewport {
             x: (layout_width - 320.0) / 2.0 * scale,
             y: 240.0 * scale,
@@ -257,7 +248,7 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
     let mut offset_x = (window_width as f32 - total_width * scale) / 2.0;
     let mut offset_y = (window_height as f32 - total_height * scale) / 2.0;
     if integer {
-        // whole pixels, or every texel would not get the same size
+        // whole pixels, or every texel wouldn't get the same size
         offset_x = offset_x.floor();
         offset_y = offset_y.floor();
     }
@@ -269,48 +260,46 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
     (top.map(offset), bottom.map(offset))
 }
 
-/// how the top screen's two pictures, one for each eye, are shown when the
-/// title draws in 3D.
+/// how the top screen's two pictures (one per eye) get shown when the title draws in 3D
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StereoMode {
-    /// the left eye's picture alone, as with the 3D slider down.
+    /// the left eye's picture alone, like w/ the 3D slider down
     #[default]
     Off,
     /// the eyes mixed into red for the left one and cyan for the right, for
-    /// glasses of those colors.
+    /// glasses of those colors
     Anaglyph,
-    /// each eye in its half of the window, for 3D TVs and headsets.
+    /// each eye in its half of the window, for 3D TVs and headsets
     SideBySide,
-    /// the same squeezed to half width, which a 3D TV stretches back.
+    /// the same squeezed to half width, a 3D TV stretches it back
     HalfSideBySide,
-    /// the eyes on alternate rows of the window, for passive 3D monitors.
+    /// the eyes on alternate rows of the window, for passive 3D monitors
     Interlaced,
 }
 
-/// the 3D a presenter shows.
+/// the 3D a presenter shows
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stereo {
     pub mode: StereoMode,
-    /// the right eye's picture where the left one's goes, for viewing cross
-    /// eyed, glasses worn the other way round or rows counted the other way.
+    /// the right eye's picture where the left one's goes, for cross eyed viewing, glasses worn backwards or rows counted the other way
     pub swap: bool,
 }
 
-/// which picture a place in the window shows.
+/// which picture a place in the window shows
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shown {
-    /// the top screen, as the left eye sees it.
+    /// the top screen, as the left eye sees it
     Top,
-    /// the top screen as the right eye sees it.
+    /// the top screen as the right eye sees it
     Right,
     Bottom,
-    /// the top screen's two pictures mixed the way the stereo mode does.
+    /// the top screen's two pictures mixed like the stereo mode does
     Both,
 }
 
-/// the screens a frame draws, where and from which picture. the 3D shows
-/// when the title drew a picture for the right eye, side by side shows the
-/// left one's twice otherwise, so a 3D TV keeps its halves.
+/// the screens a frame draws, where and from which picture
+/// the 3D shows when the title drew a picture for the right eye,
+/// side by side shows the left one's twice otherwise so a 3D TV keeps its halves
 pub fn place(window_width: u32, window_height: u32, arrangement: ScreenLayout, orientation: ScreenOrientation, top_width: f32, integer: bool, stereo: Stereo, right: bool) -> Vec<(Viewport, Shown)> {
     let screens = |(top, bottom): (Option<Viewport>, Option<Viewport>), eye: Shown| {
         top.map(|viewport| (viewport, eye)).into_iter().chain(bottom.map(|viewport| (viewport, Shown::Bottom)))
@@ -356,9 +345,8 @@ pub enum PresentError {
 pub trait Presenter {
     fn name(&self) -> &'static str;
 
-    /// draws both screens into the window, and the overlay over them. right
-    /// is the top screen's picture for the right eye, empty when the title
-    /// draws no 3D or none is shown.
+    /// draws both screens into the window, and the overlay over them
+    /// right is the top screen's picture for the right eye, empty when the title draws no 3D or none is shown
     fn present(
         &mut self,
         top: ScreenImage<'_>,
@@ -367,23 +355,22 @@ pub trait Presenter {
         overlay: &Overlay,
     ) -> Result<(), PresentError>;
 
-    /// the window changed size.
+    /// the window changed size
     fn resize(&mut self, width: u32, height: u32);
 
-    /// how the screens are arranged from the next frame on.
+    /// how the screens are arranged from the next frame on
     fn set_layout(&mut self, arrangement: ScreenLayout);
 
-    /// sets the orientation of both screens.
+    /// sets the orientation of both screens
     fn set_orientation(&mut self, orientation: ScreenOrientation);
 
-    /// how wide the top screen shows, TOP_WIDTH for the console's shape.
+    /// how wide the top screen shows, TOP_WIDTH for the console's shape
     fn set_top_width(&mut self, width: f32);
 
-    /// how the screens are filtered, and whether they are scaled by whole
-    /// numbers, from the next frame on.
+    /// how the screens are filtered, and if they're scaled by whole numbers, from the next frame on
     fn set_scaling(&mut self, filter: ScreenFilter, integer: bool);
 
-    /// how the 3D shows from the next frame on.
+    /// how the 3D shows from the next frame on
     fn set_stereo(&mut self, stereo: Stereo);
 }
 
@@ -397,7 +384,7 @@ mod tests {
 
     #[test]
     fn layout_keeps_the_aspect_ratio_and_centers() {
-        // a window exactly 400x480 needs no scaling or offset.
+        // a window exactly 400x480 needs no scaling or offset
         let (top, bottom) = layout(400, 480, ScreenLayout::Stacked, ScreenOrientation::North, TOP_WIDTH, false);
         let (top, bottom) = (top.unwrap(), bottom.unwrap());
         assert_eq!(top.x, 0.0);
@@ -407,12 +394,12 @@ mod tests {
         assert_eq!(bottom.x, 40.0);
         assert_eq!(bottom.width, 320.0);
 
-        // doubling both dimensions doubles the scale.
+        // doubling both dimensions doubles the scale
         let top = layout(800, 960, ScreenLayout::Stacked, ScreenOrientation::North, TOP_WIDTH, false).0.unwrap();
         assert_eq!(top.width, 800.0);
         assert_eq!(top.height, 480.0);
 
-        // a window that is too wide letterboxes horizontally.
+        // a window that's too wide letterboxes horizontally
         let top = layout(1000, 480, ScreenLayout::Stacked, ScreenOrientation::North, TOP_WIDTH, false).0.unwrap();
         assert_eq!(top.width, 400.0);
         assert_eq!(top.x, 300.0);
@@ -464,7 +451,7 @@ mod tests {
     }
 
     /// a wider top screen fills a window of its shape, and the screens
-    /// around it move over to make room.
+    /// around it move over to make room
     #[test]
     fn a_wider_top_screen_takes_its_shape() {
         let wide = 240.0 * 16.0 / 9.0;
@@ -484,7 +471,7 @@ mod tests {
         assert_eq!(ScreenLayout::TopOnly.size(wide), (427, 240));
     }
 
-    /// the screens each stereo mode draws, from which picture and where.
+    /// the screens each stereo mode draws, from which picture and where
     #[test]
     fn the_stereo_modes_place_the_eyes() {
         let on = |mode| Stereo { mode, swap: false };
@@ -519,8 +506,7 @@ mod tests {
         assert_eq!(at(&squeezed, 1), (120.0, 240.0, 160.0, 240.0));
         assert_eq!(at(&squeezed, 2), (500.0, 0.0, 200.0, 240.0));
 
-        // swapped, the right eye on the left, and with no 3D drawn both
-        // halves the left eye's
+        // swapped, the right eye on the left, and w/ no 3D drawn both halves are the left eye's
         let swapped = place(800, 480, ScreenLayout::Stacked, ScreenOrientation::North, TOP_WIDTH, false, Stereo { mode: StereoMode::SideBySide, swap: true }, true);
         assert_eq!(shown(&swapped), [Shown::Right, Shown::Bottom, Shown::Top, Shown::Bottom]);
         let flat = place(800, 480, ScreenLayout::TopOnly, ScreenOrientation::North, TOP_WIDTH, false, on(StereoMode::SideBySide), false);
@@ -569,7 +555,7 @@ mod tests {
 
     #[test]
     fn integer_scaling_keeps_whole_multiples() {
-        // 2.5 times fits, 2 is used, and the rest is border
+        // 2.5 times fits, 2 is used and the rest is border
         let top = layout(1000, 1200, ScreenLayout::Stacked, ScreenOrientation::North, TOP_WIDTH, true).0.unwrap();
         assert_eq!((top.width, top.height), (800.0, 480.0));
         assert_eq!((top.x, top.y), (100.0, 120.0));
