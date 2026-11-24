@@ -179,22 +179,41 @@ impl Interpolation {
             !(change <= JUMP || change <= JUMP_PART * before.abs().max(now.abs()))
         };
         let mut lerped = false;
+        // a shared one that moved w/o jumping, so the block the coords may read moves along (bones, a camera)
+        let block_moves = before.iter().zip(now.iter()).zip(moved_before.iter()).enumerate().any(|(uniform, ((before, now), moved_before))| {
+            let moving: [bool; 4] = std::array::from_fn(|i| moves(uniform, before[i], now[i]));
+            shared(uniform) && moving.contains(&true) && !(0..4).any(|i| moving[i] && jumps(before[i], now[i], moved_before[i]))
+        });
+        let mut torn = false;
         let uniforms = between.iter_mut().zip(before.iter()).zip(now.iter()).zip(moved_before.iter());
         for (uniform, (((out, before), now), moved_before)) in uniforms.enumerate() {
             let moving: [bool; 4] = std::array::from_fn(|i| moves(uniform, before[i], now[i]));
             let jumping: [bool; 4] = std::array::from_fn(|i| moving[i] && jumps(before[i], now[i], moved_before[i]));
             if jumping.contains(&true) {
-                // one the coords may read too is as the frame has it, whatever it is,
                 // one that only places the vertices says the draw is another than the one b4
                 if !shared(uniform) {
                     jumped = true;
                     break;
                 }
-                *out = *now;
-                continue;
+                // one the coords may read too moves w/ the rest when its block moves, it's a row of a matrix turning fast
+                // (a bone) or slowing down (the camera), and kept as is it'd tear that matrix (Ultra Moon's limbs and outlines)
+                // the draw counts as a jump tho, so a cut that moves only the block isn't shown in between
+                // when nothing else there moves it's a flag or a wrap, as the frame has it
+                if !block_moves {
+                    *out = *now;
+                    continue;
+                }
+                torn = true;
             }
             *out = std::array::from_fn(|i| if moving[i] { before[i] + (now[i] - before[i]) * 0.5 } else { now[i] });
             lerped |= moving.contains(&true);
+        }
+        if torn && !jumped {
+            match restless {
+                0 => self.jumped += 1,
+                _ => self.jumping += 1,
+            }
+            *still_restless = RESTLESS;
         }
         if !jumped && !lerped {
             // what moved jumped, and is as the frame has it
@@ -361,6 +380,43 @@ mod tests {
             interpolation.frame_done();
         }
         assert_eq!(moved, [false, false, true, true, true], "nothing before, then the first move jumps");
+    }
+
+    /// a shared row that jumps while the rest of its block moves (a bone turning fast, Ultra Moon's limbs) moves w/ it,
+    /// halfway like the other rows of its matrix instead of as the frame has it, and the draw counts as a jump
+    #[test]
+    fn a_shared_row_that_jumps_moves_with_its_block() {
+        // o0 = c[a0.x + 20] . v0, o2 = c[a0.x + 20], so c20 and up are shared
+        let mut program = ShaderUnit::new();
+        program.program[0] = (0x02 << 26) | (1 << 19) | ((0x20 + 20) << 12);
+        program.program[1] = (0x13 << 26) | (0x02 << 21) | (1 << 19) | ((0x20 + 20) << 12);
+        program.program[2] = 0x22 << 26;
+        program.descriptors[0] = 0xF | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
+        program.prepare();
+        let mut registers = registers(3);
+        registers[REG_SHADER_OUTPUT_TOTAL] = 3;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 2] = 0x1F1F_0D0C;
+        // a bone, rows c20 and c21 turn steadily, c22 turns slow then fast (none of them round, see steps)
+        let at = |t: f32, turn: f32| {
+            let mut unit = program.clone();
+            unit.float_uniforms[20] = [0.9, 0.1 * t, -0.3, 10.1 + 1.3 * t];
+            unit.float_uniforms[21] = [0.1 * t, 0.95, 0.2, 5.0];
+            unit.float_uniforms[22] = [0.3, -0.2, turn, 7.0];
+            unit
+        };
+        let mut interpolation = Interpolation::default();
+        for (t, turn) in [(0.0, 0.8), (1.0, 0.75)] {
+            if let Some(between) = interpolation.draw(&registers, &at(t, turn), None, true) {
+                interpolation.give_back(between);
+            }
+            interpolation.frame_done();
+        }
+        let between = interpolation.draw(&registers, &at(2.0, -0.6), None, true).expect("the bone moved");
+        assert!((between[20][3] - 12.05).abs() < 1e-5, "the steady rows halfway");
+        assert!((between[22][2] - 0.075).abs() < 1e-6, "the row that jumped halfway too, not as the frame has it");
+        interpolation.give_back(between);
+        assert_eq!(interpolation.frame_done().jumped, 1, "and it counts as a jump");
     }
 
     /// a draw that jumps frame after frame (a batch of sprites sorted fresh each frame) gets drawn as is and
