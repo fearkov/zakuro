@@ -26,18 +26,17 @@ pub struct Options {
     pub interpreter: bool,
     /// play no sound (shh)
     pub mute: bool,
-    /// start in full screen, as F11 would.
+    /// start in full screen, like F11
     pub fullscreen: bool,
-    /// where the window opens, so full screen is on that screen.
+    /// where the window opens, so full screen lands on that screen
     pub at: Option<(i32, i32)>,
-    /// controllers only reach the game while its window is in front, for a front end that
-    /// shows its own window over the game.
+    /// pads only play while the window's in front, so a front end can show its own window on top
     pub focus_pad: bool,
-    /// fast forward at most this many times the console's speed, unlimited when none.
+    /// fast forward at most this many times the console's speed, no cap when none
     pub fast_forward: Option<u32>,
-    /// after a headless run, save the state to this file.
+    /// after a headless run, save the state to this file
     pub state_save: Option<String>,
-    /// start the game from this saved state, booting as usual when it cannot.
+    /// start the game from this state, booting as usual when it won't load
     pub state_load: Option<String>,
 }
 

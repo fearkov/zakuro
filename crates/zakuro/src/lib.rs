@@ -151,7 +151,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         if let Some(game) = &mut app.game {
             run_headless(&mut game.system, frames);
             if let Some(file) = app.options.state_save.clone() {
-                // written beside it first, so a cut-short state never takes the place of a whole one
+                // written beside it first, so a state cut short never replaces a whole one
                 let partial = PathBuf::from(format!("{file}.new"));
                 let saved = game.system.save_state().and_then(|bytes| {
                     std::fs::write(&partial, &bytes).and_then(|()| std::fs::rename(&partial, &file)).map_err(|error| error.to_string())
