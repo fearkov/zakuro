@@ -6099,6 +6099,109 @@ mod tests {
         }
     }
 
+    /// a texture copy of whole tiles out of a buffer drawn on the GPU leaves the same bytes as the CPU's,
+    /// cropped, w/ gaps after the lines on either side, in one run and at a scale,
+    /// and copies that aren't whole tiles stay the CPU's
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn texture_copies_on_the_gpu_match_the_cpu() {
+        use crate::format::ColorFormat::*;
+        const OUTPUT: u32 = 0x10_0000;
+        // 8 tiles across, 4 rows of them
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 32;
+        let mut seed = 5u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        for scale in [1, 2] {
+            let Ok(mut hardware) = hardware::Hardware::new() else { return };
+            let scale = hardware.set_scale(scale);
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            for format in [Rgba8, Rgb565] {
+                let mut registers = target_registers();
+                registers[REG_VIEWPORT_WIDTH] = float24(WIDTH as f32 / 2.0);
+                registers[REG_VIEWPORT_HEIGHT] = float24(HEIGHT as f32 / 2.0);
+                registers[REG_FRAMEBUFFER_DIMENSIONS] = WIDTH | ((HEIGHT - 1) << 12) | 1 << 24;
+                registers[REG_COLOR_BUFFER_FORMAT] = format.color_buffer_raw() << 16;
+                // out of the color buffer's way
+                registers[REG_DEPTH_BUFFER_ADDRESS] = 0x8_0000 >> 3;
+                let tile = 64 * format.bytes_per_pixel() as u32;
+                let row = 8 * tile;
+                // where it starts, the size, the input's line and gap, the output's, all in bytes
+                let cases = [
+                    // 4 tiles from the 3rd, 2 rows of tiles from the 2nd
+                    (COLOR + row + 2 * tile, 8 * tile, (4 * tile, 4 * tile), (4 * tile, 0)),
+                    // into lines w/ gaps after them
+                    (COLOR, 12 * tile, (3 * tile, 5 * tile), (3 * tile, 2 * tile)),
+                    // one run
+                    (COLOR, 4 * row, (0, 0), (0, 0)),
+                    // a zero width on one side skips nothing on either
+                    (COLOR + row, 2 * row, (2 * tile, 6 * tile), (0, 0)),
+                    // whole rows of tiles into longer lines
+                    (COLOR + row, 3 * row, (row, 0), (row, 2 * tile)),
+                ];
+                let gap = |(line, skip): (u32, u32)| line / 16 | (skip / 16) << 16;
+                for (input, size, input_line, output_line) in cases {
+                    let lines = if input_line.0 == 0 || output_line.0 == 0 { 1 } else { size / input_line.0 };
+                    let len = (size + lines * output_line.1) as usize + 512;
+                    let before: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+                    let mut memory = ConsoleMemory::default();
+                    memory.write(OUTPUT, &before);
+                    // rectangles on the console's pixels, so scaled up each pixel is all one color and comes back the same
+                    // from either buffer, edges across them come back as whichever sample the blit lands on
+                    for _ in 0..40 {
+                        let color = [random(), random(), random(), random()];
+                        let (x, y) = ((random() * WIDTH as f32).floor(), (random() * HEIGHT as f32).floor());
+                        let (w, h) = ((random() * 24.0).floor() + 1.0, (random() * 16.0).floor() + 1.0);
+                        let at = |x: f32, y: f32| Vertex {
+                            clip: [x / (WIDTH as f32 / 2.0) - 1.0, y / (HEIGHT as f32 / 2.0) - 1.0, -0.5, 1.0],
+                            color,
+                            texcoords: [[0.0; 2]; 3],
+                            quaternion: [0.0, 0.0, 0.0, 1.0],
+                            view: [0.0; 3],
+                            texcoord0_w: 1.0,
+                        };
+                        let (x1, y1) = ((x + w).min(WIDTH as f32), (y + h).min(HEIGHT as f32));
+                        rasterize_shaded(&registers, &mut memory, &mut resources, &[at(x, y), at(x1, y), at(x, y1)]);
+                        rasterize_shaded(&registers, &mut memory, &mut resources, &[at(x1, y), at(x1, y1), at(x, y1)]);
+                    }
+                    let hardware = resources.hardware.as_mut().unwrap();
+                    let copy = hardware::TileCopy { input, output: OUTPUT, size, input_line, output_line };
+                    assert!(hardware.texture_copy(&mut memory, &copy).unwrap(), "{format:?} at {input:X}, scale {scale}");
+                    hardware.flush(&mut memory).unwrap();
+                    // the CPU's from what the GPU drew
+                    let mut cpu = memory.clone();
+                    cpu.write(OUTPUT, &before);
+                    crate::Gpu::new().texture_copy(&mut cpu, input, OUTPUT, size, gap(input_line), gap(output_line));
+                    let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+                    cpu.read(OUTPUT, &mut a);
+                    memory.read(OUTPUT, &mut b);
+                    assert!(a == b, "{format:?} at {input:X}, lines {input_line:?} into {output_line:?}, scale {scale}");
+                    let colors: std::collections::HashSet<&[u8]> = a[..size as usize].chunks(format.bytes_per_pixel()).collect();
+                    assert!(colors.len() > 8, "only {} colors", colors.len());
+                }
+                // parts of tiles, lines of another length, and a start inside a tile, out of a buffer just drawn
+                let mut memory = ConsoleMemory::default();
+                rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+                let hardware = resources.hardware.as_mut().unwrap();
+                for (input, input_line, output_line) in [
+                    (COLOR, (tile / 2, row - tile / 2), (tile / 2, 0)),
+                    (COLOR, (4 * tile, 4 * tile), (2 * tile, 0)),
+                    (COLOR + 16, (4 * tile, 4 * tile), (4 * tile, 0)),
+                ] {
+                    let copy = hardware::TileCopy { input, output: OUTPUT, size: 4 * input_line.0, input_line, output_line };
+                    assert!(!hardware.texture_copy(&mut memory, &copy).unwrap(), "{format:?} {input_line:?} into {output_line:?}");
+                }
+                // which the GPU would've taken whole
+                let copy = hardware::TileCopy { input: COLOR, output: OUTPUT, size: 16 * tile, input_line: (4 * tile, 4 * tile), output_line: (4 * tile, 0) };
+                assert!(hardware.texture_copy(&mut memory, &copy).unwrap());
+                hardware.flush(&mut memory).unwrap();
+            }
+        }
+    }
+
     /// the triangles assemble_into puts down are assemble's, for a list, a strip and a fan of any length, each thru the vertex it names
     #[test]
     fn both_assemblers_make_the_same_triangles() {

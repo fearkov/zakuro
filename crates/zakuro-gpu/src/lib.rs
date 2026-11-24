@@ -561,14 +561,34 @@ impl Gpu {
         // every line and the gaps between them
         let span = |width: u32, skip: u32| if width == 0 { size } else { size + size.div_ceil(width) * skip };
         let (input, output) = (memory.translate(input_paddr), memory.translate(output_paddr));
-        self.sync_memory(memory, input, span(input_width, input_skip));
         let output_width = (output_gap & 0xFFFF) * 16;
         let output_skip = (output_gap >> 16) * 16;
-        self.sync_memory(memory, output, span(output_width, output_skip));
 
         log::debug!(
             "texture copy: 0x{input_paddr:08X} -> 0x{output_paddr:08X} size 0x{size:X}"
         );
+
+        // whole tiles of a color buffer the host GPU drew it copies itself, keeping the output (see Hardware::texture_copy)
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            let copy = raster::hardware::TileCopy {
+                input,
+                output,
+                size,
+                input_line: (input_width, input_skip),
+                output_line: (output_width, output_skip),
+            };
+            match hardware.texture_copy(memory, &copy) {
+                Ok(true) => {
+                    self.transfers += 1;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => log::error!("the GPU could not copy a texture, {error}"),
+            }
+        }
+        self.sync_memory(memory, input, span(input_width, input_skip));
+        self.sync_memory(memory, output, span(output_width, output_skip));
 
         let (mut src, mut dst) = (input, output);
 
