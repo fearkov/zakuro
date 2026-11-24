@@ -22,6 +22,8 @@ layout(push_constant) uniform Transfer {
     // the surface row the input starts at, and the surface's height
     int source_row;
     int source_height;
+    // drawn scaled, the scale when the output's texels are to come out as the console's (see main), else 0
+    int footprint;
 } transfer;
 
 uint expand(uint value, uint bits) {
@@ -44,9 +46,43 @@ uvec4 quantize(uvec4 c, int format) {
     }
 }
 
+// an output texel of the console's, the average of the whole block of input it covers, at that scale
+vec4 console_texel(ivec2 texel) {
+    int n = transfer.footprint;
+    uvec4 sum = uvec4(0u);
+    for (int dy = 0; dy < transfer.scale.y * n; dy++) {
+        for (int dx = 0; dx < transfer.scale.x * n; dx++) {
+            int x = texel.x * transfer.scale.x * n + dx;
+            int y = texel.y * transfer.scale.y * n + dy;
+            if (transfer.flip != 0) {
+                y = transfer.input_height - 1 - y;
+            }
+            int row = transfer.source_height - 1 - (transfer.source_row + y);
+            sum += quantize(uvec4(round(imageLoad(source, ivec2(x, row)) * 255.0)), transfer.input_format);
+        }
+    }
+    uint count = uint(transfer.scale.x * transfer.scale.y * n * n);
+    return vec4(quantize((sum + count / 2u) / count, transfer.output_format));
+}
+
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (at.x >= transfer.size.x || at.y >= transfer.size.y) {
+        return;
+    }
+    // a texture made smaller to be blurred (a bloom) holds the console's texels, filtered across the scaled ones,
+    // averaging only its own few pixels it'd keep all the detail drawn scaled, and the blur would show copies instead
+    if (transfer.footprint > 1) {
+        int n = transfer.footprint;
+        ivec2 texels = transfer.size / n;
+        vec2 p = (vec2(at) + 0.5) / float(n) - 0.5;
+        ivec2 low = ivec2(floor(p));
+        vec2 f = p - vec2(low);
+        ivec2 a = clamp(low, ivec2(0), texels - 1);
+        ivec2 b = clamp(low + 1, ivec2(0), texels - 1);
+        vec4 top = mix(console_texel(a), console_texel(ivec2(b.x, a.y)), f.x);
+        vec4 bottom = mix(console_texel(ivec2(a.x, b.y)), console_texel(b), f.x);
+        imageStore(target, ivec2(at.x, transfer.output_height - 1 - at.y), round(mix(top, bottom, f.y)) / 255.0);
         return;
     }
     uvec4 sum = uvec4(0u);

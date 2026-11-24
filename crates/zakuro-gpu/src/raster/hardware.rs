@@ -4341,7 +4341,13 @@ impl Hardware {
         };
         // drawn scaled, every size and row is that many times more, and the pixels averaged stay as many
         let n = self.scale as i32;
-        let constants: [i32; 11] = [
+        // a tiled output made smaller is a texture to be blurred (Ultra Moon's bloom), its texels come out as the console's,
+        // drawn scaled the bloom would keep all the detail and show copies of what glows instead of a glow
+        let footprint = match self.scale > 1 && t.output_tiled && (t.scale.0 > 1 || t.scale.1 > 1) {
+            true => n,
+            false => 0,
+        };
+        let constants: [i32; 12] = [
             t.copy.0 as i32 * n,
             t.copy.1 as i32 * n,
             // a flip turns the rows read over, not the whole input
@@ -4354,6 +4360,7 @@ impl Hardware {
             format_index(t.output_format),
             row as i32 * n,
             input_size.1 as i32 * n,
+            footprint,
         ];
         // and in between, from the input's twin into the output's, which holds what the output did b4
         let twinned = self.twins && (self.surfaces[source].twinned || self.surfaces[target].twinned);
@@ -4387,7 +4394,7 @@ impl Hardware {
     }
 
     /// records the transfer shader going over size pixels, from one image to another, like the constants say
-    fn dispatch_transfer(&mut self, (source, target): (vk::ImageView, vk::ImageView), constants: [i32; 11], size: (u32, u32)) -> Result<(), String> {
+    fn dispatch_transfer(&mut self, (source, target): (vk::ImageView, vk::ImageView), constants: [i32; 12], size: (u32, u32)) -> Result<(), String> {
         self.mark(Work::Transfer, false);
         let (layout, pipeline) = self.transfer_pipeline()?;
         self.end_rendering();
@@ -4403,7 +4410,7 @@ impl Hardware {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&infos[1]),
         ];
-        let mut bytes = [0u8; 44];
+        let mut bytes = [0u8; 48];
         for (bytes, constant) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(constants) {
             *bytes = constant.to_le_bytes();
         }
@@ -4573,7 +4580,7 @@ impl Hardware {
             let n = self.scale;
             let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
             let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
-            let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height];
+            let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height, 0];
             let from = self.surface_view(source, twin);
             self.dispatch_transfer((from, view), constants, (texture.width * n, rows * n))?;
         }
@@ -5008,7 +5015,7 @@ impl Hardware {
     fn transfer_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
         if self.transfer.is_none() {
             let images = [vk::DescriptorType::STORAGE_IMAGE; 2];
-            self.transfer = Some(self.compute(TRANSFER_SPIRV, &images, 11 * 4)?);
+            self.transfer = Some(self.compute(TRANSFER_SPIRV, &images, 12 * 4)?);
         }
         let transfer = self.transfer.as_ref().expect("made above");
         Ok((transfer.layout, transfer.pipeline))
