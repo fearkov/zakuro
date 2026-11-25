@@ -5,10 +5,19 @@
 #   appimage.sh <binary> <output>
 set -eu
 
-tool_url=https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
-tool_sha256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
-runtime_url=https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
-runtime_sha256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+# the AppImage is for the machine it's packed on
+arch=$(uname -m)
+case $arch in
+    x86_64)
+        tool_sha256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+        runtime_sha256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d ;;
+    aarch64)
+        tool_sha256=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+        runtime_sha256=00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444 ;;
+    *) echo "no AppImage tools for $arch" >&2; exit 1 ;;
+esac
+tool_url=https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$arch.AppImage
+runtime_url=https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-$arch
 
 binary=$1
 output=$2
@@ -29,7 +38,7 @@ ln -s usr/bin/zakuro "$app/AppRun"
 cp "$here/zakuro.desktop" "$here/zakuro.png" "$app/"
 
 # the update info makes AppImage updaters (Gear Lever's say) follow the releases
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$work/appimagetool" \
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH=$arch "$work/appimagetool" \
     --runtime-file "$work/runtime" \
-    --updateinformation "gh-releases-zsync|fearkov|zakuro|latest|Zakuro-x86_64.AppImage.zsync" \
+    --updateinformation "gh-releases-zsync|fearkov|zakuro|latest|Zakuro-$arch.AppImage.zsync" \
     "$app" "$output"

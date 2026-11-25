@@ -29,6 +29,11 @@ jobs:
           - os: ubuntu-latest
             container: ubuntu:22.04
             archive: zakuro-linux-x86_64.tar.gz
+            appimage: Zakuro-x86_64.AppImage
+          - os: ubuntu-24.04-arm
+            container: ubuntu:22.04
+            archive: zakuro-linux-aarch64.tar.gz
+            appimage: Zakuro-aarch64.AppImage
           - os: macos-latest
             archive: zakuro-macos-arm64.zip
           # MoltenVK aborts inside Metal on this runner's virtual GPU, it has no real driver for what it asks
@@ -60,8 +65,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           tar czf ${{ matrix.archive }} README.md LICENSE -C target/release zakuro
-          packaging/appimage.sh target/release/zakuro Zakuro-x86_64.AppImage
-          APPIMAGE_EXTRACT_AND_RUN=1 RUST_LOG=info ./Zakuro-x86_64.AppImage --test-pattern --headless 1 --mute
+          packaging/appimage.sh target/release/zakuro ${{ matrix.appimage }}
+          APPIMAGE_EXTRACT_AND_RUN=1 RUST_LOG=info ./${{ matrix.appimage }} --test-pattern --headless 1 --mute
       - name: Pack for macOS
         if: runner.os == 'macOS'
         env:
@@ -75,7 +80,7 @@ jobs:
           name: ${{ matrix.archive }}
           path: |
             ${{ matrix.archive }}
-            Zakuro-x86_64.AppImage*
+            Zakuro-*.AppImage*
 
   release:
     needs: build
@@ -92,7 +97,7 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           cat > notes.md <<'NOTES'
-          On Windows, unzip zakuro-windows-x86_64.zip and run zakuro.exe. On Linux, make Zakuro-x86_64.AppImage executable and run it, or extract zakuro-linux-x86_64.tar.gz and run ./zakuro, either of which needs the ALSA library (libasound2 on Debian and Ubuntu, alsa-lib on Arch). On macOS, unzip zakuro-macos-arm64.zip on Apple silicon or zakuro-macos-x86_64.zip on Intel and open Zakuro.app. It isn't notarized, so macOS refuses it the first time: allow it in System Settings, Privacy & Security, Open Anyway.
+          On Windows, unzip zakuro-windows-x86_64.zip and run zakuro.exe. On Linux, make Zakuro-x86_64.AppImage (Zakuro-aarch64.AppImage on 64-bit ARM) executable and run it, or extract zakuro-linux-x86_64.tar.gz (zakuro-linux-aarch64.tar.gz on 64-bit ARM) and run ./zakuro, either of which needs the ALSA library (libasound2 on Debian and Ubuntu, alsa-lib on Arch). On macOS, unzip zakuro-macos-arm64.zip on Apple silicon or zakuro-macos-x86_64.zip on Intel and open Zakuro.app. It isn't notarized, so macOS refuses it the first time: allow it in System Settings, Privacy & Security, Open Anyway.
 
           Games need to be decrypted ROMs. Recompiling a game, which makes it run much faster, needs a C compiler. Zakuro uses gcc or clang when the computer has one, and otherwise offers to download Zig, which needs no installing, into its own folder.
           NOTES
