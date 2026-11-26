@@ -42,7 +42,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           apt-get update
-          apt-get install -y build-essential ca-certificates clang curl file git libasound2-dev libudev-dev pkg-config zsync
+          apt-get install -y build-essential ca-certificates clang curl file git libasound2-dev libdrm-dev libudev-dev libwayland-dev pkg-config zsync
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7

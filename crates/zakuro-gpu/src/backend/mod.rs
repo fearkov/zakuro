@@ -6,6 +6,10 @@ pub mod gl;
 pub mod vulkan;
 #[cfg(feature = "vulkan")]
 mod vulkan_overlay;
+#[cfg(all(feature = "vulkan", drm_lease))]
+mod drm_lease;
+#[cfg(all(feature = "vulkan", drm_lease))]
+mod vulkan_panel;
 
 /// one screen's pixels, already converted to straight RGBA8, or where they are on the GPU, for a presenter sharing the renderer's device
 pub struct ScreenImage<'a> {
@@ -122,6 +126,27 @@ impl ScreenOrientation {
             ScreenOrientation::East => 90,
             ScreenOrientation::South => 180,
             ScreenOrientation::West => 270,
+        }
+    }
+
+    /// the way that shows a screen upright on a panel turned this many degrees counter-clockwise, as a DRM connector's
+    /// panel orientation counts them (Right Side Up is 270)
+    pub fn for_panel_rotation(degrees: i32) -> ScreenOrientation {
+        match degrees {
+            90 => ScreenOrientation::West,
+            180 => ScreenOrientation::South,
+            270 => ScreenOrientation::East,
+            _ => ScreenOrientation::North,
+        }
+    }
+
+    /// where the point (u, v) of a screen's place, as fractions of its width and height, lies on the screen itself
+    pub fn upright(&self, u: f32, v: f32) -> (f32, f32) {
+        match self {
+            ScreenOrientation::North => (u, v),
+            ScreenOrientation::East => (v, 1.0 - u),
+            ScreenOrientation::South => (1.0 - u, 1.0 - v),
+            ScreenOrientation::West => (1.0 - v, u),
         }
     }
 }
@@ -380,6 +405,19 @@ mod tests {
 
     fn bounds(viewport: Viewport) -> (f32, f32, f32, f32) {
         (viewport.x, viewport.y, viewport.width, viewport.height)
+    }
+
+    #[test]
+    fn a_panel_turned_right_side_up_shows_the_screen_turned_east() {
+        // DRM's Right Side Up, 270 counter-clockwise, puts the screen's top at the panel's right edge
+        let orientation = ScreenOrientation::for_panel_rotation(270);
+        assert_eq!(orientation, ScreenOrientation::East);
+        // so the panel's top right corner is the screen's top left, and its bottom left the screen's bottom right
+        assert_eq!(orientation.upright(1.0, 0.0), (0.0, 0.0));
+        assert_eq!(orientation.upright(0.0, 1.0), (1.0, 1.0));
+        assert_eq!(ScreenOrientation::for_panel_rotation(90), ScreenOrientation::West);
+        assert_eq!(ScreenOrientation::for_panel_rotation(180), ScreenOrientation::South);
+        assert_eq!(ScreenOrientation::for_panel_rotation(0), ScreenOrientation::North);
     }
 
     #[test]

@@ -4733,6 +4733,7 @@ dependencies = [
  "ash",
  "ash-window",
  "bitflags 2.13.2",
+ "cc",
  "cityhasher",
  "cranelift-codegen",
  "cranelift-frontend",
