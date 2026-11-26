@@ -28,7 +28,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage, ScreenLayout};
 
 use gui::Gui;
 use input::Keyboard;
@@ -548,6 +548,7 @@ impl ApplicationHandler for App {
             Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
                 backend.set_layout(self.layout.screens());
+                backend.set_second_display(self.layout.second_display());
                 backend.set_orientation(self.orientation.screen_orientation());
                 backend.set_top_width(self.active.top_shape.width());
                 backend.set_scaling(self.active.filter.screens(), self.active.integer_scale);
@@ -904,7 +905,9 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.orientation.screen_orientation(), self.top_shape.width(), self.active.integer_scale);
+        // the window shows the top screen alone while the bottom one is on the second display
+        let shown = if self.backend.as_ref().is_some_and(Backend::second_display_shown) { ScreenLayout::TopOnly } else { self.layout.screens() };
+        let (_, bottom) = layout(size.width, size.height, shown, self.orientation.screen_orientation(), self.top_shape.width(), self.active.integer_scale);
         // w/ the top screen alone there's nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
@@ -914,13 +917,7 @@ impl App {
         let y = self.cursor.1 - bottom.y;
         let inside = x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height;
         self.keyboard.touch((self.mouse_down && inside).then(|| {
-            let (u, v) = (x / bottom.width, y / bottom.height);
-            let (u, v) = match self.orientation {
-                Orientation::North => (u, v),
-                Orientation::East => (v, 1.0 - u),
-                Orientation::South => (1.0 - u, 1.0 - v),
-                Orientation::West => (1.0 - v, u),
-            };
+            let (u, v) = self.orientation.screen_orientation().upright(x / bottom.width, y / bottom.height);
             (((u * 320.0) as u16).min(319), ((v * 240.0) as u16).min(239))
         }));
     }
@@ -1051,6 +1048,7 @@ impl App {
             self.top_shape = self.active.top_shape;
             if let Some(backend) = &mut self.backend {
                 backend.set_layout(self.layout.screens());
+                backend.set_second_display(self.layout.second_display());
                 backend.set_orientation(self.orientation.screen_orientation());
             }
             // a full screen or maximized window keeps its size, resizing it would take it out of that, full screen fits it on leaving
@@ -1443,6 +1441,10 @@ impl App {
 
     /// runs one frame of the game
     fn emulate(&mut self) {
+        // a finger on the second display touches the bottom screen, read right b4 the frame for the least delay
+        if let Some(backend) = self.backend.as_ref().filter(|backend| backend.second_display_shown()) {
+            self.keyboard.touch(backend.second_display_touch());
+        }
         let Some(game) = &mut self.game else { return };
         let input = match &mut game.replay {
             Some(replay) => replay.input(game.frame),

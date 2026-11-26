@@ -26,9 +26,15 @@ pub enum Screens {
     TopOnly,
     BottomOnly,
     LargeTop,
+    /// the top screen in the window and the bottom one on a second display the compositor leases, a dual-screen
+    /// handheld's lower panel in gamescope, top over bottom in the window while there's none
+    SecondDisplay,
 }
 
 impl Screens {
+    #[cfg(target_os = "linux")]
+    pub const ALL: [Screens; 6] = [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::TopOnly, Screens::BottomOnly, Screens::SecondDisplay];
+    #[cfg(not(target_os = "linux"))]
     pub const ALL: [Screens; 5] = [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::TopOnly, Screens::BottomOnly];
 
     pub fn name(self) -> &'static str {
@@ -38,6 +44,7 @@ impl Screens {
             Screens::TopOnly => "Top screen only",
             Screens::BottomOnly => "Bottom screen only",
             Screens::LargeTop => "Big top screen, small bottom one",
+            Screens::SecondDisplay => "Bottom screen on the second display",
         }
     }
 
@@ -48,7 +55,15 @@ impl Screens {
             Screens::TopOnly => ScreenLayout::TopOnly,
             Screens::BottomOnly => ScreenLayout::BottomOnly,
             Screens::LargeTop => ScreenLayout::LargeTop,
+            // the window's arrangement while the second display isn't there, the presenter shows the top screen alone
+            // while it is
+            Screens::SecondDisplay => ScreenLayout::Stacked,
         }
+    }
+
+    /// does the bottom screen go on the second display
+    pub fn second_display(self) -> bool {
+        self == Screens::SecondDisplay
     }
 
     /// the one after it, going round

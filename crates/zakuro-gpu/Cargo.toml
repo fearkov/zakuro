@@ -11,6 +11,10 @@ vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
 # the shaders the CPU runs compiled to the host's code instead of interpreted
 jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
+[build-dependencies]
+# the second display's lease code, drm_lease/
+cc = "1.4"
+
 [dependencies]
 zakuro-common.workspace = true
 log.workspace = true

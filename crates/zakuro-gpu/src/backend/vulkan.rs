@@ -8,28 +8,30 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::vulkan_overlay::OverlayPainter;
+#[cfg(drm_lease)]
+use super::vulkan_panel::{self, SecondDisplay};
 use super::{place, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport};
 use crate::raster::hardware::{can_render, render_device};
 use crate::SharedDevice;
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
-const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
+pub(super) const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
 
 /// byte offset of the vertex shader's push constants
-const VERT_CONSTANTS_OFFSET: u32 = 0;
+pub(super) const VERT_CONSTANTS_OFFSET: u32 = 0;
 
 /// byte offset of the fragment shader's push constants
-const FRAG_CONSTANTS_OFFSET: u32 = 16;
+pub(super) const FRAG_CONSTANTS_OFFSET: u32 = 16;
 
 /// the bytes of push constants the fragment shader reads
 /// where the screen lies in its image, the bounds its samples stay inside and the filter,
 /// and for 3D how the eyes show plus the right eye's place in its image
-const CONSTANTS: u32 = 36;
+pub(super) const CONSTANTS: u32 = 36;
 const STEREO_CONSTANTS: u32 = 80;
 
 /// how many frames may be recorded b4 waiting on the oldest
-const FRAMES_IN_FLIGHT: usize = 2;
+pub(super) const FRAMES_IN_FLIGHT: usize = 2;
 
 /// a whole image, as the area of it a screen takes and the bounds its samples stay inside, for the fragment shader
 const WHOLE: [f32; 8] = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
@@ -130,6 +132,9 @@ pub struct VulkanPresenter {
     stereo: Stereo,
     /// set when the swapchain no longer matches the window
     stale: bool,
+    /// the bottom screen on a panel of its own
+    #[cfg(drm_lease)]
+    second: SecondDisplay,
 }
 
 impl VulkanPresenter {
@@ -154,9 +159,14 @@ impl VulkanPresenter {
             .engine_name(c"Zakuro")
             .api_version(vk::API_VERSION_1_3);
 
-        let extensions = ash_window::enumerate_required_extensions(display.as_raw())
+        #[cfg_attr(not(drm_lease), allow(unused_mut))]
+        let mut extensions = ash_window::enumerate_required_extensions(display.as_raw())
             .map_err(vk_fail("querying surface extensions"))?
             .to_vec();
+        #[cfg(drm_lease)]
+        let panel_extensions = vulkan_panel::instance_extensions(&entry);
+        #[cfg(drm_lease)]
+        extensions.extend(&panel_extensions);
 
         let instance = crate::instance::new(&entry, &application, &extensions)
             .map_err(vk_fail("creating the instance"))?;
@@ -408,6 +418,8 @@ impl VulkanPresenter {
             integer: false,
             stereo: Stereo::default(),
             stale: false,
+            #[cfg(drm_lease)]
+            second: SecondDisplay::new(!panel_extensions.is_empty()),
         };
 
         presenter.build_swapchain()?;
@@ -601,6 +613,68 @@ impl VulkanPresenter {
         self.waits
     }
 
+    /// puts the bottom screen on a second display the compositor leases (a dual-screen handheld's lower panel in
+    /// gamescope), the window shows the top screen alone while it's there,
+    /// w/o one, or in a build w/o the lease code, the screens stay as they are
+    pub fn set_second_display(&mut self, wanted: bool) {
+        #[cfg(drm_lease)]
+        self.second.set_wanted(wanted);
+        #[cfg(not(drm_lease))]
+        let _ = wanted;
+    }
+
+    /// does the bottom screen show on the second display
+    pub fn second_display_shown(&self) -> bool {
+        #[cfg(drm_lease)]
+        return self.second.panel().is_some();
+        #[cfg(not(drm_lease))]
+        false
+    }
+
+    /// where a finger on the second display touches the bottom screen, in its 320x240,
+    /// None w/o a finger on the bottom screen there or w/o the second display
+    pub fn second_display_touch(&self) -> Option<(u16, u16)> {
+        #[cfg(drm_lease)]
+        return self.second.panel().zip(super::drm_lease::touch()).and_then(|(panel, at)| panel.touch(at, self.integer));
+        #[cfg(not(drm_lease))]
+        None
+    }
+
+    /// how the window arranges the screens, the top one alone while the bottom one is on the second display
+    fn window_arrangement(&self) -> ScreenLayout {
+        if self.second_display_shown() { ScreenLayout::TopOnly } else { self.arrangement }
+    }
+
+    /// what the second display's panel is made w/ and drawn on
+    #[cfg(drm_lease)]
+    fn panel_device(&self) -> vulkan_panel::Device<'_> {
+        vulkan_panel::Device {
+            entry: &self._entry,
+            instance: &self.instance,
+            surface_instance: &self.surface_instance,
+            swapchain_device: &self.swapchain_device,
+            physical: self.physical_device,
+            queue_family: self.queue_family,
+            device: &self.device,
+            descriptor_layout: self.descriptor_layout,
+        }
+    }
+
+    /// shows the panel's picture drawn this frame
+    #[cfg(drm_lease)]
+    fn present_panel(&mut self, image_index: Option<u32>, frame: usize) {
+        let (Some(index), Some(panel)) = (image_index, self.second.panel()) else { return };
+        let wait = [panel.finished(frame)];
+        let swapchains = [panel.swapchain()];
+        let indices = [index];
+        let present = vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&indices);
+        // safe bc the image was acquired this frame and its picture's submitted w/ the semaphore waited on
+        if let Err(error) = unsafe { self.swapchain_device.queue_present(self.queue, &present) } {
+            log::error!("presenting on the second display: {error}");
+            self.second.lose();
+        }
+    }
+
     /// what a screen gets drawn from this frame, pixels uploaded to its own image or one of the renderer's images the frame's set points at
     fn source(&mut self, index: usize, image: &ScreenImage<'_>) -> Result<Source, PresentError> {
         if let Some(gpu) = image.gpu {
@@ -662,6 +736,7 @@ impl VulkanPresenter {
         overlay: &Overlay,
         sources: [Source; 3],
         right: bool,
+        panel_image: Option<u32>,
     ) -> Result<(), PresentError> {
         let device = &self.device;
         unsafe {
@@ -763,7 +838,7 @@ impl VulkanPresenter {
                     Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
                 }
             };
-            let places = place(self.extent.width, self.extent.height, self.arrangement, self.orientation, self.top_width, self.integer, self.stereo, right);
+            let places = place(self.extent.width, self.extent.height, self.window_arrangement(), self.orientation, self.top_width, self.integer, self.stereo, right);
             for (viewport, shown) in places {
                 let index = match shown {
                     Shown::Top | Shown::Both => 0,
@@ -771,8 +846,7 @@ impl VulkanPresenter {
                     Shown::Right => 2,
                 };
                 let Some((descriptor, area)) = crop(index) else { continue };
-                let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
-                constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                let mut constants = screen_constants(&area, self.filter);
                 let (pipeline, layout, set) = if shown == Shown::Both {
                     // then how the eyes show, and the right eye's place
                     let Some((_, right)) = crop(2) else { continue };
@@ -795,6 +869,13 @@ impl VulkanPresenter {
 
             painter.draw(device, command_buffer, self.frame, overlay, self.extent);
             device.cmd_end_render_pass(command_buffer);
+            #[cfg(drm_lease)]
+            if let (Some(index), Some(panel)) = (panel_image, self.second.panel()) {
+                let picture = crop(1).map(|(set, area)| (set, screen_constants(&area, self.filter)));
+                panel.record(device, command_buffer, index, picture, self.integer);
+            }
+            #[cfg(not(drm_lease))]
+            let _ = panel_image;
             device.end_command_buffer(command_buffer).expect("end command buffer");
         }
         Ok(())
@@ -813,6 +894,12 @@ impl Presenter for VulkanPresenter {
         right: ScreenImage<'_>,
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
+        #[cfg(drm_lease)]
+        {
+            let mut second = std::mem::take(&mut self.second);
+            second.update(&self.panel_device());
+            self.second = second;
+        }
         if self.stale {
             // the swapchain no longer matches the window
             // rebuilding it is what lets a minimized window come back, while minimized the surface has no size,
@@ -868,6 +955,20 @@ impl Presenter for VulkanPresenter {
                 .map_err(vk_fail("resetting a fence"))?;
         }
 
+        // the second display's image, w/o waiting for one, the picture goes unshown there when none is free yet
+        #[cfg(drm_lease)]
+        let panel_image = match self.second.panel().map(|panel| panel.acquire(&self.swapchain_device, frame)) {
+            Some(Ok(index)) => index,
+            Some(Err(error)) => {
+                log::error!("acquiring an image of the second display: {error}");
+                self.second.lose();
+                None
+            }
+            None => None,
+        };
+        #[cfg(not(drm_lease))]
+        let panel_image: Option<u32> = None;
+
         for screen in &mut self.screens {
             screen.dirty = false;
         }
@@ -887,7 +988,7 @@ impl Presenter for VulkanPresenter {
         // the painter gets taken out while it records, since it and the presenter are both borrowed
         let mut painter = self.overlay.take().expect("the overlay painter lives as long as the presenter");
         painter.begin_frame(&self.device, frame);
-        let recorded = self.record(command_buffer, self.framebuffers[image_index as usize], &mut painter, overlay, sources, has_right);
+        let recorded = self.record(command_buffer, self.framebuffers[image_index as usize], &mut painter, overlay, sources, has_right, panel_image);
         painter.free(frame, overlay);
         self.overlay = Some(painter);
         recorded?;
@@ -898,13 +999,20 @@ impl Presenter for VulkanPresenter {
             }
         }
 
-        let wait = [self.image_available[frame]];
-        let signal = [self.render_finished[frame]];
-        let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        #[cfg_attr(not(drm_lease), allow(unused_mut))]
+        let mut wait = vec![self.image_available[frame]];
+        #[cfg_attr(not(drm_lease), allow(unused_mut))]
+        let mut signal = vec![self.render_finished[frame]];
+        #[cfg(drm_lease)]
+        if let (Some(_), Some(panel)) = (panel_image, self.second.panel()) {
+            wait.push(panel.available(frame));
+            signal.push(panel.finished(frame));
+        }
+        let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT; 2];
         let buffers = [command_buffer];
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&wait)
-            .wait_dst_stage_mask(&stages)
+            .wait_dst_stage_mask(&stages[..wait.len()])
             .command_buffers(&buffers)
             .signal_semaphores(&signal);
         unsafe {
@@ -916,10 +1024,12 @@ impl Presenter for VulkanPresenter {
         let swapchains = [self.swapchain];
         let indices = [image_index];
         let present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&signal)
+            .wait_semaphores(&signal[..1])
             .swapchains(&swapchains)
             .image_indices(&indices);
         let result = unsafe { self.swapchain_device.queue_present(self.queue, &present) };
+        #[cfg(drm_lease)]
+        self.present_panel(panel_image, frame);
 
         self.frame = (self.frame + 1) % FRAMES_IN_FLIGHT;
 
@@ -966,6 +1076,11 @@ impl Presenter for VulkanPresenter {
 
 impl Drop for VulkanPresenter {
     fn drop(&mut self) {
+        #[cfg(drm_lease)]
+        {
+            let mut second = std::mem::take(&mut self.second);
+            second.close(&self.panel_device());
+        }
         unsafe {
             let _ = self.device.device_wait_idle();
             for screen in std::mem::replace(&mut self.screens, [Screen::null(), Screen::null(), Screen::null()]) {
@@ -1058,7 +1173,7 @@ fn pick_device(
         .ok_or_else(|| fail("no Vulkan device can present to this window"))
 }
 
-fn choose_format(
+pub(super) fn choose_format(
     surface_instance: &ash::khr::surface::Instance,
     physical_device: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
@@ -1080,7 +1195,7 @@ fn choose_format(
         .ok_or_else(|| fail("the surface reports no formats"))
 }
 
-fn create_render_pass(
+pub(super) fn create_render_pass(
     device: &ash::Device,
     format: vk::Format,
 ) -> Result<vk::RenderPass, PresentError> {
@@ -1143,7 +1258,7 @@ fn create_descriptor_layout(
     .map_err(vk_fail("creating the descriptor set layout"))
 }
 
-fn create_pipeline(
+pub(super) fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     descriptor_layout: vk::DescriptorSetLayout,
@@ -1321,7 +1436,14 @@ pub(super) fn transition(
     }
 }
 
-fn set_viewport(
+/// the fragment shader's constants for a screen, its place in its image and its sample bounds, then the filter
+fn screen_constants(area: &[f32; 8], filter: ScreenFilter) -> Vec<u8> {
+    let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
+    constants.extend_from_slice(&filter.mode().to_le_bytes());
+    constants
+}
+
+pub(super) fn set_viewport(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     viewport: Viewport,

@@ -114,6 +114,26 @@ impl Backend {
         }
     }
 
+    /// the bottom screen on a second display, Vulkan only
+    pub fn set_second_display(&mut self, wanted: bool) {
+        if let Backend::Vulkan(presenter) = self {
+            presenter.set_second_display(wanted);
+        }
+    }
+
+    /// does the bottom screen show on the second display, then the window shows the top screen alone
+    pub fn second_display_shown(&self) -> bool {
+        matches!(self, Backend::Vulkan(presenter) if presenter.second_display_shown())
+    }
+
+    /// where a finger on the second display touches the bottom screen
+    pub fn second_display_touch(&self) -> Option<(u16, u16)> {
+        match self {
+            Backend::Vulkan(presenter) => presenter.second_display_touch(),
+            _ => None,
+        }
+    }
+
     pub fn set_orientation(&mut self, orientation: ScreenOrientation) {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_orientation(orientation),
