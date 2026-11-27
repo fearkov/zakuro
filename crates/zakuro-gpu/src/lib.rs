@@ -345,6 +345,10 @@ impl Gpu {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, address, length as u32, true);
+        }
 
         let bytes = value.to_le_bytes();
         let pattern = &bytes[..if matches!(width, 2 | 3) { width as usize } else { 4 }];
@@ -430,6 +434,12 @@ impl Gpu {
         };
         let output_paddr = output_paddr.wrapping_add(skew);
         let (input_base, output_base) = (memory.translate(input_paddr), memory.translate(output_paddr));
+
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, input_base, input_width.saturating_mul(input_height).saturating_mul(4), true);
+            renderer.sync(memory, output_base, output_width.saturating_mul(output_height).saturating_mul(4), true);
+        }
 
         log::debug!(
             "display transfer: 0x{input_paddr:08X} {input_width}x{input_height} \
@@ -862,6 +872,10 @@ impl Gpu {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, addr, len, true);
+        }
         #[cfg(not(feature = "vulkan"))]
         let _ = (memory, addr, len);
     }
@@ -874,6 +888,10 @@ impl Gpu {
             if let Err(error) = hardware.sync_depth(memory, addr, len) {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
+        }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, addr, len, false);
         }
         #[cfg(not(feature = "vulkan"))]
         let _ = (memory, addr, len);

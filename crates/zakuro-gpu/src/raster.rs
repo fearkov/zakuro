@@ -1990,7 +1990,7 @@ fn drawn_texture<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
 }
 
 /// the guest memory a texture unit reads, when it's on
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Option<(u32, u32)> {
     if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
         return None;
@@ -3045,6 +3045,14 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             }
         }
     }
+    #[cfg(feature = "opengl")]
+    if let Some(renderer) = resources.opengl.as_mut() {
+        for unit in 0..3 {
+            if let Some((addr, len)) = texture_range(registers, memory, unit) {
+                renderer.sync(memory, addr, len, false);
+            }
+        }
+    }
     let textures: [Option<BoundTexture>; 3] =
         std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit, drawn[unit], past[unit]));
     let tex_env = resources.tex_env.read(registers);
@@ -3191,13 +3199,26 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             && state.alpha_test.is_none()
             && state.blend.is_none()
             && state.logic_op.is_none()
-            && state.depth_stencil.is_none()
-            && state.tex_env.is_vertex_color_passthrough();
+            && state.tex_env.is_vertex_color_passthrough()
+            && state.depth_stencil.as_ref().map_or(true, |depth| {
+                let color_end = state.target.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(4));
+                let depth_end = depth.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(depth.bytes));
+                color_end <= depth.addr || depth_end <= state.target.addr
+            });
         if supported {
-            match renderer.draw(memory, &state.target, &triangles) {
+            match renderer.draw(memory, &state.target, state.depth_stencil.as_ref(), state.depth_map, &triangles) {
                 Ok(()) => return Some(triangle_count as u32),
                 Err(error) => log::error!("the OpenGL rasterizer could not draw, {error}, drawing in software"),
             }
+        }
+    }
+    #[cfg(feature = "opengl")]
+    if let Some(renderer) = resources.opengl.as_mut() {
+        let target = &state.target;
+        let color_len = target.buffer_width.saturating_mul(target.buffer_height).saturating_mul(target.format.bytes_per_pixel() as u32);
+        renderer.sync(memory, target.addr, color_len, true);
+        if let Some(depth) = &state.depth_stencil {
+            renderer.sync(memory, depth.addr, target.buffer_width.saturating_mul(target.buffer_height).saturating_mul(depth.bytes), true);
         }
     }
     // the rows the triangles can reach, as window rows then as rows of the buffer, which counts from the other end
