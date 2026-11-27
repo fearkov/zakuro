@@ -562,15 +562,24 @@ void combine_stage(
     uint scale = registers.w;
     // a stage handing the previous color on as is changes nothing, the color's between 0 and 1 already
     // titles leave most stages like that, and the generic shader, which can't drop them at compile time, skips them at run time
-    bool passes = (source & 0x000F000Fu) == 0x000F000Fu && (operand & 0x700Fu) == 0u
+    bool passes = stage != 0u && (source & 0x000F000Fu) == 0x000F000Fu && (operand & 0x700Fu) == 0u
         && (combiner & 0x000F000Fu) == 0u && scale == 0u;
     if (!passes) {
         vec4 constant = unpack_color(tev[stage * 2u].w);
         vec4 rgb_in[3];
         vec4 alpha_in[3];
         for (uint i = 0u; i < 3u; i++) {
-            rgb_in[i] = source_value((source >> (i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
-            alpha_in[i] = source_value((source >> (16u + i * 4u)) & 0xFu, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
+            uint c_src = (source >> (i * 4u)) & 0xFu;
+            uint a_src = (source >> (16u + i * 4u)) & 0xFu;
+            // stage 0 has no previous stage; PICA200 substitutes source 2 (source3) for Source::Previous (0xF)
+            if (stage == 0u && c_src == 0xFu) {
+                c_src = (source >> 8u) & 0xFu;
+            }
+            if (stage == 0u && a_src == 0xFu) {
+                a_src = (source >> 24u) & 0xFu;
+            }
+            rgb_in[i] = source_value(c_src, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
+            alpha_in[i] = source_value(a_src, primary, fragment_primary, fragment_secondary, textures, previous, held, constant);
         }
         uint color_op = operation(combiner);
         uint alpha_op = operation(combiner >> 16);
@@ -654,7 +663,7 @@ void main() {
         shade(textures, fragment_primary, fragment_secondary);
     }
 
-    vec4 previous = primary;
+    vec4 previous = vec4(0.0);
     // the buffer lags a stage behind, the first stage reads zero, the second the configured buffer color
     vec4 held = vec4(0.0);
     vec4 next_buffer = unpack_color(misc.y);
