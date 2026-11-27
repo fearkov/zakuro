@@ -51,6 +51,5 @@ opt-level = 3
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 4
-panic = "unwind"
-debug = 1
+codegen-units = 1
+panic = "abort"

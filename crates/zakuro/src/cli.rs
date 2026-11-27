@@ -52,8 +52,7 @@ options:
   --renderer <vulkan|gl|software>  presentation backend (default: vulkan,
                                    or gl where Vulkan does not start)
   --rasterizer <hardware|software> where the 3D is drawn (default: hardware,
-                                   the host GPU through Vulkan, or software
-                                   where that does not start)
+                                   Vulkan, or the OpenGL 4.3 MVP with --renderer gl)
   --scale <n>                      window scale factor (default: 2)
   (Esc opens the menu over a game, F1 pauses, F11 goes fullscreen)
   --headless <frames>              run without a window and print a report

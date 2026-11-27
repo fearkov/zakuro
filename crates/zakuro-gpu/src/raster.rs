@@ -10,6 +10,8 @@ use crate::lighting::{Lighting, Tables};
 
 #[cfg(feature = "vulkan")]
 pub(crate) mod hardware;
+#[cfg(feature = "opengl")]
+pub(crate) mod opengl;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -1462,6 +1464,8 @@ pub struct Resources {
     /// the host GPU, when draws go to it instead of the software path
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
+    #[cfg(feature = "opengl")]
+    pub(crate) opengl: Option<opengl::OpenGlRasterizer>,
 }
 
 impl Resources {
@@ -3174,6 +3178,28 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
 
     let triangles: Vec<[Screen; 3]> =
         indices.as_chunks::<3>().0.iter().map(|&[a, b, c]| [placed[a as usize], placed[b as usize], placed[c as usize]]).collect();
+    #[cfg(feature = "opengl")]
+    if let Some(renderer) = resources.opengl.as_mut() {
+        let supported = state.target.buffer_width.is_multiple_of(8)
+            && state.target.buffer_height.is_multiple_of(8)
+            && state.target.format == ColorFormat::Rgba8
+            && state.target.write == [true; 4]
+            && state.textures.iter().all(Option::is_none)
+            && state.proctex.is_none()
+            && state.lighting.is_none()
+            && state.fog.is_none()
+            && state.alpha_test.is_none()
+            && state.blend.is_none()
+            && state.logic_op.is_none()
+            && state.depth_stencil.is_none()
+            && state.tex_env.is_vertex_color_passthrough();
+        if supported {
+            match renderer.draw(memory, &state.target, &triangles) {
+                Ok(()) => return Some(triangle_count as u32),
+                Err(error) => log::error!("the OpenGL rasterizer could not draw, {error}, drawing in software"),
+            }
+        }
+    }
     // the rows the triangles can reach, as window rows then as rows of the buffer, which counts from the other end
     let target = &state.target;
     let low = triangles.iter().map(|t| t.iter().map(|v| v.y).fold(f32::MAX, f32::min).floor() as i32).min();

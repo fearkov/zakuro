@@ -11,7 +11,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zakuro-common.workspace = true
 zakuro-cpu.workspace = true
 zakuro-fs.workspace = true
-zakuro-gpu = { workspace = true, features = ["vulkan"] }
+zakuro-gpu = { workspace = true, features = ["opengl", "vulkan"] }
 log.workspace = true
 serde.workspace = true
 # saved states, the state as postcard writes it plus memory, both LZ4'd

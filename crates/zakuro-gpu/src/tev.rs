@@ -118,6 +118,18 @@ impl Stage {
             && self.color_scale == 1.0
             && self.alpha_scale == 1.0
     }
+
+    fn is_vertex_color_passthrough(&self) -> bool {
+        let primary_or_previous = |source| matches!(source, Source::PrimaryColor | Source::Previous);
+        self.color_op == Operation::Replace
+            && self.alpha_op == Operation::Replace
+            && primary_or_previous(self.color_sources[0])
+            && primary_or_previous(self.alpha_sources[0])
+            && self.color_operands[0] == 0
+            && self.alpha_operands[0] == 0
+            && self.color_scale == 1.0
+            && self.alpha_scale == 1.0
+    }
 }
 
 impl TexEnv {
@@ -186,6 +198,10 @@ impl TexEnv {
                     || (stage.color_op != Operation::Dot3Rgba
                         && stage.alpha_sources[..stage.alpha_op.inputs()].iter().any(lit)))
         })
+    }
+
+    pub(crate) fn is_vertex_color_passthrough(&self) -> bool {
+        self.stages.iter().all(Stage::is_vertex_color_passthrough)
     }
 
     /// runs every stage for one fragment
@@ -379,6 +395,7 @@ mod tests {
     #[test]
     fn a_modulate_stage_multiplies_its_inputs() {
         let env = TexEnv::read(&modulate_registers());
+        assert!(!env.is_vertex_color_passthrough());
         let out = env.apply([1.0, 0.5, 0.0, 1.0], [[0.5, 0.5, 0.5, 0.5]; 4], None);
         assert!((out[0] - 0.5).abs() < 1e-5, "red was {}", out[0]);
         assert!((out[1] - 0.25).abs() < 1e-5, "green was {}", out[1]);
@@ -396,6 +413,7 @@ mod tests {
             registers[base + 2] = 0x0000_0000; // replace
         }
         let env = TexEnv::read(&registers);
+        assert!(env.is_vertex_color_passthrough());
         let primary = [0.25, 0.5, 0.75, 1.0];
         let out = env.apply(primary, [[1.0, 0.0, 0.0, 1.0]; 4], None);
         for channel in 0..4 {
@@ -439,6 +457,7 @@ mod tests {
     #[test]
     fn pass_through_stages_leave_the_color_alone() {
         let env = TexEnv::read(&passthrough_registers());
+        assert!(env.is_vertex_color_passthrough());
         assert!(env.passthrough.iter().all(|&p| p));
         let color = [0.25, 0.5, 0.75, 1.0];
         assert_eq!(env.apply(color, [[0.0; 4]; 4], None), color);

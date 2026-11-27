@@ -268,7 +268,11 @@ fn paint_test_pattern(config: Config) -> System {
 
     let mut system = System::new(config);
     if system.config.hardware_renderer {
-        match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone(), None) {
+        let renderer = match system.config.open_gl_context.clone() {
+            Some(context) => system.gpu.enable_opengl_renderer(context),
+            None => system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone(), None),
+        };
+        match renderer {
             Ok(name) => log::info!("the 3D draws on {name}"),
             Err(error) => log::warn!("the 3D can't draw on the GPU, {error}"),
         }
@@ -516,9 +520,10 @@ fn skips_showing(playing: bool, behind: bool, waits: bool, skipped: u32) -> bool
 }
 
 /// what the player is told when the 3D can't be drawn on the GPU
-const GPU_FALLBACK: &str = "The 3D can't be drawn on the GPU, as Vulkan isn't working on this computer, so it's drawn in software. \
+const GPU_FALLBACK: &str = "The 3D can't be drawn on the host GPU, so it's drawn in software. \
 Games run much slower that way, and texture packs are left out. Updating the graphics driver usually fixes it; the log says \
-what went wrong. To draw in software without this message, turn off \"Draw the 3D on the GPU\" in Settings, Graphics.";
+what went wrong. The Vulkan rasterizer needs Vulkan 1.3; the OpenGL MVP needs OpenGL 4.3. To draw in software without \
+this message, turn off \"Draw the 3D on the GPU\" in Settings, Graphics.";
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -652,6 +657,7 @@ impl App {
                 .collect(),
             resolution: settings.resolution,
             device: self.backend.as_ref().and_then(Backend::shared_device),
+            open_gl_context: self.backend.as_ref().and_then(Backend::shared_opengl_context),
             username: self.nickname(),
             console_id: settings.console_id,
             slider_3d: settings.slider_3d(),

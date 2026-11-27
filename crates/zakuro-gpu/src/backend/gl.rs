@@ -1,6 +1,7 @@
 //! OpenGL presentation backend
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use glow::HasContext;
 
@@ -128,7 +129,7 @@ struct GlOverlay {
 }
 
 pub struct GlPresenter {
-    gl: glow::Context,
+    gl: Arc<glow::Context>,
     program: glow::Program,
     /// what draws the top screen's two pictures in one, for 3D
     stereo_program: glow::Program,
@@ -157,7 +158,7 @@ impl GlPresenter {
         loader: impl FnMut(&str) -> *const std::ffi::c_void,
         window: (u32, u32),
     ) -> Result<GlPresenter, PresentError> {
-        let gl = unsafe { glow::Context::from_loader_function(loader) };
+        let gl = Arc::new(unsafe { glow::Context::from_loader_function(loader) });
 
         let version = unsafe { gl.get_parameter_string(glow::VERSION) };
         let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
@@ -215,6 +216,10 @@ impl GlPresenter {
             integer: false,
             stereo: Stereo::default(),
         })
+    }
+
+    pub fn shared_context(&self) -> crate::SharedOpenGlContext {
+        crate::SharedOpenGlContext(self.gl.clone())
     }
 
     fn upload(&mut self, index: usize, image: &ScreenImage<'_>) {

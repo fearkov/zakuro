@@ -22,6 +22,8 @@ This is a personal experimental project. You can use it to play games, but that 
 
 Builds for Windows, Linux and macOS are on the [releases page](https://github.com/fearkov/zakuro/releases). On Windows, unzip it and run zakuro.exe. On Linux, make the AppImage executable and run it, or extract the tar.gz and run ./zakuro. On macOS, unzip the one for your Mac (arm64 for Apple silicon, x86_64 for Intel) and open Zakuro.app. It isn't notarized, so macOS refuses it the first time: allow it in System Settings, Privacy & Security, Open Anyway. The macOS builds are new and haven't been tried on a real Mac yet, so they may have problems.
 
+The optional OpenGL 4.3 rasterizer is an experimental MVP: it accelerates only untextured, vertex-colored triangles. Other draws use the CPU rasterizer, and the per-draw readback can make this path slower than software. See [TODO.md](TODO.md) and [PLAN.md](PLAN.md) for its current limitations and next steps.
+
 To build it yourself you need Rust 1.95 or newer. On Linux, building also needs pkg-config and the ALSA and udev development files (libasound2-dev and libudev-dev on Debian and Ubuntu, alsa-lib and systemd-libs on Arch). On macOS, the Xcode command line tools are needed (`xcode-select --install`), and for Vulkan, MoltenVK and the Vulkan loader (`brew install molten-vk vulkan-loader`); without them it presents with OpenGL and draws on the CPU. On Windows, nothing else is needed:
 
     cargo install --git https://github.com/fearkov/zakuro --locked zakuro

@@ -64,6 +64,8 @@ pub struct Config {
     pub resolution: u32,
     /// the Vulkan presenter's device, to draw on and show the screens straight from when it can
     pub device: Option<std::sync::Arc<zakuro_gpu::SharedDevice>>,
+    /// the current OpenGL context, for the MVP rasterizer when OpenGL presents the window
+    pub open_gl_context: Option<zakuro_gpu::SharedOpenGlContext>,
     /// console clock start in millis since 1900, host time when none, a fixed one makes runs repeat exactly
     pub clock: Option<u64>,
     /// draw a picture between every two for titles drawing every other refresh (see System::pace)
@@ -100,6 +102,7 @@ impl Default for Config {
             enhancements: std::collections::BTreeMap::new(),
             resolution: 1,
             device: None,
+            open_gl_context: None,
             clock: None,
             interpolate: false,
             username: "Zakuro".into(),

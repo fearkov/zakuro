@@ -90,6 +90,13 @@ impl Backend {
         }
     }
 
+    pub fn shared_opengl_context(&self) -> Option<zakuro_gpu::SharedOpenGlContext> {
+        match self {
+            Backend::OpenGl { presenter, .. } => Some(presenter.shared_context()),
+            _ => None,
+        }
+    }
+
     pub fn set_scaling(&mut self, filter: zakuro_gpu::ScreenFilter, integer: bool) {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_scaling(filter, integer),
@@ -182,12 +189,22 @@ fn create_opengl(
         .as_raw();
 
     let display = config.display();
-    // ask for 3.3 core, that's what the presentation shaders need
-    let context_attributes = ContextAttributesBuilder::new()
-        .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
-        .build(Some(raw_handle));
-    let not_current = unsafe { display.create_context(&config, &context_attributes) }
-        .map_err(|e| format!("could not create an OpenGL 3.3 context: {e}"))?;
+    // prefer 4.3 for the hardware rasterizer, while retaining 3.3 presentation on older drivers
+    let make_attributes = |version| {
+        ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(version)))
+            .build(Some(raw_handle))
+    };
+    let not_current = match unsafe {
+        display.create_context(&config, &make_attributes(Version::new(4, 3)))
+    } {
+        Ok(context) => context,
+        Err(error_43) => {
+            log::info!("OpenGL 4.3 unavailable ({error_43}), trying OpenGL 3.3 for presentation");
+            unsafe { display.create_context(&config, &make_attributes(Version::new(3, 3))) }
+                .map_err(|error| format!("could not create an OpenGL 4.3 or 3.3 context: {error}"))?
+        }
+    };
 
     let surface_attributes = window
         .build_surface_attributes(Default::default())

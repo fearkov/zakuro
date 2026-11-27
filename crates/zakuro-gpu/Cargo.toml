@@ -18,6 +18,7 @@ serde.workspace = true
 bitflags.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
+bytemuck.workspace = true
 wide = "1.7"
 raw-window-handle = "0.6"
 # texture packs, their PNGs, pack.json and the hash Citra names pictures by

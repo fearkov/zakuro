@@ -28,6 +28,16 @@ pub use backend::{layout, place, GpuScreen, Overlay, OverlayMesh, OverlayTexture
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
 #[cfg(feature = "vulkan")]
 pub use device::SharedDevice;
+#[cfg(feature = "opengl")]
+#[derive(Clone)]
+pub struct SharedOpenGlContext(pub(crate) std::sync::Arc<glow::Context>);
+
+#[cfg(feature = "opengl")]
+impl std::fmt::Debug for SharedOpenGlContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedOpenGlContext")
+    }
+}
 
 /// how the GPU reaches guest memory
 pub trait GpuMemory {
@@ -680,12 +690,33 @@ impl Gpu {
         Ok(name)
     }
 
+    /// uses OpenGL for the supported untextured, vertex-colored rasterization path
+    #[cfg(feature = "opengl")]
+    pub fn enable_opengl_renderer(&mut self, context: SharedOpenGlContext) -> Result<String, String> {
+        let renderer = unsafe { raster::opengl::OpenGlRasterizer::new(context)? };
+        self.resources.opengl = Some(renderer);
+        Ok("OpenGL 4.3 MVP at 1x".to_owned())
+    }
+
     /// draws the texture pack's pictures in place of the textures they replace, or no pack's
     /// only the host's GPU draws them, so a pack waits for enable_hardware_renderer, and says if it's drawn
     pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
-        #[cfg(feature = "vulkan")]
-        let pack = pack.filter(|_| self.resources.hardware.is_some());
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(any(feature = "vulkan", feature = "opengl"))]
+        let rasterizer_enabled = {
+            let mut enabled = false;
+            #[cfg(feature = "vulkan")]
+            {
+                enabled |= self.resources.hardware.is_some();
+            }
+            #[cfg(feature = "opengl")]
+            {
+                enabled |= self.resources.opengl.is_some();
+            }
+            enabled
+        };
+        #[cfg(any(feature = "vulkan", feature = "opengl"))]
+        let pack = pack.filter(|_| rasterizer_enabled);
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let pack = pack.filter(|_| false);
         let drawn = pack.is_some();
         self.resources.textures.set_pack(pack);
@@ -696,6 +727,10 @@ impl Gpu {
     pub fn draws_on_gpu(&self) -> bool {
         #[cfg(feature = "vulkan")]
         if self.resources.hardware.is_some() {
+            return true;
+        }
+        #[cfg(feature = "opengl")]
+        if self.resources.opengl.is_some() {
             return true;
         }
         false

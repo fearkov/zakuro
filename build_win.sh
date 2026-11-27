@@ -1,0 +1,1 @@
+cargo +nightly-x86_64-unknown-linux-gnu build -Z build-std=std,panic_abort --target x86_64-pc-windows-gnu --release
