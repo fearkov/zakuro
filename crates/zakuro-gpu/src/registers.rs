@@ -33,6 +33,11 @@ pub const REG_SHADER_OUTPUT_TOTAL: usize = 0x004F;
 pub const REG_SHADER_OUTPUT_MAP: usize = 0x0050;
 pub const REG_SHADER_OUTPUT_MAP_END: usize = 0x0056;
 
+/// scissor test mode (0 off, 1 exclude, 3 include) and its inclusive window bounds
+pub const REG_SCISSORTEST_MODE: usize = 0x0065;
+pub const REG_SCISSORTEST_POS: usize = 0x0066;
+pub const REG_SCISSORTEST_DIM: usize = 0x0067;
+
 pub const REG_VIEWPORT_XY: usize = 0x0068;
 
 pub const REG_TEXTURE_CONFIG: usize = 0x0080;
