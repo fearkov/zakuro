@@ -140,18 +140,25 @@ impl TexEnv {
         let (stage_registers, _) = read.as_chunks::<5>();
         let stages: [Stage; 6] = std::array::from_fn(|i| {
             let [source, operand, combiner, constant, scale] = stage_registers[i];
+            let mut color_sources = [
+                Source::from_raw(source),
+                Source::from_raw(source >> 4),
+                Source::from_raw(source >> 8),
+            ];
+            let mut alpha_sources = [
+                Source::from_raw(source >> 16),
+                Source::from_raw(source >> 20),
+                Source::from_raw(source >> 24),
+            ];
+            // stage 0 has no previous stage; PICA200 substitutes source 2 (source3) for Source::Previous
+            if i == 0 {
+                color_sources = color_sources.map(|s| if s == Source::Previous { color_sources[2] } else { s });
+                alpha_sources = alpha_sources.map(|s| if s == Source::Previous { alpha_sources[2] } else { s });
+            }
 
             Stage {
-                color_sources: [
-                    Source::from_raw(source),
-                    Source::from_raw(source >> 4),
-                    Source::from_raw(source >> 8),
-                ],
-                alpha_sources: [
-                    Source::from_raw(source >> 16),
-                    Source::from_raw(source >> 20),
-                    Source::from_raw(source >> 24),
-                ],
+                color_sources,
+                alpha_sources,
                 color_operands: [operand & 0xF, (operand >> 4) & 0xF, (operand >> 8) & 0xF],
                 alpha_operands: [
                     (operand >> 12) & 0x7,
@@ -191,7 +198,7 @@ impl TexEnv {
     /// runs every stage for one fragment
     /// fragment is the primary and secondary color fragment lighting made, when it's on
     pub fn apply(&self, primary: [f32; 4], textures: [[f32; 4]; 4], fragment: Option<([f32; 4], [f32; 4])>) -> [f32; 4] {
-        let mut previous = primary;
+        let mut previous = [0.0; 4];
         // the buffer lags a stage behind, the first stage reads zero, the second the configured buffer color,
         // and a stage's update is only visible to the stage after the next one
         let mut buffer = [0.0; 4];
@@ -439,9 +446,25 @@ mod tests {
     #[test]
     fn pass_through_stages_leave_the_color_alone() {
         let env = TexEnv::read(&passthrough_registers());
-        assert!(env.passthrough.iter().all(|&p| p));
+        // stage 0 maps Previous -> source 2 (PrimaryColor here), stages 1..5 are passthrough
+        assert!(!env.passthrough[0]);
+        assert!(env.passthrough[1..].iter().all(|&p| p));
         let color = [0.25, 0.5, 0.75, 1.0];
         assert_eq!(env.apply(color, [[0.0; 4]; 4], None), color);
+    }
+
+    #[test]
+    fn stage0_previous_substitutes_source2() {
+        let mut registers = passthrough_registers();
+        // Fantasy Life color swatch / eye setup: Replace(Previous) with source2 = Constant (0xE)
+        registers[STAGE_REGISTERS[0]] = 0x0E43_0EEF;
+        registers[STAGE_REGISTERS[0] + 2] = 0x0002_0000;
+        registers[STAGE_REGISTERS[0] + 3] = 0xFF33_6699; // R=0x99, G=0x66, B=0x33, A=0xFF
+        let env = TexEnv::read(&registers);
+        let out = env.apply([1.0, 1.0, 1.0, 1.0], [[0.0, 0.0, 0.0, 0.5]; 4], None);
+        assert!((out[0] - 0x99 as f32 / 255.0).abs() < 1e-5);
+        assert!((out[1] - 0x66 as f32 / 255.0).abs() < 1e-5);
+        assert!((out[2] - 0x33 as f32 / 255.0).abs() < 1e-5);
     }
 
     /// stage 0 writes red into the buffer
@@ -478,9 +501,15 @@ mod tests {
                 let combiner = registers[base + 2];
                 let constant = registers[base + 3];
                 let scale = registers[base + 4];
+                let mut color_sources = [Source::from_raw(source), Source::from_raw(source >> 4), Source::from_raw(source >> 8)];
+                let mut alpha_sources = [Source::from_raw(source >> 16), Source::from_raw(source >> 20), Source::from_raw(source >> 24)];
+                if i == 0 {
+                    color_sources = color_sources.map(|s| if s == Source::Previous { color_sources[2] } else { s });
+                    alpha_sources = alpha_sources.map(|s| if s == Source::Previous { alpha_sources[2] } else { s });
+                }
                 Stage {
-                    color_sources: [Source::from_raw(source), Source::from_raw(source >> 4), Source::from_raw(source >> 8)],
-                    alpha_sources: [Source::from_raw(source >> 16), Source::from_raw(source >> 20), Source::from_raw(source >> 24)],
+                    color_sources,
+                    alpha_sources,
                     color_operands: [operand & 0xF, (operand >> 4) & 0xF, (operand >> 8) & 0xF],
                     alpha_operands: [(operand >> 12) & 0x7, (operand >> 16) & 0x7, (operand >> 20) & 0x7],
                     color_op: Operation::from_raw(combiner),
