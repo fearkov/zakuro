@@ -2976,6 +2976,17 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
     }
 }
 
+/// the hardware scissor rect [left, bottom, right, top] in window coords when include mode (3) is on
+fn scissor(registers: &[u32]) -> Option<[i32; 4]> {
+    if registers[REG_SCISSORTEST_MODE] & 0x3 != 3 {
+        return None;
+    }
+    let xy = |word: u32| ((word & 0x3FF) as i32, ((word >> 16) & 0x3FF) as i32);
+    let (x1, y1) = xy(registers[REG_SCISSORTEST_POS]);
+    let (x2, y2) = xy(registers[REG_SCISSORTEST_DIM]);
+    Some([x1, y1, x2 + 1, y2 + 1])
+}
+
 /// assembles shaded vertices into triangles like the primitive config says and fills them w/ the current back end state
 /// returns the triangles drawn, none for arrays the GPU couldn't decode, the CPU decodes those then
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
@@ -2993,8 +3004,17 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let viewport_top = (viewport_y + viewport_height).round() as i32;
     let (buffer_width, buffer_height) = buffer_size(registers, viewport);
     let (target_width, target_height) = (buffer_width, buffer_height);
-    // drawing stays inside the viewport, its rows flipped on an upside down buffer
-    let (bottom, top) = ((viewport_y.round() as i32).max(0), viewport_top.min(buffer_height as i32));
+    // drawing stays inside the viewport (and hardware scissor when enabled), its rows flipped on an upside down buffer
+    let mut left = (viewport_x.round() as i32).max(0);
+    let mut right = viewport_right.min(buffer_width as i32);
+    let mut bottom = (viewport_y.round() as i32).max(0);
+    let mut top = viewport_top.min(buffer_height as i32);
+    if let Some([sx1, sy1, sx2, sy2]) = scissor(registers) {
+        left = left.max(sx1);
+        right = right.min(sx2);
+        bottom = bottom.max(sy1);
+        top = top.min(sy2);
+    }
     let (bottom, top) = match upside_down(registers) {
         true => (buffer_height as i32 - top, buffer_height as i32 - bottom),
         false => (bottom, top),
@@ -3049,9 +3069,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
-            left: (viewport_x.round() as i32).max(0),
+            left,
             bottom,
-            right: viewport_right.min(buffer_width as i32),
+            right,
             top,
             buffer_width,
             buffer_height,
@@ -3707,6 +3727,33 @@ mod tests {
                 assert_eq!(red, row < 4, "row {row}, column {x}");
             }
         }
+    }
+
+    /// hardware scissor in include mode (3) clips drawing to [x1..=x2] x [y1..=y2] in window coords (y up)
+    #[test]
+    fn hardware_scissor_include_clips_drawing_to_the_rect() {
+        let mut registers = target_registers();
+        registers[REG_SCISSORTEST_MODE] = 3;
+        registers[REG_SCISSORTEST_POS] = 2 | (1 << 16); // x1 = 2, y1 = 1
+        registers[REG_SCISSORTEST_DIM] = 5 | (4 << 16); // x2 = 5, y2 = 4 (inclusive -> 4x4 = 16 pixels)
+        let mut memory = ConsoleMemory::default();
+        assert_eq!(rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED)), 16);
+        for row in 0..8 {
+            let y = 7 - row;
+            for x in 0..8 {
+                let index = crate::format::morton_offset(x, row, 8, 1);
+                let mut raw = [0u8; 4];
+                memory.read(COLOR + index * 4, &mut raw);
+                let red = ColorFormat::Rgba8.decode(&raw) == [255, 0, 0, 255];
+                let inside = (2..=5).contains(&x) && (1..=4).contains(&y);
+                assert_eq!(red, inside, "row {row} (y={y}), column {x}");
+            }
+        }
+
+        // disabling scissor (mode 0) ignores the scissor rect and fills the whole 8x8 buffer
+        registers[REG_SCISSORTEST_MODE] = 0;
+        let mut memory = ConsoleMemory::default();
+        assert_eq!(rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED)), 64);
     }
 
     #[test]
