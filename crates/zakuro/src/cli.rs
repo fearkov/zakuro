@@ -1,11 +1,13 @@
 //! command line parsing
 
+use std::path::PathBuf;
+
 use zakuro_gpu::RendererKind;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     /// the game to start, none to open the library
-    pub rom: Option<String>,
+    pub rom: Option<PathBuf>,
     /// the settings' choice when not given
     pub renderer: Option<RendererKind>,
     /// window scale relative to the console's 400x480 combined screens, the settings' when not given
@@ -173,7 +175,7 @@ pub fn parse() -> Result<Options, String> {
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}'"));
             }
-            path => rom = Some(path.to_owned()),
+            path => rom = Some(PathBuf::from(path)),
         }
     }
 

@@ -182,6 +182,25 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
     (games, children)
 }
 
+/// the game with program_id in folder, for a standalone port started w/o a ROM path
+pub fn find_game_in(folder: &Path, program_id: u64) -> Option<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(folder)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| GAME_FILES.iter().any(|known| ext.eq_ignore_ascii_case(known)))
+        })
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .find(|path| zakuro_fs::Title::load(path).is_ok_and(|title| title.program_id() == program_id))
+}
+
 /// the update, DLC and Download Play child in the folder of the game at path, the way a scan pairs them
 /// for a game started from the command line (it starts b4 the library's scan is in) or from outside the library's folder
 pub fn addons_beside(path: &Path) -> Option<(Option<Addon>, Vec<Addon>, Option<Addon>)> {

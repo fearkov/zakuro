@@ -69,13 +69,21 @@ pub fn run(linked: Option<Linked>) {
 pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
     report::init();
 
-    let options = match cli::parse() {
+    let mut options = match cli::parse() {
         Ok(options) => options,
         Err(message) => {
             eprintln!("zakuro: {message}");
             std::process::exit(2);
         }
     };
+    if options.rom.is_none() {
+        if let (Some(code), Some(dir)) = (
+            &linked,
+            std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
+        ) {
+            options.rom = library::find_game_in(&dir, code.program_id());
+        }
+    }
     let mut settings = Settings::load();
     // the console's own number, made the first time and kept, it tells this one apart from others over local wireless
     if settings.console_id == 0 {
@@ -667,7 +675,7 @@ impl App {
             self.game = Some(Running::new(system, PathBuf::new(), "test pattern".to_owned()));
             self.paused = true;
         } else if let Some(rom) = self.options.rom.clone() {
-            if let Err(error) = self.play(Path::new(&rom)) {
+            if let Err(error) = self.play(&rom) {
                 eprintln!("zakuro: {error}");
                 std::process::exit(1);
             }
